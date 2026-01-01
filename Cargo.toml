@@ -1,0 +1,31 @@
+[workspace]
+members = [
+    "crates/observation",
+    "crates/task-runs",
+    "crates/task-sessions",
+    "crates/task",
+    "crates/scryer",
+    "crates/qed-gha",
+    "crates/qed",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.8.11"
+edition = "2021"
+authors = ["yah Dev <human@yah.dev>"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/yah-ai/qed"
+
+# During development, patch crates.io with local warden paths.
+# Remove once warden crates are published.
+[workspace.dependencies]
+# Turso pin — keep in lockstep with yah root and external/turso-backup (0.6.1).
+turso = "0.6.1"
+turso_core = { version = "0.6.1", features = [] }
+
+[patch.crates-io]
+workload-spec  = { path = "../warden/crates/workload-spec" }
+keys           = { path = "../warden/crates/keys" }
+yah-object-store = { path = "../warden/crates/object-store" }
+local-driver   = { path = "../warden/crates/local-driver" }

@@ -1,0 +1,36 @@
+[package]
+name = "scryer"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Per-machine event store: ring buffer + short-disk SQLite + cross-service query surface"
+publish = false
+
+[lib]
+name = "scryer"
+path = "src/lib.rs"
+
+[dependencies]
+observation = { path = "../observation" }
+task-runs = { path = "../task-runs" }
+workload-spec = { version = "0.8.11" }
+yah-object-store = { version = "0.8.11" }
+async-trait = "0.1"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "1.0"
+uuid = { version = "1", features = ["v4", "serde"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+tokio = { version = "1", features = ["sync", "rt", "time", "macros", "net", "io-util", "process"] }
+# Long-tier Parquet (R093-F5) — Apache-2.0, opt-in feature
+parquet = { version = "58", default-features = false, features = ["arrow"] }
+arrow-array = "58"
+arrow-schema = "58"
+bytes = "1"
+
+[dev-dependencies]
+async-trait = "0.1"
+tempfile = "3"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync", "net", "io-util"] }

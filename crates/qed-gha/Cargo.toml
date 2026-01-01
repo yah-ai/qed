@@ -1,0 +1,28 @@
+[package]
+name = "qed-gha"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Native Rust GHA YAML workflow runtime for QED (parser + types; F1)"
+publish = false
+
+[lib]
+name = "qed_gha"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_yaml = "0.9"
+indexmap = { version = "2", features = ["serde"] }
+thiserror = "1.0"
+# F4: bash step exec + GITHUB_OUTPUT / GITHUB_ENV scratch files.
+tempfile = "3"
+# F4: TOML loader for .yah/qed/gha-actions.toml override config.
+toml = "0.8"
+# F6: parse `docker buildx --metadata-file` output (digest + imageid).
+serde_json = "1.0"
+
+[dev-dependencies]
+serde_json = "1.0"

@@ -1,0 +1,83 @@
+# yah-qed bundled image catalog.
+#
+# Each `[[image]]` entry is a yah-managed container image. Either `base`
+# (an upstream image, e.g. `rust:1-slim-bookworm`) or `extends` (another
+# catalog entry by name) must be set. `digests` is empty in source; the
+# release pipeline injects per-arch SHA-256 digests at build time.
+#
+# Per-camp entries at `.yah/qed/images/<name>/` override these by name.
+# See `.yah/docs/working/W148-qed-container-builds.md`.
+#
+# @yah:ticket(R455-F2, "yah-mesofact-dev container image: almanac + issue-tracker side-by-side under tini")
+# @yah:assignee(agent:claude)
+# @yah:at(2026-06-05T08:24:30Z)
+# @yah:status(review)
+# @yah:phase(D)
+# @yah:parent(R455)
+# @yah:next("New crates/yah/qed/images/yah-mesofact-dev/{Dockerfile, supervise.sh}; multi-stage build emitting both binaries; tini PID 1; bash supervisor starts almanac then issue-tracker, wait -n for either")
+# @yah:next("Register in catalog.toml + EXPECTED_BUNDLED test array (mirror R408-T1's yah-warden pattern)")
+# @yah:next("GHA image-yah-mesofact-dev job in .github/workflows/release.yml (mirror image-yah-warden once that lands)")
+# @yah:verify("cargo test -p qed --lib images::catalog::tests")
+# @yah:verify("docker buildx build the image locally; both binaries respond on their configured ports")
+# @arch:see(.yah/docs/working/W180-pond-richer-topology.md)
+# @yah:depends_on(R443-F7)
+
+[[image]]
+name        = "yah-base"
+base        = "debian:bookworm-slim"
+description = "Minimal shell scripts; cheap pulls"
+tools       = ["bash", "git", "curl", "ca-certificates"]
+
+[[image]]
+name        = "yah-rust"
+base        = "rust:1-slim-bookworm"
+description = "Cargo workspaces — yah-base + cargo, rustc, build-essential"
+tools       = ["bash", "git", "curl", "cargo", "rustc", "build-essential", "pkg-config"]
+
+[[image]]
+name        = "yah-bun"
+base        = "oven/bun:debian"
+description = "Frontend builds, TS scripts"
+tools       = ["bash", "git", "curl", "bun", "node"]
+
+[[image]]
+name        = "yah-rust-bun"
+extends     = "yah-rust"
+description = "Default for the yah workspace itself (Rust + frontend) — direct heir of forge-minimal"
+tools       = ["bash", "git", "curl", "cargo", "rustc", "bun", "node"]
+
+[[image]]
+name        = "yah-python"
+base        = "python:3-slim-bookworm"
+description = "Python apps"
+tools       = ["bash", "git", "curl", "pip", "build-essential"]
+
+[[image]]
+name        = "yah-cuda"
+base        = "nvidia/cuda:12-runtime-ubuntu22.04"
+description = "GPU workloads — built only when a host advertises GPU capability"
+tools       = ["bash", "git", "curl", "nvcc", "cudnn"]
+
+[[image]]
+name        = "yah-node"
+base        = "node:lts-bookworm"
+description = "npm-ecosystem builds"
+tools       = ["bash", "git", "curl", "npm", "pnpm", "yarn"]
+
+[[image]]
+name        = "yah-warden"
+base        = "debian:bookworm-slim"
+description = "Pond-tier warden+constable container (tini PID 1, both binaries baked in) — see W154"
+tools       = ["tini", "yah-warden", "constable"]
+
+[[image]]
+name        = "yah-miniflare"
+base        = "oven/bun:1-debian"
+description = "Pond-tier miniflare (workerd) container — bun + tini + baked miniflare; Worker bundle bind-mounted at runtime (R455-F1; W180)"
+tools       = ["tini", "bun", "miniflare"]
+
+[[image]]
+name        = "yah-mesofact-dev"
+base        = "debian:bookworm-slim"
+description = "Pond-tier mesofact backend (almanac-serve + issue-tracker under tini) — W180 Phase D"
+tools       = ["tini", "almanac-serve", "issue-tracker"]

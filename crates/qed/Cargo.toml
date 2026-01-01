@@ -1,0 +1,54 @@
+[package]
+name = "qed"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CI scheduler: pipelines, step DAGs, triggers, and pass/fail gating over task execution"
+publish = false
+
+[lib]
+name = "qed"
+path = "src/lib.rs"
+
+[[bin]]
+name = "qed"
+path = "src/bin/qed.rs"
+
+[dependencies]
+task = { path = "../task" }
+task-runs = { path = "../task-runs" }
+workload-spec = { version = "0.8.11" }
+scryer = { path = "../scryer" }
+observation = { path = "../observation" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+thiserror = "1.0"
+tokio = { version = "1", features = ["sync", "rt", "time", "macros", "process", "io-util"] }
+async-trait = "0.1"
+uuid = { version = "1.0", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+tracing = "0.1"
+# Staging dir for the release-channel publish layout (R330-F3) before handoff
+# to a ReleasePublisher.
+tempfile = "3"
+# Native-tarball packaging (R407-T2): write a static musl Rust binary + a
+# workload-spec manifest into a .tar.gz consumable by Constable.
+tar = "0.4"
+flate2 = "1"
+# musl-static cross-compile preflight (R407-T3): walks a workspace package's
+# transitive dep tree to flag glibc-only crates before the cross build.
+cargo_metadata = "0.18"
+# W200-F9: dispatch StepKind::GhaWorkflow into the native GHA runtime.
+qed-gha = { path = "../qed-gha" }
+indexmap = { version = "2", features = ["serde"] }
+# R487 follow-up: vault-backed `~/.yah/qed/secrets.toml` resolver — maps GHA
+# secret names to vault slot names so workflows that reference
+# ${{ secrets.X }} get the same value GHA's secret store would.
+keys = { version = "0.8.11" }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }

@@ -1,0 +1,71 @@
+# @yah:ticket(R299-T5, "Scaffold crates/yah/qed crate (types, runner, config loader)")
+# @yah:at(2026-05-23T01:46:41Z)
+# @yah:status(review)
+# @yah:phase(P1)
+# @yah:parent(R299)
+# @arch:see(.yah/docs/working/W126-yah-qed.md)
+# @yah:depends_on(R299-T1)
+#
+# @yah:ticket(R299-T6, "Embed built-in pipelines (check, smoke, release-build) in builtins.rs")
+# @yah:assignee(agent:claude)
+# @yah:at(2026-05-23T01:46:49Z)
+# @yah:status(review)
+# @yah:phase(P1)
+# @yah:parent(R299)
+# @arch:see(.yah/docs/working/W126-yah-qed.md)
+# @yah:depends_on(R299-T5)
+# @yah:handoff("Extracted builtin_check/smoke/release-build out of config.rs into crates/yah/qed/src/builtins.rs. Public API: get_builtin(name) + BUILTIN_NAMES constant. config.rs PipelineLoader.load() delegates to builtins::get_builtin; new list_all() dedupes built-ins + camp TOML files. release-build builtin gets an on_success=warden-deploy outcome per arch doc. cargo check -p qed clean; cargo test -p qed 3/3 pass.")
+# @yah:verify("cargo check -p qed — no errors")
+# @yah:verify("cargo test -p qed — 3 tests pass (test_builtin_check_pipeline, test_builtin_smoke_pipeline, test_builtin_release_build_pipeline)")
+#
+# @yah:ticket(R299-T9, "Pipeline outcome dispatch: warden-deploy + almanac-run (on_success/on_failure)")
+# @yah:at(2026-05-23T01:47:19Z)
+# @yah:status(review)
+# @yah:phase(P3)
+# @yah:parent(R299)
+# @arch:see(.yah/docs/working/W126-yah-qed.md)
+# @yah:depends_on(R299-T5)
+# @yah:handoff("Outcome dispatch wired end-to-end. Three pieces: (1) config.rs PipelineConfig now deserializes on_success/on_fail from TOML (PipelineToml → load_from_file threads them through); (2) runner.rs adds OutcomeDispatcher trait (async_trait) + LoggingOutcomeDispatcher stub (warden deploy RPC not yet stable per R040-F4, almanac not yet implemented — both log and no-op); (3) PipelineRunner::run() dispatches the matching outcome list after step loop completes. New constructor new_with_dispatcher() for testing. 11 tests pass: 3 runner outcome tests (dispatches_on_success, dispatches_on_fail_not_on_success, no_outcomes_no_dispatch) + 2 config TOML parse tests.")
+# @yah:verify("cargo test -p qed — 11 pass")
+#
+# @yah:ticket(R299-T10, "Schedule trigger: almanac dispatches qed pipelines via TaskSpec interface")
+# @yah:assignee(agent:claude)
+# @yah:at(2026-05-23T01:47:24Z)
+# @yah:status(review)
+# @yah:phase(P3)
+# @yah:parent(R299)
+# @arch:see(.yah/docs/working/W126-yah-qed.md)
+# @yah:depends_on(R299-T5)
+# @yah:handoff("Added Trigger enum (Manual/Tag/Schedule/Pipeline) to types.rs; added triggers field to Pipeline (serde default = []); wired TOML parsing in config.rs; updated all Pipeline struct literals in builtins.rs and runner.rs tests; added almanac_dispatch_argv(pipeline, params) public function to lib.rs — this is the stable contract almanac uses to dispatch qed pipelines as subprocess TaskSpecs. 16 tests pass.")
+# @yah:verify("cargo test -p qed # 16 tests pass including parses_schedule_trigger_from_toml, parses_tag_trigger_from_toml, almanac_dispatch_argv_no_params, almanac_dispatch_argv_with_params")
+
+[package]
+name = "task"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Transient execution umbrella: local, remote, and integration task species sharing TaskId + scryer scope"
+publish = false
+
+[lib]
+name = "task"
+path = "src/lib.rs"
+
+[dependencies]
+observation = { path = "../observation" }
+workload-spec = { version = "0.8.11" }
+task-runs = { path = "../task-runs" }
+scryer = { path = "../scryer" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+async-trait = "0.1"
+thiserror = "1.0"
+toml = "0.8"
+tokio = { version = "1", features = ["sync", "rt", "time", "macros", "process"] }
+
+[dev-dependencies]
+serde_json = "1.0"
+tempfile = "3"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }
