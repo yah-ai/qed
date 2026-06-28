@@ -1,5 +1,5 @@
 [package]
-name = "qed"
+name = "yah-qed"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -9,22 +9,22 @@ description = "CI scheduler: pipelines, step DAGs, triggers, and pass/fail gatin
 publish = false
 
 [lib]
-name = "qed"
+name = "yah_qed"
 path = "src/lib.rs"
 
 [[bin]]
-name = "qed"
+name = "yah-qed"
 path = "src/bin/qed.rs"
 
 [dependencies]
-task = { path = "../task" }
+velveteen = { path = "../task" }
 task-runs = { path = "../task-runs" }
-workload-spec = { version = "0.8.11" }
-scryer = { path = "../scryer" }
+workload-spec = { package = "yah-workload-spec", version = "0.8.16" }
+yah-scryer = { path = "../scryer" }
 observation = { path = "../observation" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-toml = "0.8"
+toml = { version = "0.8", features = ["preserve_order"] }
 thiserror = "1.0"
 tokio = { version = "1", features = ["sync", "rt", "time", "macros", "process", "io-util"] }
 async-trait = "0.1"
@@ -34,20 +34,44 @@ tracing = "0.1"
 # Staging dir for the release-channel publish layout (R330-F3) before handoff
 # to a ReleasePublisher.
 tempfile = "3"
+# Authenticode adapter (R509-F2): decode a base64-stored PKCS#12 cert blob
+# resolved from the secrets bridge into the raw .pfx bytes.
+base64 = "0.22"
+# Sparkle adapter (R509-F3): EdDSA (ed25519) sign of the update archive for the
+# appcast `sparkle:edSignature`. BSD-3-Clause.
+ed25519-dalek = "2"
 # Native-tarball packaging (R407-T2): write a static musl Rust binary + a
-# workload-spec manifest into a .tar.gz consumable by Constable.
+# workload-spec manifest into a .tar.gz consumable by Kamaji.
 tar = "0.4"
 flate2 = "1"
 # musl-static cross-compile preflight (R407-T3): walks a workspace package's
 # transitive dep tree to flag glibc-only crates before the cross build.
 cargo_metadata = "0.18"
 # W200-F9: dispatch StepKind::GhaWorkflow into the native GHA runtime.
-qed-gha = { path = "../qed-gha" }
+yah-qed-gha = { path = "../qed-gha" }
+# R533-F1 (W224): blake3 content-hash pin for an imported `workflow.yml`
+# source. Same content-addressing primitive the rest of yah uses (kept at the
+# workspace-wide `1.x` line).
+blake3 = "1"
 indexmap = { version = "2", features = ["serde"] }
 # R487 follow-up: vault-backed `~/.yah/qed/secrets.toml` resolver — maps GHA
 # secret names to vault slot names so workflows that reference
 # ${{ secrets.X }} get the same value GHA's secret store would.
-keys = { version = "0.8.11" }
+fob = { version = "0.8.16" }
+# W209: pipeline outputs → manifest bind. Parse-time schema (BindSpec,
+# OutputDecl, OutputRef, ValueType, Intent) consumed by the pipeline TOML
+# loader; the applier itself runs at step boundaries inside the runner.
+manifest-bind = { path = "../manifest-bind" }
+# R533-T10 (W224): JSON Schema derivation for the .yah/qed/*.toml pipeline
+# format. Optional + default-off so the runtime binary deps don't carry
+# schemars; xtask turns it on to generate qed-pipeline.toml.schema.json (same
+# pattern cloud/workload-spec use).
+schemars = { version = "0.8", optional = true }
+
+[features]
+# Derive `schemars::JsonSchema` on the pipeline-manifest type graph. Off by
+# default — only the schema-emit xtask needs it.
+json-schema = ["dep:schemars"]
 
 [dev-dependencies]
 tempfile = "3"

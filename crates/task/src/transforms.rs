@@ -138,6 +138,32 @@ impl TransformRecipeLoader {
         self.transforms_dir.join(format!("{name}.toml"))
     }
 
+    /// List every recipe name (the `*.toml` file stem) in the transforms dir,
+    /// sorted. Mirrors [`PipelineLoader::list_all`](crate) — scans the
+    /// directory on each call so a freshly-dropped recipe surfaces without a
+    /// daemon restart. A missing transforms dir is not an error: it yields an
+    /// empty list (a camp may legitimately define no transforms).
+    pub fn list_all(&self) -> Result<Vec<String>, RecipeError> {
+        let entries = match fs::read_dir(&self.transforms_dir) {
+            Ok(e) => e,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(source) => {
+                return Err(RecipeError::Io {
+                    path: self.transforms_dir.clone(),
+                    source,
+                })
+            }
+        };
+        let mut names: Vec<String> = entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|ext| ext == "toml"))
+            .filter_map(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()))
+            .collect();
+        names.sort();
+        Ok(names)
+    }
+
     /// Load and validate a recipe by name. The two post-parse rules:
     /// - `recipe.name` must match the requested name (catches typos / rename
     ///   accidents).
@@ -280,6 +306,27 @@ timeout = 600
                 "{{quant}}",
             ]
         );
+    }
+
+    #[test]
+    fn list_all_returns_sorted_stems_and_ignores_non_toml() {
+        let dir = tempdir().unwrap();
+        let transforms = dir.path().join("transforms");
+        fs::create_dir_all(&transforms).unwrap();
+        fs::write(transforms.join("zeta.toml"), "").unwrap();
+        fs::write(transforms.join("alpha.toml"), "").unwrap();
+        fs::write(transforms.join("README.md"), "ignore me").unwrap();
+
+        let loader = TransformRecipeLoader::new(&transforms);
+        let names = loader.list_all().expect("list_all ok");
+        assert_eq!(names, vec!["alpha".to_string(), "zeta".to_string()]);
+    }
+
+    #[test]
+    fn list_all_missing_dir_is_empty_not_error() {
+        let dir = tempdir().unwrap();
+        let loader = TransformRecipeLoader::new(dir.path().join("does-not-exist"));
+        assert_eq!(loader.list_all().expect("ok"), Vec::<String>::new());
     }
 
     #[test]

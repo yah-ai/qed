@@ -222,6 +222,29 @@ pub struct TaskSession {
     pub result: Option<SessionResult>,
 }
 
+// ─── TicketClaim ──────────────────────────────────────────────────────────────
+
+/// Outcome of an atomic ticket claim (W210 board.claim).
+///
+/// The claim is conflict-rejecting: at most one live (active) TaskSession may
+/// own a ticket. Because the daemon is the single writer, the find-then-create
+/// inside [`SessionStore::claim_ticket_session`] is effectively atomic — two
+/// pickers racing through the daemon serialize, so exactly one gets `Claimed`
+/// and the other gets `Conflict`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TicketClaim {
+    /// No live session existed; a fresh one was created and bound to the ticket.
+    Claimed(TaskSessionId),
+    /// The caller already owns the live session (idempotent re-claim).
+    AlreadyOwned(TaskSessionId),
+    /// A different live session already owns the ticket — claim rejected.
+    Conflict {
+        session: TaskSessionId,
+        /// The holder's claimant token (`label`), if it recorded one.
+        holder: Option<String>,
+    },
+}
+
 // ─── SessionFilter ────────────────────────────────────────────────────────────
 
 #[derive(Debug, Default)]

@@ -16,7 +16,7 @@
 //!
 //! F2 adds:
 //!   - `EventScope::Service(MeshIdent)` ingestion via [`adapters::ContainerdLogsAdapter`]
-//!     (containerd gRPC log API) and [`adapters::WardenRpcAdapter`] (warden's
+//!     (containerd gRPC log API) and [`adapters::WardenRpcAdapter`] (yubaba's
 //!     own structured emissions).
 //!   - [`beholders::ServiceBeholder`] trait + bundled `vanilla` (rfc5424-ish)
 //!     and `unstructured` (passthrough) parsers.
@@ -31,12 +31,12 @@
 //!
 //! F7 adds (P2 narrow):
 //!   - [`adapters::JournaldAdapter`] — host-level systemd units (sshd, kernel,
-//!     warden's own unit). Entries scoped to `Service(MeshIdent("<unit>.host"))`.
+//!     yubaba's own unit). Entries scoped to `Service(MeshIdent("<unit>.host"))`.
 //!     Explicit allow-list; yah-managed services stay on `containerd_logs`.
 //!
 //! F8 adds (P2 tier-2):
 //!   - [`ingestion::IngestionServer`] — Unix socket ingestion server for
-//!     `yah-log` service-scope events. Warden injects `YAH_SERVICE_IDENT` +
+//!     `yah-log` service-scope events. Yubaba injects `YAH_SERVICE_IDENT` +
 //!     `YAH_SCRYER_SOCKET` into workload env; the shim connects and writes
 //!     JSON-lines with `scope_kind = "service"` scope envelope.
 //!

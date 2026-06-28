@@ -1,5 +1,5 @@
 [package]
-name = "qed-gha"
+name = "yah-qed-gha"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -9,7 +9,7 @@ description = "Native Rust GHA YAML workflow runtime for QED (parser + types; F1
 publish = false
 
 [lib]
-name = "qed_gha"
+name = "yah_qed_gha"
 path = "src/lib.rs"
 
 [dependencies]
@@ -23,6 +23,9 @@ tempfile = "3"
 toml = "0.8"
 # F6: parse `docker buildx --metadata-file` output (digest + imageid).
 serde_json = "1.0"
+# T3: content-address the vendored github-workflow schema (same blake3 scheme
+# as the import primitive's content_hash).
+blake3 = "1"
 
 [dev-dependencies]
 serde_json = "1.0"

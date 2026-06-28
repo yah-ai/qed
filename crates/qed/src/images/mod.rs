@@ -13,6 +13,5 @@ pub mod compile;
 
 pub use catalog::{CatalogEntry, CatalogError, CatalogManifest, ProduceTarget};
 pub use compile::{
-    catalog_image_ref, compile_entry, compile_with_dockerfile_dir, CompileError,
-    MAX_EXTENDS_DEPTH,
+    catalog_image_ref, compile_entry, compile_with_dockerfile_dir, CompileError, MAX_EXTENDS_DEPTH,
 };

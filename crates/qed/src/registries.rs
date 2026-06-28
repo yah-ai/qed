@@ -61,9 +61,15 @@ pub struct RegistryEntry {
 #[derive(Debug, Error)]
 pub enum RegistryConfigError {
     #[error("IO error reading {path}: {source}")]
-    Io { path: String, source: std::io::Error },
+    Io {
+        path: String,
+        source: std::io::Error,
+    },
     #[error("TOML parse error in {path}: {source}")]
-    Parse { path: String, source: toml::de::Error },
+    Parse {
+        path: String,
+        source: toml::de::Error,
+    },
 }
 
 impl RegistryConfig {
@@ -88,9 +94,7 @@ impl RegistryConfig {
 
     /// Returns true when `host` is declared writable in this config.
     pub fn is_writable(&self, host: &str) -> bool {
-        self.registries
-            .iter()
-            .any(|r| r.writable && r.host == host)
+        self.registries.iter().any(|r| r.writable && r.host == host)
     }
 }
 
@@ -130,7 +134,10 @@ mod tests {
 
     #[test]
     fn extract_registry_host_recognises_ghcr() {
-        assert_eq!(extract_registry_host("ghcr.io/yah-ai/yah-rust:dev"), "ghcr.io");
+        assert_eq!(
+            extract_registry_host("ghcr.io/yah-ai/yah-rust:dev"),
+            "ghcr.io"
+        );
     }
 
     #[test]
@@ -193,8 +200,7 @@ host = "docker.io"
     #[test]
     fn registry_config_load_parses_bad_toml_as_error() {
         let dir = TempDir::new().unwrap();
-        std::fs::write(dir.path().join("registries.toml"), "not = valid toml [[")
-            .unwrap();
+        std::fs::write(dir.path().join("registries.toml"), "not = valid toml [[").unwrap();
         let err = RegistryConfig::load(dir.path()).unwrap_err();
         match err {
             RegistryConfigError::Parse { .. } => {}

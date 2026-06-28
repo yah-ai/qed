@@ -15,8 +15,8 @@
 # @yah:phase(D)
 # @yah:parent(R455)
 # @yah:next("New crates/yah/qed/images/yah-mesofact-dev/{Dockerfile, supervise.sh}; multi-stage build emitting both binaries; tini PID 1; bash supervisor starts almanac then issue-tracker, wait -n for either")
-# @yah:next("Register in catalog.toml + EXPECTED_BUNDLED test array (mirror R408-T1's yah-warden pattern)")
-# @yah:next("GHA image-yah-mesofact-dev job in .github/workflows/release.yml (mirror image-yah-warden once that lands)")
+# @yah:next("Register in catalog.toml + EXPECTED_BUNDLED test array (mirror R408-T1's yah-yubaba pattern)")
+# @yah:next("GHA image-yah-mesofact-dev job in .github/workflows/release.yml (mirror image-yah-yubaba once that lands)")
 # @yah:verify("cargo test -p qed --lib images::catalog::tests")
 # @yah:verify("docker buildx build the image locally; both binaries respond on their configured ports")
 # @arch:see(.yah/docs/working/W180-pond-richer-topology.md)
@@ -65,10 +65,10 @@ description = "npm-ecosystem builds"
 tools       = ["bash", "git", "curl", "npm", "pnpm", "yarn"]
 
 [[image]]
-name        = "yah-warden"
+name        = "yah-yubaba"
 base        = "debian:bookworm-slim"
-description = "Pond-tier warden+constable container (tini PID 1, both binaries baked in) — see W154"
-tools       = ["tini", "yah-warden", "constable"]
+description = "Pond-tier yubaba+kamaji container (tini PID 1, both binaries baked in) — see W154"
+tools       = ["tini", "yah-yubaba", "kamaji"]
 
 [[image]]
 name        = "yah-miniflare"
@@ -81,3 +81,15 @@ name        = "yah-mesofact-dev"
 base        = "debian:bookworm-slim"
 description = "Pond-tier mesofact backend (almanac-serve + issue-tracker under tini) — W180 Phase D"
 tools       = ["tini", "almanac-serve", "issue-tracker"]
+
+[[image]]
+name        = "yah-cloud-runner"
+base        = "debian:bookworm-slim"
+description = "Cloud-tier almanac runner (almanac-serve under tini) behind runner.yah.dev — R330-F11, W059"
+tools       = ["tini", "almanac-serve"]
+
+[[image]]
+name        = "rusty-v8-musl-builder"
+base        = "alpine:edge"
+description = "Expensive-leg builder for the rusty-v8-musl transform recipe (V8 from source → musl static lib) — R546. Alpine native-musl toolchain (no cross, no depot_tools); builds per-arch under the matching --platform."
+tools       = ["bash", "git", "curl", "cargo", "rustc", "gn", "samurai", "clang-22", "lld", "python3", "build-v8.sh"]

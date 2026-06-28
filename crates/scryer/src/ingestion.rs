@@ -1,6 +1,6 @@
 //! Unix socket ingestion server for yah-log service-scope events.
 //!
-//! Warden binds the socket (typically `/run/yah/scryer.sock`), sets
+//! Yubaba binds the socket (typically `/run/yah/scryer.sock`), sets
 //! `YAH_SCRYER_SOCKET` in every workload env, and runs this server so that
 //! workloads using `yah-log` with `YAH_SERVICE_IDENT` set can write structured
 //! events into scryer's store with `EventScope::Service(MeshIdent)` scope —
@@ -90,7 +90,7 @@ impl IngestionServer {
 
     /// Bind the Unix socket and accept connections until the task is cancelled.
     ///
-    /// Suitable for running as a `tokio::spawn`-ed background task in warden.
+    /// Suitable for running as a `tokio::spawn`-ed background task in yubaba.
     pub async fn run(&self) -> Result<(), IngestionError> {
         let listener = UnixListener::bind(&self.socket_path)?;
         loop {

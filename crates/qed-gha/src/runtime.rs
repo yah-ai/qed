@@ -5,7 +5,11 @@
 //! running steps through [`run_step`]. `run:` blocks spawn `bash`, capture
 //! `::set-output::` / `$GITHUB_OUTPUT` / `$GITHUB_ENV`, and thread results
 //! into `steps.<id>.outputs.*` for the next step. `uses:` blocks route
-//! through [`OverrideRegistry`]; an unknown slug is a loud error per W200.
+//! through the tier-1/2 [`ToolkitRegistry`] (W224 R533-T7). A slug that isn't a
+//! registered toolkit action is classified by [`crate::tier`]: a tier-3
+//! service action becomes a [`RuntimeError::Tier3RequiresNative`] (import it as
+//! a native QED step, don't run it); an unrecognized slug stays a loud
+//! [`RuntimeError::UnknownAction`].
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -20,9 +24,10 @@ use crate::graph::{
     build_context_for_instance, evaluate_outputs, plan as build_plan, CompletedInstance,
     GraphError, JobInstance, JobResult, Plan,
 };
-use crate::overrides::{Lookup, OverrideCall, OverrideRegistry, ProducedArtifact, StepConclusion};
+use crate::tier::{classify_uses, Disposition, NativeReplacement};
+use crate::toolkit::{Lookup, StepConclusion, ToolkitCall, ToolkitRegistry};
 #[cfg(test)]
-use crate::overrides::OverrideOutcome;
+use crate::toolkit::ToolkitOutcome;
 use crate::workflow::{Job, Step, StepAction, Workflow};
 
 #[derive(Debug, Error)]
@@ -37,23 +42,34 @@ pub enum RuntimeError {
     Graph(#[from] GraphError),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
-    #[error("no override registered for `{slug}` — register a built-in or add a TOML deny rule (W200 policy: every uses: must be overridden)")]
+    #[error("unrecognized action `{slug}` — not a tier-1/2 toolkit action and not in the tier-3 native-replacement catalog. Import it as a native QED step (W224 R533-T7)")]
     UnknownAction { slug: String },
-    #[error("override `{slug}` denied: {message}")]
-    DeniedAction { slug: String, message: String },
-    #[error("override `{slug}` failed: {message}")]
-    OverrideFailed { slug: String, message: String },
+    #[error("tier-3 action `{slug}` is replaced by a native QED facility — {replacement}. Import it, don't run it: {stanza}")]
+    Tier3RequiresNative {
+        slug: String,
+        replacement: String,
+        stanza: String,
+    },
+    #[error("toolkit action `{slug}` failed: {message}")]
+    ToolkitFailed { slug: String, message: String },
 }
 
 /// Public executor handle. Workflow-level inputs (github / inputs / runner_os)
 /// stay on the executor so a single instance can run several workflows; the
-/// registry is owned here so callers wire built-ins + TOML overlays once.
+/// tier-1/2 [`ToolkitRegistry`] is owned here so callers wire the built-in
+/// toolkit actions once (via [`Executor::new`]).
 pub struct Executor {
     pub workspace: PathBuf,
-    pub registry: OverrideRegistry,
+    pub registry: ToolkitRegistry,
     pub github: Value,
     pub inputs: Value,
     pub runner_os: String,
+    /// Host arch in the GHA `runner.arch` vocabulary (`X64` / `ARM64` / …).
+    /// Defaults to the running host (see [`detect_runner_arch`]). The QED
+    /// runner overwrites this from its self-detected host triple (R531-T1)
+    /// so a workflow gating on `runner.arch` sees the real host it's running
+    /// on, not just `runner.os`.
+    pub runner_arch: String,
     /// Forward the parent process env into step subprocesses. Tests usually
     /// want this off so the workflow env is hermetic; production wants it on
     /// so steps see PATH, HOME, etc.
@@ -86,26 +102,28 @@ pub struct Executor {
 }
 
 impl Executor {
-    /// New executor with the F5 built-in overrides pre-registered. This is
+    /// New executor with the tier-1/2 toolkit actions pre-registered. This is
     /// the right default for production callers — a workflow whose `uses:`
-    /// only references built-in slugs (the common case for `release.yml`'s
-    /// build-only legs) runs straight through without extra wiring.
+    /// only references toolkit-contract compute slugs (`rust-toolchain`,
+    /// `setup-bun`, the buildx/qemu setup verifiers, `cosign-installer`) runs
+    /// straight through without extra wiring.
     pub fn new(workspace: impl Into<PathBuf>) -> Self {
         let mut e = Self::bare(workspace);
-        crate::overrides_builtin::register_builtins(&mut e.registry);
+        crate::toolkit_builtin::register_toolkit(&mut e.registry);
         e
     }
 
     /// Empty-registry executor for tests that want hermetic dispatch (no
-    /// built-ins, no `git`/`rustup`/`bun` shelled out by accident). F4 tests
-    /// use this to assert the W200 unknown-action error fires.
+    /// built-ins, no `rustup`/`bun`/`docker` shelled out by accident). Used to
+    /// assert the unknown-action / tier-3 dispatch errors fire.
     pub fn bare(workspace: impl Into<PathBuf>) -> Self {
         Self {
             workspace: workspace.into(),
-            registry: OverrideRegistry::new(),
+            registry: ToolkitRegistry::new(),
             github: Value::object(),
             inputs: Value::object(),
             runner_os: detect_runner_os().into(),
+            runner_arch: detect_runner_arch().into(),
             env_passthrough: true,
             included_instance_keys: None,
             events: None,
@@ -126,6 +144,7 @@ impl Executor {
         self.secrets = secrets;
         self
     }
+
 }
 
 fn detect_runner_os() -> &'static str {
@@ -134,6 +153,19 @@ fn detect_runner_os() -> &'static str {
         "linux" => "Linux",
         "windows" => "Windows",
         _ => "Linux",
+    }
+}
+
+/// Host arch in the GHA `runner.arch` vocabulary. Mirrors the mapping in
+/// `qed::platform::gha_runner_arch`, kept here so qed-gha stays free of a
+/// dep edge back onto the qed runner crate.
+fn detect_runner_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "x86_64" => "X64",
+        "aarch64" | "arm64" => "ARM64",
+        "x86" | "i686" => "X86",
+        "arm" => "ARM",
+        _ => "X64",
     }
 }
 
@@ -154,17 +186,6 @@ impl WorkflowRun {
             .iter()
             .find(|i| i.job_id == job_id && i.matrix_index == Some(matrix_index))
     }
-
-    /// Flat list of artifacts every successful override step produced. This
-    /// is the F9 hook: the QED runner lifts this into the parent step's
-    /// `Outcome::Publish` collection, no per-step plumbing required.
-    pub fn produced(&self) -> Vec<&ProducedArtifact> {
-        self.instances
-            .iter()
-            .filter(|i| matches!(i.result, JobResult::Success))
-            .flat_map(|i| i.produced.iter())
-            .collect()
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -174,9 +195,6 @@ pub struct InstanceRun {
     pub result: JobResult,
     pub steps: Vec<StepResult>,
     pub outputs: IndexMap<String, Value>,
-    /// Concatenated [`ProducedArtifact`]s from every successful step in this
-    /// instance — the per-job slice of [`WorkflowRun::produced`].
-    pub produced: Vec<ProducedArtifact>,
 }
 
 #[derive(Debug, Clone)]
@@ -187,7 +205,6 @@ pub struct StepResult {
     pub outputs: IndexMap<String, Value>,
     pub stdout: String,
     pub stderr: String,
-    pub produced: Vec<ProducedArtifact>,
 }
 
 // ─── workflow walker ───────────────────────────────────────────────────────
@@ -220,7 +237,6 @@ pub fn execute_workflow(
                     result: JobResult::Skipped,
                     steps: vec![],
                     outputs: IndexMap::new(),
-                    produced: vec![],
                 }
             } else {
                 emit_job_started(executor, instance, workflow);
@@ -252,6 +268,27 @@ fn run_instance(
         .get(&instance.job_id)
         .expect("plan only references known jobs");
 
+    // GHA implicit needs-gate: a job with no explicit `if:` runs only when
+    // every job in its `needs:` succeeded. A failed / cancelled / skipped
+    // dependency short-circuits the job to Skipped — matching GHA, where a
+    // dependent job is skipped unless it opts in via an explicit `if:`
+    // (`always()` / a `needs.X.result` check). Without this gate a consumer
+    // job (e.g. `image-yah-yubaba`, which downloads `yubaba-bins-*`) runs
+    // even when its producer (`yubaba-build`) failed and uploaded nothing,
+    // so its `actions/download-artifact` step hits an empty store. The fix
+    // is structural: the consumer never runs, so the failure surfaces at the
+    // producing job — not as a bogus download error three waves later
+    // (R516-B1).
+    if !needs_gate_passes(job, completed) {
+        return Ok(InstanceRun {
+            job_id: instance.job_id.clone(),
+            matrix_index: instance.matrix_index,
+            result: JobResult::Skipped,
+            steps: vec![],
+            outputs: IndexMap::new(),
+        });
+    }
+
     // Pre-step context: matrix + needs + env composed but ctx.steps empty.
     let mut ctx = build_context_for_instance(
         instance,
@@ -260,6 +297,7 @@ fn run_instance(
         executor.github.clone(),
         executor.inputs.clone(),
         &executor.runner_os,
+        &executor.runner_arch,
         executor.secrets.clone(),
     )?;
 
@@ -270,7 +308,6 @@ fn run_instance(
             result: JobResult::Skipped,
             steps: vec![],
             outputs: IndexMap::new(),
-            produced: vec![],
         });
     }
 
@@ -309,7 +346,6 @@ fn run_instance(
                 outputs: IndexMap::new(),
                 stdout: String::new(),
                 stderr: String::new(),
-                produced: vec![],
             };
             steps_obj.insert(synthetic_id, step_value(&skipped));
             step_results.push(skipped);
@@ -351,19 +387,12 @@ fn run_instance(
         JobResult::Success
     };
 
-    let produced: Vec<ProducedArtifact> = step_results
-        .iter()
-        .filter(|s| matches!(s.conclusion, StepConclusion::Success))
-        .flat_map(|s| s.produced.iter().cloned())
-        .collect();
-
     Ok(InstanceRun {
         job_id: instance.job_id.clone(),
         matrix_index: instance.matrix_index,
         result,
         steps: step_results,
         outputs,
-        produced,
     })
 }
 
@@ -400,6 +429,77 @@ fn step_value(step: &StepResult) -> Value {
 }
 
 // ─── if-cond eval (job + step) ─────────────────────────────────────────────
+
+/// GHA status-check functions. Their presence anywhere in a job `if:` is what
+/// makes GHA drop the implicit `success()` needs-gate — *not* the mere presence
+/// of an `if:`. An `if:` built only from event/ref filters keeps the gate.
+const STATUS_FUNCTIONS: [&str; 4] = ["always", "success", "failure", "cancelled"];
+
+/// Whether an `if:` condition references a GHA status-check function as a call
+/// (`always()`, `failure()`, …). Scans the raw token bodies; matches the name
+/// only when it stands as its own identifier immediately followed by `(`, so
+/// `needs.failure_count` or a `success_url` field don't trip it.
+fn references_status_function(expr_str: &ExprString) -> bool {
+    expr_str.tokens.iter().any(|t| {
+        let body = match t {
+            ExprToken::Literal(s) | ExprToken::Expr(s) => s.as_str(),
+        };
+        STATUS_FUNCTIONS.iter().any(|f| body_calls(body, f))
+    })
+}
+
+/// True if `body` contains `name` as a standalone identifier followed (after
+/// optional whitespace) by `(`.
+fn body_calls(body: &str, name: &str) -> bool {
+    let bytes = body.as_bytes();
+    let mut from = 0;
+    while let Some(rel) = body[from..].find(name) {
+        let start = from + rel;
+        let end = start + name.len();
+        let prev_ok = start == 0
+            || !matches!(bytes[start - 1], b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'_');
+        let next_is_paren = body[end..].trim_start().starts_with('(');
+        if prev_ok && next_is_paren {
+            return true;
+        }
+        from = end;
+    }
+    false
+}
+
+/// GHA implicit needs-gate. Returns `false` when at least one `needs:`
+/// dependency did not aggregate to success (matrix rows aggregate per
+/// [`JobResult::aggregate`]: any failure wins).
+///
+/// GHA injects an implicit `success()` (all-needs-succeeded) into a job's `if:`
+/// *unless* the author's condition references a status-check function — so
+/// `if: <event/ref filter>` is really `success() && (<filter>)` and a job with
+/// such a filter is still skipped when a `needs:` producer failed or was
+/// skipped. Only `always()` / `failure()` / `cancelled()` / explicit
+/// `success()` opt out of the auto gate (which is why `if: always() && …`
+/// publish jobs still run after a skipped dependency). The earlier
+/// `if_cond.is_some()` short-circuit was too coarse: it let `smoke` (an
+/// event/ref `if:` with no status function) run after its `cli-build` producer
+/// was skipped, then fail on an empty artifact store three waves later (R516-B1).
+fn needs_gate_passes(job: &Job, completed: &[CompletedInstance]) -> bool {
+    if let Some(cond) = &job.if_cond {
+        if references_status_function(cond) {
+            return true;
+        }
+    }
+    for need in &job.needs {
+        let agg = JobResult::aggregate(
+            completed
+                .iter()
+                .filter(|c| &c.job_id == need)
+                .map(|c| c.result),
+        );
+        if agg != JobResult::Success {
+            return false;
+        }
+    }
+    true
+}
 
 fn should_run_job(job: &Job, ctx: &Context) -> Result<bool, RuntimeError> {
     let Some(expr_str) = &job.if_cond else { return Ok(true) };
@@ -447,10 +547,10 @@ fn run_step(
     instance: &JobInstance,
     step_index: usize,
 ) -> Result<StepResult, RuntimeError> {
-    let env = compose_step_env(step, ctx, env_overlay)?;
+    let env = compose_step_env(step, ctx, env_overlay, executor)?;
     let res = match &step.action {
         StepAction::Run { body, shell } => {
-            run_bash_step(step, body, shell.as_deref(), &env, executor, instance, step_index)?
+            run_bash_step(step, body, shell.as_deref(), &env, ctx, executor, instance, step_index)?
         }
         StepAction::Uses { slug, git_ref, with } => {
             run_uses_step(step, slug, git_ref.as_deref(), with, &env, ctx, executor)?
@@ -468,8 +568,20 @@ fn compose_step_env(
     step: &Step,
     ctx: &Context,
     _env_overlay: &IndexMap<String, String>,
+    executor: &Executor,
 ) -> Result<IndexMap<String, String>, RuntimeError> {
     let mut out: IndexMap<String, String> = IndexMap::new();
+    // Lowest-precedence host default (inserted first so workflow / job / step
+    // `env:` below override it): when the runner host isn't x86_64, point docker
+    // at linux/amd64. Steps that pull the amd64-only cross base images
+    // (`cross build`) otherwise fail on an arm64 host with "no match for
+    // platform in manifest"; with this they resolve under emulation. Explicit
+    // `docker buildx build --platform …` in the multi-arch image jobs still
+    // wins over this default, and it's a no-op on x86_64 hosts (and on real
+    // GHA, which never executes through this runner).
+    if executor.runner_arch != "X64" {
+        out.insert("DOCKER_DEFAULT_PLATFORM".into(), "linux/amd64".into());
+    }
     if let Value::Object(m) = &ctx.env {
         for (k, v) in m {
             out.insert(k.clone(), v.as_str_lossy());
@@ -490,20 +602,14 @@ fn run_bash_step(
     body: &ExprString,
     shell: Option<&str>,
     env: &IndexMap<String, String>,
+    ctx: &Context,
     executor: &Executor,
     instance: &JobInstance,
     step_index: usize,
 ) -> Result<StepResult, RuntimeError> {
-    let body_str = crate::graph::eval_exprstring(body, &empty_ctx()).map_err(|source| {
-        // The body's expressions need the current ctx — call site doesn't
-        // pass it through here because compose_step_env already did the env
-        // work. Re-eval against an empty ctx is wrong; route via the caller.
-        // (Replaced in the next call site.)
-        RuntimeError::Expr { site: "step.run".into(), source }
-    })?;
-    // Compute body against an env-aware shell instead — fall through.
-    let _ = body_str;
-    let body_str = render_run_body(body, env)?;
+    let body_str = crate::graph::eval_exprstring(body, ctx)
+        .map_err(|source| RuntimeError::Expr { site: "step.run".into(), source })?
+        .as_str_lossy();
 
     let shell = shell.unwrap_or("bash");
     if shell != "bash" {
@@ -547,6 +653,7 @@ fn run_bash_step(
     cmd.env("GITHUB_ENV", &env_path);
     cmd.env("GITHUB_STEP_SUMMARY", &step_summary_path);
     cmd.env("RUNNER_OS", &executor.runner_os);
+    cmd.env("RUNNER_ARCH", &executor.runner_arch);
 
     // Pipe stdout + stderr so we can stream lines through the event sink
     // (when configured) and still capture full buffers for the returned
@@ -638,7 +745,6 @@ fn run_bash_step(
         outputs,
         stdout,
         stderr,
-        produced: vec![],
     };
     if !env_updates.is_empty() {
         // Encode env updates as a magic prefix on stderr so `pop_env_updates`
@@ -652,39 +758,6 @@ fn run_bash_step(
         step_res.stderr.push_str(&payload);
     }
     Ok(step_res)
-}
-
-fn render_run_body(
-    body: &ExprString,
-    _env: &IndexMap<String, String>,
-) -> Result<String, RuntimeError> {
-    // The run-body is a YAML scalar that may carry `${{ }}` interpolations.
-    // We've already evaluated env separately; here we only need to swap in
-    // expression values, leaving the surrounding shell text intact. The
-    // caller hands us the ExprString tokens; we walk and stitch.
-    //
-    // Note: the body's expressions read the same ctx the env composition
-    // used, but ctx isn't threaded here — the caller's pre-eval already
-    // produced literal-or-expr tokens. We assume the run body's expressions
-    // have already been folded; for tokens of [Literal], we return the
-    // literal. For mixed tokens we'd need ctx — that path lands in
-    // `run_bash_step_with_ctx` (see [`run_step_full`]).
-    if let [ExprToken::Literal(b)] = body.tokens.as_slice() {
-        return Ok(b.clone());
-    }
-    // F4 happens to not need run-body expression eval in any test, but a
-    // correct fallback is to concatenate already-rendered tokens.
-    let mut out = String::new();
-    for t in &body.tokens {
-        if let ExprToken::Literal(s) = t {
-            out.push_str(s);
-        }
-    }
-    Ok(out)
-}
-
-fn empty_ctx() -> Context<'static> {
-    Context::new()
 }
 
 const ENV_UPDATE_PREFIX: &str = "__qed_gha_env_updates_BEGIN__\n";
@@ -766,6 +839,108 @@ fn exprstring_static(s: &ExprString) -> Option<String> {
 
 // ─── uses dispatch ─────────────────────────────────────────────────────────
 
+/// True when an `actions/checkout` step targets a *different* repository (a
+/// non-empty `repository:` input) — the one case W224 says still needs a native
+/// clone. A same-repo checkout (the overwhelming default: no `repository:`, or an
+/// empty one) is implicit on QED and skipped as a no-op.
+fn checks_out_foreign_repo(with: &IndexMap<String, Value>) -> bool {
+    matches!(with.get("repository"), Some(Value::String(repo)) if !repo.trim().is_empty())
+}
+
+/// Read an `actions/checkout` `with:` input as a trimmed non-empty string.
+/// Numbers (`fetch-depth: 0`) come through `as_str_lossy`, so this works for
+/// both string and numeric YAML scalars.
+fn checkout_input(with: &IndexMap<String, Value>, key: &str) -> Option<String> {
+    let s = with.get(key)?.as_str_lossy();
+    (!s.trim().is_empty()).then(|| s.trim().to_string())
+}
+
+/// W224 R533-T12: emit an explicit native `git clone` for a *foreign-repo*
+/// `actions/checkout`. Same-repo checkout is a no-op (the workspace already IS
+/// the checkout); only a `with: repository:` naming a different repo lands here.
+///
+/// Honors the three inputs the [`NativeReplacement::Checkout`] stanza promises:
+/// - `ref` → `git clone --branch <ref>` (a branch or tag; a bare commit SHA is
+///   not supported by `--branch` and fails here — pin foreign repos to a
+///   branch/tag, or import an explicit fetch+checkout step for a SHA),
+/// - `path` → the clone subdir under the workspace (default: the repo's short
+///   name, never the workspace root, so a foreign checkout can't clobber the
+///   run's own positioned tree),
+/// - `fetch-depth` → `--depth N` (GHA's default is `1` = shallow; `0` = full
+///   history, no `--depth`).
+///
+/// A non-zero `git` exit surfaces as a [`StepConclusion::Failure`] step (with
+/// the git stderr captured), exactly like a failing `run:` step — not a hard
+/// [`RuntimeError`] — so normal job-failure handling applies. A spawn failure
+/// (no `git` on PATH) is the one [`RuntimeError::Io`] case.
+fn run_native_checkout(
+    step: &Step,
+    with: &IndexMap<String, Value>,
+    executor: &Executor,
+) -> Result<StepResult, RuntimeError> {
+    let repository = checkout_input(with, "repository")
+        .expect("caller verified a non-empty repository via checks_out_foreign_repo");
+
+    // `owner/repo` → `https://github.com/owner/repo.git`. A literal URL (any
+    // scheme) or a filesystem path (absolute or `.`-relative) passes through
+    // unchanged — the latter lets a clone target a local repo with no network,
+    // which is also what the unit test exercises.
+    let url = if repository.contains("://")
+        || repository.starts_with('/')
+        || repository.starts_with('.')
+    {
+        repository.clone()
+    } else {
+        format!("https://github.com/{repository}.git")
+    };
+
+    let dest_rel = checkout_input(with, "path").unwrap_or_else(|| {
+        repository
+            .trim_end_matches(".git")
+            .rsplit('/')
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("checkout")
+            .to_string()
+    });
+    let dest = executor.workspace.join(&dest_rel);
+
+    let depth: u64 = checkout_input(with, "fetch-depth")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
+
+    let mut cmd = Command::new("git");
+    cmd.arg("clone");
+    if depth > 0 {
+        cmd.arg("--depth").arg(depth.to_string());
+    }
+    if let Some(git_ref) = checkout_input(with, "ref") {
+        cmd.arg("--branch").arg(git_ref);
+    }
+    cmd.arg("--").arg(&url).arg(&dest);
+    cmd.current_dir(&executor.workspace);
+    if !executor.env_passthrough {
+        cmd.env_clear();
+    }
+
+    let output = cmd.output()?; // spawn failure ⇒ RuntimeError::Io
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    let conclusion = if output.status.success() {
+        StepConclusion::Success
+    } else {
+        StepConclusion::Failure
+    };
+    Ok(StepResult {
+        step_id: step.id.clone(),
+        name: step.name.as_ref().and_then(exprstring_static),
+        conclusion,
+        outputs: IndexMap::new(),
+        stdout,
+        stderr,
+    })
+}
+
 fn run_uses_step(
     step: &Step,
     slug: &str,
@@ -785,38 +960,88 @@ fn run_uses_step(
     }
 
     let outcome = match executor.registry.lookup(slug) {
-        Lookup::Found { ovr, config } => {
-            let call = OverrideCall {
+        Lookup::Found { action } => {
+            let call = ToolkitCall {
                 slug,
                 git_ref,
                 with: &typed_with,
                 env,
                 workspace: &executor.workspace,
-                config,
             };
-            ovr.execute(&call)
-                .map_err(|message| RuntimeError::OverrideFailed {
+            action
+                .execute(&call)
+                .map_err(|message| RuntimeError::ToolkitFailed {
                     slug: slug.into(),
                     message,
                 })?
         }
-        Lookup::Denied { message } => {
-            return Err(RuntimeError::DeniedAction {
-                slug: slug.into(),
-                message: message.into(),
-            })
+        // Not a tier-1/2 toolkit action. W224 R533-T7: decline to imitate
+        // tier-3 GitHub services — the tier classifier names the native QED
+        // replacement so the failure is honest ("import this as a native step")
+        // instead of mysterious. A slug in neither bucket is a genuine unknown.
+        Lookup::Unknown => {
+            let (_, disposition) = classify_uses(slug);
+            // W224: `actions/checkout` against the *same* repo is implicit on QED
+            // — it already owns the workspace (the camp root IS the checkout), so
+            // re-cloning over a live tree is wrong. Treat a same-repo checkout as
+            // a successful no-op rather than erroring; the workflow stays valid on
+            // GitHub-the-service (where the step does real work) while running
+            // unchanged here. Only a *foreign-repo* checkout (a `repository:`
+            // input naming another repo) genuinely needs a native clone, so that
+            // case still falls through to the tier-3 error below.
+            if matches!(disposition, Disposition::ReplaceWithNative(NativeReplacement::Checkout)) {
+                // W224: a *same-repo* checkout is implicit on QED — the camp root
+                // (or the run's positioned worktree) IS the checkout, so re-cloning
+                // over the live tree is wrong. Treat it as a successful no-op.
+                if !checks_out_foreign_repo(&typed_with) {
+                    return Ok(StepResult {
+                        step_id: step.id.clone(),
+                        name: step.name.as_ref().and_then(exprstring_static),
+                        conclusion: StepConclusion::Success,
+                        outputs: IndexMap::new(),
+                        stdout: "checkout is implicit on QED (workspace already present) — step skipped"
+                            .into(),
+                        stderr: String::new(),
+                    });
+                }
+                // R533-T12: a *foreign-repo* checkout (`with: repository: other/repo`)
+                // genuinely needs a clone — the NativeReplacement::Checkout stanza
+                // promises one. Emit an explicit native git clone into a subdir of
+                // the workspace, honoring `ref` / `path` / `fetch-depth`.
+                return run_native_checkout(step, &typed_with, executor);
+            }
+            return Err(match disposition {
+                Disposition::ReplaceWithNative(nr) => RuntimeError::Tier3RequiresNative {
+                    slug: slug.into(),
+                    replacement: nr.label().into(),
+                    stanza: nr.stanza_hint().into(),
+                },
+                // Compute/Unknown that has no registered toolkit impl: we have
+                // no executor for it. Surface it for human review rather than
+                // guessing (e.g. a tier-1 `uses:` we haven't wired an impl for).
+                Disposition::Compute | Disposition::Unknown => {
+                    RuntimeError::UnknownAction { slug: slug.into() }
+                }
+            });
         }
-        Lookup::Unknown => return Err(RuntimeError::UnknownAction { slug: slug.into() }),
     };
 
+    // A failing toolkit action (conclusion=Failure) mirrors its log into stderr
+    // so the qed-runner's stderr-tail diagnostic surfaces *why* the step failed
+    // (it reads `StepResult::stderr`, not stdout). Without this, a graceful
+    // action failure shows up downstream as "(no stderr)".
+    let stderr = if matches!(outcome.conclusion, StepConclusion::Failure) {
+        outcome.log.clone()
+    } else {
+        String::new()
+    };
     Ok(StepResult {
         step_id: step.id.clone(),
         name: step.name.as_ref().and_then(exprstring_static),
         conclusion: outcome.conclusion,
         outputs: outcome.outputs,
         stdout: outcome.log,
-        stderr: String::new(),
-        produced: outcome.produced,
+        stderr,
     })
 }
 
@@ -899,7 +1124,6 @@ fn emit_step_finished(
         conclusion: res.conclusion,
         msg,
         outputs: res.outputs.clone(),
-        produced: res.produced.clone(),
     });
 }
 
@@ -908,7 +1132,7 @@ fn emit_step_finished(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::overrides::Override;
+    use crate::toolkit::ToolkitAction;
     use crate::parse_workflow;
 
     fn workflow(yaml: &str) -> Workflow {
@@ -968,6 +1192,38 @@ jobs:
         assert_eq!(
             s.outputs.get("digest"),
             Some(&Value::String("sha256:abc".into()))
+        );
+    }
+
+    #[test]
+    fn matrix_expr_in_run_body_is_interpolated() {
+        // Regression: render_run_body used to drop ${{ }} tokens, so
+        // `cargo build --target ${{ matrix.target }}` shipped to bash as
+        // `cargo build --target ` (trailing flag, no value).
+        let yaml = r#"
+on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [x86_64-unknown-linux-musl, aarch64-unknown-linux-musl]
+    steps:
+      - id: emit
+        run: |
+          echo "::set-output name=t::${{ matrix.target }}"
+"#;
+        let wf = workflow(yaml);
+        let run = run_with_path(&wf);
+        let inst0 = run.instance_at("build", 0).unwrap();
+        let inst1 = run.instance_at("build", 1).unwrap();
+        assert_eq!(
+            inst0.steps[0].outputs.get("t"),
+            Some(&Value::String("x86_64-unknown-linux-musl".into()))
+        );
+        assert_eq!(
+            inst1.steps[0].outputs.get("t"),
+            Some(&Value::String("aarch64-unknown-linux-musl".into()))
         );
     }
 
@@ -1108,13 +1364,72 @@ jobs:
         );
     }
 
+    #[test]
+    fn non_amd64_host_injects_docker_default_platform() {
+        // On an arm64 host, steps see DOCKER_DEFAULT_PLATFORM=linux/amd64 so
+        // `cross build` can pull the amd64-only cross base image under emulation
+        // instead of failing with "no match for platform in manifest".
+        let yaml = r#"
+on: [push]
+jobs:
+  one:
+    runs-on: ubuntu-latest
+    steps:
+      - id: a
+        run: |
+          echo "plat=$DOCKER_DEFAULT_PLATFORM" >> "$GITHUB_OUTPUT"
+"#;
+        let wf = workflow(yaml);
+        let mut e = Executor::new(workspace_path());
+        e.env_passthrough = true;
+        e.runner_os = "Linux".into();
+        e.runner_arch = "ARM64".into();
+        let run = execute_workflow(&wf, &e).unwrap_or_else(|err| panic!("execute: {err}"));
+        let inst = run.instance("one").unwrap();
+        assert_eq!(inst.result, JobResult::Success);
+        assert_eq!(
+            inst.steps[0].outputs.get("plat"),
+            Some(&Value::String("linux/amd64".into())),
+        );
+    }
+
+    #[test]
+    fn workflow_env_overrides_injected_docker_default_platform() {
+        // The injected value is a *default* — an explicit workflow/job/step
+        // `env:` still wins (lowest-precedence insertion).
+        let yaml = r#"
+on: [push]
+env:
+  DOCKER_DEFAULT_PLATFORM: linux/arm64
+jobs:
+  one:
+    runs-on: ubuntu-latest
+    steps:
+      - id: a
+        run: |
+          echo "plat=$DOCKER_DEFAULT_PLATFORM" >> "$GITHUB_OUTPUT"
+"#;
+        let wf = workflow(yaml);
+        let mut e = Executor::new(workspace_path());
+        e.env_passthrough = true;
+        e.runner_os = "Linux".into();
+        e.runner_arch = "ARM64".into();
+        let run = execute_workflow(&wf, &e).unwrap_or_else(|err| panic!("execute: {err}"));
+        let inst = run.instance("one").unwrap();
+        assert_eq!(inst.result, JobResult::Success);
+        assert_eq!(
+            inst.steps[0].outputs.get("plat"),
+            Some(&Value::String("linux/arm64".into())),
+        );
+    }
+
     // ── uses dispatch
 
-    struct FakeOverride {
+    struct FakeAction {
         slug: &'static str,
     }
-    impl Override for FakeOverride {
-        fn execute(&self, call: &OverrideCall<'_>) -> Result<OverrideOutcome, String> {
+    impl ToolkitAction for FakeAction {
+        fn execute(&self, call: &ToolkitCall<'_>) -> Result<ToolkitOutcome, String> {
             let mut outputs = IndexMap::new();
             outputs.insert(
                 "slug".into(),
@@ -1129,19 +1444,18 @@ jobs:
             for (k, v) in call.with.iter() {
                 outputs.insert(format!("in_{k}"), v.clone());
             }
-            // Use the slug to identify which override fired.
+            // Use the slug to identify which action fired.
             let _ = self.slug;
-            Ok(OverrideOutcome {
+            Ok(ToolkitOutcome {
                 outputs,
                 log: "fake".into(),
                 conclusion: StepConclusion::Success,
-            produced: Vec::new(),
             })
         }
     }
 
     #[test]
-    fn uses_unknown_action_raises_w200_error() {
+    fn uses_unknown_action_raises_error() {
         let yaml = r#"
 on: [push]
 jobs:
@@ -1179,7 +1493,7 @@ jobs:
         e.env_passthrough = true;
         e.inputs = crate::obj([("tag", "v1.2.3")]);
         e.registry
-            .register("test/echo", Box::new(FakeOverride { slug: "test/echo" }));
+            .register("test/echo", Box::new(FakeAction { slug: "test/echo" }));
         let run = execute_workflow(&wf, &e).unwrap();
         let s = &run.instance("one").unwrap().steps[0];
         assert_eq!(s.outputs.get("slug"), Some(&Value::String("test/echo".into())));
@@ -1198,35 +1512,178 @@ jobs:
     }
 
     #[test]
-    fn uses_denied_action_surfaces_message() {
+    fn uses_tier3_action_requires_native_replacement() {
+        // W224 R533-T7: a tier-3 service action (here `actions/upload-artifact`)
+        // is no longer reimplemented — it routes through the tier classifier to a
+        // Tier3RequiresNative error naming the native QED facility, so the
+        // failure says "import this as a native step" instead of running a
+        // half-faithful clone of the GitHub service.
         let yaml = r#"
 on: [push]
 jobs:
   one:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/github-script@v6
+      - uses: actions/upload-artifact@v4
 "#;
         let wf = workflow(yaml);
         let mut e = Executor::new(workspace_path());
         e.env_passthrough = true;
-        e.registry
-            .load_toml_str(
-                r#"
-            [overrides."actions/github-script"]
-            deny = true
-            deny_message = "JS actions not supported in v1"
-            "#,
-            )
-            .unwrap();
-        let err = execute_workflow(&wf, &e).expect_err("denied");
+        let err = execute_workflow(&wf, &e).expect_err("tier-3 must not run");
         match err {
-            RuntimeError::DeniedAction { slug, message } => {
-                assert_eq!(slug, "actions/github-script");
-                assert_eq!(message, "JS actions not supported in v1");
+            RuntimeError::Tier3RequiresNative { slug, replacement, stanza } => {
+                assert_eq!(slug, "actions/upload-artifact");
+                assert!(!replacement.is_empty(), "replacement label present");
+                assert!(!stanza.is_empty(), "native stanza hint present");
             }
-            other => panic!("expected DeniedAction, got {other}"),
+            other => panic!("expected Tier3RequiresNative, got {other}"),
         }
+    }
+
+    #[test]
+    fn uses_same_repo_checkout_is_implicit_noop() {
+        // W224: `actions/checkout` against the same repo is implicit on QED —
+        // the camp root IS the workspace, so the step is a successful no-op
+        // rather than a Tier3RequiresNative error. This keeps a stock release
+        // workflow (every job opens with `- uses: actions/checkout@v4`) runnable
+        // on QED unchanged while staying valid on GitHub-the-service.
+        let yaml = r#"
+on: [push]
+jobs:
+  one:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+"#;
+        let wf = workflow(yaml);
+        let mut e = Executor::new(workspace_path());
+        e.env_passthrough = true;
+        let run = execute_workflow(&wf, &e).expect("same-repo checkout no-ops");
+        let step = &run.instances[0].steps[0];
+        assert_eq!(step.conclusion, StepConclusion::Success);
+        assert!(step.stdout.contains("implicit"), "no-op note surfaced: {}", step.stdout);
+    }
+
+    #[test]
+    fn uses_foreign_repo_checkout_emits_a_native_clone() {
+        // R533-T12: a `repository:` input naming another repo can't be the
+        // implicit workspace — QED emits an explicit native `git clone` into a
+        // subdir of the workspace, honoring `ref` / `path` / `fetch-depth`,
+        // instead of the old Tier3RequiresNative refusal.
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            let ok = Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?} failed in {}", dir.display());
+        };
+        // A local source repo with a committed file, also on branch `release`.
+        // An absolute path is treated as a literal clone URL, so the test needs
+        // no network.
+        let src = tempfile::tempdir().unwrap();
+        git(src.path(), &["init", "-b", "main"]);
+        git(src.path(), &["config", "user.email", "t@t.t"]);
+        git(src.path(), &["config", "user.name", "t"]);
+        std::fs::write(src.path().join("hello.txt"), "from-foreign-repo").unwrap();
+        git(src.path(), &["add", "."]);
+        git(src.path(), &["commit", "-m", "init"]);
+        git(src.path(), &["branch", "release"]);
+
+        // A fresh, empty workspace to clone into (not the shared temp_dir).
+        let ws = tempfile::tempdir().unwrap();
+        let yaml = format!(
+            r#"
+on: [push]
+jobs:
+  one:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: {src}
+          ref: release
+          path: vendored/dep
+          fetch-depth: 1
+"#,
+            src = src.path().display()
+        );
+        let wf = workflow(&yaml);
+        let mut e = Executor::new(ws.path());
+        e.env_passthrough = true; // need git on PATH
+        let run = execute_workflow(&wf, &e).expect("foreign-repo checkout clones natively");
+        let step = &run.instances[0].steps[0];
+        assert_eq!(
+            step.conclusion,
+            StepConclusion::Success,
+            "stderr: {}",
+            step.stderr
+        );
+        // `path:` placed the clone under the workspace; `ref:` checked it out.
+        let cloned = ws.path().join("vendored/dep/hello.txt");
+        assert!(cloned.exists(), "clone landed at the requested path");
+        assert_eq!(
+            std::fs::read_to_string(&cloned).unwrap(),
+            "from-foreign-repo"
+        );
+    }
+
+    #[test]
+    fn foreign_checkout_default_path_is_the_repo_short_name() {
+        // No `path:` ⇒ the clone lands in a subdir named after the repo, never
+        // the workspace root (which would clobber the run's own positioned tree).
+        let git = |dir: &std::path::Path, args: &[&str]| {
+            assert!(Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success());
+        };
+        let src = tempfile::tempdir().unwrap();
+        git(src.path(), &["init", "-b", "main"]);
+        git(src.path(), &["config", "user.email", "t@t.t"]);
+        git(src.path(), &["config", "user.name", "t"]);
+        std::fs::write(src.path().join("f"), "x").unwrap();
+        git(src.path(), &["add", "."]);
+        git(src.path(), &["commit", "-m", "i"]);
+        // Rename the source dir's leaf so the default-path derivation is
+        // observable: clone into `<workspace>/<leaf>`.
+        let leaf = src
+            .path()
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+
+        let ws = tempfile::tempdir().unwrap();
+        let yaml = format!(
+            r#"
+on: [push]
+jobs:
+  one:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: {src}
+"#,
+            src = src.path().display()
+        );
+        let wf = workflow(&yaml);
+        let mut e = Executor::new(ws.path());
+        e.env_passthrough = true;
+        let run = execute_workflow(&wf, &e).expect("clones with default path");
+        assert_eq!(run.instances[0].steps[0].conclusion, StepConclusion::Success);
+        assert!(
+            ws.path().join(&leaf).join("f").exists(),
+            "default clone path is the repo short name `{leaf}`"
+        );
+        // The workspace root itself was not turned into the clone.
+        assert!(!ws.path().join("f").exists());
     }
 
     #[test]
@@ -1259,6 +1716,100 @@ jobs:
         // Selected row actually ran a step; skipped rows have no steps.
         assert_eq!(run.instance_at("build", 0).unwrap().steps.len(), 0);
         assert_eq!(run.instance_at("build", 1).unwrap().steps.len(), 1);
+    }
+
+    fn run_in_fresh_workspace(wf: &Workflow) -> WorkflowRun {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut e = Executor::new(tmp.path());
+        e.env_passthrough = true; // need PATH for bash/coreutils
+        e.runner_os = "Linux".into();
+        let run = execute_workflow(wf, &e).unwrap_or_else(|err| panic!("execute: {err}"));
+        std::mem::forget(tmp); // keep .qed-artifacts alive through assertions
+        run
+    }
+
+    #[test]
+    fn needs_ordered_producer_runs_before_consumer() {
+        // R516-B1 happy path (recast off tier-3 artifacts onto run: steps after
+        // R533-T7 retired upload/download-artifact): a `needs`-ordered
+        // producer→consumer pair both succeed, pinning that the wave scheduler
+        // runs the producer before the consumer.
+        let yaml = r#"
+on: [push]
+jobs:
+  producer:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "payload-bytes" > artifact.txt
+  consumer:
+    needs: [producer]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "consume"
+"#;
+        let wf = workflow(yaml);
+        let run = run_in_fresh_workspace(&wf);
+        assert_eq!(run.instance("producer").unwrap().result, JobResult::Success);
+        let consumer = run.instance("consumer").unwrap();
+        assert_eq!(consumer.result, JobResult::Success);
+        assert_eq!(consumer.steps[0].conclusion, StepConclusion::Success);
+    }
+
+    #[test]
+    fn failed_producer_skips_consumer_via_needs_gate() {
+        // R516-B1 regression: when the producer fails, the consumer that
+        // `needs` it must be SKIPPED (GHA implicit needs-gate), and the workflow
+        // must complete (return Ok), not abort. (Recast off tier-3 artifacts
+        // onto run: steps after R533-T7 retired upload/download-artifact.)
+        let yaml = r#"
+on: [push]
+jobs:
+  producer:
+    runs-on: ubuntu-latest
+    steps:
+      - run: exit 1
+      - run: echo "never reached"
+  consumer:
+    needs: [producer]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "consume"
+"#;
+        let wf = workflow(yaml);
+        let run = run_in_fresh_workspace(&wf);
+        assert_eq!(run.instance("producer").unwrap().result, JobResult::Failure);
+        // Second step skipped (prior step failed without continue-on-error).
+        let producer = run.instance("producer").unwrap();
+        assert_eq!(producer.steps[1].conclusion, StepConclusion::Skipped);
+        // Consumer skipped by the needs-gate; it never reached its step.
+        let consumer = run.instance("consumer").unwrap();
+        assert_eq!(consumer.result, JobResult::Skipped);
+        assert!(consumer.steps.is_empty(), "consumer must not run any step");
+    }
+
+    #[test]
+    fn explicit_if_overrides_needs_gate() {
+        // A consumer with an explicit `if: always()` opts out of the implicit
+        // needs-gate (GHA semantics) and runs even though its producer failed.
+        // This is the `publish-*` job shape in release.yml.
+        let yaml = r#"
+on: [push]
+jobs:
+  producer:
+    runs-on: ubuntu-latest
+    steps:
+      - run: exit 1
+  consumer:
+    needs: [producer]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "ran anyway"
+"#;
+        let wf = workflow(yaml);
+        let run = run_in_fresh_workspace(&wf);
+        assert_eq!(run.instance("producer").unwrap().result, JobResult::Failure);
+        assert_eq!(run.instance("consumer").unwrap().result, JobResult::Success);
     }
 
     #[test]

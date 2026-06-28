@@ -1,0 +1,21 @@
+[package]
+name = "manifest-bind"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Apply pipeline outputs to in-tree manifests as content-addressed receipts (W209). Per-file transactional, idempotent, predicate-gated write-back."
+publish = false
+
+[dependencies]
+anyhow = "1.0"
+thiserror = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+toml_edit = "0.22"
+regex = "1.10"
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3.10"
+toml = { version = "0.8", features = ["preserve_order"] }

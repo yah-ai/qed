@@ -1,7 +1,7 @@
 //! QED — CI scheduler: pipelines, step DAGs, triggers, and pass/fail gating over task execution
 //!
 //! QED is yah's CI layer. It schedules named pipelines, gates on results, and chains into
-//! warden (deployment) and almanac (data scheduler). Unlike task (execution primitive),
+//! yubaba (deployment) and almanac (data scheduler). Unlike task (execution primitive),
 //! qed handles definition, ordering, gating, and triggering.
 //!
 //! @yah:ticket(R299-T2, "Wire qed subcommand into CLI")
@@ -25,7 +25,7 @@
 //! @yah:status(open)
 //! @yah:phase(P2)
 //! @yah:parent(Q405)
-//! @arch:see(.yah/docs/working/W154-warden-dual-runtime.md)
+//! @arch:see(.yah/docs/working/W154-yubaba-dual-runtime.md)
 //!
 //! @yah:ticket(R407-T1, "QED catalog: add 'produces' field (oci-image | native-tarball | both)")
 //! @yah:assignee(agent:claude)
@@ -33,7 +33,7 @@
 //! @yah:status(review)
 //! @yah:phase(P1)
 //! @yah:parent(R407)
-//! @arch:see(.yah/docs/working/W154-warden-dual-runtime.md)
+//! @arch:see(.yah/docs/working/W154-yubaba-dual-runtime.md)
 //! @yah:handoff("Added ProduceTarget enum (oci-image | native-tarball) and produces: Vec<ProduceTarget> field to CatalogEntry. Defaults to [oci-image] for container-first safety per W154. Empty produces lists are rejected via CatalogError::EmptyProduces. Re-exported ProduceTarget from images mod + crate root. 5 new tests cover default-when-omitted, explicit native-tarball, both-targets, empty-rejected, and unknown-variant-rejected; all bundled entries verified to default to [oci-image] (no catalog.toml edits needed). compile.rs test fixture updated. 16/16 images::catalog::tests pass.")
 //! @yah:verify("cargo test -p qed --lib images::catalog::tests")
 //! @yah:gotcha("Pre-existing unrelated qed test failures: config::tests::parses_build_image_step_from_toml (PushRequiresWritableRegistry on ghcr.io — fallout from in-flight registries module) and tests::test_builtin_release_build_pipeline (asserts 4 steps; release-build now has 6). Neither touches catalog.")
@@ -49,11 +49,11 @@
 //! @yah:next("Warn (don't refuse) when `local-only` runs on CI — drop a hint to flip placement or split the recipe")
 //! @yah:next("Decision matrix in W155 is the canonical truth table — encode it in one place")
 //! @yah:verify("Unit test: each (placement × runner) cell from W155's matrix routes correctly")
-//! @yah:verify("Manual: `yah qed run warden-release` from a laptop emits the refusal; `--force` bypasses with a warning")
+//! @yah:verify("Manual: `yah qed run yubaba-release` from a laptop emits the refusal; `--force` bypasses with a warning")
 //! @arch:see(.yah/docs/working/W170-qed-recipe-discipline.md)
 //! @yah:depends_on(R435-F1)
 //! @yah:handoff("F2 complete. Single source of truth lives at crates/yah/qed/src/placement_gate.rs: `RunnerEnv::detect()` (reads $CI / $GITHUB_ACTIONS), `evaluate(placement, env, force) -> GateOutcome` (Allow{warning} | Refuse{reason}). All 6 matrix cells + the --force escape hatch are encoded once. Gate runs at BOTH entry points: (1) CLI `yah qed run` (app/yah/cli/src/qed.rs) before the camp-proxy probe — fails fast without a daemon round-trip; (2) camp daemon `qed_run_handler` (app/yah/cli/src/camp.rs) as defence in depth for direct JSON-RPC callers (desktop Run button, agent tools). Added `force: Option<bool>` to rpc::QedRunParams and threaded through 4 wire construction sites (qed.rs CLI, desktop/qed.rs, agent-tools/qed_tools.rs, all 16 camp.rs test sites). Added --force flag to the Run subcommand. Tests in placement_gate::tests cover all 6 cells, the --force flip, and env_truthy canonical values (9 new tests, all green). Manual verify against /tmp fixture passed all 3 cases: (a) `yah qed run ci-thing` on Local without --force → Error + exit 1 + clear reason; (b) same + --force → stderr warning + run proceeds; (c) CI=true → silent allow. Full qed lib suite: 165 pass (up from 156); the lone pre-existing test_builtin_release_build_pipeline failure is the same one flagged in R380-T3's handoff — unrelated to this work. `cargo check --workspace` clean.")
-//! @yah:next("R435-T3 can start: stamp `placement` on the 3 existing recipes (desktop-local=local-only, pond-smoke=anywhere, warden-release=ci-only) and audit `concurrency_key` per W155 principle 3. The gate is live so warden-release will start refusing local kicks the moment the field is added — expected and intentional.")
+//! @yah:next("R435-T3 can start: stamp `placement` on the 3 existing recipes (desktop-local=local-only, pond-smoke=anywhere, yubaba-release=ci-only) and audit `concurrency_key` per W155 principle 3. The gate is live so yubaba-release will start refusing local kicks the moment the field is added — expected and intentional.")
 //! @yah:cleanup("Surface `placement` in `yah qed list`/`tail` headers — still deferred from F1, equally easy to graft into either F2 or T3.")
 //!
 //! @yah:ticket(R438-T4, "Recipe TOML loader for .yah/qed/transforms/*.toml")
@@ -192,12 +192,12 @@
 //! @yah:next("Override impl reads with.files glob, writes each as a ProducedArtifact with binary derived from filename stem")
 //! @yah:next("config.r2.bucket + config.r2.prefix from gha-actions.toml; prefix templated against ${{ github.ref_name }}")
 //! @yah:next("Aggregator: workflow run rolls up all overrides' ProducedArtifacts into the parent QED step's collection (see F9)")
-//! @yah:verify("Run release.yml's cli-release/warden-release/camp-release legs through W200; staged tree appears under cdn.yah.dev")
+//! @yah:verify("Run release.yml's cli-release/yubaba-release/camp-release legs through W200; staged tree appears under cdn.yah.dev")
 //! @arch:see(.yah/docs/working/W200-qed-gha-action-overrides.md)
 //! @yah:depends_on(R487-F6)
 //! @yah:tier(Cleric)
-//! @yah:handoff("F7 landed: softprops/action-gh-release override + ProducedArtifact plumbing end-to-end. Tests=88/88 (84 prior + 4 new). Plumbing: added qed_gha::ProducedArtifact { binary, path, triple } — structurally compatible with qed::types::ProducedArtifact so F9 maps at the qed-runner seam without dragging a qed dep into qed-gha. New produced: Vec<ProducedArtifact> field on OverrideOutcome / StepResult / InstanceRun, plus WorkflowRun::produced() aggregator (only successful jobs + only successful steps contribute, so failed legs don't leak half-baked artifacts into Outcome::Publish). Override: reads with.files line-by-line; each line is a workspace-relative path or single-segment * / ? glob (no **, no character classes — release.yml's files: are single tokens), expands against the workspace, derives binary from leading dash-segment of stem and triple from trailing segment (cli-v0.8.10-x86_64-unknown-linux-musl.tar.gz → binary=cli, triple=x86_64-unknown-linux-musl). Strips .tar.gz / .tar.xz / .tar.bz2 / .tgz / .zip; falls back to (stem, None) for filenames that don't match the convention. with.fail_on_unmatched_files=true is loud per release.yml usage. Outputs: upload_url + url (latter shaped as https://cdn.yah.dev/releases/<tag> so workflow steps that read steps.release.outputs.url still get a usable string).")
-//! @yah:next("User: verify F7 — especially (a) the binary/triple parsing convention (leading-dash-segment + trailing-suffix vs.<tag>-<triple> — confirm against release.yml's actual filenames: cli-*.tar.gz, warden-*.tar.gz, camp-*.tar.gz), (b) the choice to surface url as https://cdn.yah.dev/releases/<tag> (path layout must match W160's publisher), and (c) that filtering produced by successful-jobs-only is the right policy for partial-release failures (alternative: ship whatever shipped so a partial release isn't lost). Pickable next: R487-F8 (cosign sign override) and R487-F9 (StepKind::GhaWorkflow integration — this is where ProducedArtifact gets mapped to qed::types::ProducedArtifact and rolled into the outer step's Outcome::Publish).")
+//! @yah:handoff("F7 landed: softprops/action-gh-release override + ProducedArtifact plumbing end-to-end. Tests=88/88 (84 prior + 4 new). Plumbing: added yah_qed_gha::ProducedArtifact { binary, path, triple } — structurally compatible with qed::types::ProducedArtifact so F9 maps at the qed-runner seam without dragging a qed dep into qed-gha. New produced: Vec<ProducedArtifact> field on OverrideOutcome / StepResult / InstanceRun, plus WorkflowRun::produced() aggregator (only successful jobs + only successful steps contribute, so failed legs don't leak half-baked artifacts into Outcome::Publish). Override: reads with.files line-by-line; each line is a workspace-relative path or single-segment * / ? glob (no **, no character classes — release.yml's files: are single tokens), expands against the workspace, derives binary from leading dash-segment of stem and triple from trailing segment (cli-v0.8.10-x86_64-unknown-linux-musl.tar.gz → binary=cli, triple=x86_64-unknown-linux-musl). Strips .tar.gz / .tar.xz / .tar.bz2 / .tgz / .zip; falls back to (stem, None) for filenames that don't match the convention. with.fail_on_unmatched_files=true is loud per release.yml usage. Outputs: upload_url + url (latter shaped as https://cdn.yah.dev/releases/<tag> so workflow steps that read steps.release.outputs.url still get a usable string).")
+//! @yah:next("User: verify F7 — especially (a) the binary/triple parsing convention (leading-dash-segment + trailing-suffix vs.<tag>-<triple> — confirm against release.yml's actual filenames: cli-*.tar.gz, yubaba-*.tar.gz, camp-*.tar.gz), (b) the choice to surface url as https://cdn.yah.dev/releases/<tag> (path layout must match W160's publisher), and (c) that filtering produced by successful-jobs-only is the right policy for partial-release failures (alternative: ship whatever shipped so a partial release isn't lost). Pickable next: R487-F8 (cosign sign override) and R487-F9 (StepKind::GhaWorkflow integration — this is where ProducedArtifact gets mapped to qed::types::ProducedArtifact and rolled into the outer step's Outcome::Publish).")
 //!
 //! @yah:ticket(R487-F8, "sigstore/cosign-installer + cosign sign override (verify identity regex matches our registry)")
 //! @yah:assignee(agent:claude)
@@ -213,8 +213,8 @@
 //! @arch:see(.yah/docs/working/W200-qed-gha-action-overrides.md)
 //! @yah:depends_on(R487-F7)
 //! @yah:tier(Cleric)
-//! @yah:handoff("F8 landed: sigstore/cosign-installer override (verify-only, parity with setup-bun / setup-buildx). Tests=88/88 (registration test extended; install paths are too heavy for v1 — see W200 §No external downloads). Two notes baked into the code header for future readers / F9: (1) Identity regex is REGISTRY-AGNOSTIC. The verifier in task::default_image::pull pins `--certificate-identity-regexp ^https://github\\.com/yah-ai/yah/\\.github/workflows/release\\.yml@` — keyed on the workflow URL, not the pushed registry. So F6's ghcr.io → registry.yah.dev redirect needs NO consumer-side change. Open question #1 from W200 resolves: no regex tweak needed. (2) QED-mode signing is a known v1 gap. The bare `cosign sign --yes ghcr.io/yah-ai/<name>@${DIGEST}` in release.yml is a normal run: step, not a uses:; cosign-installer just ensures the tool is present. In GHA mode keyless OIDC against token.actions.githubusercontent.com mints the identity and the sign succeeds. In QED mode (warden / local) there's no GHA OIDC token, so cosign sign either drops into the interactive browser flow or fails. Wiring a QED-managed OIDC path (workload identity from camp keystore) is out of scope for F8; v1 expectation is releases sign on GHA, QED-side runs treat sign as best-effort (failure logs without blocking pulls — matches release.yml's existing behaviour). Worth a follow-up ticket if QED-side signed releases become a goal.")
-//! @yah:next("User: verify F8 — mostly a doc / scope spike. Confirm (a) you're OK that v1 cosign-installer is verify-only (host must have cosign on PATH; no auto-install), and (b) you accept the QED-mode signing gap as a future ticket rather than blocking F9. Pickable next: R487-F9 (StepKind::GhaWorkflow + QED runner dispatch — the integration phase that maps qed_gha::ProducedArtifact → qed::types::ProducedArtifact and rolls into the outer step's Outcome::Publish, and surfaces `yah qed run release` as a one-step pipeline that wraps release.yml end-to-end).")
+//! @yah:handoff("F8 landed: sigstore/cosign-installer override (verify-only, parity with setup-bun / setup-buildx). Tests=88/88 (registration test extended; install paths are too heavy for v1 — see W200 §No external downloads). Two notes baked into the code header for future readers / F9: (1) Identity regex is REGISTRY-AGNOSTIC. The verifier in task::default_image::pull pins `--certificate-identity-regexp ^https://github\\.com/yah-ai/yah/\\.github/workflows/release\\.yml@` — keyed on the workflow URL, not the pushed registry. So F6's ghcr.io → registry.yah.dev redirect needs NO consumer-side change. Open question #1 from W200 resolves: no regex tweak needed. (2) QED-mode signing is a known v1 gap. The bare `cosign sign --yes ghcr.io/yah-ai/<name>@${DIGEST}` in release.yml is a normal run: step, not a uses:; cosign-installer just ensures the tool is present. In GHA mode keyless OIDC against token.actions.githubusercontent.com mints the identity and the sign succeeds. In QED mode (yubaba / local) there's no GHA OIDC token, so cosign sign either drops into the interactive browser flow or fails. Wiring a QED-managed OIDC path (workload identity from camp keystore) is out of scope for F8; v1 expectation is releases sign on GHA, QED-side runs treat sign as best-effort (failure logs without blocking pulls — matches release.yml's existing behaviour). Worth a follow-up ticket if QED-side signed releases become a goal.")
+//! @yah:next("User: verify F8 — mostly a doc / scope spike. Confirm (a) you're OK that v1 cosign-installer is verify-only (host must have cosign on PATH; no auto-install), and (b) you accept the QED-mode signing gap as a future ticket rather than blocking F9. Pickable next: R487-F9 (StepKind::GhaWorkflow + QED runner dispatch — the integration phase that maps yah_qed_gha::ProducedArtifact → qed::types::ProducedArtifact and rolls into the outer step's Outcome::Publish, and surfaces `yah qed run release` as a one-step pipeline that wraps release.yml end-to-end).")
 //!
 //! @yah:relay(R495, "QED MCP tools: run status, pipeline list, run history")
 //! @yah:assignee(bundle-anthropic-miravel)
@@ -224,7 +224,7 @@
 //! @yah:next("Expose qed.pipelines → list defined pipelines with source file + placement")
 //! @yah:next("Expose qed.runs { limit, pipeline? } → recent run history (depends on run storage being wired)")
 //! @yah:next("Wire run storage so yah qed list is populated (prerequisite for qed.runs)")
-//! @yah:handoff("Shipped QED MCP tools across three sites. (1) crates/yah/agent-tools/src/qed_tools.rs: added QedPipelines tool that dispatches QED_PIPELINES RPC to the camp daemon, returns name/label/scope/params_required/step_count/step_names per pipeline. Exported in qed_tools() vec alongside existing QedRun/QedStatus/QedList/QedCancel. (2) app/yah/cli/src/mcp/tools.rs: added Qed CapabilityGroup; updated group_for_name (qed.* → Qed); updated allowed_groups (Relay + Warden get Qed); registered 5 Tool entries (qed.run, qed.status, qed.list, qed.cancel, qed.pipelines) with full input_schema in QED CI TOOLS (5) section; added qed.* dispatch arm in call() that routes through agent-tools KgTool impls (same ToolContext pattern as cloud.*). (3) app/yah/cli/src/qed.rs: wired List subcommand to proxy qed.list to camp daemon via hub_dispatch::try_call_camp, prints tabular run history or graceful 'no daemon' message; wired Status subcommand to proxy qed.status, prints pipeline/status/steps. Added 3 tests: qed_tools_are_registered, relay_job_includes_qed_tools, chat_job_drops_qed_tools. 67/67 mcp::tools tests pass; cargo check --workspace clean.")
+//! @yah:handoff("Shipped QED MCP tools across three sites. (1) crates/yah/agent-tools/src/qed_tools.rs: added QedPipelines tool that dispatches QED_PIPELINES RPC to the camp daemon, returns name/label/scope/params_required/step_count/step_names per pipeline. Exported in qed_tools() vec alongside existing QedRun/QedStatus/QedList/QedCancel. (2) app/yah/cli/src/mcp/tools.rs: added Qed CapabilityGroup; updated group_for_name (qed.* → Qed); updated allowed_groups (Relay + Yubaba get Qed); registered 5 Tool entries (qed.run, qed.status, qed.list, qed.cancel, qed.pipelines) with full input_schema in QED CI TOOLS (5) section; added qed.* dispatch arm in call() that routes through agent-tools KgTool impls (same ToolContext pattern as cloud.*). (3) app/yah/cli/src/qed.rs: wired List subcommand to proxy qed.list to camp daemon via hub_dispatch::try_call_camp, prints tabular run history or graceful 'no daemon' message; wired Status subcommand to proxy qed.status, prints pipeline/status/steps. Added 3 tests: qed_tools_are_registered, relay_job_includes_qed_tools, chat_job_drops_qed_tools. 67/67 mcp::tools tests pass; cargo check --workspace clean.")
 //! @yah:verify("cargo test -p yah --lib mcp::tools  # 67/67 pass")
 //! @yah:verify("cargo check --workspace  # clean")
 //! @yah:verify("cargo test -p yah --lib mcp::tools::tests::qed_tools_are_registered  # 1/1")
@@ -232,49 +232,94 @@
 //! @yah:verify("yah qed status <run_id>  # with daemon: pipeline+steps; without: clear error")
 
 pub mod config;
+pub mod eject;
 pub mod events;
+pub mod export;
 pub mod images;
+pub mod import;
+pub mod matrix;
 pub mod native;
-pub mod placement_gate;
-pub mod preflight;
-pub mod publish;
+pub mod nativecross;
 pub mod peers;
+pub mod placement_gate;
+pub mod platform;
+pub mod ports;
+pub mod preflight;
+pub mod provider;
+pub mod publish;
 pub mod registries;
 pub mod runner;
 pub mod secrets_bridge;
+pub mod toolchain;
+pub mod transform;
 pub mod types;
+pub mod waitfor;
 
 pub use config::{ConfigError, GhaWorkflowEntry, LoaderSubPipelineResolver, PipelineLoader};
-/// Re-exported so daemon/UI glue can match on workflow step shapes without
-/// taking a direct `qed-gha` dep edge — the catalog converter in
-/// `camp.rs::qed_pipelines_handler` walks these to flatten jobs/steps.
-pub use qed_gha;
 pub use events::{OutputStream, QedEvent};
-pub use placement_gate::{evaluate as evaluate_placement_gate, GateOutcome, RunnerEnv};
 pub use images::{CatalogEntry, CatalogError, CatalogManifest, ProduceTarget};
+pub use eject::{
+    eject, freshness as eject_freshness, validate_ejected, EjectFreshness, GeneratedHeader,
+    ValidateError as EjectValidateError,
+};
+pub use export::{export_pipeline, Degradation, ExportReport};
+pub use import::{content_hash, expand_import, ImportExpansion, ImportFreshness};
 pub use native::{
     native_tarball_output_path, pack_native_tarball, tarball_stem, CosignSigner, LoggingSigner,
     NativeTarballManifest, SignedBlob, SigstoreSigner,
+};
+pub use nativecross::{
+    is_native_cross_target, plan_native_cross, rewrite_build_argv, select_cross_tool, CrossTool,
+    CrossToolUnavailable, NativeCrossPlan, ToolAvailability,
+};
+pub use peers::{PeerConfig, PeerConfigError, PeerEntry};
+pub use placement_gate::{evaluate as evaluate_placement_gate, GateOutcome, RunnerEnv};
+pub use platform::{
+    arch_of, detect_host_triple, gha_runner_arch, host_native_crossable, preflight_line,
+    resolve as resolve_platform, Platform, PlatformSpec, Resolution,
+};
+pub use ports::{
+    workflow_ports, PortError, PortInput, PortOutput, PortSecret, WorkflowPorts,
 };
 pub use preflight::{
     audit_workspace, check_dep_list, check_musl_compatibility, render_markdown, AuditRow,
     MuslPreflightError, WorkspaceAudit, KNOWN_GLIBC_ONLY_CRATES,
 };
+pub use provider::{
+    EventLogConfig, EventLogProvider, MapSecrets, NotarizeProvider, ProviderContext,
+    ProviderRegistry, ProviderReport, ReleaseProvider, SecretSource, EVENT_LOG_PROVIDER,
+};
 pub use publish::{
     resolve_release_version, stage_release, ChannelManifest, LoggingReleasePublisher,
     PublishRequest, PublishingOutcomeDispatcher, ReleasePublisher, StageReport,
 };
-pub use peers::{PeerConfig, PeerConfigError, PeerEntry};
-pub use registries::{
-    extract_registry_host, RegistryConfig, RegistryConfigError, RegistryEntry,
+/// Re-exported so daemon/UI glue can match on workflow step shapes without
+/// taking a direct `qed-gha` dep edge — the catalog converter in
+/// `camp.rs::qed_pipelines_handler` walks these to flatten jobs/steps.
+pub use yah_qed_gha;
+pub use registries::{extract_registry_host, RegistryConfig, RegistryConfigError, RegistryEntry};
+pub use runner::{
+    LoggingOutcomeDispatcher, OutcomeDispatcher, PipelineRunner, RunWhere, RunnerError,
 };
-pub use runner::{LoggingOutcomeDispatcher, OutcomeDispatcher, PipelineRunner, RunnerError, RunWhere};
-pub use task::TaskRuntime;
+pub use velveteen::TaskRuntime;
+pub use velveteen::{
+    RecipeError, RecipeLocation, RecipePlacement, RecipeStep, TransformRecipe,
+    TransformRecipeLoader,
+};
+pub use toolchain::{
+    detect_host_versions, effective_pins, resolve_pin, version_satisfies, PinResolution,
+    PreflightEntry, Tool, ToolchainPreflight, ToolchainSpec,
+};
+pub use transform::{
+    transform_workflow, transform_workflow_src, FlagKind, FlagSeverity, TransformReport,
+    TransformedStep,
+};
 pub use types::{
-    sub_pipeline_ref_token, validate_sub_pipeline_graph, GhaWorkflowConfig, Outcome, OutputDecl,
-    Pipeline, Placement, ProducedArtifact, QedRunId, QedRunMeta, QedStep, RunStatus, StepKind,
-    StepStatus, StepValidationError, SubPipelineCollect, SubPipelineConfig, SubPipelineError,
-    SubPipelineRef, SubPipelineResolver, Trigger, MAX_SUB_PIPELINE_DEPTH,
+    new_run_id, sub_pipeline_ref_token, validate_sub_pipeline_graph, GhaWorkflowConfig,
+    ImportConfig, JobRow, Outcome, OutputDecl, Pipeline, Placement, ProducedArtifact, QedRunId,
+    QedRunMeta, QedStep, RunStatus, StepActivation, StepKind, StepStatus, StepValidationError,
+    SubPipelineCollect, SubPipelineConfig, SubPipelineError, SubPipelineRef, SubPipelineResolver,
+    Trigger, WaitForConfig, MAX_SUB_PIPELINE_DEPTH,
 };
 
 /// Returns the argv that an external scheduler (e.g. almanac) should submit as a TaskSpec
@@ -285,7 +330,10 @@ pub use types::{
 /// `TaskSpec { argv: qed::almanac_dispatch_argv("check"), .. }`.
 ///
 /// Params are appended as `--<key>=<value>` flags, matching `yah qed run` CLI behaviour.
-pub fn almanac_dispatch_argv(pipeline: &str, params: &std::collections::HashMap<String, String>) -> Vec<String> {
+pub fn almanac_dispatch_argv(
+    pipeline: &str,
+    params: &std::collections::HashMap<String, String>,
+) -> Vec<String> {
     let mut argv = vec![
         "yah".to_string(),
         "qed".to_string(),
@@ -303,6 +351,25 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    /// Locate the yah monorepo's `.yah/qed` pipeline dir by walking up from the
+    /// crate manifest. In-tree this crate is nested at `oss/qed/crates/qed`, so
+    /// the old fixed 3-`parent()`-hop math (written for `crates/yah/qed`) now
+    /// overshoots; ascend until the marker is found. When consumed as the
+    /// standalone github.com/yah-ai/qed export mirror there is no yah `.yah/qed`,
+    /// so these workspace-coupled tests skip rather than fail.
+    fn find_qed_dir() -> Option<std::path::PathBuf> {
+        let mut dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        loop {
+            let candidate = dir.join(".yah").join("qed");
+            if candidate.join("P013-release.toml").is_file() {
+                return Some(candidate);
+            }
+            if !dir.pop() {
+                return None;
+            }
+        }
+    }
+
     // R467-cleanup: the four per-builtin tests (check / smoke / release-build /
     // desktop-release) were deleted alongside the `builtins.rs` module. Each
     // pipeline is now an ordinary `.yah/qed/P00*-<name>.toml` file; loader
@@ -315,18 +382,16 @@ mod tests {
     /// cycles or depth violations, and a single terminal Outcome::Publish is
     /// declared at the parent so one revalidate POST fires after both
     /// children finish. (R499-T2: pipeline name was `full-release` until
-    /// P007-warden-release.toml collapsed into this file and the canonical
+    /// P007-yubaba-release.toml collapsed into this file and the canonical
     /// name shifted to `release`.)
     #[test]
     fn test_release_composite_pipeline() {
-        // Resolve workspace `.yah/qed` from the crate manifest dir so the
-        // test runs regardless of cwd (cargo runs from crate root by default).
-        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let qed_dir = manifest
-            .parent().unwrap()
-            .parent().unwrap()
-            .parent().unwrap()
-            .join(".yah/qed");
+        // Resolve workspace `.yah/qed` by walking up from the crate manifest so
+        // the test runs regardless of cwd (and of nesting depth under oss/).
+        let Some(qed_dir) = find_qed_dir() else {
+            eprintln!("skip: yah .yah/qed pipelines not present (standalone export)");
+            return;
+        };
         let loader = PipelineLoader::new(qed_dir);
         let pipeline = loader
             .load_and_validate_graph("release")
@@ -350,50 +415,58 @@ mod tests {
     /// external/ peers, then itself, under one terminal publish. Loads
     /// against the real workspace `.yah/qed/peers.toml` registry so a
     /// missing or misspelled peer key surfaces here at parse time. Active
-    /// children today: peer(mesofact) + path(P013-full-release) for yah.
-    /// cheers + rs-hack are registered but their `release-build` pipelines
-    /// don't exist yet, so their SubPipeline steps stay commented out.
-    /// (R499-T1: yah step retargeted from builtin(release-build) → path
-    /// after P003-release-build.toml was retired.)
+    /// children today (publish order): peer(yubaba) + peer(qed) +
+    /// peer(mesofact), then path(P013-release.toml) for yah itself. cheers is
+    /// registered but its `release-build` pipeline doesn't exist yet, so that
+    /// SubPipeline step stays commented out. (R499-T1: yah step retargeted
+    /// from builtin(release-build) → path after P003-release-build.toml was
+    /// retired.)
     #[test]
     fn test_peer_release_composite_pipeline() {
-        let manifest = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let qed_dir = manifest
-            .parent().unwrap()
-            .parent().unwrap()
-            .parent().unwrap()
-            .join(".yah/qed");
+        let Some(qed_dir) = find_qed_dir() else {
+            eprintln!("skip: yah .yah/qed pipelines not present (standalone export)");
+            return;
+        };
         let loader = PipelineLoader::new(qed_dir);
         let pipeline = loader
             .load_and_validate_graph("peer-release")
             .expect("peer-release pipeline loads + graph validates");
         assert_eq!(pipeline.name, "peer-release");
-        assert_eq!(pipeline.steps.len(), 2, "active SubPipeline children: mesofact + yah");
+        assert_eq!(
+            pipeline.steps.len(),
+            4,
+            "active SubPipeline children: yubaba + qed + mesofact peers, then yah path",
+        );
 
-        let mut saw_peer_mesofact = false;
-        let mut saw_path_yah = false;
+        // Collect the peers and the yah path target rather than asserting a
+        // fixed pair, so adding/removing a peer is a one-line list edit here.
+        let mut peers: Vec<String> = Vec::new();
+        let mut yah_path: Option<String> = None;
         for step in &pipeline.steps {
             assert_eq!(step.kind, crate::types::StepKind::SubPipeline);
             let cfg = step.sub_pipeline.as_ref().expect("sub_pipeline block");
             assert!(cfg.propagate.produces, "child produces roll up to parent");
             match &cfg.target {
                 crate::SubPipelineRef::Peer { camp, pipeline } => {
-                    assert_eq!(camp, "mesofact");
                     assert_eq!(pipeline, "release-build");
-                    saw_peer_mesofact = true;
+                    peers.push(camp.clone());
                 }
                 crate::SubPipelineRef::Path(p) => {
-                    assert_eq!(
-                        p.to_str().unwrap(),
-                        ".yah/qed/P013-release.toml"
-                    );
-                    saw_path_yah = true;
+                    yah_path = Some(p.to_str().unwrap().to_string());
                 }
                 other => panic!("unexpected SubPipelineRef in peer-release: {other:?}"),
             }
         }
-        assert!(saw_peer_mesofact, "mesofact peer step present");
-        assert!(saw_path_yah, "yah full-release path step present");
+        assert_eq!(
+            peers,
+            vec!["yubaba", "qed", "mesofact"],
+            "peer release-build children in publish order",
+        );
+        assert_eq!(
+            yah_path.as_deref(),
+            Some(".yah/qed/P013-release.toml"),
+            "yah self-release path step present",
+        );
 
         let pubs: Vec<_> = pipeline
             .on_success
@@ -414,7 +487,12 @@ mod tests {
         let mut params = HashMap::new();
         params.insert("provider".to_string(), "groq".to_string());
         let argv = almanac_dispatch_argv("smoke", &params);
-        assert!(argv.starts_with(&["yah".to_string(), "qed".to_string(), "run".to_string(), "smoke".to_string()]));
+        assert!(argv.starts_with(&[
+            "yah".to_string(),
+            "qed".to_string(),
+            "run".to_string(),
+            "smoke".to_string()
+        ]));
         assert!(argv.contains(&"--provider=groq".to_string()));
     }
 }

@@ -32,14 +32,15 @@ pub enum CompileError {
     ExtendsNotFound { name: String, target: String },
     #[error("catalog entry `{name}` has a cyclic extends chain: {}", chain.join(" → "))]
     ExtendsCycle { name: String, chain: Vec<String> },
-    #[error(
-        "catalog entry `{name}` extends chain is deeper than the {max}-step limit"
-    )]
+    #[error("catalog entry `{name}` extends chain is deeper than the {max}-step limit")]
     ExtendsTooDeep { name: String, max: usize },
     #[error("catalog entry `{0}` has neither `base` nor `extends`")]
     NoBase(String),
     #[error("io error reading sibling Dockerfile at {path}: {source}")]
-    DockerfileIo { path: String, source: std::io::Error },
+    DockerfileIo {
+        path: String,
+        source: std::io::Error,
+    },
 }
 
 /// The published image reference for a catalog entry — what other Dockerfiles
@@ -91,12 +92,11 @@ pub fn compile_with_dockerfile_dir(
     // if they reference an unknown parent in TOML we want to fail fast.
     validate_extends_chain(entry, catalog)?;
 
-    let contents = std::fs::read_to_string(&dockerfile_path).map_err(|e| {
-        CompileError::DockerfileIo {
+    let contents =
+        std::fs::read_to_string(&dockerfile_path).map_err(|e| CompileError::DockerfileIo {
             path: dockerfile_path.display().to_string(),
             source: e,
-        }
-    })?;
+        })?;
 
     if has_from_line(&contents) {
         return Ok(contents);
@@ -142,10 +142,12 @@ fn validate_extends_chain(
                 max: MAX_EXTENDS_DEPTH,
             });
         }
-        cursor = catalog.get(parent_name).ok_or_else(|| CompileError::ExtendsNotFound {
-            name: entry.name.clone(),
-            target: parent_name.to_string(),
-        })?;
+        cursor = catalog
+            .get(parent_name)
+            .ok_or_else(|| CompileError::ExtendsNotFound {
+                name: entry.name.clone(),
+                target: parent_name.to_string(),
+            })?;
     }
 
     // Reached an entry with no `extends`. It must have a `base` — otherwise
@@ -262,10 +264,22 @@ mod tests {
             dockerfile.contains("FROM ghcr.io/yah-ai/yah-rust:latest"),
             "missing FROM: {dockerfile}"
         );
-        assert!(dockerfile.contains("apt-get install"), "missing apt: {dockerfile}");
-        assert!(dockerfile.contains("libpq-dev"), "missing package: {dockerfile}");
-        assert!(dockerfile.contains("postgresql-client"), "missing package: {dockerfile}");
-        assert!(dockerfile.contains("ENV PGUSER=yah"), "missing env: {dockerfile}");
+        assert!(
+            dockerfile.contains("apt-get install"),
+            "missing apt: {dockerfile}"
+        );
+        assert!(
+            dockerfile.contains("libpq-dev"),
+            "missing package: {dockerfile}"
+        );
+        assert!(
+            dockerfile.contains("postgresql-client"),
+            "missing package: {dockerfile}"
+        );
+        assert!(
+            dockerfile.contains("ENV PGUSER=yah"),
+            "missing env: {dockerfile}"
+        );
     }
 
     #[test]
@@ -297,7 +311,9 @@ mod tests {
     fn extends_unknown_target_rejected() {
         let e = entry("orphan", None, Some("does-not-exist"));
         let err = compile_entry(&e, &bundled()).unwrap_err();
-        assert!(matches!(err, CompileError::ExtendsNotFound { ref target, .. } if target == "does-not-exist"));
+        assert!(
+            matches!(err, CompileError::ExtendsNotFound { ref target, .. } if target == "does-not-exist")
+        );
     }
 
     #[test]
@@ -338,7 +354,10 @@ description = "cycle b"
             CompileError::ExtendsCycle { name, chain } => {
                 assert_eq!(name, "a");
                 assert_eq!(chain.first().map(String::as_str), Some("a"));
-                assert!(chain.iter().filter(|n| *n == "a").count() >= 2, "cycle chain shows return: {chain:?}");
+                assert!(
+                    chain.iter().filter(|n| *n == "a").count() >= 2,
+                    "cycle chain shows return: {chain:?}"
+                );
             }
             other => panic!("expected ExtendsCycle, got {other:?}"),
         }
@@ -399,8 +418,7 @@ description = "root"
         )
         .unwrap();
         let e = entry("custom", None, Some("yah-base"));
-        let out =
-            compile_with_dockerfile_dir(&e, &bundled(), dir.path()).unwrap();
+        let out = compile_with_dockerfile_dir(&e, &bundled(), dir.path()).unwrap();
         assert_eq!(out, "FROM debian:bookworm-slim\nRUN echo hi\n");
     }
 
@@ -409,8 +427,7 @@ description = "root"
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("Dockerfile"), "RUN echo hi\n").unwrap();
         let e = entry("custom", None, Some("yah-base"));
-        let out =
-            compile_with_dockerfile_dir(&e, &bundled(), dir.path()).unwrap();
+        let out = compile_with_dockerfile_dir(&e, &bundled(), dir.path()).unwrap();
         assert!(
             out.starts_with("FROM ghcr.io/yah-ai/yah-base:latest"),
             "missing prepended FROM: {out}"
@@ -428,8 +445,7 @@ description = "root"
         )
         .unwrap();
         let e = entry("custom", None, Some("yah-base"));
-        let out =
-            compile_with_dockerfile_dir(&e, &bundled(), dir.path()).unwrap();
+        let out = compile_with_dockerfile_dir(&e, &bundled(), dir.path()).unwrap();
         assert!(
             out.starts_with("FROM ghcr.io/yah-ai/yah-base:latest"),
             "syntax directive shouldn't count as FROM: {out}"
@@ -441,8 +457,7 @@ description = "root"
         let dir = tempdir().unwrap();
         let mut e = entry("layered", None, Some("yah-base"));
         e.apt = vec!["jq".into()];
-        let out =
-            compile_with_dockerfile_dir(&e, &bundled(), dir.path()).unwrap();
+        let out = compile_with_dockerfile_dir(&e, &bundled(), dir.path()).unwrap();
         assert!(out.contains("FROM ghcr.io/yah-ai/yah-base:latest"));
         assert!(out.contains("jq"));
     }
@@ -454,8 +469,9 @@ description = "root"
         let dir = tempdir().unwrap();
         fs::write(dir.path().join("Dockerfile"), "FROM scratch\n").unwrap();
         let e = entry("typo", None, Some("yah-rsut")); // 'rsut' typo
-        let err =
-            compile_with_dockerfile_dir(&e, &bundled(), dir.path()).unwrap_err();
-        assert!(matches!(err, CompileError::ExtendsNotFound { ref target, .. } if target == "yah-rsut"));
+        let err = compile_with_dockerfile_dir(&e, &bundled(), dir.path()).unwrap_err();
+        assert!(
+            matches!(err, CompileError::ExtendsNotFound { ref target, .. } if target == "yah-rsut")
+        );
     }
 }

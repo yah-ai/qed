@@ -2,7 +2,7 @@
 //!
 //! The bundled manifest at `crates/yah/qed/images/catalog.toml` ships
 //! `yah-base`, `yah-rust`, `yah-bun`, `yah-rust-bun`, `yah-python`,
-//! `yah-cuda`, `yah-node`, `yah-warden`, `yah-miniflare`. Per-camp entries
+//! `yah-cuda`, `yah-node`, `yah-yubaba`, `yah-miniflare`. Per-camp entries
 //! at `.yah/qed/images/<name>.toml`
 //! (or `.yah/qed/images/<name>/image.toml` when a Dockerfile lives next to
 //! the TOML) override or extend the bundled set.
@@ -21,7 +21,7 @@ use thiserror::Error;
 /// W148 ships only [`ProduceTarget::OciImage`] — entries are built into
 /// container images. W154 (R407) adds [`ProduceTarget::NativeTarball`]:
 /// a static musl Rust binary packaged as a plain tarball for the native
-/// runtime path under Constable. The two are not mutually exclusive — an
+/// runtime path under Kamaji. The two are not mutually exclusive — an
 /// entry may declare both to cover container and native peers from one
 /// catalog row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize)]
@@ -101,7 +101,10 @@ pub enum CatalogError {
     #[error("IO error reading catalog: {0}")]
     Io(#[from] std::io::Error),
     #[error("TOML parse error in {path}: {source}")]
-    TomlParse { path: String, source: toml::de::Error },
+    TomlParse {
+        path: String,
+        source: toml::de::Error,
+    },
     #[error("catalog entry `{0}` has neither `base` nor `extends`")]
     OrphanEntry(String),
     #[error("catalog entry `{0}` sets both `base` and `extends` (pick one)")]
@@ -160,9 +163,7 @@ impl CatalogManifest {
             let entry = entry?;
             let path = entry.path();
             let file_type = entry.file_type()?;
-            let parsed = if file_type.is_file()
-                && path.extension().map_or(false, |e| e == "toml")
-            {
+            let parsed = if file_type.is_file() && path.extension().map_or(false, |e| e == "toml") {
                 Some(parse_per_camp(&path)?)
             } else if file_type.is_dir() {
                 let nested = path.join("image.toml");
@@ -182,15 +183,16 @@ impl CatalogManifest {
     }
 
     fn from_bundled_str(src: &str) -> Result<Self, CatalogError> {
-        let parsed: BundledToml =
-            toml::from_str(src).map_err(|e| CatalogError::TomlParse {
-                path: "<bundled catalog.toml>".to_string(),
-                source: e,
-            })?;
+        let parsed: BundledToml = toml::from_str(src).map_err(|e| CatalogError::TomlParse {
+            path: "<bundled catalog.toml>".to_string(),
+            source: e,
+        })?;
         for entry in &parsed.image {
             entry.validate()?;
         }
-        Ok(Self { entries: parsed.image })
+        Ok(Self {
+            entries: parsed.image,
+        })
     }
 
     fn upsert(&mut self, entry: CatalogEntry) {
@@ -219,11 +221,10 @@ impl CatalogManifest {
 
 fn parse_per_camp(path: &Path) -> Result<CatalogEntry, CatalogError> {
     let content = fs::read_to_string(path)?;
-    let parsed: PerCampToml =
-        toml::from_str(&content).map_err(|e| CatalogError::TomlParse {
-            path: path.display().to_string(),
-            source: e,
-        })?;
+    let parsed: PerCampToml = toml::from_str(&content).map_err(|e| CatalogError::TomlParse {
+        path: path.display().to_string(),
+        source: e,
+    })?;
     parsed.image.validate()?;
     Ok(parsed.image)
 }
@@ -244,9 +245,11 @@ mod tests {
         "yah-python",
         "yah-cuda",
         "yah-node",
-        "yah-warden",
+        "yah-yubaba",
         "yah-miniflare",
         "yah-mesofact-dev",
+        "yah-cloud-runner",
+        "rusty-v8-musl-builder",
     ];
 
     #[test]
@@ -406,18 +409,18 @@ description = "Sets both — ambiguous"
     fn per_camp_produces_native_tarball_parses() {
         let dir = tempdir().unwrap();
         fs::write(
-            dir.path().join("yah-warden.toml"),
+            dir.path().join("yah-yubaba.toml"),
             r#"
 [image]
-name        = "yah-warden"
+name        = "yah-yubaba"
 base        = "scratch"
-description = "Native musl-static warden binary"
+description = "Native musl-static yubaba binary"
 produces    = ["native-tarball"]
 "#,
         )
         .unwrap();
         let manifest = CatalogManifest::load(dir.path()).unwrap();
-        let entry = manifest.get("yah-warden").unwrap();
+        let entry = manifest.get("yah-yubaba").unwrap();
         assert_eq!(entry.produces, vec![ProduceTarget::NativeTarball]);
     }
 
@@ -425,10 +428,10 @@ produces    = ["native-tarball"]
     fn per_camp_produces_both_targets_parses() {
         let dir = tempdir().unwrap();
         fs::write(
-            dir.path().join("yah-warden.toml"),
+            dir.path().join("yah-yubaba.toml"),
             r#"
 [image]
-name        = "yah-warden"
+name        = "yah-yubaba"
 base        = "debian:bookworm-slim"
 description = "Container + native peer"
 produces    = ["oci-image", "native-tarball"]
@@ -436,7 +439,7 @@ produces    = ["oci-image", "native-tarball"]
         )
         .unwrap();
         let manifest = CatalogManifest::load(dir.path()).unwrap();
-        let entry = manifest.get("yah-warden").unwrap();
+        let entry = manifest.get("yah-yubaba").unwrap();
         assert_eq!(
             entry.produces,
             vec![ProduceTarget::OciImage, ProduceTarget::NativeTarball],

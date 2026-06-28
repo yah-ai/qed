@@ -98,6 +98,9 @@ pub struct SpawnOpts {
     /// so Tier-2 shim libraries (yah-log-rust, @yah/log) can emit structured
     /// events. Has no effect on non-Unix platforms. Defaults to `true`.
     pub log_fd_enabled: bool,
+    /// Provenance tag stored on the run's `TaskRunMeta.origin` (e.g.
+    /// `Some("terminal")` for an interactive shell). `None` is an ordinary job.
+    pub origin: Option<String>,
 }
 
 impl Default for SpawnOpts {
@@ -114,6 +117,7 @@ impl Default for SpawnOpts {
             beholder_select: BeholderSelect::Auto,
             tty_attached: false,
             log_fd_enabled: true,
+            origin: None,
         }
     }
 }
@@ -268,6 +272,7 @@ impl TaskDriver {
             initiator: opts.initiator.clone(),
             beholder_status: Some(attach.status),
             pinned: opts.pin,
+            origin: opts.origin.clone(),
         }).await?;
 
         // Open PTY pair.
@@ -786,6 +791,7 @@ mod tests {
                 initiator: Initiator::Human { camp: "test".to_string() },
                 beholder_status: None,
                 pinned: false,
+                origin: None,
             })
             .await
             .unwrap();
@@ -819,6 +825,7 @@ mod tests {
                 initiator: Initiator::Human { camp: "test".to_string() },
                 beholder_status: None,
                 pinned: false,
+                origin: None,
             })
             .await
             .unwrap();

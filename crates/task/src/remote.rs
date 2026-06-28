@@ -1,4 +1,4 @@
-//! @yah:ticket(R299-F7, "Remote step dispatch (where=remote): run qed steps as task::remote workloads on warden")
+//! @yah:ticket(R299-F7, "Remote step dispatch (where=remote): run qed steps as task::remote workloads on yubaba")
 //! @yah:assignee(agent:claude)
 //! @yah:at(2026-05-23T01:46:59Z)
 //! @yah:status(review)
@@ -6,10 +6,10 @@
 //! @yah:parent(R299)
 //! @arch:see(.yah/docs/working/W126-yah-qed.md)
 //! @yah:depends_on(R299-T5)
-//! @yah:handoff("Remote step dispatch wired in crates/yah/qed/src/runner.rs. PipelineRunner::new_remote(pipeline, scryer, warden) added; execute_step_remote maps QedStep → ForgeSpec (RemoteAny/infra tier), dispatches via RemoteForgeDriver, records forge_id in StepStatus.task_run_id. RunWhere enum exported from qed lib. CLI --where=remote gives clear error 'warden RPC client (R091) not yet implemented'. 3 new tests (remote_step_success, remote_step_failure, remote_abort_on_fail) all pass. cargo test -p qed: 6/6 ok, cargo check -p yah: clean.")
+//! @yah:handoff("Remote step dispatch wired in crates/yah/qed/src/runner.rs. PipelineRunner::new_remote(pipeline, scryer, yubaba) added; execute_step_remote maps QedStep → ForgeSpec (RemoteAny/infra tier), dispatches via RemoteForgeDriver, records forge_id in StepStatus.task_run_id. RunWhere enum exported from qed lib. CLI --where=remote gives clear error 'yubaba RPC client (R091) not yet implemented'. 3 new tests (remote_step_success, remote_step_failure, remote_abort_on_fail) all pass. cargo test -p qed: 6/6 ok, cargo check -p yah: clean.")
 //! @yah:verify("cargo test -p qed  # 6/6 pass (includes 3 new remote_* tests)")
 //! @yah:verify("cargo check -p qed -p yah  # clean")
-//! @yah:verify("yah qed run --where=remote check  # exits with 'warden RPC client (R091) not yet implemented'")
+//! @yah:verify("yah qed run --where=remote check  # exits with 'yubaba RPC client (R091) not yet implemented'")
 //!
 //! @yah:ticket(R380-T2, "Migrate task crate internal callsites to TaskPlacement (remote.rs, meta.rs, list.rs)")
 //! @yah:assignee(agent:claude)
@@ -32,25 +32,25 @@
 //! @yah:at(2026-06-01T21:06:28Z)
 //! @yah:status(review)
 //! @yah:parent(R380)
-//! @yah:next("Decision recommendation: refuse remote+native in v1. Implement only when a real use case arrives (BuildKit shelling to host docker on a warden node is the leading candidate).")
-//! @yah:next("WardenClient::deploy receives a TaskPlacement; if runtime=Native, return RemoteForgeError::InvalidSpec('warden-native exec not supported in v1; use runtime=container').")
+//! @yah:next("Decision recommendation: refuse remote+native in v1. Implement only when a real use case arrives (BuildKit shelling to host docker on a yubaba node is the leading candidate).")
+//! @yah:next("WardenClient::deploy receives a TaskPlacement; if runtime=Native, return RemoteForgeError::InvalidSpec('yubaba-native exec not supported in v1; use runtime=container').")
 //! @yah:next("Document the v2 hook: WardenClient gets a separate exec_native(spec) method later, parallel to deploy(). Don't add it now — type-level option only.")
 //! @yah:next("Test: a remote+native ForgeSpec fails with InvalidSpec at start() and emits no events.")
-//! @yah:handoff("v1 refusal seam for remote+native locked in. The refusal lives in task::remote::build_workload_spec — the very first thing RemoteForgeDriver::start does — so a remote+native ForgeSpec never allocates a ForgeId in scryer's namespace, never spawns the log-ingest task, and never reaches WardenClient::deploy. The error message now reads 'remote + native is not supported in v1 — set placement.runtime = container, or run locally with placement.location = local. A future warden `exec_native` surface lands when a real use case arrives (R380-T7 / W149).'")
-//! @yah:handoff("WardenClient trait docs now carry the v2 contract: an explicit 'Remote + native: not in v1' section explains that `deploy` is image-backed only and that v2 adds a sibling `async fn exec_native(spec) -> ...` when a real use case lands (BuildKit shelling to host docker on a warden node is the leading W149 candidate). No exec_native method added — type-level option only, per the ticket's instructions.")
-//! @yah:handoff("Test: remote::remote_native_refused_at_start_emits_no_events asserts (a) start() returns Err(InvalidSpec) with the right message, (b) warden.deploy was never called, (c) scryer holds no Forge-scoped events after the refusal. ScriptedWardenClient gained a deploy_called: Arc<Mutex<bool>> so the assertion is structural, not log-grep. cargo test -p task --lib: 54/54 pass (53 before + the new refusal test). cargo check --workspace clean.")
+//! @yah:handoff("v1 refusal seam for remote+native locked in. The refusal lives in task::remote::build_workload_spec — the very first thing RemoteForgeDriver::start does — so a remote+native ForgeSpec never allocates a ForgeId in scryer's namespace, never spawns the log-ingest task, and never reaches WardenClient::deploy. The error message now reads 'remote + native is not supported in v1 — set placement.runtime = container, or run locally with placement.location = local. A future yubaba `exec_native` surface lands when a real use case arrives (R380-T7 / W149).'")
+//! @yah:handoff("WardenClient trait docs now carry the v2 contract: an explicit 'Remote + native: not in v1' section explains that `deploy` is image-backed only and that v2 adds a sibling `async fn exec_native(spec) -> ...` when a real use case lands (BuildKit shelling to host docker on a yubaba node is the leading W149 candidate). No exec_native method added — type-level option only, per the ticket's instructions.")
+//! @yah:handoff("Test: remote::remote_native_refused_at_start_emits_no_events asserts (a) start() returns Err(InvalidSpec) with the right message, (b) yubaba.deploy was never called, (c) scryer holds no Forge-scoped events after the refusal. ScriptedWardenClient gained a deploy_called: Arc<Mutex<bool>> so the assertion is structural, not log-grep. cargo test -p task --lib: 54/54 pass (53 before + the new refusal test). cargo check --workspace clean.")
 //! @yah:next("R380-T8 (cleanup, the last child) picks up next: drop ForgeWhere from task + tower-rules, move Integration off the placement enum onto a sibling ForgeMeta.species field, delete ForgeWhere.ts, restore species-based Integration filtering in ForgeListFilter (replaces the integration_metas_always_merge_until_t8 placeholder test that T2 left behind), and sweep .yah/docs/architecture/A035-yah-forge.md + arch refs for stale ForgeWhere mentions.")
-//! @yah:next("Future work for v2 exec_native: when the first real use case arrives (e.g. BuildKit shelling to host docker on a warden node), the v2 PR adds `async fn exec_native(&self, spec: &NativeExecSpec) -> Result<..., RemoteForgeError>` to WardenClient and a parallel `start_native` path on RemoteForgeDriver. Until then the type-level hook stays trait-docs-only — no NativeExecSpec, no exec_native method, no premature surface.")
+//! @yah:next("Future work for v2 exec_native: when the first real use case arrives (e.g. BuildKit shelling to host docker on a yubaba node), the v2 PR adds `async fn exec_native(&self, spec: &NativeExecSpec) -> Result<..., RemoteForgeError>` to WardenClient and a parallel `start_native` path on RemoteForgeDriver. Until then the type-level hook stays trait-docs-only — no NativeExecSpec, no exec_native method, no premature surface.")
 //! @yah:verify("cargo test -p task --lib  # 54 pass, 2 ignored")
 //! @yah:verify("cargo test -p task --lib remote_native_refused_at_start_emits_no_events  # the new test in isolation")
 //! @yah:verify("cargo check --workspace  # clean (pre-existing desktop warnings unrelated)")
 
-// @yah:ticket(R094-F3, "Remote-forge driver: synthesize WorkloadSpec from ForgeSpec, deploy via warden RPC, attach containerd-logs scryer adapter scoped to Forge(id)")
+// @yah:ticket(R094-F3, "Remote-forge driver: synthesize WorkloadSpec from ForgeSpec, deploy via yubaba RPC, attach containerd-logs scryer adapter scoped to Forge(id)")
 // @yah:assignee(agent:claude)
 // @yah:status(review)
 // @yah:phase(P2)
 // @yah:parent(R094)
-// @yah:handoff("crates/yah/task/src/remote.rs — WardenClient trait (deploy/connect_logs/teardown/exit_code) + RemoteForgeDriver::start (allocates ForgeId, synthesizes WorkloadSpec::for_forge, deploys via warden, spawns log-ingestion task with EventScope::Forge scope, returns ForgeRunHandle backed by tokio::sync::watch) + ForgeRunHandle::wait (async, terminal-state poll) + ForgeRunHandle::kill. ScriptedWardenClient + HangingWardenClient test helpers in test_support mod. task Cargo.toml: added scryer, tokio, async-trait, thiserror deps. Two verify tests pass: remote::happy (Done exit_code=0 + 2 events queryable via scryer.events(Forge(id))) and remote::timeout (TimedOut + warden.teardown called). cargo test -p task 18/18 ok; cargo check --workspace clean.")
+// @yah:handoff("crates/yah/task/src/remote.rs — WardenClient trait (deploy/connect_logs/teardown/exit_code) + RemoteForgeDriver::start (allocates ForgeId, synthesizes WorkloadSpec::for_forge, deploys via yubaba, spawns log-ingestion task with EventScope::Forge scope, returns ForgeRunHandle backed by tokio::sync::watch) + ForgeRunHandle::wait (async, terminal-state poll) + ForgeRunHandle::kill. ScriptedWardenClient + HangingWardenClient test helpers in test_support mod. task Cargo.toml: added scryer, tokio, async-trait, thiserror deps. Two verify tests pass: remote::happy (Done exit_code=0 + 2 events queryable via scryer.events(Forge(id))) and remote::timeout (TimedOut + yubaba.teardown called). cargo test -p task 18/18 ok; cargo check --workspace clean.")
 // @yah:next("Human review: (a) check crates/yah/task/src/remote.rs — WardenClient trait shape, ForgeRunHandle watch semantics, build_workload_spec tier defaulting (Remote(ident) → infra), default_forge_image placeholder tagged as F8 follow-up; (b) check test_support::ScriptedWardenClient + HangingWardenClient for correctness; (c) confirm the Forge(id) scryer scope is correct per arch doc §Remote-forge ingestion-side branch.")
 // @yah:next("Smoke under R091 smoke tier: forge.run({ command: Subprocess { argv: [\"cargo\", \"check\"] }, where: RemoteAny { tier: \"infra\" } }) runs against real Hetzner — deferred to R091 integration test infrastructure landing.")
 // @arch:see(.yah/docs/architecture/A035-yah-forge.md)
@@ -63,8 +63,8 @@
 //!
 //! # Seam
 //!
-//! [`WardenClient`] is the trait warden (or test code) implements.  Production
-//! warden uses containerd gRPC (R091).  Tests use
+//! [`WardenClient`] is the trait yubaba (or test code) implements.  Production
+//! yubaba uses containerd gRPC (R091).  Tests use
 //! [`test_support::ScriptedWardenClient`] and
 //! [`test_support::HangingWardenClient`].
 
@@ -74,25 +74,26 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use observation::{Event, EventScope, EventSource, ForgeId, Level, TaskRunId};
-use scryer::service::Scryer;
+use yah_scryer::service::Scryer;
 use serde_json::json;
 use thiserror::Error;
 use tokio::sync::{mpsc, watch};
 use workload_spec::{ImageRef, MeshIdent, TierTag, VolumeMount, VolumeSource, WorkloadSpec};
 
+use crate::executor::{ExecEvent, OutputStream};
 use crate::{ForgeCommand, ForgeSpec, ForgeStatus, TaskLocation, TaskRuntime};
 
 // ─── Error ────────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Error)]
 pub enum RemoteForgeError {
-    #[error("warden deploy: {0}")]
+    #[error("yubaba deploy: {0}")]
     Deploy(String),
-    #[error("warden log stream: {0}")]
+    #[error("yubaba log stream: {0}")]
     LogStream(String),
-    #[error("warden teardown: {0}")]
+    #[error("yubaba teardown: {0}")]
     Teardown(String),
-    #[error("warden exit code: {0}")]
+    #[error("yubaba exit code: {0}")]
     ExitCode(String),
     #[error("scryer push: {0}")]
     Push(String),
@@ -102,18 +103,18 @@ pub enum RemoteForgeError {
 
 // ─── WardenClient ─────────────────────────────────────────────────────────────
 
-/// Seam between the remote-forge driver and warden's containerd-backed RPC.
+/// Seam between the remote-forge driver and yubaba's containerd-backed RPC.
 ///
-/// Production: warden's containerd gRPC client (R091).  Tests:
+/// Production: yubaba's containerd gRPC client (R091).  Tests:
 /// [`test_support::ScriptedWardenClient`] / [`test_support::HangingWardenClient`].
 ///
 /// # Remote + native: not in v1
 ///
 /// All v1 paths through this trait are containerd-backed — `deploy` takes a
 /// [`WorkloadSpec`] which is an image-pinned workload.  Remote + native (a
-/// host subprocess running directly on the warden node, no containerd) is
+/// host subprocess running directly on the yubaba node, no containerd) is
 /// intentionally absent from the surface.  When a real use case lands
-/// (BuildKit shelling to host docker on a warden node is the leading
+/// (BuildKit shelling to host docker on a yubaba node is the leading
 /// candidate per W149 §Open policy), v2 adds a sibling method here:
 ///
 /// ```ignore
@@ -152,41 +153,58 @@ pub trait WardenClient: Send + Sync {
 
 // ─── RemoteForgeDriver ────────────────────────────────────────────────────────
 
-/// Drives one-shot forge runs on warden-managed machines.
+/// Drives one-shot forge runs on yubaba-managed machines.
 ///
 /// [`start`](Self::start) deploys the workload, spawns the log-ingestion task,
 /// and returns a [`ForgeRunHandle`] immediately.  The caller calls
 /// [`ForgeRunHandle::wait`] to block until a terminal state is reached.
 pub struct RemoteForgeDriver {
     scryer: Arc<Scryer>,
-    warden: Arc<dyn WardenClient>,
+    yubaba: Arc<dyn WardenClient>,
 }
 
 impl RemoteForgeDriver {
-    pub fn new(scryer: Arc<Scryer>, warden: Arc<dyn WardenClient>) -> Self {
-        Self { scryer, warden }
+    pub fn new(scryer: Arc<Scryer>, yubaba: Arc<dyn WardenClient>) -> Self {
+        Self { scryer, yubaba }
     }
 
     /// Start a remote forge run.
     ///
-    /// Synthesizes a `WorkloadSpec`, deploys it via warden, and spawns the
+    /// Synthesizes a `WorkloadSpec`, deploys it via yubaba, and spawns the
     /// log-ingestion task.  Returns a `ForgeRunHandle` before the run finishes.
     pub async fn start(&self, spec: ForgeSpec) -> Result<ForgeRunHandle, RemoteForgeError> {
+        self.start_with_sink(spec, None).await
+    }
+
+    /// Like [`start`](Self::start) but also tees each container log line into
+    /// `sink` as an [`ExecEvent::Output`].
+    ///
+    /// The qed runner passes its live-event sink here so a yubaba-dispatched
+    /// step streams stdout lines into `QedEvent::StepOutput` *during* the run
+    /// rather than batching them post-completion (R508). The sink is a pure
+    /// fan-out: lines still flow into scryer under `Forge(id)` scope exactly as
+    /// before. Container logs are line-merged with no stdout/stderr split, so
+    /// every forwarded line is tagged [`OutputStream::Stdout`].
+    pub async fn start_with_sink(
+        &self,
+        spec: ForgeSpec,
+        sink: Option<mpsc::UnboundedSender<ExecEvent>>,
+    ) -> Result<ForgeRunHandle, RemoteForgeError> {
         let forge_id = ForgeId::new();
         let ident = forge_mesh_ident(&forge_id);
         let timeout = spec.timeout.map(|ms| Duration::from_millis(ms.as_ms()));
 
         let workload = build_workload_spec(&forge_id, &spec)?;
-        self.warden.deploy(&workload).await?;
+        self.yubaba.deploy(&workload).await?;
 
         let (status_tx, status_rx) = watch::channel(ForgeStatus::Running);
         let scryer = self.scryer.clone();
-        let warden = self.warden.clone();
+        let yubaba = self.yubaba.clone();
         let id = forge_id.clone();
 
         tokio::spawn(async move {
             let status =
-                run_log_task(id, ident, timeout, scryer, warden).await;
+                run_log_task(id, ident, timeout, scryer, yubaba, sink).await;
             let _ = status_tx.send(status);
         });
 
@@ -197,9 +215,9 @@ impl RemoteForgeDriver {
     ///
     /// The background log task will detect the stream closing and resolve the
     /// run to a terminal state (typically `Lost` or the actual exit code if
-    /// warden reports one before the stream closes).
+    /// yubaba reports one before the stream closes).
     pub async fn kill(&self, forge_id: &ForgeId) -> Result<(), RemoteForgeError> {
-        self.warden.teardown(&forge_mesh_ident(forge_id)).await
+        self.yubaba.teardown(&forge_mesh_ident(forge_id)).await
     }
 }
 
@@ -249,9 +267,9 @@ fn now_ms() -> u64 {
 /// Synthesise a [`WorkloadSpec`] from a [`ForgeSpec`].
 ///
 /// Refuses the remote + native quadrant with [`RemoteForgeError::InvalidSpec`]
-/// before any state is allocated or any warden RPC is issued — see W149
+/// before any state is allocated or any yubaba RPC is issued — see W149
 /// §Open policy and the [`WardenClient`] trait docs for the v2 `exec_native`
-/// path.  No forge id is published, no events flow into scryer, and warden's
+/// path.  No forge id is published, no events flow into scryer, and yubaba's
 /// `deploy` is not called.
 fn build_workload_spec(
     forge_id: &ForgeId,
@@ -261,7 +279,7 @@ fn build_workload_spec(
         return Err(RemoteForgeError::InvalidSpec(
             "remote + native is not supported in v1 — \
              set placement.runtime = container, or run locally with placement.location = local. \
-             A future warden `exec_native` surface lands when a real use case arrives \
+             A future yubaba `exec_native` surface lands when a real use case arrives \
              (R380-T7 / W149)."
                 .into(),
         ));
@@ -298,9 +316,9 @@ fn build_workload_spec(
 // ─── BuildKit workload synthesis (R381-T5) ────────────────────────────────────
 
 /// Conventional output dir bind-mounted into the BuildKit container when an
-/// OCI archive is requested.  The warden node must have this directory
+/// OCI archive is requested.  The yubaba node must have this directory
 /// writable and on a filesystem the operator can reach for cross-node
-/// consumption; the single-machine sim/dogfood case (warden + qed sharing a
+/// consumption; the single-machine sim/dogfood case (yubaba + qed sharing a
 /// host) is the v1 happy path.  Cross-node consumers should set `push=true`
 /// and let the registry handle distribution.
 const BUILDKIT_HOST_OUT_DIR: &str = "/var/lib/yah/qed/build-out";
@@ -310,7 +328,7 @@ const BUILDKIT_HOST_OUT_DIR: &str = "/var/lib/yah/qed/build-out";
 /// Held in `option_env!` so a deployment can pin a different version without
 /// rebuilding qed.  The default is a current rootless BuildKit release: the
 /// rootless variant runs `buildkitd` in user-space inside the container so the
-/// workload doesn't require warden to grant `CAP_SYS_ADMIN`.
+/// workload doesn't require yubaba to grant `CAP_SYS_ADMIN`.
 fn default_buildkit_image() -> ImageRef {
     let tag = option_env!("YAH_BUILDKIT_TAG").unwrap_or("v0.12.5-rootless");
     let digest = option_env!("YAH_BUILDKIT_DIGEST")
@@ -333,7 +351,7 @@ fn default_buildkit_image() -> ImageRef {
 /// otherwise an OCI archive is written to a bind-mounted host directory
 /// ([`BUILDKIT_HOST_OUT_DIR`]).
 ///
-/// Bind volume mounts require `tier == "infra"`, which warden's shape
+/// Bind volume mounts require `tier == "infra"`, which yubaba's shape
 /// validation enforces; the forge convention picks infra by default so this is
 /// safe for the v1 dogfood path.
 fn build_image_workload_spec(
@@ -449,16 +467,17 @@ async fn run_log_task(
     ident: MeshIdent,
     timeout: Option<Duration>,
     scryer: Arc<Scryer>,
-    warden: Arc<dyn WardenClient>,
+    yubaba: Arc<dyn WardenClient>,
+    sink: Option<mpsc::UnboundedSender<ExecEvent>>,
 ) -> ForgeStatus {
-    let ingest = ingest_logs(forge_id.clone(), &ident, &scryer, warden.as_ref());
+    let ingest = ingest_logs(forge_id.clone(), &ident, &scryer, yubaba.as_ref(), sink);
 
     let ingest_result = match timeout {
         None => ingest.await,
         Some(d) => match tokio::time::timeout(d, ingest).await {
             Ok(r) => r,
             Err(_) => {
-                let _ = warden.teardown(&ident).await;
+                let _ = yubaba.teardown(&ident).await;
                 return ForgeStatus::TimedOut { ended_at: now_ms() };
             }
         },
@@ -466,7 +485,7 @@ async fn run_log_task(
 
     match ingest_result {
         Err(e) => ForgeStatus::Lost { reason: e.to_string() },
-        Ok(()) => match warden.exit_code(&ident).await {
+        Ok(()) => match yubaba.exit_code(&ident).await {
             Ok(Some(code)) => ForgeStatus::Done { exit_code: code, ended_at: now_ms() },
             Ok(None) => ForgeStatus::Lost {
                 reason: "container exited but no exit code available".into(),
@@ -480,16 +499,26 @@ async fn ingest_logs(
     forge_id: ForgeId,
     ident: &MeshIdent,
     scryer: &Scryer,
-    warden: &dyn WardenClient,
+    yubaba: &dyn WardenClient,
+    sink: Option<mpsc::UnboundedSender<ExecEvent>>,
 ) -> Result<(), RemoteForgeError> {
     let mut rx =
-        warden.connect_logs(ident).await.map_err(|e| RemoteForgeError::LogStream(e.to_string()))?;
+        yubaba.connect_logs(ident).await.map_err(|e| RemoteForgeError::LogStream(e.to_string()))?;
 
     let scope = EventScope::Forge(forge_id.clone());
     let run_id: TaskRunId = forge_id.into();
     let mut seq = 0u32;
 
     while let Some(line) = rx.recv().await {
+        // Fan the line out to the live sink first (a closed sink is benign —
+        // the run continues; only the live tail loses the line). scryer
+        // remains the durable record.
+        if let Some(s) = &sink {
+            let _ = s.send(ExecEvent::Output {
+                stream: OutputStream::Stdout,
+                line: line.clone(),
+            });
+        }
         let ev = Event {
             run_id: run_id.clone(),
             seq,
@@ -512,13 +541,13 @@ async fn ingest_logs(
 
 // ─── Test support ─────────────────────────────────────────────────────────────
 
-/// Test-only warden client implementations.
+/// Test-only yubaba client implementations.
 #[cfg(test)]
 pub mod test_support {
     use super::*;
     use std::sync::Mutex;
 
-    /// A warden client that sends a fixed set of log lines then exits with a
+    /// A yubaba client that sends a fixed set of log lines then exits with a
     /// configured exit code.
     pub struct ScriptedWardenClient {
         pub lines: Vec<String>,
@@ -575,7 +604,7 @@ pub mod test_support {
         }
     }
 
-    /// A warden client whose log stream never closes — simulates a hung
+    /// A yubaba client whose log stream never closes — simulates a hung
     /// container so that timeout behavior can be tested.
     pub struct HangingWardenClient {
         pub initial_lines: Vec<String>,
@@ -635,7 +664,7 @@ mod remote {
     use super::*;
     use crate::TaskPlacement;
     use observation::EventScope;
-    use scryer::service::{EventFilter, Scryer, ScryerConfig};
+    use yah_scryer::service::{EventFilter, Scryer, ScryerConfig};
     use task_runs::Initiator;
     use tempfile::TempDir;
     use workload_spec::{Millis, TierTag};
@@ -666,7 +695,7 @@ mod remote {
         )
     }
 
-    /// R094-F3 accept: forge.run with RemoteAny + Subprocess, scripted warden
+    /// R094-F3 accept: forge.run with RemoteAny + Subprocess, scripted yubaba
     /// that emits two log lines and exits 0.  After wait(), status is Done and
     /// the two events are queryable via scryer.events(Forge(id)).
     #[tokio::test]
@@ -674,12 +703,12 @@ mod remote {
         let dir = TempDir::new().unwrap();
         let scryer = make_scryer(&dir);
 
-        let warden = ScriptedWardenClient::new(
+        let yubaba = ScriptedWardenClient::new(
             vec!["line one".to_string(), "line two".to_string()],
             0,
         );
 
-        let driver = RemoteForgeDriver::new(scryer.clone(), warden);
+        let driver = RemoteForgeDriver::new(scryer.clone(), yubaba);
         let spec = subprocess_spec(remote_any_infra(), None);
 
         let handle = driver.start(spec).await.unwrap();
@@ -700,22 +729,64 @@ mod remote {
         assert_eq!(events[0].target, "forge.remote");
     }
 
+    /// R508 accept: `start_with_sink` tees every yubaba log line into the
+    /// caller's sink as an `ExecEvent::Output` *as well as* scryer, so the qed
+    /// runner can stream remote-step output live. After the run completes the
+    /// sink has seen the same two lines, in order, that scryer recorded.
+    #[tokio::test]
+    async fn streams_log_lines_to_sink() {
+        let dir = TempDir::new().unwrap();
+        let scryer = make_scryer(&dir);
+
+        let yubaba = ScriptedWardenClient::new(
+            vec!["alpha".to_string(), "beta".to_string()],
+            0,
+        );
+
+        let driver = RemoteForgeDriver::new(scryer.clone(), yubaba);
+        let (tx, mut rx) = mpsc::unbounded_channel::<ExecEvent>();
+        let spec = subprocess_spec(remote_any_infra(), None);
+
+        let handle = driver.start_with_sink(spec, Some(tx)).await.unwrap();
+        let id = handle.id.clone();
+        let status = handle.wait().await;
+        assert!(
+            matches!(status, ForgeStatus::Done { exit_code: 0, .. }),
+            "expected Done exit_code=0, got {status:?}"
+        );
+
+        // The driver's ingest task drops its sink clone when the log stream
+        // closes, so draining to None terminates.
+        let mut lines = Vec::new();
+        while let Some(ExecEvent::Output { stream, line }) = rx.recv().await {
+            assert_eq!(stream, OutputStream::Stdout, "container logs are stdout-tagged");
+            lines.push(line);
+        }
+        assert_eq!(lines, vec!["alpha".to_string(), "beta".to_string()]);
+
+        // scryer still holds the durable copy — the sink is pure fan-out.
+        scryer.flush_ring().unwrap();
+        let events =
+            scryer.events(&EventScope::Forge(id), &EventFilter::default()).await.unwrap();
+        assert_eq!(events.len(), 2, "scryer must still record both lines");
+    }
+
     /// R380-T7 accept: a remote + native ForgeSpec is refused at `start()`
-    /// before any warden RPC fires and before any event is pushed to scryer.
+    /// before any yubaba RPC fires and before any event is pushed to scryer.
     ///
     /// Verifies the v1 refusal contract on the WardenClient seam:
     /// - `start()` returns `Err(InvalidSpec)` with an actionable message.
-    /// - `warden.deploy` is never called (state-of-the-cluster untouched).
+    /// - `yubaba.deploy` is never called (state-of-the-cluster untouched).
     /// - No `Forge(*)` events appear in scryer (no ingest thread spawned).
     #[tokio::test]
     async fn remote_native_refused_at_start_emits_no_events() {
         let dir = TempDir::new().unwrap();
         let scryer = make_scryer(&dir);
 
-        let warden = ScriptedWardenClient::new(vec!["should not arrive".into()], 0);
-        let deploy_called = warden.deploy_called.clone();
+        let yubaba = ScriptedWardenClient::new(vec!["should not arrive".into()], 0);
+        let deploy_called = yubaba.deploy_called.clone();
 
-        let driver = RemoteForgeDriver::new(scryer.clone(), warden);
+        let driver = RemoteForgeDriver::new(scryer.clone(), yubaba);
         // remote + native — the quadrant this ticket refuses.
         let placement = TaskPlacement::new(
             TaskLocation::RemoteAny { tier: TierTag("infra".into()) },
@@ -743,7 +814,7 @@ mod remote {
 
         assert!(
             !*deploy_called.lock().unwrap(),
-            "warden.deploy must NOT be called when the spec is refused upstream",
+            "yubaba.deploy must NOT be called when the spec is refused upstream",
         );
 
         // Give any (unexpected) background ingest task a tick to push, then
@@ -897,20 +968,20 @@ mod remote {
 
     /// Remote BuildImage dispatch round-trips through RemoteForgeDriver +
     /// ScriptedWardenClient: the synthesized BuildKit workload is deployed,
-    /// the scripted exit code surfaces as a Done status, and warden.deploy
+    /// the scripted exit code surfaces as a Done status, and yubaba.deploy
     /// was actually called.
     #[tokio::test]
     async fn remote_build_image_success_round_trip() {
         let dir = TempDir::new().unwrap();
         let scryer = make_scryer(&dir);
 
-        let warden = ScriptedWardenClient::new(
+        let yubaba = ScriptedWardenClient::new(
             vec!["#1 [internal] load build definition".into(), "#5 DONE".into()],
             0,
         );
-        let deploy_called = warden.deploy_called.clone();
+        let deploy_called = yubaba.deploy_called.clone();
 
-        let driver = RemoteForgeDriver::new(scryer.clone(), warden);
+        let driver = RemoteForgeDriver::new(scryer.clone(), yubaba);
         let handle = driver.start(build_image_spec(true)).await.unwrap();
         let id = handle.id.clone();
         let status = handle.wait().await;
@@ -921,7 +992,7 @@ mod remote {
         );
         assert!(
             *deploy_called.lock().unwrap(),
-            "warden.deploy should have been called for remote build-image"
+            "yubaba.deploy should have been called for remote build-image"
         );
 
         scryer.flush_ring().unwrap();
@@ -931,16 +1002,16 @@ mod remote {
     }
 
     /// R094-F3 accept: forge.run with a 50ms timeout against a hanging stream.
-    /// Status must be TimedOut and warden teardown must have been called.
+    /// Status must be TimedOut and yubaba teardown must have been called.
     #[tokio::test]
     async fn timeout() {
         let dir = TempDir::new().unwrap();
         let scryer = make_scryer(&dir);
 
-        let warden = HangingWardenClient::new(vec!["slow start".to_string()]);
-        let teardown_called = warden.teardown_called.clone();
+        let yubaba = HangingWardenClient::new(vec!["slow start".to_string()]);
+        let teardown_called = yubaba.teardown_called.clone();
 
-        let driver = RemoteForgeDriver::new(scryer.clone(), warden);
+        let driver = RemoteForgeDriver::new(scryer.clone(), yubaba);
         let spec = subprocess_spec(remote_any_infra(), Some(Millis::from_ms(50)));
 
         let handle = driver.start(spec).await.unwrap();
@@ -952,7 +1023,7 @@ mod remote {
         );
         assert!(
             *teardown_called.lock().unwrap(),
-            "warden.teardown must be called on timeout"
+            "yubaba.teardown must be called on timeout"
         );
     }
 }

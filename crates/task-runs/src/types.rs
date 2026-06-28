@@ -127,6 +127,13 @@ pub struct TaskRunMeta {
     /// Pinned runs are exempt until explicitly unpinned or archived.
     #[serde(default)]
     pub pinned: bool,
+    /// What surface spawned this run. `None` (the default) is an ordinary
+    /// `task.run` job; `Some("terminal")` marks an interactive terminal
+    /// session (SSH / local PTY / camp shell). A generic provenance tag, not
+    /// a UI concept — it lets a consumer (e.g. the desktop terminal rail) list
+    /// just its own runs from `task.list` without scooping up unrelated jobs.
+    #[serde(default)]
+    pub origin: Option<String>,
 }
 
 // ─── Stream ───────────────────────────────────────────────────────────────────

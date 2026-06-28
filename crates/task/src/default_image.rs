@@ -8,7 +8,7 @@
 //! GHA matrix that fans out to every catalog image; T7 is open).
 //!
 //! Each catalog image is signed with Sigstore keyless OIDC (cosign).
-//! Warden's R090-F4 environment validator verifies the signature before
+//! Yubaba's R090-F4 environment validator verifies the signature before
 //! pulling. The trust chain is identical to what `forge-minimal` had.
 //!
 //! ## Compile-time digest injection
@@ -53,7 +53,7 @@ pub const YAH_IMAGE_TAG: &str = "latest";
 // ─── Per-image digest envs ────────────────────────────────────────────────────
 //
 // Injected at compile time by the release pipeline (R381-T7). `None` on
-// local dev builds — warden falls back to `:latest`.
+// local dev builds — yubaba falls back to `:latest`.
 
 /// SHA-256 digest of `ghcr.io/yah-ai/yah-base` for the current release.
 pub const YAH_BASE_DIGEST: Option<&str> = option_env!("YAH_BASE_DIGEST");
@@ -66,8 +66,8 @@ pub const YAH_RUST_DIGEST: Option<&str> = option_env!("YAH_RUST_DIGEST");
 /// when a subprocess step doesn't pick its own image.
 pub const YAH_RUST_BUN_DIGEST: Option<&str> = option_env!("YAH_RUST_BUN_DIGEST");
 
-/// SHA-256 digest of `ghcr.io/yah-ai/yah-warden` for the current release.
-/// Read by camp's pond bring-up so the warden-container is pinned to the
+/// SHA-256 digest of `ghcr.io/yah-ai/yah-yubaba` for the current release.
+/// Read by camp's pond bring-up so the yubaba-container is pinned to the
 /// release's signed image (W154, R408-T1).
 pub const YAH_WARDEN_DIGEST: Option<&str> = option_env!("YAH_WARDEN_DIGEST");
 
@@ -120,7 +120,7 @@ pub fn catalog_digest(name: &str) -> Option<&'static str> {
         "yah-base" => YAH_BASE_DIGEST,
         "yah-rust" => YAH_RUST_DIGEST,
         "yah-rust-bun" => YAH_RUST_BUN_DIGEST,
-        "yah-warden" => YAH_WARDEN_DIGEST,
+        "yah-yubaba" => YAH_WARDEN_DIGEST,
         "yah-miniflare" => YAH_MINIFLARE_DIGEST,
         _ => None,
     }
@@ -152,7 +152,7 @@ mod default_image {
     /// names fall back to the test-fixture digest sentinel.
     #[test]
     fn catalog_image_resolves_known_and_unknown_names() {
-        for known in ["yah-base", "yah-rust", "yah-rust-bun", "yah-warden", "yah-miniflare"] {
+        for known in ["yah-base", "yah-rust", "yah-rust-bun", "yah-yubaba", "yah-miniflare"] {
             let img = catalog_image(known);
             assert_eq!(img.registry, YAH_IMAGE_REGISTRY);
             assert_eq!(img.repository, format!("{YAH_IMAGE_OWNER}/{known}"));

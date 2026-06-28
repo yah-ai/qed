@@ -4,7 +4,7 @@
 //! qed needs to know where that camp lives. The registry lives at
 //! `<qed_dir>/peers.toml` (typically `.yah/qed/peers.toml`) and maps
 //! registry keys to camp folders on this rig — or, when `rig` is set, to a
-//! camp on another rig that constable will broker the run to.
+//! camp on another rig that kamaji will broker the run to.
 //!
 //! Shape:
 //!
@@ -17,7 +17,7 @@
 //! path = "external/cheers"
 //!
 //! [peer.bigbuild]
-//! rig  = "rig-tokyo-1"                # remote — constable brokers (R494-T5)
+//! rig  = "rig-tokyo-1"                # remote — kamaji brokers (R494-T5)
 //! path = "/srv/camps/bigbuild"
 //! ```
 //!
@@ -28,13 +28,13 @@
 //!   [`QedRun`](crate::types::QedRunId). Same process, same runner, same
 //!   DB. There is **one camp-daemon per rig**; "other camps" are just
 //!   different folders to that daemon. No IPC.
-//! - **Remote peer (`rig` set).** Daemon asks constable to broker the
+//! - **Remote peer (`rig` set).** Daemon asks kamaji to broker the
 //!   run on the named rig's daemon (R494-T5 stubs this — v1 surfaces an
 //!   explicit unsupported error).
 //!
-//! `warden` does **not** enter the resolution path. It only appears if a
+//! `yubaba` does **not** enter the resolution path. It only appears if a
 //! peer's own pipeline carries an `[[pipeline.on_success]] kind =
-//! "warden-deploy"` outcome — same as a same-camp pipeline.
+//! "yubaba-deploy"` outcome — same as a same-camp pipeline.
 
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -58,7 +58,7 @@ pub struct PeerConfig {
 pub struct PeerEntry {
     pub path: PathBuf,
     /// When set, the peer lives on another rig and resolution goes
-    /// through constable. v1 surfaces this as an unsupported-error at
+    /// through kamaji. v1 surfaces this as an unsupported-error at
     /// step-execution time (R494-T5).
     #[serde(default)]
     pub rig: Option<String>,
@@ -69,9 +69,15 @@ pub struct PeerEntry {
 #[derive(Debug, Error)]
 pub enum PeerConfigError {
     #[error("IO error reading {path}: {source}")]
-    Io { path: String, source: std::io::Error },
+    Io {
+        path: String,
+        source: std::io::Error,
+    },
     #[error("TOML parse error in {path}: {source}")]
-    Parse { path: String, source: toml::de::Error },
+    Parse {
+        path: String,
+        source: toml::de::Error,
+    },
 }
 
 impl PeerConfig {
@@ -151,7 +157,11 @@ mod tests {
     #[test]
     fn entry_without_path_is_a_parse_error() {
         let tmp = tempfile::tempdir().unwrap();
-        fs::write(tmp.path().join("peers.toml"), "[peer.broken]\nrig = \"some-rig\"\n").unwrap();
+        fs::write(
+            tmp.path().join("peers.toml"),
+            "[peer.broken]\nrig = \"some-rig\"\n",
+        )
+        .unwrap();
         let err = PeerConfig::load(tmp.path()).unwrap_err();
         assert!(matches!(err, PeerConfigError::Parse { .. }), "got: {err:?}");
     }

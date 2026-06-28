@@ -2,7 +2,7 @@
 //!
 //! Local-forge entries come from the `TaskStore` (same store as `task.list`).
 //! Remote and integration entries are passed in as pre-fetched slices; the
-//! caller is responsible for querying them (via warden RPC / R093-F4 federation
+//! caller is responsible for querying them (via yubaba RPC / R093-F4 federation
 //! for remote, via integration driver registry for integration runs).
 //!
 //! Sorting: running first, then by `started_at` descending.
@@ -37,7 +37,7 @@ pub struct ForgeListFilter {
 ///
 /// - `local_store`: the `TaskStore` for local-forge runs.
 /// - `remote_metas`: pre-fetched remote-forge `ForgeMeta` entries (e.g. from
-///   warden RPC).  Pass `&[]` when no remote query was performed.
+///   yubaba RPC).  Pass `&[]` when no remote query was performed.
 /// - `integration_metas`: pre-fetched integration-forge entries.  Pass `&[]`
 ///   when no integration query was performed.
 /// - `filter`: species, status, label, since, and limit constraints.
@@ -111,6 +111,7 @@ fn to_run_filter(f: &ForgeListFilter) -> RunFilter {
         status: f.status.clone(),
         limit: None,
         archived: None,
+        origin: None,
     }
 }
 
@@ -173,6 +174,7 @@ mod list {
             initiator: Initiator::Human { camp: "test".into() },
             beholder_status: None,
             pinned: false,
+            origin: None,
         };
         store.insert_run(&meta).expect("insert_run");
         id

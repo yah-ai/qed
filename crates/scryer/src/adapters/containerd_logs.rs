@@ -1,6 +1,6 @@
 //! `adapter::containerd_logs` — subscribes to a container's stdout/stderr.
 //!
-//! Production deployment: warden owns the containerd gRPC client; it provides a
+//! Production deployment: yubaba owns the containerd gRPC client; it provides a
 //! [`ContainerLogSource`] impl that yields lines per task. Scryer's adapter is
 //! transport-agnostic — it consumes a `ContainerLogSource` impl and forwards
 //! lines through a [`ServiceBeholder`] into the [`Scryer`] store.
@@ -16,7 +16,7 @@
 //! @yah:parent(R471)
 //! @yah:verify("DockerLogSource impl drives the existing ContainerdLogsAdapter against an OrbStack container; lines land in scryer's store via the bundled beholder registry (pino / tracing-json / vanilla / unstructured fallback).")
 //! @yah:verify("Synthetic `service.restart` events fire on each container restart cycle, not just on adapter stream breaks.")
-//! @yah:verify("yah-warden crash-loop tail is parsed by vanilla beholder (the warden help-text output) without falling through to unstructured.")
+//! @yah:verify("yah-yubaba crash-loop tail is parsed by vanilla beholder (the yubaba help-text output) without falling through to unstructured.")
 //! @yah:handoff("DockerLogSource struct added to containerd_logs.rs (same file as ContainerLogSource trait). Implements ContainerLogSource via `docker logs --follow --tail N <container>` using tokio::process::Command. Merges stdout+stderr into one mpsc channel using two spawn tasks. Channel closes when child exits → StreamBroken → Supervisor emits service.restart and reconnects. Default tail: 50 lines (shows crash causes without flooding). Public ctors: new(), with_tail(n), follow_only(). Re-exported from adapters::mod as DockerLogSource. tokio process feature added to scryer Cargo.toml. 72 existing tests green; live docker test added (skip when docker unreachable). cargo check -p scryer: clean.")
 //! @yah:depends_on(R471-F3)
 
@@ -32,7 +32,7 @@ use workload_spec::MeshIdent;
 
 // ─── ContainerLogSource ───────────────────────────────────────────────────────
 
-/// Trait warden (or test code) implements to provide a line-oriented log
+/// Trait yubaba (or test code) implements to provide a line-oriented log
 /// stream for a given mesh identity.
 ///
 /// `connect` opens a fresh stream — the adapter calls it once per `run()`

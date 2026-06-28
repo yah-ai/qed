@@ -8,7 +8,7 @@
 //! query surface (`forge.run/status/events/diagnostics/triage/kill/list`) (tool names remain "forge" for now):
 //!
 //! - **local-forge**: subprocess on the dev box; backed by `crates/yah/task-runs/`.
-//! - **remote-forge**: one-shot workload on a warden machine (R094-F3).
+//! - **remote-forge**: one-shot workload on a yubaba machine (R094-F3).
 //! - **integration-forge**: N-workload stand-up scoped to a test or flow (R094-F4).
 //!
 //! `ForgeId` lives in `crates/yah/observation/` so scryer can reference it in
@@ -82,9 +82,9 @@
 //! @yah:status(review)
 //! @yah:phase(P1)
 //! @yah:parent(R406)
-//! @arch:see(.yah/docs/working/W154-warden-dual-runtime.md)
+//! @arch:see(.yah/docs/working/W154-yubaba-dual-runtime.md)
 //! @yah:next("Sign off → archive R406-T3. R406-T1/T2/T3 close out P1 of R406. P2 begins with the Linux-specific drivers: T4 (cgroup), T5 (fork+exec+sandbox), T6 (pidfd loop).")
-//! @yah:handoff("TaskRuntime peer parity verified post-R380. Findings: (1) task::TaskRuntime at crates/yah/task/src/lib.rs:207 declares Native + Container as peer variants with snake_case serde — used as a sibling field in TaskPlacement {location, runtime}. (2) tower_rules::TaskRuntime at crates/yah/tower-rules/src/lib.rs:293 mirrors the same Native|Container shape with TS-export. (3) TS binding crates/yah/tower-rules/bindings/TaskRuntime.ts emits exactly \"native\" | \"container\". (4) Four-quadrant TaskPlacement doc-table (task/lib.rs:219-223) explicitly covers all (location × runtime) pairs incl. Local+Native / Local+Container / Remote+Native / Remote+Container. (5) Runner dispatch at qed/runner.rs:296-307 routes (Local, Native)→execute_step_local, (Local, Container)→execute_step_local_container, and (Remote, _)→execute_step_remote(step, runtime) — runtime threaded into remote dispatch. (6) task::local module doc explicitly enumerates Native (tokio::process::Command) and Container (docker run shim) as siblings under the local location; image_ref_arg supports digest pinning identical to the warden remote path. (7) Round-trip tests at tower-rules/tests/round_trip.rs prove both variants round-trip wire-compatibly: task_runtime_round_trip + task_placement_four_quadrants_round_trip + task_placement_remote_any_native_wire_format (24/24 pass on the suite). Conclusion: Native + Container are first-class peers across the Rust types, TS bindings, doc model, dispatch, and tests — no asymmetry to fix. T3 is verification-only; no code change required.")
+//! @yah:handoff("TaskRuntime peer parity verified post-R380. Findings: (1) task::TaskRuntime at crates/yah/task/src/lib.rs:207 declares Native + Container as peer variants with snake_case serde — used as a sibling field in TaskPlacement {location, runtime}. (2) tower_rules::TaskRuntime at crates/yah/tower-rules/src/lib.rs:293 mirrors the same Native|Container shape with TS-export. (3) TS binding crates/yah/tower-rules/bindings/TaskRuntime.ts emits exactly \"native\" | \"container\". (4) Four-quadrant TaskPlacement doc-table (task/lib.rs:219-223) explicitly covers all (location × runtime) pairs incl. Local+Native / Local+Container / Remote+Native / Remote+Container. (5) Runner dispatch at qed/runner.rs:296-307 routes (Local, Native)→execute_step_local, (Local, Container)→execute_step_local_container, and (Remote, _)→execute_step_remote(step, runtime) — runtime threaded into remote dispatch. (6) task::local module doc explicitly enumerates Native (tokio::process::Command) and Container (docker run shim) as siblings under the local location; image_ref_arg supports digest pinning identical to the yubaba remote path. (7) Round-trip tests at tower-rules/tests/round_trip.rs prove both variants round-trip wire-compatibly: task_runtime_round_trip + task_placement_four_quadrants_round_trip + task_placement_remote_any_native_wire_format (24/24 pass on the suite). Conclusion: Native + Container are first-class peers across the Rust types, TS bindings, doc model, dispatch, and tests — no asymmetry to fix. T3 is verification-only; no code change required.")
 //! @yah:verify("cargo check -p task -p tower-rules -p qed")
 //! @yah:verify("cargo test -p tower-rules --test round_trip")
 //!
@@ -188,14 +188,14 @@ impl From<task_runs::RunStatus> for ForgeStatus {
 /// Sibling to [`TaskPlacement`] on [`ForgeMeta`]: the placement says *where*
 /// and *how* the run executes; the species says *which driver* produced it.
 /// The two are orthogonal — a `Remote` species always runs as a containerd
-/// workload on warden, but a `Local` species can run native or container per
+/// workload on yubaba, but a `Local` species can run native or container per
 /// `TaskPlacement.runtime`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ForgeSpecies {
     /// Subprocess on the dev box, driven by `task-runs`.
     Local,
-    /// One-shot workload on a warden node, driven by [`RemoteForgeDriver`].
+    /// One-shot workload on a yubaba node, driven by [`RemoteForgeDriver`].
     Remote,
     /// N-workload stand-up driven by [`IntegrationForgeDriver`].
     Integration,
@@ -213,10 +213,10 @@ pub enum TaskLocation {
     /// Run on the dev box that submitted the task.
     Local,
 
-    /// Run on the named warden node.
+    /// Run on the named yubaba node.
     Remote { node: MeshIdent },
 
-    /// Run on any warden node in the requested tier; warden picks based on
+    /// Run on any yubaba node in the requested tier; yubaba picks based on
     /// capacity admission control (R090-F3).
     RemoteAny { tier: TierTag },
 }
@@ -228,7 +228,7 @@ pub enum TaskLocation {
 pub enum TaskRuntime {
     /// Subprocess on the host (no container).
     Native,
-    /// Image-backed container (docker/podman locally; containerd on warden).
+    /// Image-backed container (docker/podman locally; containerd on yubaba).
     Container,
 }
 
@@ -240,8 +240,8 @@ pub enum TaskRuntime {
 /// | location → runtime | `Native` | `Container` |
 /// |---|---|---|
 /// | `Local`        | subprocess on dev box       | docker run on dev box |
-/// | `Remote(_)`    | warden agent exec on node   | containerd workload on node |
-/// | `RemoteAny{_}` | warden agent exec (any node)| containerd workload (any node) |
+/// | `Remote(_)`    | yubaba agent exec on node   | containerd workload on node |
+/// | `RemoteAny{_}` | yubaba agent exec (any node)| containerd workload (any node) |
 ///
 /// See [W149](.yah/docs/working/W149-task-placement-axis.md) for the model.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -297,14 +297,14 @@ pub enum ForgeCommand {
         image: Option<ImageRef>,
     },
 
-    /// Deploy the spec verbatim via warden RPC.  Warden sets
+    /// Deploy the spec verbatim via yubaba RPC.  Yubaba sets
     /// `restart_policy=Never` and the forge mesh-ident convention if not
     /// already present.
     Workload { spec: WorkloadSpec },
 
     /// Build a container image from a Dockerfile + build context, producing an
     /// `ImageRef`.  Local builds shell to `docker buildx` (R381-T4); remote
-    /// builds submit a BuildKit-in-containerd workload to warden (R381-T5).
+    /// builds submit a BuildKit-in-containerd workload to yubaba (R381-T5).
     ///
     /// `dockerfile` and `context` are paths resolved by the caller — the qed
     /// runner uses the catalog (R381-T1) to translate a catalog name into
@@ -386,7 +386,7 @@ pub struct IntegrationForgeSpec {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TopologyHints {
     /// Minimum node count.  `1` targets a single local node; higher values
-    /// require a live warden cluster.
+    /// require a live yubaba cluster.
     #[serde(default = "default_node_count")]
     pub node_count: u32,
 }
@@ -499,7 +499,7 @@ mod types {
         let json = serde_json::to_string(&cmd).unwrap();
         let back: ForgeCommand = serde_json::from_str(&json).unwrap();
         assert_eq!(cmd, back);
-        // Confirm the snake_case tag is what warden reads on the wire.
+        // Confirm the snake_case tag is what yubaba reads on the wire.
         assert!(json.contains(r#""kind":"build_image""#));
     }
 
@@ -566,7 +566,7 @@ mod types {
     #[test]
     fn task_placement_round_trip_serde() {
         let placement = TaskPlacement::new(
-            TaskLocation::Remote { node: ident("warden-01") },
+            TaskLocation::Remote { node: ident("yubaba-01") },
             TaskRuntime::Container,
         );
         let json = serde_json::to_string(&placement).unwrap();

@@ -59,7 +59,9 @@ impl SecretsConfig {
     /// Path: `<home>/.yah/qed/secrets.toml`. Returns `Default::default()`
     /// when the file or HOME is unavailable.
     pub fn load_default() -> Self {
-        let Some(path) = default_path() else { return Self::default() };
+        let Some(path) = default_path() else {
+            return Self::default();
+        };
         Self::load_from(&path)
     }
 
@@ -92,17 +94,30 @@ impl SecretsConfig {
     /// Each declared GHA secret name is resolved through its source URI
     /// using the canonical yah vault; unresolved sources surface as `""`
     /// (matches GHA's unset behavior).
-    pub fn resolve_all(&self) -> qed_gha::Value {
+    pub fn resolve_all(&self) -> yah_qed_gha::Value {
         // Open the vault once per resolve — `KeysStore::get` is a small
         // file read + AES-GCM decrypt of a usually-tiny credentials.enc,
         // so the open cost amortizes across N lookups.
-        let vault = keys::KeysStore::open().ok();
-        let mut out: indexmap::IndexMap<String, qed_gha::Value> = indexmap::IndexMap::new();
+        let vault = fob::KeysStore::open().ok();
+        let mut out: indexmap::IndexMap<String, yah_qed_gha::Value> = indexmap::IndexMap::new();
         for (gha_name, source) in &self.secrets {
             let value = resolve_source(source, vault.as_ref()).unwrap_or_default();
-            out.insert(gha_name.clone(), qed_gha::Value::String(value));
+            out.insert(gha_name.clone(), yah_qed_gha::Value::String(value));
         }
-        qed_gha::Value::Object(out)
+        yah_qed_gha::Value::Object(out)
+    }
+
+    /// Resolve a single declared secret by its bridged name, running the same
+    /// `vault:` / `env:` / pipe-fallback chain as [`resolve_all`]. Returns
+    /// `None` when the name isn't declared in the bridge, or when its source
+    /// chain yields nothing. Opens the vault once per call — fine for the
+    /// handful of credential slots a release-provider adapter reads at publish
+    /// time (R509). For resolving the whole bridge at once, prefer
+    /// [`resolve_all`], which amortizes the vault open across all entries.
+    pub fn resolve_one(&self, name: &str) -> Option<String> {
+        let source = self.secrets.get(name)?;
+        let vault = fob::KeysStore::open().ok();
+        resolve_source(source, vault.as_ref())
     }
 
     /// Names of declared GHA secrets (sorted). Used by the desktop
@@ -119,7 +134,7 @@ impl SecretsConfig {
     /// non-empty value, never the value itself. Sorted by GHA name so
     /// the editor UI gets a stable row order. (R500-F1)
     pub fn resolve_status(&self) -> Vec<EntryStatus> {
-        let vault = keys::KeysStore::open().ok();
+        let vault = fob::KeysStore::open().ok();
         let mut out: Vec<EntryStatus> = self
             .secrets
             .iter()
@@ -168,12 +183,18 @@ pub fn save_to(
         // bare; anything else (a name with a dot, say) needs quoting.
         // GHA secret names in practice are uppercase + underscores;
         // err on the side of always-quoting to keep the writer total.
-        buf.push_str(&format!("{} = {}\n", quote_toml_key(name), quote_toml_str(source)));
+        buf.push_str(&format!(
+            "{} = {}\n",
+            quote_toml_key(name),
+            quote_toml_str(source)
+        ));
     }
     let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
     let tmp_name = format!(
         ".{}.tmp",
-        path.file_name().and_then(|s| s.to_str()).unwrap_or("secrets.toml")
+        path.file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("secrets.toml")
     );
     let tmp = dir.join(tmp_name);
     std::fs::write(&tmp, buf.as_bytes())?;
@@ -212,7 +233,7 @@ fn quote_toml_str(s: &str) -> String {
 /// Resolve a single source URI to its current string value, using `vault`
 /// for `vault:<slot>` lookups. Returns `None` when nothing resolved (the
 /// caller folds that to `""` so undefined secrets read empty, matching GHA).
-fn resolve_source(source: &str, vault: Option<&keys::KeysStore>) -> Option<String> {
+fn resolve_source(source: &str, vault: Option<&fob::KeysStore>) -> Option<String> {
     // Pipe-joined fallback chain: try each alternative in order until one
     // yields a Some. Same precedence as shell `${VAR:-${OTHER:-…}}` — the
     // first non-empty wins.
@@ -272,7 +293,12 @@ fn resolve_source(source: &str, vault: Option<&keys::KeysStore>) -> Option<Strin
 /// that need to read **and** write the file share the same path.
 pub fn default_path() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
-    Some(PathBuf::from(home).join(".yah").join("qed").join("secrets.toml"))
+    Some(
+        PathBuf::from(home)
+            .join(".yah")
+            .join("qed")
+            .join("secrets.toml"),
+    )
 }
 
 #[cfg(test)]
@@ -300,8 +326,10 @@ mod tests {
     #[test]
     fn unresolved_env_var_yields_empty_string() {
         let mut cfg = SecretsConfig::default();
-        cfg.secrets
-            .insert("GITHUB_TOKEN".into(), "env:DEFINITELY_NOT_SET_QED_X92".into());
+        cfg.secrets.insert(
+            "GITHUB_TOKEN".into(),
+            "env:DEFINITELY_NOT_SET_QED_X92".into(),
+        );
         let v = cfg.resolve_all();
         // Unresolved → empty string (matches GHA's unset-secret behavior).
         assert_eq!(string_at(&v, "GITHUB_TOKEN").as_deref(), Some(""));
@@ -352,10 +380,7 @@ CF_R2_ACCESS_KEY = "vault:r2-access-key|env:CF_R2_ACCESS_KEY"
         let path = dir.path().join("secrets.toml");
         let mut entries = std::collections::BTreeMap::new();
         entries.insert("GITHUB_TOKEN".into(), "vault:github-pat".into());
-        entries.insert(
-            "GH_PAT".into(),
-            "vault:github-pat|env:GH_PAT_LOCAL".into(),
-        );
+        entries.insert("GH_PAT".into(), "vault:github-pat|env:GH_PAT_LOCAL".into());
         save_to(&path, &entries).unwrap();
         let cfg = SecretsConfig::load_from(&path);
         assert_eq!(cfg.secrets.len(), 2);
@@ -388,8 +413,7 @@ CF_R2_ACCESS_KEY = "vault:r2-access-key|env:CF_R2_ACCESS_KEY"
         let key = "QED_SECRETS_STATUS_VAR_BBBB";
         std::env::set_var(key, "present");
         let mut cfg = SecretsConfig::default();
-        cfg.secrets
-            .insert("PRESENT".into(), format!("env:{key}"));
+        cfg.secrets.insert("PRESENT".into(), format!("env:{key}"));
         cfg.secrets
             .insert("ABSENT".into(), "env:DEFINITELY_NOT_SET_QED_X93".into());
         let report = cfg.resolve_status();
@@ -406,10 +430,10 @@ CF_R2_ACCESS_KEY = "vault:r2-access-key|env:CF_R2_ACCESS_KEY"
         std::env::remove_var(key);
     }
 
-    fn string_at(v: &qed_gha::Value, key: &str) -> Option<String> {
+    fn string_at(v: &yah_qed_gha::Value, key: &str) -> Option<String> {
         match v {
-            qed_gha::Value::Object(m) => m.get(key).and_then(|x| match x {
-                qed_gha::Value::String(s) => Some(s.clone()),
+            yah_qed_gha::Value::Object(m) => m.get(key).and_then(|x| match x {
+                yah_qed_gha::Value::String(s) => Some(s.clone()),
                 _ => None,
             }),
             _ => None,

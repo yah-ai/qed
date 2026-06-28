@@ -11,7 +11,7 @@
 use crate::types::{
     Binding, CardOutcome, CardOutcomeRow, ChatBindingRole, DeclineReason, EscalationTarget,
     SessionFilter, SessionResult, SessionStatus, TaskSession, TaskSessionId, TaskSessionKind,
-    ToolCallRef, Verdict,
+    TicketClaim, ToolCallRef, Verdict,
 };
 use std::path::Path;
 use thiserror::Error;
@@ -641,6 +641,32 @@ impl SessionStore {
         .transpose()
     }
 
+    /// List every ticket ID that currently has an Active Ticket session.
+    ///
+    /// The whole-board analogue of [`find_active_for_ticket`]: one query that
+    /// folds all live ticket ownership into a set the board layer derives
+    /// columns from (W210). A ticket in this set is `active` regardless of its
+    /// source `@yah:status`, so it can't appear in the picker's `handoff`/`open`
+    /// view (collision-free dispatch).
+    pub async fn list_active_ticket_ids(&self) -> Result<Vec<String>, SessionStoreError> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT DISTINCT sb.payload FROM task_sessions ts
+                 JOIN session_bindings sb ON sb.session_id = ts.id
+                 WHERE ts.kind_tag = 'ticket'
+                   AND ts.status = 'active'
+                   AND sb.binding_kind = 'ticket'",
+                (),
+            )
+            .await?;
+        let mut ids = Vec::new();
+        while let Some(row) = rows.next().await? {
+            ids.push(row.get::<String>(0)?);
+        }
+        Ok(ids)
+    }
+
     /// Find the ticket binding for a session — the inverse of `find_active_for_ticket`.
     /// Returns the ticket ID string bound to this session, or `None` if the session
     /// has no ticket binding.
@@ -663,6 +689,88 @@ impl SessionStore {
             None => None,
         };
         Ok(payload)
+    }
+
+    /// Relabel the active Ticket session for `ticket_id` (W210-F2).
+    ///
+    /// The picker claims a ticket *before* it knows the engine session id (the
+    /// claim must reject a racing picker before any session is spawned), so the
+    /// claim labels the session with the agent id. Once the engine session is
+    /// forked, the desktop relabels the session with the concrete engine
+    /// `session_id` so [`close_ticket_sessions_with_label`] can release exactly
+    /// this session's claim when it ends — never a different worker's. Returns
+    /// `true` when an active session was found and relabelled.
+    pub async fn set_ticket_session_label(
+        &self,
+        ticket_id: &str,
+        label: &str,
+    ) -> Result<bool, SessionStoreError> {
+        let Some(id) = self.find_active_for_ticket(ticket_id).await? else {
+            return Ok(false);
+        };
+        let n = self
+            .conn
+            .execute(
+                "UPDATE task_sessions SET label=?2 WHERE id=?1",
+                params![id.to_string(), label.to_string()],
+            )
+            .await?;
+        Ok(n > 0)
+    }
+
+    /// Close every active Ticket session whose `label` equals `label` (W210-F2).
+    ///
+    /// The release half of the picker-claim lifecycle: when an engine session
+    /// ends — cleanly, by crash, or by app-quit — the desktop calls this with
+    /// the ended session id so the ticket it owned re-derives to `handoff`/`open`
+    /// for the next picker. Keyed on `label` (the engine session id, set by
+    /// [`set_ticket_session_label`]) so it closes only the ended session's claim,
+    /// not a claim some other live worker holds on the same ticket. Idempotent:
+    /// returns `0` when the session was already released by `review`/`handoff`.
+    pub async fn close_ticket_sessions_with_label(
+        &self,
+        label: &str,
+    ) -> Result<usize, SessionStoreError> {
+        let now = Self::now_ms();
+        let n = self
+            .conn
+            .execute(
+                "UPDATE task_sessions SET status='closed', closed_at=?2
+                 WHERE kind_tag='ticket' AND status='active' AND label=?1",
+                params![label.to_string(), now as i64],
+            )
+            .await?;
+        Ok(n as usize)
+    }
+
+    /// List every active Ticket session as `(session id, owner label)` (W210-F2).
+    ///
+    /// The boot-reconcile read side: the desktop closes any claim whose owner
+    /// label (the engine session id stamped by [`set_ticket_session_label`]) is
+    /// no longer live or cleanly paused, freeing tickets orphaned by a hard
+    /// app-quit. A `None` label is a claim that crashed between claim and
+    /// relabel — it has no live owner and is reconciled the same way.
+    pub async fn list_active_ticket_sessions(
+        &self,
+    ) -> Result<Vec<(TaskSessionId, Option<String>)>, SessionStoreError> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT id, label FROM task_sessions
+                 WHERE kind_tag='ticket' AND status='active'",
+                (),
+            )
+            .await?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await? {
+            let id_s: String = row.get(0)?;
+            let label: Option<String> = row.get(1)?;
+            let id = id_s
+                .parse::<TaskSessionId>()
+                .map_err(|e| SessionStoreError::Parse(e.to_string()))?;
+            out.push((id, label));
+        }
+        Ok(out)
     }
 
     /// Idempotent: finds an existing active Ticket session or creates a new one.
@@ -691,6 +799,65 @@ impl SessionStore {
         )
         .await?;
         Ok(id)
+    }
+
+    /// Atomically claim a ticket for a live session (W210 `board.claim`).
+    ///
+    /// Conflict-rejecting: at most one active TaskSession may own a ticket.
+    /// - No live session → create one (labelled with `claimant`), bind it,
+    ///   return [`TicketClaim::Claimed`].
+    /// - A live session whose `label` equals `claimant` → idempotent
+    ///   [`TicketClaim::AlreadyOwned`] (a picker re-claiming its own ticket).
+    /// - A live session owned by anyone else → [`TicketClaim::Conflict`]; no
+    ///   write happens.
+    ///
+    /// A `None` claimant can never match an existing owner — an anonymous
+    /// caller can't prove ownership, so any live session is a conflict. The
+    /// picker always passes its session/agent token, so idempotent re-claim
+    /// works for the real call site.
+    ///
+    /// Atomicity rests on the daemon being the single writer: the find +
+    /// create run without another writer interleaving, so two pickers racing
+    /// through the daemon serialize — one `Claimed`, the other `Conflict`.
+    pub async fn claim_ticket_session(
+        &self,
+        ticket_id: &str,
+        claimant: Option<&str>,
+    ) -> Result<TicketClaim, SessionStoreError> {
+        if let Some(existing) = self.find_active_for_ticket(ticket_id).await? {
+            let holder = self.get_session(&existing).await?.label;
+            // Idempotent only when both sides carry the same non-empty token.
+            let mine = match (claimant, holder.as_deref()) {
+                (Some(c), Some(h)) => c == h,
+                _ => false,
+            };
+            return Ok(if mine {
+                TicketClaim::AlreadyOwned(existing)
+            } else {
+                TicketClaim::Conflict {
+                    session: existing,
+                    holder,
+                }
+            });
+        }
+
+        let id = self
+            .create_session(
+                TaskSessionKind::Ticket {
+                    ticket_id: ticket_id.to_string(),
+                },
+                claimant.map(|c| c.to_string()),
+                None,
+            )
+            .await?;
+        self.bind_session(
+            &id,
+            &Binding::Ticket {
+                id: ticket_id.to_string(),
+            },
+        )
+        .await?;
+        Ok(TicketClaim::Claimed(id))
     }
 
     /// Count how many GnomeShift sessions exist for `shift_id` (any status).
@@ -1242,6 +1409,142 @@ mod tests {
         // Different ticket gets a new session.
         let id3 = s.ensure_ticket_session("R001-T2", None).await.unwrap();
         assert_ne!(id1, id3);
+    }
+
+    #[tokio::test]
+    async fn list_active_ticket_ids_folds_live_ownership() {
+        let s = SessionStore::open_in_memory().await.unwrap();
+        // Two active ticket sessions.
+        s.ensure_ticket_session("R001-T1", None).await.unwrap();
+        s.ensure_ticket_session("R001-T2", None).await.unwrap();
+        // A closed one must not appear.
+        let id3 = s.ensure_ticket_session("R001-T3", None).await.unwrap();
+        s.close_session(&id3, None).await.unwrap();
+
+        let mut ids = s.list_active_ticket_ids().await.unwrap();
+        ids.sort();
+        assert_eq!(
+            ids,
+            vec!["R001-T1".to_string(), "R001-T2".to_string()],
+            "only live (active) ticket sessions are folded; closed ones excluded"
+        );
+    }
+
+    #[tokio::test]
+    async fn relabel_then_close_by_label_releases_only_that_owner() {
+        let s = SessionStore::open_in_memory().await.unwrap();
+
+        // Two ticket claims, agent-labelled by the picker, then relabelled to
+        // their concrete engine session ids (W210-F2).
+        s.claim_ticket_session("R001-T1", Some("agent:A")).await.unwrap();
+        s.claim_ticket_session("R001-T2", Some("agent:B")).await.unwrap();
+        assert!(s.set_ticket_session_label("R001-T1", "session:S1").await.unwrap());
+        assert!(s.set_ticket_session_label("R001-T2", "session:S2").await.unwrap());
+
+        // Relabelling a ticket with no active claim is a no-op (false).
+        assert!(!s.set_ticket_session_label("R001-T9", "session:X").await.unwrap());
+
+        // Closing by S1's owner token releases exactly T1's claim.
+        assert_eq!(s.close_ticket_sessions_with_label("session:S1").await.unwrap(), 1);
+        assert!(s.find_active_for_ticket("R001-T1").await.unwrap().is_none());
+        assert!(s.find_active_for_ticket("R001-T2").await.unwrap().is_some());
+
+        // Idempotent: closing the same owner again closes nothing.
+        assert_eq!(s.close_ticket_sessions_with_label("session:S1").await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn list_active_ticket_sessions_reports_id_and_label() {
+        let s = SessionStore::open_in_memory().await.unwrap();
+        s.claim_ticket_session("R001-T1", Some("agent:A")).await.unwrap();
+        s.set_ticket_session_label("R001-T1", "session:S1").await.unwrap();
+        // A claim that never got relabelled keeps its agent label.
+        s.claim_ticket_session("R001-T2", Some("agent:B")).await.unwrap();
+        // A closed one must not appear.
+        let id3 = s.claim_ticket_session("R001-T3", Some("agent:C")).await.unwrap();
+        if let TicketClaim::Claimed(id) = id3 {
+            s.close_session(&id, None).await.unwrap();
+        }
+
+        let mut labels: Vec<Option<String>> = s
+            .list_active_ticket_sessions()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(_, label)| label)
+            .collect();
+        labels.sort();
+        assert_eq!(
+            labels,
+            vec![Some("agent:B".to_string()), Some("session:S1".to_string())],
+            "only live claims, carrying their current owner label"
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_ticket_session_fresh_then_idempotent_then_conflict() {
+        let s = SessionStore::open_in_memory().await.unwrap();
+
+        // First claim by picker-A → fresh.
+        let first = s
+            .claim_ticket_session("R001-T1", Some("agent:A"))
+            .await
+            .unwrap();
+        let claimed_id = match first {
+            TicketClaim::Claimed(id) => id,
+            other => panic!("expected Claimed, got {other:?}"),
+        };
+
+        // A re-claims its own ticket → idempotent, same session.
+        let again = s
+            .claim_ticket_session("R001-T1", Some("agent:A"))
+            .await
+            .unwrap();
+        assert_eq!(again, TicketClaim::AlreadyOwned(claimed_id.clone()));
+
+        // Picker-B races on the same ticket → conflict, no new session.
+        let conflict = s
+            .claim_ticket_session("R001-T1", Some("agent:B"))
+            .await
+            .unwrap();
+        assert_eq!(
+            conflict,
+            TicketClaim::Conflict {
+                session: claimed_id.clone(),
+                holder: Some("agent:A".to_string()),
+            }
+        );
+
+        // Only one active session exists despite three claim calls.
+        assert_eq!(
+            s.list_active_ticket_ids().await.unwrap(),
+            vec!["R001-T1".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn claim_ticket_session_anonymous_caller_never_owns() {
+        let s = SessionStore::open_in_memory().await.unwrap();
+        // Anonymous claim creates the session...
+        let first = s.claim_ticket_session("R001-T1", None).await.unwrap();
+        assert!(matches!(first, TicketClaim::Claimed(_)));
+        // ...but a second anonymous claim can't prove ownership → conflict.
+        let second = s.claim_ticket_session("R001-T1", None).await.unwrap();
+        assert!(matches!(second, TicketClaim::Conflict { .. }));
+    }
+
+    #[tokio::test]
+    async fn claim_ticket_session_reclaimable_after_close() {
+        let s = SessionStore::open_in_memory().await.unwrap();
+        let id = match s.claim_ticket_session("R001-T1", Some("agent:A")).await.unwrap() {
+            TicketClaim::Claimed(id) => id,
+            other => panic!("expected Claimed, got {other:?}"),
+        };
+        // Owner closes the session (handoff / crash recovery).
+        s.close_session(&id, None).await.unwrap();
+        // A different agent can now claim cleanly — column re-derived to open.
+        let next = s.claim_ticket_session("R001-T1", Some("agent:B")).await.unwrap();
+        assert!(matches!(next, TicketClaim::Claimed(_)));
     }
 
     #[tokio::test]

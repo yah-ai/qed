@@ -5,7 +5,7 @@
 //! @yah:handoff(".yah/qed/ directory created at workspace root. PipelineLoader.list_all() now dedupes built-ins + custom files. Camp TOML overrides built-ins by name.")
 
 use crate::peers::PeerConfig;
-use crate::registries::{RegistryConfig, RegistryConfigError, extract_registry_host};
+use crate::registries::{extract_registry_host, RegistryConfig, RegistryConfigError};
 use crate::types::{
     GhaWorkflowConfig, OnFail, ParamDef, Pipeline, Placement, QedStep, StepKind,
     StepValidationError, SubPipelineRef, SubPipelineResolver,
@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 /// Parse a `P{n}-{name}` filename stem into `(n, name)`.
-/// e.g. `"P006-build-yah-warden"` → `(6, "build-yah-warden")`.
+/// e.g. `"P006-build-yah-yubaba"` → `(6, "build-yah-yubaba")`.
 fn parse_p_prefix(stem: &str) -> Option<(u32, &str)> {
     let rest = stem.strip_prefix('P')?;
     let dash = rest.find('-')?;
@@ -52,7 +52,11 @@ fn find_pipeline_file(dir: &Path, name: &str) -> Option<PathBuf> {
     }
     // Fallback: unprefixed (cloud-init generated cards, legacy, tests).
     let legacy = dir.join(format!("{name}.toml"));
-    if legacy.exists() { Some(legacy) } else { None }
+    if legacy.exists() {
+        Some(legacy)
+    } else {
+        None
+    }
 }
 
 #[derive(Error, Debug)]
@@ -69,15 +73,35 @@ pub enum ConfigError {
     Registry(#[from] RegistryConfigError),
     #[error("Sub-pipeline graph: {0}")]
     SubPipelineGraph(#[from] crate::types::SubPipelineError),
+    #[error("Invalid bind: {0}")]
+    InvalidBind(String),
+}
+
+/// On-disk shape of a `.yah/qed/*.toml` pipeline file. This is the JSON-Schema
+/// source of truth (R533-T10): `cargo run -p xtask -- emit-schemas` derives
+/// `qed-pipeline.toml.schema.json` from it via `schemars`, and a drift test
+/// asserts the committed schema matches. Kept `pub` solely so xtask can name it
+/// in `schema_for!`.
+#[derive(Debug, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct PipelineToml {
+    pub pipeline: PipelineConfig,
+    /// W209: top-level `[[bind]]` tables — placed at file root (not inside
+    /// `[pipeline]`) per the design doc's examples. The loader hoists them
+    /// onto `Pipeline.binds`.
+    #[serde(default, rename = "bind")]
+    #[cfg_attr(feature = "json-schema", schemars(schema_with = "crate::types::permissive_schema"))]
+    pub binds: Vec<manifest_bind::BindSpec>,
+    /// W209/R510-F6: top-level `[[on_change]]` hash-change hooks, hoisted onto
+    /// `Pipeline.on_change` (same root-level placement as `[[bind]]`).
+    #[serde(default)]
+    #[cfg_attr(feature = "json-schema", schemars(schema_with = "crate::types::permissive_schema"))]
+    pub on_change: Vec<manifest_bind::OnChangeHook>,
 }
 
 #[derive(Debug, Deserialize)]
-struct PipelineToml {
-    pipeline: PipelineConfig,
-}
-
-#[derive(Debug, Deserialize)]
-struct PipelineConfig {
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct PipelineConfig {
     name: String,
     label: String,
     #[serde(default)]
@@ -95,7 +119,20 @@ struct PipelineConfig {
     #[serde(default)]
     placement: Placement,
     #[serde(default)]
+    workspace: crate::types::WorkspaceMode,
+    #[serde(default)]
     wraps: Option<String>,
+    #[serde(default)]
+    #[cfg_attr(feature = "json-schema", schemars(schema_with = "crate::types::permissive_schema"))]
+    matrix: Option<crate::matrix::MatrixSpec>,
+    #[serde(default)]
+    #[cfg_attr(feature = "json-schema", schemars(schema_with = "crate::types::permissive_schema"))]
+    toolchain: Option<crate::toolchain::ToolchainSpec>,
+    /// W207 Gap #6 (R513-F4): `[[finally]]` always-run teardown steps. Authored
+    /// at the `[pipeline]` level (a sibling of `[[steps]]`). Hoisted onto
+    /// [`Pipeline::finally`] and validated with [`QedStep::validate_finally`].
+    #[serde(default)]
+    finally: Vec<QedStep>,
 }
 
 #[derive(Clone)]
@@ -122,7 +159,11 @@ impl PipelineLoader {
         let qed_dir = qed_dir.as_ref().to_path_buf();
         let registries = RegistryConfig::load(&qed_dir).unwrap_or_default();
         let peers = PeerConfig::load(&qed_dir).unwrap_or_default();
-        Self { qed_dir, registries, peers }
+        Self {
+            qed_dir,
+            registries,
+            peers,
+        }
     }
 
     /// Replace the auto-loaded registry config. Useful in tests when the
@@ -198,7 +239,7 @@ impl PipelineLoader {
                 Ok(c) => c,
                 Err(_) => continue,
             };
-            let workflow = match qed_gha::parse_workflow(&content) {
+            let workflow = match yah_qed_gha::parse_workflow(&content) {
                 Ok(w) => w,
                 Err(e) => {
                     tracing::warn!(
@@ -213,14 +254,20 @@ impl PipelineLoader {
                 .strip_prefix(self.workspace_root())
                 .map(|p| p.to_path_buf())
                 .unwrap_or_else(|_| path.clone());
-            out.push(GhaWorkflowEntry { name, rel_path, workflow });
+            out.push(GhaWorkflowEntry {
+                name,
+                rel_path,
+                workflow,
+            });
         }
         out.sort_by(|a, b| a.name.cmp(&b.name));
         out
     }
 
     fn find_gha_workflow(&self, name: &str) -> Option<GhaWorkflowEntry> {
-        self.list_gha_workflows().into_iter().find(|w| w.name == name)
+        self.list_gha_workflows()
+            .into_iter()
+            .find(|w| w.name == name)
     }
 
     /// List all pipeline names from `<qed_dir>/*.toml`, sorted by P-number
@@ -286,7 +333,10 @@ impl PipelineLoader {
                 }
             }
         }
-        names.iter().filter_map(|n| map.get(n).map(|&v| (n.clone(), v))).collect()
+        names
+            .iter()
+            .filter_map(|n| map.get(n).map(|&v| (n.clone(), v)))
+            .collect()
     }
 
     /// List only custom pipeline files from `.yah/qed/` (excludes built-ins),
@@ -325,10 +375,25 @@ impl PipelineLoader {
             triggers: parsed.pipeline.triggers,
             concurrency_key: parsed.pipeline.concurrency_key,
             placement: parsed.pipeline.placement,
+            workspace: parsed.pipeline.workspace,
             wraps: parsed.pipeline.wraps,
+            matrix: parsed.pipeline.matrix,
+            toolchain: parsed.pipeline.toolchain,
+            binds: parsed.binds,
+            on_change: parsed.on_change,
+            finally: parsed.pipeline.finally,
         };
         self.validate_steps(&pipeline)?;
+        self.validate_binds(&pipeline)?;
         Ok(pipeline)
+    }
+
+    /// Public helper: parse a pipeline directly from a file path, bypassing
+    /// the `<qed_dir>/P{n}-<name>.toml` lookup. Used by `qed plan
+    /// <path>.toml` to preview drafts that haven't been moved into the camp
+    /// pipeline directory yet.
+    pub fn parse_from_path(&self, path: &Path) -> Result<Pipeline, ConfigError> {
+        self.load_from_file(path)
     }
 
     pub(crate) fn load_from_file(&self, path: &Path) -> Result<Pipeline, ConfigError> {
@@ -344,9 +409,16 @@ impl PipelineLoader {
             triggers: parsed.pipeline.triggers,
             concurrency_key: parsed.pipeline.concurrency_key,
             placement: parsed.pipeline.placement,
+            workspace: parsed.pipeline.workspace,
             wraps: parsed.pipeline.wraps,
+            matrix: parsed.pipeline.matrix,
+            toolchain: parsed.pipeline.toolchain,
+            binds: parsed.binds,
+            on_change: parsed.on_change,
+            finally: parsed.pipeline.finally,
         };
         self.validate_steps(&pipeline)?;
+        self.validate_binds(&pipeline)?;
         Ok(pipeline)
     }
 
@@ -359,11 +431,7 @@ impl PipelineLoader {
         for step in &pipeline.steps {
             step.validate()?;
             if matches!(step.kind, StepKind::BuildImage) && step.push {
-                let tag_for_host = step
-                    .tag
-                    .as_deref()
-                    .or(step.image.as_deref())
-                    .unwrap_or("");
+                let tag_for_host = step.tag.as_deref().or(step.image.as_deref()).unwrap_or("");
                 let host = extract_registry_host(tag_for_host);
                 if !self.registries.is_writable(host) {
                     return Err(ConfigError::InvalidStep(
@@ -373,6 +441,56 @@ impl PipelineLoader {
                         },
                     ));
                 }
+            }
+        }
+        // R513-F4: `[[finally]]` teardown steps validate with the stricter
+        // finally rule (subprocess-only, never background) on top of the normal
+        // kind-specific checks.
+        for step in &pipeline.finally {
+            step.validate_finally()
+                .map_err(ConfigError::InvalidStep)?;
+        }
+        Ok(())
+    }
+
+    /// W209 parse-time bind validation: every `[[bind]].from` that names a
+    /// step output must reference (a) a step that exists in this pipeline,
+    /// and (b) an output key declared on that step. URI-shaped `from`
+    /// (`registry://...`) is the escape hatch and skips this check. Surfaces
+    /// the first offender — authors get one error at a time, same as
+    /// `validate_steps`.
+    fn validate_binds(&self, pipeline: &Pipeline) -> Result<(), ConfigError> {
+        for bind in &pipeline.binds {
+            match &bind.from {
+                manifest_bind::OutputRef::Uri(_) => continue,
+                manifest_bind::OutputRef::StepOutput { step, key } => {
+                    let Some(producer) = pipeline.steps.iter().find(|s| &s.name == step) else {
+                        return Err(ConfigError::InvalidBind(format!(
+                            "[[bind]] file = {:?}: from references unknown step {step:?}",
+                            bind.file
+                        )));
+                    };
+                    if !producer.outputs.iter().any(|o| &o.name == key) {
+                        return Err(ConfigError::InvalidBind(format!(
+                            "[[bind]] file = {:?}: step {step:?} does not declare output {key:?} \
+                             (declare it under [[pipeline.steps]].outputs)",
+                            bind.file
+                        )));
+                    }
+                }
+            }
+        }
+        // W209/R510-F6: every `[[on_change]].bind` selector must reference a
+        // declared `[[bind]].path` — a hook keyed off a slot nothing binds is
+        // dead config (a typo'd selector). Same first-offender surface as the
+        // bind checks above.
+        for hook in &pipeline.on_change {
+            if !pipeline.binds.iter().any(|b| b.path == hook.bind) {
+                return Err(ConfigError::InvalidBind(format!(
+                    "[[on_change]] bind = {:?}: no [[bind]] declares path {:?} \
+                     (the selector must match a bound slot's `path`)",
+                    hook.bind, hook.bind
+                )));
             }
         }
         Ok(())
@@ -412,10 +530,10 @@ pub struct GhaWorkflowEntry {
     pub name: String,
     /// Path relative to the workspace root (`.github/workflows/release.yml`).
     pub rel_path: PathBuf,
-    /// Fully parsed workflow as returned by `qed_gha::parse_workflow`. The
+    /// Fully parsed workflow as returned by `yah_qed_gha::parse_workflow`. The
     /// daemon walks `workflow.jobs[].steps[]` to build the wire's `steps[]`,
     /// keeping a single source of truth between visualisation and execution.
-    pub workflow: qed_gha::Workflow,
+    pub workflow: yah_qed_gha::Workflow,
 }
 
 /// Synthesise a one-step `StepKind::GhaWorkflow` pipeline that wraps the
@@ -424,6 +542,9 @@ pub struct GhaWorkflowEntry {
 /// at the same runner arm.
 fn synthesise_gha_pipeline(entry: &GhaWorkflowEntry) -> Pipeline {
     let step = QedStep {
+        background: false,
+        background_until: None,
+        wait_for: None,
         name: "gha-workflow".to_string(),
         argv: Vec::new(),
         cwd: None,
@@ -443,11 +564,18 @@ fn synthesise_gha_pipeline(entry: &GhaWorkflowEntry) -> Pipeline {
         load: false,
         sub_pipeline: None,
         outputs: Vec::new(),
+        import: None,
         gha_workflow: Some(GhaWorkflowConfig {
             path: entry.rel_path.clone(),
             event: None,
             inputs: HashMap::new(),
         }),
+        matrix: None,
+        enabled: true,
+        activation: crate::types::StepActivation::Active,
+        if_cond: None,
+        platform: None,
+        toolchain: None,
     };
     Pipeline {
         name: entry.name.clone(),
@@ -463,7 +591,13 @@ fn synthesise_gha_pipeline(entry: &GhaWorkflowEntry) -> Pipeline {
         triggers: Vec::new(),
         concurrency_key: None,
         placement: Placement::default(),
+        workspace: crate::types::WorkspaceMode::default(),
         wraps: None,
+        matrix: None,
+        toolchain: None,
+        binds: Vec::new(),
+        on_change: Vec::new(),
+        finally: Vec::new(),
     }
 }
 
@@ -474,6 +608,28 @@ pub struct LoaderSubPipelineResolver {
 impl LoaderSubPipelineResolver {
     pub fn new(loader: PipelineLoader) -> Self {
         Self { loader }
+    }
+
+    /// Resolve a local peer camp's root from `peers.toml`, relative to this
+    /// camp. Returns `None` for unknown camps and for remote peers (`rig`
+    /// set) — those don't resolve to a local path. Shared by [`resolve`]
+    /// (to load the peer's pipeline) and [`resolved_camp_root`] (to run that
+    /// pipeline's steps in the peer's workspace).
+    fn local_peer_camp_root(&self, camp: &str) -> Option<std::path::PathBuf> {
+        let entry = self.loader.peers.get(camp)?;
+        if entry.rig.is_some() {
+            return None;
+        }
+        if entry.path.is_absolute() {
+            return Some(entry.path.clone());
+        }
+        // self.loader.qed_dir is `<this camp root>/.yah/qed`; pop twice to
+        // reach `<this camp root>`, then join the peer's relative path.
+        self.loader
+            .qed_dir
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|root| root.join(&entry.path))
     }
 }
 
@@ -500,14 +656,21 @@ impl SubPipelineResolver for LoaderSubPipelineResolver {
             }
             // GhaWorkflow children synthesize a one-step Pipeline whose
             // single step is `StepKind::GhaWorkflow` (W200-F9). The runner's
-            // own arm then dispatches to qed_gha::execute_workflow and lifts
+            // own arm then dispatches to yah_qed_gha::execute_workflow and lifts
             // ProducedArtifacts the same way Subprocess `produces` does.
             // Going through SubPipeline preserves the propagate.produces /
             // suppress_publish_outcomes plumbing so a child workflow's R2
             // staging fires from the parent's terminal publish, not the
             // child's.
-            SubPipelineRef::GhaWorkflow { path, event, inputs } => {
+            SubPipelineRef::GhaWorkflow {
+                path,
+                event,
+                inputs,
+            } => {
                 let step = crate::types::QedStep {
+                    background: false,
+                    background_until: None,
+                    wait_for: None,
                     name: "gha-workflow".into(),
                     argv: Vec::new(),
                     cwd: None,
@@ -527,11 +690,18 @@ impl SubPipelineResolver for LoaderSubPipelineResolver {
                     load: false,
                     sub_pipeline: None,
                     outputs: Vec::new(),
+                    import: None,
                     gha_workflow: Some(crate::types::GhaWorkflowConfig {
                         path: path.clone(),
                         event: event.clone(),
                         inputs: inputs.clone(),
                     }),
+                    matrix: None,
+                    enabled: true,
+                    activation: crate::types::StepActivation::Active,
+                    if_cond: None,
+                    platform: None,
+                    toolchain: None,
                 };
                 Some(crate::types::Pipeline {
                     name: format!("gha-workflow:{}", path.display()),
@@ -542,8 +712,14 @@ impl SubPipelineResolver for LoaderSubPipelineResolver {
                     on_success: Vec::new(),
                     on_fail: Vec::new(),
                     placement: crate::types::Placement::default(),
+                    workspace: crate::types::WorkspaceMode::default(),
                     wraps: None,
+                    matrix: None,
                     params: std::collections::HashMap::new(),
+                    toolchain: None,
+                    binds: Vec::new(),
+                    on_change: Vec::new(),
+                    finally: Vec::new(),
                 })
             }
             // Peer resolution (R494-F2). Look the peer up in this camp's
@@ -556,27 +732,12 @@ impl SubPipelineResolver for LoaderSubPipelineResolver {
             // same peer camp (e.g. cheers/build + cheers/test) still
             // serialize on cheers' shared `target/`.
             SubPipelineRef::Peer { camp, pipeline } => {
-                let entry = self.loader.peers.get(camp)?;
-                if entry.rig.is_some() {
-                    // Remote peers go through constable, which isn't wired
-                    // yet. Swallow to None here; the runner consults
-                    // `unresolved_reason` below to surface a typed
-                    // `RemotePeerNotYetSupported` message in StepFailed.msg
-                    // rather than the generic "target unresolvable" tail.
-                    return None;
-                }
-                let peer_camp_root: std::path::PathBuf = if entry.path.is_absolute() {
-                    entry.path.clone()
-                } else {
-                    // self.loader.qed_dir is `<this camp root>/.yah/qed`;
-                    // pop twice to reach `<this camp root>`.
-                    self.loader
-                        .qed_dir
-                        .parent()
-                        .and_then(|p| p.parent())
-                        .map(|root| root.join(&entry.path))
-                        .unwrap_or_else(|| entry.path.clone())
-                };
+                // Remote peers (`rig` set) go through kamaji, which isn't
+                // wired yet. `local_peer_camp_root` returns None for them and
+                // for unknown camps; the runner consults `unresolved_reason`
+                // below to surface a typed message in StepFailed.msg rather
+                // than the generic "target unresolvable" tail.
+                let peer_camp_root = self.local_peer_camp_root(camp)?;
                 let peer_qed_dir = peer_camp_root.join(".yah").join("qed");
                 let peer_loader = PipelineLoader::new(&peer_qed_dir);
                 let mut child = peer_loader.load(pipeline).ok()?;
@@ -596,21 +757,36 @@ impl SubPipelineResolver for LoaderSubPipelineResolver {
                      (add `[peer.{camp}]` with `path = \"...\"`)",
                     self.loader.qed_dir.display()
                 )),
-                Some(entry) => entry.rig.as_ref().map(|rig| {
-                    format!(
-                        "remote peer `{camp}` lives on rig `{rig}` — \
+                Some(entry) => entry
+                    .rig
+                    .as_ref()
+                    .map(|rig| {
+                        format!(
+                            "remote peer `{camp}` lives on rig `{rig}` — \
                          cross-rig peer execution is not yet supported \
-                         (R494-T5: constable hop pending). Drop the `rig = ...` \
+                         (R494-T5: kamaji hop pending). Drop the `rig = ...` \
                          field on `[peer.{camp}]` in peers.toml to run the \
                          peer camp locally, or wait for R494-F10.",
-                    )
-                }).or_else(|| Some(format!(
-                    "peer camp `{camp}` is declared but pipeline `{pipeline}` \
+                        )
+                    })
+                    .or_else(|| {
+                        Some(format!(
+                            "peer camp `{camp}` is declared but pipeline `{pipeline}` \
                      was not found in `{}/.yah/qed/` \
                      (check the peer's pipeline name)",
-                    entry.path.display()
-                ))),
+                            entry.path.display()
+                        ))
+                    }),
             },
+            _ => None,
+        }
+    }
+
+    fn resolved_camp_root(&self, target: &SubPipelineRef) -> Option<std::path::PathBuf> {
+        // Only Peer children switch camps; Builtin/Path/GhaWorkflow run in
+        // the parent's camp (return None → runner inherits parent camp_root).
+        match target {
+            SubPipelineRef::Peer { camp, .. } => self.local_peer_camp_root(camp),
             _ => None,
         }
     }
@@ -622,9 +798,15 @@ mod tests {
 
     #[test]
     fn parse_p_prefix_parses_canonical_form() {
-        assert_eq!(parse_p_prefix("P006-build-yah-warden"), Some((6, "build-yah-warden")));
+        assert_eq!(
+            parse_p_prefix("P006-build-yah-yubaba"),
+            Some((6, "build-yah-yubaba"))
+        );
         assert_eq!(parse_p_prefix("P001-check"), Some((1, "check")));
-        assert_eq!(parse_p_prefix("P013-full-release"), Some((13, "full-release")));
+        assert_eq!(
+            parse_p_prefix("P013-full-release"),
+            Some((13, "full-release"))
+        );
     }
 
     #[test]
@@ -637,6 +819,282 @@ mod tests {
     }
     use crate::registries::RegistryEntry;
     use crate::types::Outcome;
+
+    /// W209: round-trip a pipeline TOML that declares a typed step output
+    /// and a `[[bind]]` referencing it. Loader must parse, type-validate,
+    /// and surface the BindSpec on the loaded Pipeline.
+    #[test]
+    fn loads_pipeline_with_typed_output_and_bind() {
+        let toml = r#"
+[pipeline]
+name = "publish-assets"
+label = "Publish whisper assets"
+
+[[pipeline.steps]]
+name = "apply"
+kind = "subprocess"
+argv = ["yah", "cloud", "apply"]
+
+[[pipeline.steps.outputs]]
+name = "discovered_asset_blake3"
+type = "blake3-hex"
+
+[[pipeline.steps.outputs]]
+name = "discovered_fetch_blake3"
+type = "blake3-hex"
+
+[[bind]]
+file   = "app/yah/desktop/assets/whisper/workload.toml"
+path   = "asset[filename='whisper.tar.gz'].blake3"
+from   = "apply.outputs.discovered_asset_blake3"
+intent = "latest"
+
+[[bind]]
+file   = "app/yah/desktop/assets/whisper/workload.toml"
+path   = "asset[filename='whisper.tar.gz'].derive.fetch.blake3"
+from   = "apply.outputs.discovered_fetch_blake3"
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let loader = PipelineLoader::new(dir.path());
+        let pipeline = loader.load_from_str(toml).expect("loads cleanly");
+        assert_eq!(pipeline.binds.len(), 2);
+        assert_eq!(pipeline.steps[0].outputs.len(), 2);
+        assert_eq!(
+            pipeline.steps[0].outputs[0].kind,
+            manifest_bind::ValueType::Blake3Hex,
+        );
+        // First bind = explicit latest, second omits intent and defaults to pin.
+        assert!(matches!(
+            pipeline.binds[0].intent,
+            manifest_bind::Intent::Keyword(manifest_bind::IntentKeyword::Latest)
+        ));
+        assert!(matches!(
+            pipeline.binds[1].intent,
+            manifest_bind::Intent::Keyword(manifest_bind::IntentKeyword::Pin)
+        ));
+    }
+
+    /// W209: a bind whose `from` references an undeclared step output is
+    /// rejected at parse time.
+    #[test]
+    fn rejects_bind_referencing_undeclared_output() {
+        let toml = r#"
+[pipeline]
+name = "publish-assets"
+label = "Publish whisper assets"
+
+[[pipeline.steps]]
+name = "apply"
+kind = "subprocess"
+argv = ["yah", "cloud", "apply"]
+
+[[bind]]
+file   = "workload.toml"
+path   = "image"
+from   = "apply.outputs.missing_key"
+intent = "latest"
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let loader = PipelineLoader::new(dir.path());
+        let err = loader.load_from_str(toml).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidBind(_)), "got {err:?}");
+    }
+
+    /// R513-F4: a `[[pipeline.finally]]` subprocess teardown step parses and is
+    /// hoisted onto `Pipeline::finally`.
+    #[test]
+    fn parses_finally_teardown_steps() {
+        let toml = r#"
+[pipeline]
+name = "e2e"
+label = "Dashboard E2E"
+
+[[pipeline.steps]]
+name = "test"
+kind = "subprocess"
+argv = ["playwright", "test"]
+
+[[pipeline.finally]]
+name = "upload-traces"
+kind = "subprocess"
+argv = ["aws", "s3", "cp", "traces/", "s3://ci/traces/", "--recursive"]
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let loader = PipelineLoader::new(dir.path());
+        let pipeline = loader.load_from_str(toml).expect("loads cleanly");
+        assert_eq!(pipeline.finally.len(), 1);
+        assert_eq!(pipeline.finally[0].name, "upload-traces");
+        assert_eq!(pipeline.finally[0].kind, StepKind::Subprocess);
+    }
+
+    /// R513-F4: a non-subprocess `[[pipeline.finally]]` step is rejected at
+    /// parse time (v1 teardown is subprocess-only).
+    #[test]
+    fn rejects_non_subprocess_finally_step() {
+        let toml = r#"
+[pipeline]
+name = "e2e"
+label = "Dashboard E2E"
+
+[[pipeline.steps]]
+name = "test"
+kind = "subprocess"
+argv = ["true"]
+
+[[pipeline.finally]]
+name = "gate"
+kind = "wait-for"
+[pipeline.finally.wait_for]
+http = "http://localhost:3000/health"
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let loader = PipelineLoader::new(dir.path());
+        let err = loader.load_from_str(toml).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::InvalidStep(StepValidationError::FinallyRequiresSubprocess(_))
+            ),
+            "got {err:?}"
+        );
+    }
+
+    /// W209: a bind whose `from` names a step that doesn't exist in this
+    /// pipeline is rejected at parse time.
+    #[test]
+    fn rejects_bind_referencing_unknown_step() {
+        let toml = r#"
+[pipeline]
+name = "publish-assets"
+label = "Publish whisper assets"
+
+[[pipeline.steps]]
+name = "apply"
+kind = "subprocess"
+argv = ["yah", "cloud", "apply"]
+
+[[bind]]
+file   = "workload.toml"
+path   = "image"
+from   = "doesnt_exist.outputs.x"
+intent = "latest"
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let loader = PipelineLoader::new(dir.path());
+        let err = loader.load_from_str(toml).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidBind(_)), "got {err:?}");
+    }
+
+    /// W209/R510-F6: a pipeline with `[[bind]]` + `[[on_change]]` round-trips
+    /// through the loader, with the hooks hoisted onto `Pipeline.on_change`
+    /// and the action variants parsed.
+    #[test]
+    fn loads_pipeline_with_on_change_hooks() {
+        let toml = r#"
+[pipeline]
+name = "publish-assets"
+label = "Publish whisper assets"
+
+[[pipeline.steps]]
+name = "apply"
+kind = "subprocess"
+argv = ["yah", "cloud", "apply"]
+
+[[pipeline.steps.outputs]]
+name = "discovered_asset_blake3"
+type = "blake3-hex"
+
+[[bind]]
+file   = "app/yah/desktop/assets/whisper/workload.toml"
+path   = "asset[filename='whisper.tar.gz'].blake3"
+from   = "apply.outputs.discovered_asset_blake3"
+intent = "latest"
+
+[[on_change]]
+bind   = "asset[filename='whisper.tar.gz'].blake3"
+action = { pipeline = "release.bump-manifest", params = { component = "whisper-coreml" } }
+
+[[on_change]]
+bind   = "asset[filename='whisper.tar.gz'].blake3"
+action = { journal = ".yah/qed/whisper.journal" }
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let loader = PipelineLoader::new(dir.path());
+        let pipeline = loader.load_from_str(toml).expect("loads cleanly");
+        assert_eq!(pipeline.on_change.len(), 2);
+        assert!(matches!(
+            pipeline.on_change[0].action,
+            manifest_bind::OnChangeAction::Pipeline { .. }
+        ));
+        assert!(matches!(
+            pipeline.on_change[1].action,
+            manifest_bind::OnChangeAction::Journal { .. }
+        ));
+    }
+
+    /// W209/R510-F6: an `[[on_change]]` whose `bind` selector matches no
+    /// declared `[[bind]].path` is dead config and rejected at parse time.
+    #[test]
+    fn rejects_on_change_referencing_undeclared_bind() {
+        let toml = r#"
+[pipeline]
+name = "publish-assets"
+label = "Publish whisper assets"
+
+[[pipeline.steps]]
+name = "apply"
+kind = "subprocess"
+argv = ["yah", "cloud", "apply"]
+
+[[pipeline.steps.outputs]]
+name = "discovered_asset_blake3"
+type = "blake3-hex"
+
+[[bind]]
+file   = "workload.toml"
+path   = "blake3"
+from   = "apply.outputs.discovered_asset_blake3"
+intent = "latest"
+
+[[on_change]]
+bind   = "image"
+action = { journal = ".yah/qed/x.journal" }
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let loader = PipelineLoader::new(dir.path());
+        let err = loader.load_from_str(toml).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidBind(_)), "got {err:?}");
+    }
+
+    /// W209: URI-shaped `from` (escape hatch) bypasses the
+    /// step/output-existence check — the producer is external.
+    #[test]
+    fn uri_from_bypasses_step_existence_check() {
+        let toml = r#"
+[pipeline]
+name = "pin-image"
+label = "Pin python image"
+
+[[pipeline.steps]]
+name = "noop"
+kind = "subprocess"
+argv = ["true"]
+
+[[bind]]
+file   = ".yah/qed/transforms/whisper-bundle-tar.toml"
+path   = "image"
+from   = "registry://python:3.12-slim"
+intent = { semver = "^3.12" }
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let loader = PipelineLoader::new(dir.path());
+        let pipeline = loader.load_from_str(toml).expect("URI from loads cleanly");
+        assert_eq!(pipeline.binds.len(), 1);
+        assert!(matches!(
+            pipeline.binds[0].from,
+            manifest_bind::OutputRef::Uri(_)
+        ));
+    }
 
     #[test]
     fn parses_on_success_outcomes_from_toml() {
@@ -651,7 +1109,7 @@ name = "build"
 argv = ["cargo", "build", "--release", "-p", "yah"]
 
 [[pipeline.on_success]]
-kind    = "warden-deploy"
+kind    = "yubaba-deploy"
 service = "yah"
 env     = "production"
 
@@ -683,6 +1141,44 @@ pipeline = "notify-failure"
     }
 
     #[test]
+    fn parses_provider_outcome_with_config_table() {
+        // R509: a vendor `provider` outcome (notarize) with a `with` config
+        // table + base_url round-trips through the real loader onto
+        // `Outcome::Provider`. This is the schema noisetable's release.apple.toml
+        // drafts against for the mac slice (notarize → sparkle).
+        let loader = PipelineLoader::new(".yah/qed");
+        let toml = r#"
+[pipeline]
+name  = "release.apple"
+label = "Apple release"
+
+[[pipeline.steps]]
+name = "build"
+argv = ["cargo", "build", "--release"]
+
+[[pipeline.on_success]]
+kind     = "provider"
+provider = "notarize"
+base_url = "https://releases.yah.dev"
+with     = { artifacts = ["desktop"] }
+"#;
+        let pipeline = loader.load_from_str(toml).expect("should parse");
+        assert_eq!(pipeline.on_success.len(), 1);
+        match &pipeline.on_success[0] {
+            Outcome::Provider {
+                provider,
+                with,
+                base_url,
+            } => {
+                assert_eq!(provider, "notarize");
+                assert_eq!(base_url.as_deref(), Some("https://releases.yah.dev"));
+                assert_eq!(with["artifacts"][0], "desktop");
+            }
+            other => panic!("expected Outcome::Provider, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn pipeline_without_outcomes_defaults_to_empty() {
         let loader = PipelineLoader::new(".yah/qed");
         let toml = r#"
@@ -697,6 +1193,54 @@ argv = ["cargo", "check"]
         let pipeline = loader.load_from_str(toml).expect("should parse");
         assert!(pipeline.on_success.is_empty());
         assert!(pipeline.on_fail.is_empty());
+    }
+
+    #[test]
+    fn parses_toolchain_pins_pipeline_and_step_scope() {
+        // R507/W208: `[pipeline.toolchain]` + per-step `toolchain.<tool>`
+        // override survive the real loader onto Pipeline/QedStep.
+        let loader = PipelineLoader::new(".yah/qed");
+        let toml = r#"
+[pipeline]
+name  = "release.apple"
+label = "Apple release"
+
+[pipeline.toolchain]
+rust  = "1.84.0"
+xcode = "15.4"
+ndk   = "r27"
+
+[[pipeline.steps]]
+name = "build"
+argv = ["cargo", "build", "--release"]
+
+[[pipeline.steps]]
+name = "build-android"
+argv = ["cargo", "ndk", "build"]
+toolchain.ndk = "r26d"
+"#;
+        let pipeline = loader.load_from_str(toml).expect("should parse");
+        let tc = pipeline
+            .toolchain
+            .as_ref()
+            .expect("pipeline toolchain present");
+        assert_eq!(tc.pins.get("xcode").map(String::as_str), Some("15.4"));
+        assert_eq!(tc.pins.get("rust").map(String::as_str), Some("1.84.0"));
+        // The build step inherits the pipeline pins (no override block).
+        assert!(pipeline.steps[0].toolchain.is_none());
+        // The android step carries its own ndk override.
+        let step_tc = pipeline.steps[1]
+            .toolchain
+            .as_ref()
+            .expect("step override present");
+        assert_eq!(step_tc.pins.get("ndk").map(String::as_str), Some("r26d"));
+        // Effective pins for the android step: pipeline rust/xcode + overridden ndk.
+        let eff = crate::toolchain::effective_pins(
+            pipeline.toolchain.as_ref(),
+            pipeline.steps[1].toolchain.as_ref(),
+        );
+        assert_eq!(eff.get("ndk").map(String::as_str), Some("r26d"));
+        assert_eq!(eff.get("rust").map(String::as_str), Some("1.84.0"));
     }
 
     #[test]
@@ -752,7 +1296,7 @@ argv = ["cargo", "check"]
 
     #[test]
     fn parses_optional_runtime_per_step() {
-        use task::TaskRuntime;
+        use velveteen::TaskRuntime;
 
         let loader = PipelineLoader::new(".yah/qed");
         let toml = r#"
@@ -771,7 +1315,10 @@ runtime = "container"
 "#;
         let pipeline = loader.load_from_str(toml).expect("should parse");
         assert_eq!(pipeline.steps.len(), 2);
-        assert!(pipeline.steps[0].runtime.is_none(), "no runtime ⇒ pipeline default");
+        assert!(
+            pipeline.steps[0].runtime.is_none(),
+            "no runtime ⇒ pipeline default"
+        );
         assert_eq!(pipeline.steps[1].runtime, Some(TaskRuntime::Container));
     }
 
@@ -864,7 +1411,9 @@ image = "yah-rust"
 tag   = "ghcr.io/yah-ai/yah-rust:dev"
 push  = true
 "#;
-        loader.load_from_str(toml).expect("writable registry should allow push");
+        loader
+            .load_from_str(toml)
+            .expect("writable registry should allow push");
     }
 
     #[test]
@@ -890,7 +1439,9 @@ image = "yah-rust"
 tag   = "ghcr.io/yah-ai/yah-rust:dev"
 push  = true
 "#;
-        loader.load_from_str(toml).expect_err("readonly registry must reject push");
+        loader
+            .load_from_str(toml)
+            .expect_err("readonly registry must reject push");
     }
 
     #[test]
@@ -909,7 +1460,9 @@ image = "yah-rust"
 tag   = "ghcr.io/yah-ai/yah-rust:dev"
 # push omitted → default false → OCI archive fallback (R381-T4)
 "#;
-        loader.load_from_str(toml).expect("push=false bypasses registry check");
+        loader
+            .load_from_str(toml)
+            .expect("push=false bypasses registry check");
     }
 
     #[test]
@@ -1000,24 +1553,24 @@ runtime = "native"
         let loader = PipelineLoader::new(".yah/qed");
         let toml = r#"
 [pipeline]
-name  = "pack-warden"
-label = "Package native warden"
+name  = "pack-yubaba"
+label = "Package native yubaba"
 
 [[pipeline.steps]]
 name        = "pack"
 kind        = "package-native-tarball"
-image       = "yah-warden"
-binary_path = "target/x86_64-unknown-linux-musl/release/warden"
+image       = "yah-yubaba"
+binary_path = "target/x86_64-unknown-linux-musl/release/yubaba"
 triple      = "x86_64-unknown-linux-musl"
 "#;
         let pipeline = loader.load_from_str(toml).expect("valid package step");
         assert_eq!(pipeline.steps.len(), 1);
         let step = &pipeline.steps[0];
         assert_eq!(step.kind, StepKind::PackageNativeTarball);
-        assert_eq!(step.image.as_deref(), Some("yah-warden"));
+        assert_eq!(step.image.as_deref(), Some("yah-yubaba"));
         assert_eq!(
             step.binary_path.as_deref(),
-            Some("target/x86_64-unknown-linux-musl/release/warden"),
+            Some("target/x86_64-unknown-linux-musl/release/yubaba"),
         );
         assert_eq!(step.triple.as_deref(), Some("x86_64-unknown-linux-musl"));
     }
@@ -1035,7 +1588,7 @@ label = "pack"
 [[pipeline.steps]]
 name        = "p"
 kind        = "package-native-tarball"
-binary_path = "target/release/warden"
+binary_path = "target/release/yubaba"
 "#;
         let err = loader.load_from_str(toml).expect_err("must reject");
         assert!(matches!(
@@ -1058,7 +1611,7 @@ label = "pack"
 [[pipeline.steps]]
 name  = "p"
 kind  = "package-native-tarball"
-image = "yah-warden"
+image = "yah-yubaba"
 "#;
         let err = loader.load_from_str(toml).expect_err("must reject");
         assert!(matches!(
@@ -1081,8 +1634,8 @@ label = "pack"
 [[pipeline.steps]]
 name        = "p"
 kind        = "package-native-tarball"
-image       = "yah-warden"
-binary_path = "target/release/warden"
+image       = "yah-yubaba"
+binary_path = "target/release/yubaba"
 runtime     = "container"
 "#;
         let err = loader.load_from_str(toml).expect_err("must reject");
@@ -1102,19 +1655,19 @@ runtime     = "container"
         let loader = PipelineLoader::new(".yah/qed");
         let toml = r#"
 [pipeline]
-name  = "warden-preflight"
-label = "Gate warden against musl-static deps"
+name  = "yubaba-preflight"
+label = "Gate yubaba against musl-static deps"
 
 [[pipeline.steps]]
 name    = "musl-gate"
 kind    = "musl-static-preflight"
-package = "warden"
+package = "yubaba"
 "#;
         let pipeline = loader.load_from_str(toml).expect("valid preflight step");
         assert_eq!(pipeline.steps.len(), 1);
         let step = &pipeline.steps[0];
         assert_eq!(step.kind, StepKind::MuslStaticPreflight);
-        assert_eq!(step.package.as_deref(), Some("warden"));
+        assert_eq!(step.package.as_deref(), Some("yubaba"));
     }
 
     #[test]
@@ -1152,7 +1705,7 @@ label = "preflight"
 [[pipeline.steps]]
 name    = "p"
 kind    = "musl-static-preflight"
-package = "warden"
+package = "yubaba"
 runtime = "container"
 "#;
         let err = loader.load_from_str(toml).expect_err("must reject");
@@ -1176,7 +1729,7 @@ label = "preflight"
 [[pipeline.steps]]
 name    = "p"
 kind    = "musl-static-preflight"
-package = "warden"
+package = "yubaba"
 argv    = ["cargo", "metadata"]
 "#;
         let err = loader.load_from_str(toml).expect_err("must reject");
@@ -1196,20 +1749,20 @@ argv    = ["cargo", "metadata"]
         let loader = PipelineLoader::new(".yah/qed");
         let toml = r#"
 [pipeline]
-name  = "sign-warden"
-label = "Sign native warden tarball"
+name  = "sign-yubaba"
+label = "Sign native yubaba tarball"
 
 [[pipeline.steps]]
 name   = "sign"
 kind   = "sign-native-tarball"
-image  = "yah-warden"
+image  = "yah-yubaba"
 triple = "x86_64-unknown-linux-musl"
 "#;
         let pipeline = loader.load_from_str(toml).expect("valid sign step");
         assert_eq!(pipeline.steps.len(), 1);
         let step = &pipeline.steps[0];
         assert_eq!(step.kind, StepKind::SignNativeTarball);
-        assert_eq!(step.image.as_deref(), Some("yah-warden"));
+        assert_eq!(step.image.as_deref(), Some("yah-yubaba"));
         assert_eq!(step.triple.as_deref(), Some("x86_64-unknown-linux-musl"));
     }
 
@@ -1248,7 +1801,7 @@ label = "sign"
 [[pipeline.steps]]
 name  = "s"
 kind  = "sign-native-tarball"
-image = "yah-warden"
+image = "yah-yubaba"
 argv  = ["cosign", "sign-blob"]
 "#;
         let err = loader.load_from_str(toml).expect_err("must reject");
@@ -1272,7 +1825,7 @@ label = "sign"
 [[pipeline.steps]]
 name    = "s"
 kind    = "sign-native-tarball"
-image   = "yah-warden"
+image   = "yah-yubaba"
 runtime = "container"
 "#;
         let err = loader.load_from_str(toml).expect_err("must reject");
@@ -1316,15 +1869,15 @@ argv  = ["docker", "build", "."]
         let loader = PipelineLoader::new(".yah/qed");
         let toml = r#"
 [pipeline]
-name  = "build-warden"
-label = "Build yah-warden locally"
+name  = "build-yubaba"
+label = "Build yah-yubaba locally"
 
 [[pipeline.steps]]
 name    = "image"
 kind    = "build-image"
-image   = "yah-warden"
-tag     = "ghcr.io/yah-ai/yah-warden:latest"
-context = "target/yah-warden-ctx"
+image   = "yah-yubaba"
+tag     = "ghcr.io/yah-ai/yah-yubaba:latest"
+context = "target/yah-yubaba-ctx"
 load    = true
 push    = false
 "#;
@@ -1332,9 +1885,12 @@ push    = false
         assert_eq!(pipeline.steps.len(), 1);
         let step = &pipeline.steps[0];
         assert_eq!(step.kind, StepKind::BuildImage);
-        assert_eq!(step.image.as_deref(), Some("yah-warden"));
-        assert_eq!(step.tag.as_deref(), Some("ghcr.io/yah-ai/yah-warden:latest"));
-        assert_eq!(step.context, Some(PathBuf::from("target/yah-warden-ctx")));
+        assert_eq!(step.image.as_deref(), Some("yah-yubaba"));
+        assert_eq!(
+            step.tag.as_deref(),
+            Some("ghcr.io/yah-ai/yah-yubaba:latest")
+        );
+        assert_eq!(step.context, Some(PathBuf::from("target/yah-yubaba-ctx")));
         assert!(step.load);
         assert!(!step.push);
     }
@@ -1346,13 +1902,13 @@ push    = false
         let loader = PipelineLoader::new(".yah/qed");
         let toml = r#"
 [pipeline]
-name  = "build-warden"
+name  = "build-yubaba"
 label = "Build image"
 
 [[pipeline.steps]]
 name  = "image"
 kind  = "build-image"
-image = "yah-warden"
+image = "yah-yubaba"
 "#;
         let pipeline = loader.load_from_str(toml).expect("valid");
         let step = &pipeline.steps[0];
@@ -1381,7 +1937,10 @@ image = "yah-warden"
         let step = &pipeline.steps[0];
         assert_eq!(step.kind, crate::types::StepKind::GhaWorkflow);
         let cfg = step.gha_workflow.as_ref().expect("gha_workflow block");
-        assert_eq!(cfg.path, std::path::PathBuf::from(".github/workflows/release.yml"));
+        assert_eq!(
+            cfg.path,
+            std::path::PathBuf::from(".github/workflows/release.yml")
+        );
         assert_eq!(cfg.event.as_deref(), Some("workflow_dispatch"));
         assert_eq!(cfg.inputs.get("tag").map(|s| s.as_str()), Some("v1.0.0"));
     }
@@ -1473,6 +2032,46 @@ argv = ["cargo", "build", "--release"]
     }
 
     #[test]
+    fn peer_resolver_reports_peer_camp_root_for_subprocess_cwd() {
+        // Regression: peer children must execute in the *peer* camp's
+        // workspace, not the parent's. Without this, `peer-release` runs
+        // yubaba's `cargo publish -p workload-spec` from yah's root and the
+        // package isn't found. resolved_camp_root feeds the child runner's
+        // camp_root, which is the cwd for subprocess steps.
+        let tmp = tempfile::tempdir().unwrap();
+        let parent_qed = fixture_peer_camp(
+            tmp.path(),
+            PEER_PUBLISH_TOML,
+            r#"
+            [peer.cheers]
+            path = "../peers/cheers"
+            "#,
+        );
+        let loader = PipelineLoader::new(&parent_qed);
+        let resolver = LoaderSubPipelineResolver::new(loader);
+        let root = resolver
+            .resolved_camp_root(&SubPipelineRef::Peer {
+                camp: "cheers".into(),
+                pipeline: "publish".into(),
+            })
+            .expect("peer camp root should resolve");
+        // qed_dir is `<tmp>/parent/.yah/qed`; pop twice → `<tmp>/parent`,
+        // join the peer's `../peers/cheers`.
+        assert_eq!(root, tmp.path().join("parent").join("../peers/cheers"));
+        // Non-peer targets share the parent camp → inherit (None).
+        assert!(resolver
+            .resolved_camp_root(&SubPipelineRef::Builtin("check".into()))
+            .is_none());
+        // Unknown peer → no local root.
+        assert!(resolver
+            .resolved_camp_root(&SubPipelineRef::Peer {
+                camp: "ghost".into(),
+                pipeline: "publish".into(),
+            })
+            .is_none());
+    }
+
+    #[test]
     fn peer_resolver_preserves_explicit_concurrency_key() {
         let tmp = tempfile::tempdir().unwrap();
         let parent_qed = fixture_peer_camp(
@@ -1549,7 +2148,7 @@ argv = ["cargo", "build", "--release"]
         // R494-T5: when peers.toml carries a `rig = ...` field, the
         // resolver returns None *and* publishes a typed reason naming the
         // camp + rig so the runner's StepFailed.msg routes the operator
-        // to either drop the rig field or wait for the constable hop.
+        // to either drop the rig field or wait for the kamaji hop.
         let tmp = tempfile::tempdir().unwrap();
         let parent_qed = fixture_peer_camp(
             tmp.path(),
@@ -1566,13 +2165,22 @@ argv = ["cargo", "build", "--release"]
             camp: "cheers".into(),
             pipeline: "publish".into(),
         };
-        assert!(resolver.resolve(&target).is_none(), "remote peer should not resolve in v1");
+        assert!(
+            resolver.resolve(&target).is_none(),
+            "remote peer should not resolve in v1"
+        );
         let reason = resolver
             .unresolved_reason(&target)
             .expect("remote-peer miss should publish a typed reason");
-        assert!(reason.contains("rig-tokyo-1"), "reason names the rig: {reason}");
+        assert!(
+            reason.contains("rig-tokyo-1"),
+            "reason names the rig: {reason}"
+        );
         assert!(reason.contains("cheers"), "reason names the camp: {reason}");
-        assert!(reason.contains("R494-T5"), "reason cites the ticket: {reason}");
+        assert!(
+            reason.contains("R494-T5"),
+            "reason cites the ticket: {reason}"
+        );
     }
 
     #[test]
@@ -1595,9 +2203,14 @@ argv = ["cargo", "build", "--release"]
             pipeline: "publish".into(),
         };
         assert!(resolver.resolve(&target).is_none());
-        let reason = resolver.unresolved_reason(&target).expect("reason for unknown camp");
+        let reason = resolver
+            .unresolved_reason(&target)
+            .expect("reason for unknown camp");
         assert!(reason.contains("ghost"), "reason names the camp: {reason}");
-        assert!(reason.contains("peers.toml"), "reason routes to peers.toml: {reason}");
+        assert!(
+            reason.contains("peers.toml"),
+            "reason routes to peers.toml: {reason}"
+        );
     }
 
     #[test]
@@ -1620,8 +2233,13 @@ argv = ["cargo", "build", "--release"]
             pipeline: "no-such".into(),
         };
         assert!(resolver.resolve(&target).is_none());
-        let reason = resolver.unresolved_reason(&target).expect("reason for missing pipeline");
-        assert!(reason.contains("no-such"), "reason names the pipeline: {reason}");
+        let reason = resolver
+            .unresolved_reason(&target)
+            .expect("reason for missing pipeline");
+        assert!(
+            reason.contains("no-such"),
+            "reason names the pipeline: {reason}"
+        );
         assert!(reason.contains("cheers"), "reason names the camp: {reason}");
     }
 

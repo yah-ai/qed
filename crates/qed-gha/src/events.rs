@@ -8,7 +8,7 @@
 
 use indexmap::IndexMap;
 
-use crate::overrides::{ProducedArtifact, StepConclusion};
+use crate::toolkit::StepConclusion;
 use crate::graph::JobResult;
 
 /// Which standard stream a captured bash line came from.
@@ -66,7 +66,6 @@ pub enum GhaEvent {
         conclusion: StepConclusion,
         msg: Option<String>,
         outputs: IndexMap<String, crate::expr::Value>,
-        produced: Vec<ProducedArtifact>,
     },
     /// A job instance reached a terminal result. Pairs with the prior
     /// `JobStarted` by `(job_id, matrix_index)`.

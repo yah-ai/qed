@@ -5,7 +5,7 @@
 //!    local-forge runs).
 //!  - `where_` identifies the placement of the run (location × runtime).
 //!  - `species` identifies which driver produced the run — orthogonal to
-//!    placement (a `Remote` species always runs on warden, but a `Local`
+//!    placement (a `Remote` species always runs on yubaba, but a `Local`
 //!    species can be `Native` or `Container` per `TaskPlacement.runtime`).
 //!
 //! `From<TaskRunMeta>` converts a local-forge record into `ForgeMeta` with
@@ -99,6 +99,7 @@ mod meta {
             initiator: Initiator::Human { camp: "my-camp".into() },
             beholder_status: None,
             pinned: false,
+            origin: None,
         }
     }
 

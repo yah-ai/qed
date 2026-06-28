@@ -4,15 +4,15 @@
 //! Verify conditions:
 //!   1. `scryer_federation__local` — query from machine A returns interleaved
 //!      events from peer B (mock) merged by (offset_ms, seq).
-//!   2. ACL tests live in `scryer::federation::acl` (unit tests in federation.rs).
+//!   2. ACL tests live in `yah_scryer::federation::acl` (unit tests in federation.rs).
 
 use async_trait::async_trait;
 use observation::{Event, EventScope, EventSource, Level, TaskRunId};
-use scryer::federation::{
+use yah_scryer::federation::{
     DenyAllAcl, FederationAcl, FederationError, FederationPeer, FederationRule, OperatorTagAcl,
     PeerIdentity, federated_events,
 };
-use scryer::service::{EventFilter, Scryer, ScryerConfig};
+use yah_scryer::service::{EventFilter, Scryer, ScryerConfig};
 use serde_json::json;
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -65,7 +65,7 @@ impl FederationPeer for FailingPeer {
 // ─── Federation tests ─────────────────────────────────────────────────────────
 
 /// Verify: query from machine A returns interleaved events from peer B over
-/// warden mesh.  R093-F4 acceptance criterion (arch doc §Sequencing scryer-4).
+/// yubaba mesh.  R093-F4 acceptance criterion (arch doc §Sequencing scryer-4).
 #[tokio::test]
 async fn scryer_federation__local() {
     let run_id = TaskRunId::new();
@@ -79,7 +79,7 @@ async fn scryer_federation__local() {
 
     // Machine B (peer) has events at even offset_ms (2, 4, 6).
     let peer_b: Arc<dyn FederationPeer> = Arc::new(MockPeer {
-        peer_name: "warden-pdx-2".to_string(),
+        peer_name: "yubaba-pdx-2".to_string(),
         events: vec![
             make_event(&run_id, 1, 2),
             make_event(&run_id, 3, 4),
@@ -152,11 +152,11 @@ async fn scryer_federation__tag_rule_filters_peers() {
     let local = vec![make_event(&run_id, 0, 1)];
 
     let matching_peer: Arc<dyn FederationPeer> = Arc::new(MockPeer {
-        peer_name: "warden-tier=public-1".to_string(),
+        peer_name: "yubaba-tier=public-1".to_string(),
         events: vec![make_event(&run_id, 1, 2)],
     });
     let excluded_peer: Arc<dyn FederationPeer> = Arc::new(MockPeer {
-        peer_name: "warden-private-1".to_string(),
+        peer_name: "yubaba-private-1".to_string(),
         events: vec![make_event(&run_id, 2, 3)],
     });
 
@@ -177,7 +177,7 @@ async fn scryer_federation__tag_rule_filters_peers() {
 // ─── ACL integration (mirrors unit tests in federation.rs::acl) ──────────────
 
 /// Verify: unauthorized peer (no operator tag) is rejected at RPC entry.
-/// R093-F4 verify: cargo test scryer::acl
+/// R093-F4 verify: cargo test yah_scryer::acl
 #[test]
 fn scryer_acl__unauthorized_peer_rejected() {
     let acl = OperatorTagAcl;

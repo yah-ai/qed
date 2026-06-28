@@ -22,32 +22,17 @@
 //! @yah:relay(R498, "object-store crate: lift ObjectStore trait + R2 impl + bucket CLI + data-tab viewer")
 //! @yah:at(2026-06-09T03:28:56Z)
 //! @yah:status(open)
-//! @yah:next("Lift ObjectStore trait + InMemoryObjectStore from scryer::long_tier into new crates/yah/object-store/ crate; add head/delete; generic Error; re-export from scryer for back-compat")
+//! @yah:next("Lift ObjectStore trait + InMemoryObjectStore from yah_scryer::long_tier into new crates/yah/object-store/ crate; add head/delete; generic Error; re-export from scryer for back-compat")
 //! @yah:next("R2ObjectStore impl in object-store crate wrapping local_driver::s3_sign; constructor reads cloudflare-r2-{access-key-id,secret-key} vault slots with env fallback; tests")
 //! @yah:next("yah cloud bucket put|get|ls|head <key> [--bucket B] [--file F] CLI on top of R2ObjectStore")
-//! @yah:next("First user: push warden-v0.8.9-{x86_64,aarch64}-unknown-linux-musl.tar.gz from GH Release v0.8.9 to yah-dev/warden/0.8.9/{triple}/ + write warden/release-manifest.json")
+//! @yah:next("First user: push yubaba-v0.8.9-{x86_64,aarch64}-unknown-linux-musl.tar.gz from GH Release v0.8.9 to yah-dev/yubaba/0.8.9/{triple}/ + write yubaba/release-manifest.json")
 //! @yah:next("Refactor cloud::reconciler::r2_publish::publish_to_r2 inline SigV4 PUT loop onto R2ObjectStore")
 //! @yah:next("Data-tab bucket viewer: tauri command exposing list_prefix+head+get; React panel with bucket picker + prefix nav + object list + byte preview")
-//! @yah:gotcha("scryer::long_tier currently owns ObjectStore + InMemoryObjectStore; F1 must re-export from scryer to keep LongTierStore callers compiling")
-//! @yah:gotcha("GHA tarball is named warden-v0.8.9-{triple}.tar.gz but P007 documents the published key as yah-warden-{triple}.tar.gz — pick one convention in T4 and stick with it (lean toward dropping the v prefix to match the documented layout)")
+//! @yah:gotcha("yah_scryer::long_tier currently owns ObjectStore + InMemoryObjectStore; F1 must re-export from scryer to keep LongTierStore callers compiling")
+//! @yah:gotcha("GHA tarball is named yubaba-v0.8.9-{triple}.tar.gz but P007 documents the published key as yah-yubaba-{triple}.tar.gz — pick one convention in T4 and stick with it (lean toward dropping the v prefix to match the documented layout)")
 //! @yah:assumes("ObjectStore trait shape (put/get/list_prefix) is the right starting point; head+delete are additions, not redesigns")
-//! @arch:see(.yah/qed/P007-warden-release.toml)
+//! @arch:see(.yah/qed/P007-yubaba-release.toml)
 //! @arch:see(crates/yah/cloud/src/reconciler/r2_publish.rs)
-//!
-//! @yah:ticket(R498-F1, "lift ObjectStore trait + InMemoryObjectStore into crates/yah/object-store/")
-//! @yah:assignee(agent:claude)
-//! @yah:at(2026-06-09T03:29:06Z)
-//! @yah:status(in-progress)
-//! @yah:parent(R498)
-//! @yah:next("Create crates/yah/object-store/{Cargo.toml,src/lib.rs}; register in root Cargo.toml workspace members")
-//! @yah:next("Move ObjectStore trait + InMemoryObjectStore from crates/yah/scryer/src/long_tier.rs to object-store/src/lib.rs")
-//! @yah:next("Add head(key) -> Result<bool> and delete(key) -> Result<()> to the trait; default-impls allowed where sensible")
-//! @yah:next("Introduce a crate-local Error enum (thiserror) — do NOT keep LongTierError as the trait's error type")
-//! @yah:next("Re-export ObjectStore + InMemoryObjectStore from scryer::long_tier so existing LongTierStore call sites keep compiling unchanged")
-//! @yah:next("Switch scryer's dep on the trait to object-store crate; cargo test -p scryer must still pass")
-//! @yah:verify("cargo check --workspace clean")
-//! @yah:verify("cargo test -p scryer --lib long_tier ok")
-//! @yah:tier(Cleric)
 //!
 //! @yah:ticket(R498-F2, "R2ObjectStore impl over local_driver::s3_sign")
 //! @yah:assignee(agent:claude)
@@ -62,7 +47,7 @@
 //! @yah:gotcha("list_prefix needs SigV4 over the ?list-type=2&prefix=... query — query-string signing path. Existing s3_sign helpers may need a new sign_s3_get_with_query variant")
 //! @yah:depends_on(R498-F1)
 //! @yah:tier(Warrior)
-//! @yah:handoff("R2ObjectStore landed in crates/yah/object-store/src/r2.rs. Public API: R2ObjectStore::new(account_id, bucket, access_key, secret_key) for explicit keys, R2ObjectStore::from_vault(account_id, bucket) for the keystore path (slots cloudflare-r2-access-key-id + cloudflare-r2-secret-key, env fallback CF_R2_ACCESS_KEY_ID / CF_R2_SECRET_KEY). Region pinned to 'auto' (R2 convention). Re-exported at yah_object_store::R2ObjectStore. Implements all five ObjectStore methods: put via sign_s3_put_object + body-sha256, get/head/delete via sign_s3_empty_body (HEAD returns true/false on 200/404), delete is idempotent (200/204/404 all succeed), list_prefix issues GET ?list-type=2&prefix=... via sign_s3_get_with_query and pages with continuation-token until IsTruncated=false. Status mapping: 401/403 → Error::Auth, 404 → Error::NotFound, other non-2xx → Error::Backend with first 200 chars of response body. Tiny inline XML extractor (extract_all_tags / extract_first_tag) — no quick-xml dep. HTTP via reqwest::blocking with rustls-tls (avoids OpenSSL on musl). Deps added to object-store/Cargo.toml: reqwest 0.12 (blocking + rustls-tls), sha2, hex, percent-encoding, local-driver (s3_sign), keys (vault). 10/10 tests pass (5 base + parse_list_v2 × 3 + construction × 2). cargo check --workspace exit 0. No online integration test yet — first real exercise is T4 (warden push).")
+//! @yah:handoff("R2ObjectStore landed in crates/yah/object-store/src/r2.rs. Public API: R2ObjectStore::new(account_id, bucket, access_key, secret_key) for explicit keys, R2ObjectStore::from_vault(account_id, bucket) for the keystore path (slots cloudflare-r2-access-key-id + cloudflare-r2-secret-key, env fallback CF_R2_ACCESS_KEY_ID / CF_R2_SECRET_KEY). Region pinned to 'auto' (R2 convention). Re-exported at yah_object_store::R2ObjectStore. Implements all five ObjectStore methods: put via sign_s3_put_object + body-sha256, get/head/delete via sign_s3_empty_body (HEAD returns true/false on 200/404), delete is idempotent (200/204/404 all succeed), list_prefix issues GET ?list-type=2&prefix=... via sign_s3_get_with_query and pages with continuation-token until IsTruncated=false. Status mapping: 401/403 → Error::Auth, 404 → Error::NotFound, other non-2xx → Error::Backend with first 200 chars of response body. Tiny inline XML extractor (extract_all_tags / extract_first_tag) — no quick-xml dep. HTTP via reqwest::blocking with rustls-tls (avoids OpenSSL on musl). Deps added to object-store/Cargo.toml: reqwest 0.12 (blocking + rustls-tls), sha2, hex, percent-encoding, local-driver (s3_sign), keys (vault). 10/10 tests pass (5 base + parse_list_v2 × 3 + construction × 2). cargo check --workspace exit 0. No online integration test yet — first real exercise is T4 (yubaba push).")
 //! @yah:verify("cargo test -p yah-object-store --lib  # 10/10 ok")
 //! @yah:verify("cargo check --workspace  # exit 0")
 
@@ -85,7 +70,7 @@ use workload_spec::MeshIdent;
 
 // Re-export from the new yah-object-store crate. R498-F1 lifted the trait
 // + InMemoryObjectStore out of this file; the re-exports keep existing
-// `use scryer::long_tier::{ObjectStore, InMemoryObjectStore}` call sites
+// `use yah_scryer::long_tier::{ObjectStore, InMemoryObjectStore}` call sites
 // compiling unchanged.
 pub use yah_object_store::{Error as ObjectStoreError, InMemoryObjectStore, ObjectStore};
 

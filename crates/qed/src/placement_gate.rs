@@ -104,12 +104,11 @@ pub fn evaluate(placement: Placement, env: RunnerEnv, force: bool) -> GateOutcom
                 }
             } else {
                 GateOutcome::Refuse {
-                    reason:
-                        "recipe placement = ci-only and this is not a CI runner — \
+                    reason: "recipe placement = ci-only and this is not a CI runner — \
                          the recipe needs secrets, signing identity, or a clean \
                          runner that don't exist locally. Pass --force to run \
                          anyway, or run it from a CI workflow."
-                            .to_string(),
+                        .to_string(),
                 }
             }
         }

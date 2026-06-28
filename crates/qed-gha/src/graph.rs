@@ -418,7 +418,7 @@ pub fn build_needs_value(completed: &[CompletedInstance]) -> Value {
 
 /// Build the evaluator context for one [`JobInstance`] at scheduling time.
 /// Caller supplies the workflow's `github` / `inputs` snapshot; this helper
-/// stitches in `matrix`, `needs`, `env`, and `runner.os`.
+/// stitches in `matrix`, `needs`, `env`, and `runner.{os,arch}`.
 pub fn build_context_for_instance<'h>(
     instance: &JobInstance,
     workflow: &Workflow,
@@ -426,12 +426,13 @@ pub fn build_context_for_instance<'h>(
     github: Value,
     inputs: Value,
     runner_os: &str,
+    runner_arch: &str,
     secrets: Value,
 ) -> Result<Context<'h>, GraphError> {
     let mut ctx = Context::new();
     ctx.github = github;
     ctx.inputs = inputs;
-    ctx.runner = obj([("os", runner_os)]);
+    ctx.runner = obj([("os", runner_os), ("arch", runner_arch)]);
     ctx.matrix = instance.matrix.clone();
     ctx.needs = build_needs_value(completed);
     ctx.secrets = secrets;
@@ -877,6 +878,7 @@ jobs:
             Value::object(),
             Value::object(),
             "Linux",
+            "X64",
             Value::object(),
         )
         .unwrap();
@@ -897,6 +899,7 @@ jobs:
             Value::object(),
             Value::object(),
             "Linux",
+            "X64",
             Value::object(),
         )
         .unwrap();

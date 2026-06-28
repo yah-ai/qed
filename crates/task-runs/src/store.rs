@@ -1,9 +1,14 @@
 //! Per-camp Turso store for TaskRun bytes (Tier 1).
 //!
 //! One `TaskStore` per daemon instance; callers share it via `Arc<TaskStore>`.
-//! Backed by `turso` (in-process, async) per W195 §Engine. Writes serialize
-//! through `turso::Connection`'s internal synchronization — the explicit
-//! `Mutex` that wrapped the old rusqlite `Connection` is gone.
+//! Backed by `turso` (in-process, async) per W195 §Engine. Concurrency model:
+//! each `TaskStore` method gets a fresh `turso::Connection` from the shared
+//! `Database` and drops it at the end of the call. A single `Connection`
+//! cannot be used concurrently in turso 0.6.x — the SDK's `ConcurrentGuard`
+//! returns `Misuse("concurrent use forbidden")` rather than serializing —
+//! so we don't share one across the reader thread, the tail-poll loop, and
+//! the GC sweep. `Database::connect()` is cheap (an `Arc` clone plus a
+//! per-connection state struct).
 //!
 //! Storage contract (W195 §3 / Shape 1): this store owns
 //! `.yah/db/task-runs.turso` under the camp daemon.
@@ -18,7 +23,7 @@ use std::path::Path;
 use std::str::FromStr;
 use thiserror::Error;
 use tokio::sync::Mutex;
-use turso::{params, params_from_iter, Builder, Connection, Value};
+use turso::{params, params_from_iter, Builder, Connection, Database, Value};
 
 // ─── Error ────────────────────────────────────────────────────────────────────
 
@@ -56,7 +61,8 @@ CREATE TABLE IF NOT EXISTS runs (
     initiator       TEXT NOT NULL,
     beholder_status TEXT,
     archived_at     INTEGER,
-    pinned          INTEGER NOT NULL DEFAULT 0
+    pinned          INTEGER NOT NULL DEFAULT 0,
+    origin          TEXT
 );
 
 CREATE TABLE IF NOT EXISTS chunks (
@@ -113,6 +119,9 @@ pub struct RunFilter {
     pub status: Option<String>,
     pub limit: Option<usize>,
     pub archived: Option<bool>,
+    /// Filter by provenance tag (e.g. `Some("terminal")` to list only
+    /// terminal-session runs). `None` returns runs of every origin.
+    pub origin: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -131,7 +140,7 @@ struct SeqCounters {
 }
 
 pub struct TaskStore {
-    conn: Connection,
+    db: Database,
     seq: Mutex<SeqCounters>,
 }
 
@@ -146,8 +155,12 @@ impl TaskStore {
             .await?;
         let conn = db.connect()?;
         conn.execute_batch(SCHEMA).await?;
+        /* `CREATE TABLE IF NOT EXISTS` won't add a column to a runs table that
+           predates `origin`, so add it idempotently for already-created DBs.
+           A duplicate-column error means an up-to-date schema — swallow it. */
+        let _ = conn.execute("ALTER TABLE runs ADD COLUMN origin TEXT", ()).await;
         Ok(TaskStore {
-            conn,
+            db,
             seq: Mutex::new(SeqCounters {
                 next_seq: HashMap::new(),
                 next_event_seq: HashMap::new(),
@@ -159,15 +172,22 @@ impl TaskStore {
     #[cfg(test)]
     pub async fn open_in_memory() -> Result<Self, StoreError> {
         let db = Builder::new_local(":memory:").build().await?;
-        let conn = db.connect()?;
-        conn.execute_batch(SCHEMA).await?;
+        db.connect()?.execute_batch(SCHEMA).await?;
         Ok(TaskStore {
-            conn,
+            db,
             seq: Mutex::new(SeqCounters {
                 next_seq: HashMap::new(),
                 next_event_seq: HashMap::new(),
             }),
         })
+    }
+
+    /// Open a fresh connection to the underlying database. Each call returns
+    /// an independent `Connection` that the caller may use within one logical
+    /// operation and drop. Never share a `Connection` across awaiting tasks —
+    /// `turso` 0.6.x rejects concurrent use on the same handle.
+    fn conn(&self) -> Result<Connection, StoreError> {
+        Ok(self.db.connect()?)
     }
 
     pub async fn insert_run(&self, meta: &TaskRunMeta) -> Result<(), StoreError> {
@@ -181,12 +201,12 @@ impl TaskStore {
             .transpose()?;
         let cwd = meta.cwd.to_string_lossy().to_string();
 
-        self.conn
+        self.conn()?
             .execute(
                 "INSERT INTO runs \
                  (id, command, cwd, env_json, started_at, ended_at, exit_code, signal, \
-                  status, status_detail, label, initiator, beholder_status, pinned) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
+                  status, status_detail, label, initiator, beholder_status, pinned, origin) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
                 params![
                     meta.id.to_string(),
                     meta.command.clone(),
@@ -202,6 +222,7 @@ impl TaskStore {
                     initiator_json,
                     beholder_json,
                     meta.pinned as i64,
+                    meta.origin.clone(),
                 ],
             )
             .await?;
@@ -218,7 +239,7 @@ impl TaskStore {
         status: &BeholderStatus,
     ) -> Result<(), StoreError> {
         let json = serde_json::to_string(status)?;
-        self.conn
+        self.conn()?
             .execute(
                 "UPDATE runs SET beholder_status = ?1 WHERE id = ?2",
                 params![json, id.to_string()],
@@ -233,7 +254,7 @@ impl TaskStore {
         status: &RunStatus,
     ) -> Result<(), StoreError> {
         let (status_str, ended_at, exit_code, signal, detail) = status_columns(status);
-        self.conn
+        self.conn()?
             .execute(
                 "UPDATE runs SET status=?1, status_detail=?2, ended_at=?3, exit_code=?4, signal=?5 \
                  WHERE id=?6",
@@ -275,7 +296,7 @@ impl TaskStore {
             }
         };
 
-        self.conn
+        self.conn()?
             .execute(
                 "INSERT INTO chunks (run_id, seq, offset_ms, stream, bytes) VALUES (?1,?2,?3,?4,?5)",
                 params![
@@ -292,7 +313,7 @@ impl TaskStore {
 
     async fn max_seq(&self, table: &str, run_id: &str) -> Result<Option<u32>, StoreError> {
         let sql = format!("SELECT MAX(seq) FROM {table} WHERE run_id = ?1");
-        let mut rows = self.conn.query(&sql, params![run_id.to_string()]).await?;
+        let mut rows = self.conn()?.query(&sql, params![run_id.to_string()]).await?;
         match rows.next().await? {
             Some(row) => {
                 let v: Option<i64> = row.get(0)?;
@@ -304,10 +325,10 @@ impl TaskStore {
 
     pub async fn get_run(&self, id: &TaskRunId) -> Result<Option<TaskRunMeta>, StoreError> {
         let mut rows = self
-            .conn
+            .conn()?
             .query(
                 "SELECT id, command, cwd, env_json, started_at, ended_at, exit_code, signal, \
-                        status, status_detail, label, initiator, beholder_status, pinned \
+                        status, status_detail, label, initiator, beholder_status, pinned, origin \
                  FROM runs WHERE id = ?1",
                 params![id.to_string()],
             )
@@ -320,7 +341,7 @@ impl TaskStore {
 
     pub async fn chunk_count(&self, run_id: &TaskRunId) -> Result<u32, StoreError> {
         let mut rows = self
-            .conn
+            .conn()?
             .query(
                 "SELECT COUNT(*) FROM chunks WHERE run_id = ?1",
                 params![run_id.to_string()],
@@ -352,11 +373,16 @@ impl TaskStore {
         if let Some(ref s) = filter.status {
             where_extra.push_str(&format!(" AND status = ?{next_param}"));
             p.push(Value::Text(s.clone()));
+            next_param += 1;
+        }
+        if let Some(ref o) = filter.origin {
+            where_extra.push_str(&format!(" AND origin = ?{next_param}"));
+            p.push(Value::Text(o.clone()));
         }
 
         let sql = format!(
             "SELECT id, command, cwd, env_json, started_at, ended_at, exit_code, signal, \
-                    status, status_detail, label, initiator, beholder_status, pinned \
+                    status, status_detail, label, initiator, beholder_status, pinned, origin \
              FROM runs \
              WHERE started_at >= ?1 {} {} \
              ORDER BY started_at DESC \
@@ -364,7 +390,7 @@ impl TaskStore {
             archived_clause, where_extra
         );
 
-        let mut rows = self.conn.query(&sql, params_from_iter(p)).await?;
+        let mut rows = self.conn()?.query(&sql, params_from_iter(p)).await?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().await? {
             out.push(row_to_meta(&row)?);
@@ -375,7 +401,7 @@ impl TaskStore {
     pub async fn archive_run(&self, id: &TaskRunId) -> Result<(), StoreError> {
         let now = unix_now() as i64;
         let count = self
-            .conn
+            .conn()?
             .execute(
                 "UPDATE runs SET archived_at = ?1 WHERE id = ?2 AND archived_at IS NULL",
                 params![now, id.to_string()],
@@ -389,7 +415,7 @@ impl TaskStore {
 
     pub async fn pin_run(&self, id: &TaskRunId, pinned: bool) -> Result<(), StoreError> {
         let count = self
-            .conn
+            .conn()?
             .execute(
                 "UPDATE runs SET pinned = ?1 WHERE id = ?2",
                 params![pinned as i64, id.to_string()],
@@ -419,7 +445,7 @@ impl TaskStore {
             .await?;
 
         result.chunks_deleted += self
-            .conn
+            .conn()?
             .execute(
                 "DELETE FROM chunks \
                  WHERE run_id IN (SELECT id FROM runs WHERE archived_at IS NOT NULL)",
@@ -428,7 +454,7 @@ impl TaskStore {
             .await?;
 
         result.events_deleted += self
-            .conn
+            .conn()?
             .execute(
                 "DELETE FROM events \
                  WHERE run_id IN (SELECT id FROM runs WHERE archived_at IS NOT NULL)",
@@ -437,7 +463,7 @@ impl TaskStore {
             .await?;
 
         result.chunks_deleted += self
-            .conn
+            .conn()?
             .execute(
                 "DELETE FROM chunks WHERE run_id IN \
                  (SELECT id FROM runs WHERE archived_at IS NULL AND pinned = 0 AND started_at < ?1)",
@@ -446,7 +472,7 @@ impl TaskStore {
             .await?;
 
         result.events_deleted += self
-            .conn
+            .conn()?
             .execute(
                 "DELETE FROM events WHERE run_id IN \
                  (SELECT id FROM runs WHERE archived_at IS NULL AND pinned = 0 AND started_at < ?1)",
@@ -458,7 +484,7 @@ impl TaskStore {
     }
 
     async fn count_query(&self, sql: &str, params: Vec<Value>) -> Result<u64, StoreError> {
-        let mut rows = self.conn.query(sql, params_from_iter(params)).await?;
+        let mut rows = self.conn()?.query(sql, params_from_iter(params)).await?;
         let row = rows.next().await?.expect("COUNT(*) returns one row");
         let n: i64 = row.get(0)?;
         Ok(n as u64)
@@ -494,7 +520,7 @@ impl TaskStore {
             where_clause, limit_clause
         );
 
-        let mut rows = self.conn.query(&sql, params_from_iter(p)).await?;
+        let mut rows = self.conn()?.query(&sql, params_from_iter(p)).await?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().await? {
             let seq: i64 = row.get(0)?;
@@ -547,7 +573,7 @@ impl TaskStore {
 
         let fields_json = serde_json::to_string(fields)?;
 
-        self.conn
+        self.conn()?
             .execute(
                 "INSERT INTO events \
                  (run_id, seq, offset_ms, level, target, msg, fields_json, anchor_seq, source_kind, source_name) \
@@ -653,7 +679,7 @@ impl TaskStore {
              FROM events WHERE {where_clause} ORDER BY seq {limit_clause}"
         );
 
-        let mut rows = self.conn.query(&sql, params_from_iter(p)).await?;
+        let mut rows = self.conn()?.query(&sql, params_from_iter(p)).await?;
         let mut events = Vec::new();
         while let Some(row) = rows.next().await? {
             events.push(row_to_event(&row)?);
@@ -720,7 +746,7 @@ impl TaskStore {
 
         let exists: bool = {
             let mut rows = self
-                .conn
+                .conn()?
                 .query(
                     "SELECT 1 FROM _event_field_indexes WHERE field_path = ?1",
                     params![field_path.to_string()],
@@ -740,10 +766,10 @@ impl TaskStore {
              ON events(run_id, json_extract(fields_json, '{escaped}')) \
              WHERE json_extract(fields_json, '{escaped}') IS NOT NULL"
         );
-        self.conn.execute_batch(&sql).await?;
+        self.conn()?.execute_batch(&sql).await?;
 
         let now = unix_now();
-        self.conn
+        self.conn()?
             .execute(
                 "INSERT OR IGNORE INTO _event_field_indexes (field_path, index_name, created_at) \
                  VALUES (?1, ?2, ?3)",
@@ -883,7 +909,7 @@ impl TaskStore {
         );
         p.push(Value::Integer(limit));
 
-        let mut rows = self.conn.query(&sql, params_from_iter(p)).await?;
+        let mut rows = self.conn()?.query(&sql, params_from_iter(p)).await?;
         let mut buckets = Vec::new();
         while let Some(row) = rows.next().await? {
             let key: Option<String> = row.get(0)?;
@@ -900,7 +926,7 @@ impl TaskStore {
 
     pub async fn upsert_triage(&self, triage: &Triage) -> Result<(), StoreError> {
         let keep_json = serde_json::to_string(&triage.keep)?;
-        self.conn
+        self.conn()?
             .execute(
                 "INSERT OR REPLACE INTO triages \
                  (run_id, synopsis, keep_json, primary_lo, primary_hi, \
@@ -924,7 +950,7 @@ impl TaskStore {
 
     pub async fn get_triage(&self, run_id: &TaskRunId) -> Result<Option<Triage>, StoreError> {
         let mut rows = self
-            .conn
+            .conn()?
             .query(
                 "SELECT run_id, synopsis, keep_json, primary_lo, primary_hi, \
                  model, prompt_version, cached_at, partial \
@@ -962,7 +988,7 @@ impl TaskStore {
 
     pub async fn list_field_indexes(&self) -> Result<Vec<FieldIndexInfo>, StoreError> {
         let mut rows = self
-            .conn
+            .conn()?
             .query(
                 "SELECT field_path, index_name, created_at \
                  FROM _event_field_indexes ORDER BY created_at",
@@ -1229,6 +1255,7 @@ fn row_to_meta(row: &turso::Row) -> Result<TaskRunMeta, StoreError> {
     let initiator_json: String = row.get(11)?;
     let beholder_json: Option<String> = row.get(12)?;
     let pinned: i64 = row.get(13).unwrap_or(0);
+    let origin: Option<String> = row.get(14).ok().flatten();
 
     let status = reconstruct_status(
         &status_str,
@@ -1257,6 +1284,7 @@ fn row_to_meta(row: &turso::Row) -> Result<TaskRunMeta, StoreError> {
         initiator,
         beholder_status,
         pinned: pinned != 0,
+        origin,
     })
 }
 
@@ -1310,6 +1338,7 @@ mod tests {
             },
             beholder_status: None,
             pinned: false,
+            origin: None,
         }
     }
 
@@ -1955,6 +1984,7 @@ mod tests {
             },
             beholder_status: None,
             pinned: false,
+            origin: None,
         }
     }
 

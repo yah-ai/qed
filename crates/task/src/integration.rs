@@ -7,7 +7,7 @@
 // @yah:next("Human review: (a) ClusterClient trait shape — does it match what R091-F1 ContainerRuntime will need to implement? (b) shared AtomicU32 seq counter rationale — scryer PRIMARY KEY is (scope_kind, scope_id, seq) so per-workload seq=0 would collide without it; (c) TeardownPolicy semantics in complete() vs teardown(); (d) confirm EventScope::Forge scope is correct for all events from all workloads in the stand-up.")
 // @yah:next("R091 integration tests (cargo test --test integration) will route through forge.integration once R091-F4 proc macro lands — deferred to that relay.")
 // @arch:see(.yah/docs/architecture/A035-yah-forge.md)
-// @arch:see(.yah/docs/architecture/A053-yah-warden-integration-testing.md)
+// @arch:see(.yah/docs/architecture/A053-yah-yubaba-integration-testing.md)
 //!
 //! Integration-forge driver.
 //!
@@ -17,7 +17,7 @@
 //!
 //! # Seam
 //!
-//! [`ClusterClient`] abstracts the underlying cluster. Production warden wires
+//! [`ClusterClient`] abstracts the underlying cluster. Production yubaba wires
 //! in `ContainerRuntime` (R091-F1). Tests use
 //! [`test_support::ScriptedClusterClient`].
 //!
@@ -35,7 +35,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use observation::{Event, EventScope, EventSource, ForgeId, Level, TaskRunId};
-use scryer::service::Scryer;
+use yah_scryer::service::Scryer;
 use serde_json::json;
 use thiserror::Error;
 use tokio::sync::mpsc;
@@ -59,7 +59,7 @@ pub enum IntegrationForgeError {
 
 /// Seam between the integration-forge driver and the underlying cluster.
 ///
-/// Production: warden's `ContainerRuntime` impl (R091-F1). Tests:
+/// Production: yubaba's `ContainerRuntime` impl (R091-F1). Tests:
 /// [`test_support::ScriptedClusterClient`].
 #[async_trait]
 pub trait ClusterClient: Send + Sync {
@@ -302,7 +302,7 @@ mod integration {
     use super::test_support::*;
     use super::*;
     use observation::EventScope;
-    use scryer::service::{EventFilter, Scryer, ScryerConfig};
+    use yah_scryer::service::{EventFilter, Scryer, ScryerConfig};
     use tempfile::TempDir;
     use workload_spec::{ImageRef, Millis, TierTag, WorkloadSpec};
 

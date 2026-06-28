@@ -68,8 +68,17 @@ where
 {
     const SUFFIXES: &[&str] = &["TOKEN", "KEY", "SECRET", "PASSWORD", "CREDENTIAL"];
     const PREFIXES: &[&str] = &[
-        "HETZNER_", "CLOUDFLARE_", "CF_", "AWS_", "R2_", "GITHUB_", "GH_",
-        "HUGGINGFACE_", "HF_", "ANTHROPIC_", "OPENAI_",
+        "HETZNER_",
+        "CLOUDFLARE_",
+        "CF_",
+        "AWS_",
+        "R2_",
+        "GITHUB_",
+        "GH_",
+        "HUGGINGFACE_",
+        "HF_",
+        "ANTHROPIC_",
+        "OPENAI_",
     ];
     let mut keys: Vec<String> = env_iter
         .into_iter()
@@ -101,12 +110,12 @@ mod tests {
         let env = [
             ("PATH", "/usr/bin"),
             ("HOME", "/home/u"),
-            ("KEYBOARD", "us"),                  // suffix-like but no underscore
-            ("HETZNER_S3_ACCESS_KEY", "xxx"),    // prefix + suffix
-            ("CF_API_TOKEN", "xxx"),             // prefix + suffix
-            ("MY_API_KEY", "xxx"),               // suffix only
-            ("HF_TOKEN", "xxx"),                 // prefix
-            ("DATABASE_PASSWORD", "xxx"),        // suffix
+            ("KEYBOARD", "us"),               // suffix-like but no underscore
+            ("HETZNER_S3_ACCESS_KEY", "xxx"), // prefix + suffix
+            ("CF_API_TOKEN", "xxx"),          // prefix + suffix
+            ("MY_API_KEY", "xxx"),            // suffix only
+            ("HF_TOKEN", "xxx"),              // prefix
+            ("DATABASE_PASSWORD", "xxx"),     // suffix
             ("RANDOM_VAR", "xxx"),
         ];
         let keys = credential_env_keys(env.iter().map(|(k, v)| (*k, *v)));
@@ -143,10 +152,7 @@ pub enum QedEvent {
     /// opt out (`concurrency_key = "@parallel"`), this event still
     /// fires but is immediately followed by `RunStarted` — the queue
     /// hop is just instantaneous.
-    RunQueued {
-        key: String,
-        at: DateTime<Utc>,
-    },
+    RunQueued { key: String, at: DateTime<Utc> },
     /// Emitted once, before the first step. For queued runs this fires
     /// when the key lock is acquired; for parallel pipelines it fires
     /// right after `RunQueued`.
@@ -222,7 +228,7 @@ pub enum QedEvent {
     },
     /// A job instance inside a `kind = "gha-workflow"` step began executing
     /// (W200 R487 follow-up). `index` is the qed step index of the enclosing
-    /// gha-workflow step; `job_key` is `qed_gha::JobInstance::key()`
+    /// gha-workflow step; `job_key` is `yah_qed_gha::JobInstance::key()`
     /// (`"<job>"` for non-matrix, `"<job>#<row>"` for matrix). The receiver
     /// uses `(index, job_key)` to scope the per-job subtree under the
     /// parent step.

@@ -6,14 +6,14 @@
 //! - [`crate::local::LocalForgeDriver`] — host subprocess (native or
 //!   container). Handles [`ForgeCommand::Subprocess`]; rejects `BuildImage`
 //!   and `Workload` with [`ForgeExecutorError::Unsupported`].
-//! - [`crate::remote::RemoteForgeDriver`] — warden RPC. Today exposes its
+//! - [`crate::remote::RemoteForgeDriver`] — yubaba RPC. Today exposes its
 //!   own `start()` shape; a `ForgeExecutor` impl is a follow-up when a
 //!   consumer needs to dispatch uniformly through `dyn ForgeExecutor`.
 //!
 //! `ForgeSpec` already says *what* to run and *where/how* to sandbox it.
 //! [`ExecContext`] carries host-side execution detail (cwd, env) that the
 //! wire-format spec deliberately omits — keep `ForgeSpec` portable across
-//! the warden/cloud boundary; let drivers receive context out-of-band.
+//! the yubaba/cloud boundary; let drivers receive context out-of-band.
 
 use std::path::PathBuf;
 

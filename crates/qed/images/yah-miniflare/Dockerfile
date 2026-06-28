@@ -11,9 +11,11 @@
 # bundle (`worker.js`) is workload-specific and gets bind-mounted at runtime
 # instead of baked, so a single image serves every (service, env) pond.
 #
-# Build context: the workspace root (matches yah-warden's pattern). The
-# Dockerfile COPYs the shared `miniflare-sim.mjs` from `crates/yah/cloud/worker/`
-# so the container shim and the embedded host-side shim stay byte-identical.
+# Build context: the workspace root (matches yah-yubaba's pattern). The
+# Dockerfile COPYs the shared `miniflare-sim.mjs` from
+# `oss/yubaba/crates/cloud/worker/` (the cloud crate moved under oss/yubaba in
+# the OSS extraction) so the container shim and the embedded host-side shim
+# stay byte-identical.
 # The bun install at image-build time pulls miniflare + workerd from npm.
 #
 # Layout inside the image:
@@ -23,7 +25,7 @@
 #   /app/node_modules/                   # populated by `bun install` at build
 #   /work/worker.js                      # workload's Worker bundle (bind mount)
 #
-# Required `docker run` flags (the warden + cloud reconciler wire this up):
+# Required `docker run` flags (the yubaba + cloud reconciler wire this up):
 #   --network yah-pond-<svc>-<env>        # per-cell bridge (R455-F1)
 #   --network-alias miniflare             # sibling DNS
 #   -p <host>:4322                        # operator-visible port
@@ -74,7 +76,7 @@ EOF
 RUN bun install --no-save \
     && rm -rf /root/.bun/install/cache
 
-COPY crates/yah/cloud/worker/miniflare-sim.mjs /app/miniflare-sim.mjs
+COPY oss/yubaba/crates/cloud/worker/miniflare-sim.mjs /app/miniflare-sim.mjs
 
 # Worker bundle gets bind-mounted at runtime. The default value of MF_SCRIPT
 # points at this path; callers can override via `-e MF_SCRIPT=…` if they bind

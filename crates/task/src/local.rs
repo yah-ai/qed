@@ -24,7 +24,7 @@
 //!
 //! `ImageRef` carries `{ registry, repository, tag, digest }`. When `digest`
 //! is `Some`, the docker arg is `<registry>/<repository>@<digest>` —
-//! identical to the warden remote path. When `digest` is `None`, falls back
+//! identical to the yubaba remote path. When `digest` is `None`, falls back
 //! to `<registry>/<repository>:<tag>`. Callers wanting digest pinning for
 //! local runs construct an `ImageRef` with `Some(digest)` themselves; the
 //! default builder ([`crate::default_image::default_forge_image`]) honours
@@ -218,7 +218,7 @@ pub fn build_image_command(opts: &BuildImageOptions<'_>) -> Command {
 ///
 /// Refuses [`ForgeCommand::BuildImage`] and [`ForgeCommand::Workload`] with
 /// [`ForgeExecutorError::Unsupported`] — those have dedicated paths
-/// (qed's build-image dispatch; warden RPC).
+/// (qed's build-image dispatch; yubaba RPC).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct LocalForgeDriver;
 
@@ -586,7 +586,7 @@ mod tests {
     fn build_image_load_flag_is_passed_through() {
         let dockerfile = PathBuf::from("/work/Dockerfile");
         let context = PathBuf::from(".");
-        let mut o = opts(&dockerfile, &context, "yah-warden:latest");
+        let mut o = opts(&dockerfile, &context, "yah-yubaba:latest");
         o.load = true;
         let cmd = build_image_command(&o);
         let args = args_of(&cmd);

@@ -13,5 +13,5 @@ pub use store::{SessionStore, SessionStoreError};
 pub use types::{
     Binding, CardOutcome, CardOutcomeRow, ChatBindingRole, DeclineReason, DiffSummary, Escalation,
     EscalationTarget, SessionFilter, SessionResult, SessionStatus, TaskSession, TaskSessionId,
-    TaskSessionKind, ToolCallRef, Verdict, VerificationRef,
+    TaskSessionKind, TicketClaim, ToolCallRef, Verdict, VerificationRef,
 };

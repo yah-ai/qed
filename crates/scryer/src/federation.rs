@@ -1,11 +1,11 @@
 //! Federation layer for cross-machine scryer queries — R093-F4.
 //!
 //! Shape (arch doc §Federation across machines):
-//!   - `FederationRule`  — selects which warden-mesh peers to fan out to.
+//!   - `FederationRule`  — selects which yubaba-mesh peers to fan out to.
 //!   - `FederationPeer`  — abstracts a remote scryer (gRPC in prod, mock in tests).
-//!   - `FederationAcl`   — operator-tag guard.  Sits at the warden gRPC entry
+//!   - `FederationAcl`   — operator-tag guard.  Sits at the yubaba gRPC entry
 //!                         point, not in scryer query logic, per the arch doc:
-//!                         "Implement via Tailscale-tag check at the warden RPC
+//!                         "Implement via Tailscale-tag check at the yubaba RPC
 //!                         entry point, not in scryer code."
 //!   - `merge_events`    — merge two time-ordered lists by (offset_ms, seq).
 //!   - `federated_events` — local query + fan-out + merge (best-effort).
@@ -22,7 +22,7 @@ use thiserror::Error;
 
 // ─── FederationRule ───────────────────────────────────────────────────────────
 
-/// Which peers in the warden mesh to include in a fan-out query.
+/// Which peers in the yubaba mesh to include in a fan-out query.
 #[derive(Debug, Clone)]
 pub enum FederationRule {
     /// All connected peers.
@@ -33,7 +33,7 @@ pub enum FederationRule {
 
 // ─── PeerIdentity + ACL ───────────────────────────────────────────────────────
 
-/// Calling identity presented at the warden gRPC entry point.
+/// Calling identity presented at the yubaba gRPC entry point.
 #[derive(Debug, Clone, Default)]
 pub struct PeerIdentity {
     /// Tailscale node tags (e.g. `["tag:operator"]`).
@@ -49,7 +49,7 @@ impl PeerIdentity {
 
 /// ACL guard for federated queries.
 ///
-/// Warden's gRPC dispatcher injects a concrete impl; scryer query logic is
+/// Yubaba's gRPC dispatcher injects a concrete impl; scryer query logic is
 /// ACL-agnostic so operators can swap policy without recompiling scryer.
 pub trait FederationAcl: Send + Sync {
     fn is_authorized(&self, identity: &PeerIdentity) -> bool;
@@ -91,11 +91,11 @@ pub enum FederationError {
 
 /// Abstracts a remote scryer peer.
 ///
-/// Production impl: gRPC streaming over the warden mesh (WireGuard).
+/// Production impl: gRPC streaming over the yubaba mesh (WireGuard).
 /// Test impls: in-process mock that holds a `Vec<Event>`.
 #[async_trait]
 pub trait FederationPeer: Send + Sync {
-    /// Stable display name for this peer (e.g. `"warden-pdx-1"`).
+    /// Stable display name for this peer (e.g. `"yubaba-pdx-1"`).
     fn name(&self) -> &str;
     /// Query events from this peer using `filter`.
     async fn events(&self, filter: &EventFilter) -> Result<Vec<Event>, FederationError>;
@@ -166,7 +166,7 @@ mod acl {
     use super::*;
 
     /// Unauthorized peer (no operator tag) is rejected at RPC entry.
-    /// R093-F4 verify: cargo test scryer::acl
+    /// R093-F4 verify: cargo test yah_scryer::acl
     #[test]
     fn unauthorized_peer_is_rejected() {
         let acl = OperatorTagAcl;

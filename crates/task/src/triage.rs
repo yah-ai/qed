@@ -17,7 +17,7 @@
 //! species — arch doc §forge-6 guarantee.
 
 use observation::{Diagnostic, Event, EventScope, ForgeId, Level, TaskRunId};
-use scryer::{EventFilter as ScryerEventFilter, Scryer, ScryerError};
+use yah_scryer::{EventFilter as ScryerEventFilter, Scryer, ScryerError};
 use task_runs::{
     EventFilter as TaskEventFilter, KeepRange, SeqRange, StoreError, TaskStore, Triage,
 };
@@ -228,7 +228,7 @@ pub fn event_to_diagnostic(e: Event) -> Diagnostic {
 mod diagnostics {
     use super::*;
     use observation::{EventSource, ForgeId, Level, TaskRunId};
-    use scryer::{Scryer, ScryerConfig};
+    use yah_scryer::{Scryer, ScryerConfig};
     use serde_json::json;
     use std::{path::PathBuf, sync::Arc};
     use task_runs::{Initiator, RunStatus, TaskRunMeta, TaskStore};
@@ -279,6 +279,7 @@ mod diagnostics {
                 initiator: Initiator::Human { camp: "test".into() },
                 beholder_status: None,
                 pinned: false,
+                origin: None,
             })
             .unwrap();
         for (i, (level, target, msg)) in fixture_events().iter().enumerate() {
@@ -364,7 +365,7 @@ mod diagnostics {
 mod triage {
     use super::*;
     use observation::{EventSource, ForgeId, Level, TaskRunId};
-    use scryer::{Scryer, ScryerConfig};
+    use yah_scryer::{Scryer, ScryerConfig};
     use serde_json::json;
     use std::{path::PathBuf, sync::Arc};
     use task_runs::{Initiator, RunStatus, TaskRunMeta, TaskStore};
@@ -412,6 +413,7 @@ mod triage {
                 initiator: Initiator::Human { camp: "test".into() },
                 beholder_status: None,
                 pinned: false,
+                origin: None,
             })
             .unwrap();
         for (i, (level, target, msg)) in fixture_events().iter().enumerate() {

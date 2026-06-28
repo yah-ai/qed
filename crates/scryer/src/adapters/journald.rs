@@ -1,8 +1,8 @@
 //! `adapter::journald` — narrow P2 adapter for host-level systemd units.
 //!
 //! Scope per arch doc §"`adapter::journald`" (narrow, P2):
-//! - **In scope**: warden's own systemd unit, sshd, host kernel events (opt-in),
-//!   mode-A yah-camp daemons colocated with warden (rare).
+//! - **In scope**: yubaba's own systemd unit, sshd, host kernel events (opt-in),
+//!   mode-A yah-camp daemons colocated with yubaba (rare).
 //! - **Out of scope**: yah-managed services (covered by `containerd_logs`),
 //!   cloudflared, tailscaled, every workload running under containerd.
 //!
@@ -10,7 +10,7 @@
 //! is the systemd unit name with any `.service` / `.socket` suffix stripped.
 //! sshd's entries → `Service(MeshIdent("sshd.host"))`, kernel → `kernel.host`, etc.
 //!
-//! Production deployment: warden subscribes to journald via the
+//! Production deployment: yubaba subscribes to journald via the
 //! `systemd-journal-gateway` HTTP SSE stream or `sd-journal` bindings and
 //! hands the adapter a [`JournaldSource`] impl. The trait seam lets tests inject
 //! a scripted fixture without a real journald.

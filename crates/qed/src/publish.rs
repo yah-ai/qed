@@ -33,7 +33,7 @@
 //! manifest at `<binary>/release-manifest-<triple>.json` containing just that
 //! triple's bundle entry. These keys are stable and idempotent: a re-run of the
 //! same triple writes the same key, never clobbering a sibling triple's record.
-//! The GHA assembly job (which already owns macOS code signing — warden can't
+//! The GHA assembly job (which already owns macOS code signing — yubaba can't
 //! sign macOS) reads every `release-manifest-<triple>.json` and writes the
 //! authoritative signed shared `release-manifest.json` once all triples land.
 //!
@@ -100,7 +100,7 @@ pub fn resolve_release_version() -> String {
 // not depend on the updater crate here: the producer only fills the fields it
 // can know (version, pub_date, notes, per-triple url+size). The signing-only
 // fields (`signature`, `ipc_contract`) are layered on by the GHA signing leg
-// (warden can't sign macOS — see the builtin's gotcha). almanac's `R2Channel`
+// (yubaba can't sign macOS — see the builtin's gotcha). almanac's `R2Channel`
 // reader ignores the signing fields, so the chain works with this subset.
 
 /// `release-manifest.json` as emitted by the producer.
@@ -190,15 +190,12 @@ pub fn stage_release(
     for artifact in artifacts {
         let triple = resolve_triple(artifact.triple.as_deref());
         let src = Path::new(&artifact.path);
-        let filename = src
-            .file_name()
-            .and_then(|n| n.to_str())
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    format!("artifact path has no filename: {}", artifact.path),
-                )
-            })?;
+        let filename = src.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("artifact path has no filename: {}", artifact.path),
+            )
+        })?;
 
         let key = join_key(prefix, &[&artifact.binary, &version, &triple, filename]);
         let dest = staging_dir.join(&key);
@@ -211,10 +208,13 @@ pub fn stage_release(
             Some(base) => format!("{}/{}", base.trim_end_matches('/'), key),
             None => key.clone(),
         };
-        bundles
-            .entry(artifact.binary.clone())
-            .or_default()
-            .insert(triple, ChannelBundle { url, size: Some(bytes) });
+        bundles.entry(artifact.binary.clone()).or_default().insert(
+            triple,
+            ChannelBundle {
+                url,
+                size: Some(bytes),
+            },
+        );
         report.object_keys.push(key);
     }
 
@@ -232,19 +232,17 @@ pub fn stage_release(
                 version: version.clone(),
                 pub_date: pub_date.clone(),
                 notes: None,
-                host: ChannelHost { bundle: per_triple_bundle },
+                host: ChannelHost {
+                    bundle: per_triple_bundle,
+                },
             };
-            let manifest_key = join_key(
-                prefix,
-                &[&binary, &per_triple_manifest_filename(triple)],
-            );
+            let manifest_key = join_key(prefix, &[&binary, &per_triple_manifest_filename(triple)]);
             let dest = staging_dir.join(&manifest_key);
             if let Some(parent) = dest.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            let json = serde_json::to_vec_pretty(&manifest).map_err(|e| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-            })?;
+            let json = serde_json::to_vec_pretty(&manifest)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
             std::fs::write(&dest, json)?;
             report.manifest_keys.push(manifest_key);
         }
@@ -264,9 +262,8 @@ pub fn stage_release(
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let json = serde_json::to_vec_pretty(&manifest).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-        })?;
+        let json = serde_json::to_vec_pretty(&manifest)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         std::fs::write(&dest, json)?;
         report.manifest_keys.push(manifest_key);
         report.manifests.insert(binary, manifest);
@@ -322,13 +319,16 @@ impl<P: ReleasePublisher> OutcomeDispatcher for PublishingOutcomeDispatcher<P> {
         tracing::info!(
             service,
             env,
-            "qed outcome: warden-deploy skipped (warden deploy RPC not yet stable, R040-F4)"
+            "qed outcome: yubaba-deploy skipped (yubaba deploy RPC not yet stable, R040-F4)"
         );
         Ok(())
     }
 
     async fn almanac_run(&self, pipeline: &str) -> Result<(), RunnerError> {
-        tracing::info!(pipeline, "qed outcome: almanac-run skipped (cadence scheduler pending)");
+        tracing::info!(
+            pipeline,
+            "qed outcome: almanac-run skipped (cadence scheduler pending)"
+        );
         Ok(())
     }
 
@@ -360,7 +360,12 @@ impl<P: ReleasePublisher> OutcomeDispatcher for PublishingOutcomeDispatcher<P> {
         );
 
         self.publisher
-            .sync(staging.path(), &req.provider, &req.bucket, req.prefix.as_deref())
+            .sync(
+                staging.path(),
+                &req.provider,
+                &req.bucket,
+                req.prefix.as_deref(),
+            )
             .await?;
         self.publisher.revalidate().await?;
         Ok(())
@@ -456,7 +461,10 @@ mod tests {
         let manifest = &report.manifests["yah"];
         assert_eq!(manifest.version, "0.8.6");
         let bundle = &manifest.host.bundle["darwin-aarch64"];
-        assert_eq!(bundle.url, "https://releases.yah.dev/yah/0.8.6/darwin-aarch64/yah");
+        assert_eq!(
+            bundle.url,
+            "https://releases.yah.dev/yah/0.8.6/darwin-aarch64/yah"
+        );
         assert_eq!(bundle.size, Some("YAH-BINARY".len() as u64));
 
         // The on-disk manifest round-trips through the same wire type.
@@ -472,14 +480,21 @@ mod tests {
         let staging = TempDir::new().unwrap();
         let report = stage_release(
             staging.path(),
-            &[ProducedArtifact { binary: "desktop".into(), path: bin, triple: Some("linux-x86_64".into()) }],
+            &[ProducedArtifact {
+                binary: "desktop".into(),
+                path: bin,
+                triple: Some("linux-x86_64".into()),
+            }],
             "0.9.0",
             Some("channels"),
             None,
         )
         .unwrap();
         // Prefix is applied to both the object and the manifest keys.
-        assert_eq!(report.object_keys, vec!["channels/desktop/0.9.0/linux-x86_64/desktop"]);
+        assert_eq!(
+            report.object_keys,
+            vec!["channels/desktop/0.9.0/linux-x86_64/desktop"]
+        );
         assert_eq!(
             report.manifest_keys,
             vec![
@@ -503,8 +518,16 @@ mod tests {
         let report = stage_release(
             staging.path(),
             &[
-                ProducedArtifact { binary: "yah".into(), path: yah, triple: Some("darwin-aarch64".into()) },
-                ProducedArtifact { binary: "desktop".into(), path: desktop, triple: Some("darwin-aarch64".into()) },
+                ProducedArtifact {
+                    binary: "yah".into(),
+                    path: yah,
+                    triple: Some("darwin-aarch64".into()),
+                },
+                ProducedArtifact {
+                    binary: "desktop".into(),
+                    path: desktop,
+                    triple: Some("darwin-aarch64".into()),
+                },
             ],
             "1.0.0",
             None,
@@ -514,8 +537,12 @@ mod tests {
         // One shared manifest per binary, plus one per-triple stable manifest
         // per (binary, triple).
         assert_eq!(report.manifests.len(), 2);
-        assert!(report.manifest_keys.contains(&"yah/release-manifest.json".to_string()));
-        assert!(report.manifest_keys.contains(&"desktop/release-manifest.json".to_string()));
+        assert!(report
+            .manifest_keys
+            .contains(&"yah/release-manifest.json".to_string()));
+        assert!(report
+            .manifest_keys
+            .contains(&"desktop/release-manifest.json".to_string()));
         assert!(report
             .manifest_keys
             .contains(&"yah/release-manifest-darwin-aarch64.json".to_string()));
@@ -577,19 +604,37 @@ mod tests {
 
         // Both per-triple manifests survive on disk after the second stage
         // (the bug was: shared key clobbered, no record of the first triple).
-        let darwin_path = staging.path().join("yah/release-manifest-darwin-aarch64.json");
-        let linux_path = staging.path().join("yah/release-manifest-linux-x86_64.json");
-        assert!(darwin_path.exists(), "darwin per-triple manifest must persist");
-        assert!(linux_path.exists(), "linux per-triple manifest must persist");
+        let darwin_path = staging
+            .path()
+            .join("yah/release-manifest-darwin-aarch64.json");
+        let linux_path = staging
+            .path()
+            .join("yah/release-manifest-linux-x86_64.json");
+        assert!(
+            darwin_path.exists(),
+            "darwin per-triple manifest must persist"
+        );
+        assert!(
+            linux_path.exists(),
+            "linux per-triple manifest must persist"
+        );
 
         let darwin: ChannelManifest =
             serde_json::from_slice(&std::fs::read(&darwin_path).unwrap()).unwrap();
         let linux: ChannelManifest =
             serde_json::from_slice(&std::fs::read(&linux_path).unwrap()).unwrap();
         assert!(darwin.host.bundle.contains_key("darwin-aarch64"));
-        assert_eq!(darwin.host.bundle.len(), 1, "per-triple manifest is single-triple");
+        assert_eq!(
+            darwin.host.bundle.len(),
+            1,
+            "per-triple manifest is single-triple"
+        );
         assert!(linux.host.bundle.contains_key("linux-x86_64"));
-        assert_eq!(linux.host.bundle.len(), 1, "per-triple manifest is single-triple");
+        assert_eq!(
+            linux.host.bundle.len(),
+            1,
+            "per-triple manifest is single-triple"
+        );
 
         // The shared release-manifest.json reflects the LAST stage (best-effort
         // latest single-stage view) — the GHA assembler is what unifies it.
@@ -658,7 +703,13 @@ mod tests {
         struct ArcPublisher(Arc<RecordingPublisher>);
         #[async_trait]
         impl ReleasePublisher for ArcPublisher {
-            async fn sync(&self, d: &Path, p: &str, b: &str, pre: Option<&str>) -> Result<(), RunnerError> {
+            async fn sync(
+                &self,
+                d: &Path,
+                p: &str,
+                b: &str,
+                pre: Option<&str>,
+            ) -> Result<(), RunnerError> {
                 self.0.sync(d, p, b, pre).await
             }
             async fn revalidate(&self) -> Result<(), RunnerError> {
@@ -681,11 +732,20 @@ mod tests {
         };
         dispatcher.publish(&req).await.unwrap();
 
-        assert_eq!(publisher.synced.lock().unwrap().as_slice(), ["yah-releases"]);
+        assert_eq!(
+            publisher.synced.lock().unwrap().as_slice(),
+            ["yah-releases"]
+        );
         assert_eq!(*publisher.revalidated.lock().unwrap(), 1);
         let manifest = &publisher.captured_manifests.lock().unwrap()[0];
-        assert!(manifest.contains("0.8.6"), "manifest carries version: {manifest}");
-        assert!(manifest.contains("darwin-aarch64"), "manifest carries triple");
+        assert!(
+            manifest.contains("0.8.6"),
+            "manifest carries version: {manifest}"
+        );
+        assert!(
+            manifest.contains("darwin-aarch64"),
+            "manifest carries triple"
+        );
     }
 
     #[tokio::test]
@@ -698,7 +758,13 @@ mod tests {
         struct ArcPublisher(Arc<RecordingPublisher>);
         #[async_trait]
         impl ReleasePublisher for ArcPublisher {
-            async fn sync(&self, d: &Path, p: &str, b: &str, pre: Option<&str>) -> Result<(), RunnerError> {
+            async fn sync(
+                &self,
+                d: &Path,
+                p: &str,
+                b: &str,
+                pre: Option<&str>,
+            ) -> Result<(), RunnerError> {
                 self.0.sync(d, p, b, pre).await
             }
             async fn revalidate(&self) -> Result<(), RunnerError> {
@@ -715,7 +781,10 @@ mod tests {
             artifacts: vec![],
         };
         dispatcher.publish(&req).await.unwrap();
-        assert!(probe.synced.lock().unwrap().is_empty(), "no artifacts → no sync");
+        assert!(
+            probe.synced.lock().unwrap().is_empty(),
+            "no artifacts → no sync"
+        );
         assert_eq!(*probe.revalidated.lock().unwrap(), 0);
     }
 }

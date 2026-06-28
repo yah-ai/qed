@@ -8,9 +8,9 @@
 //! error rather than dying mid-cross-build with a confusing linker error.
 //!
 //! This is the W154 musl-static gate: native-runtime deployment under
-//! Constable assumes a static musl binary, and any glibc-only dep makes
+//! Kamaji assumes a static musl binary, and any glibc-only dep makes
 //! that impossible. The gate is the producer-side guarantee that the
-//! workload classification in W154 (warden → native, codec-heavy yah CLI
+//! workload classification in W154 (yubaba → native, codec-heavy yah CLI
 //! → container) actually reflects what's buildable.
 //!
 //! ## Surface
@@ -64,13 +64,19 @@ pub enum MuslPreflightError {
     #[error("`cargo metadata` failed for `{package}`: {reason}")]
     CargoMetadata { package: String, reason: String },
     #[error("package `{package}` not found in the workspace metadata at {manifest_path}")]
-    PackageNotFound { package: String, manifest_path: PathBuf },
+    PackageNotFound {
+        package: String,
+        manifest_path: PathBuf,
+    },
     #[error(
         "package `{package}` cannot build musl-static — depends on glibc-only crate(s): {offenders:?}. \
          Route this build to the container fallback (set `runtime = \"container\"` on the upstream build step, \
          or use the `cross` toolchain) — or replace the offending dep with a musl-friendly alternative."
     )]
-    NotMuslSafe { package: String, offenders: Vec<String> },
+    NotMuslSafe {
+        package: String,
+        offenders: Vec<String>,
+    },
 }
 
 /// Pure dep-list gate. Used in tests directly and by
@@ -291,16 +297,16 @@ mod tests {
     #[test]
     fn check_dep_list_passes_clean_tree() {
         let deps = ["tokio", "serde", "thiserror", "uuid"];
-        check_dep_list("warden", deps).unwrap();
+        check_dep_list("yubaba", deps).unwrap();
     }
 
     #[test]
     fn check_dep_list_flags_openssl_sys() {
         let deps = ["tokio", "openssl-sys", "serde"];
-        let err = check_dep_list("warden", deps).unwrap_err();
+        let err = check_dep_list("yubaba", deps).unwrap_err();
         match err {
             MuslPreflightError::NotMuslSafe { package, offenders } => {
-                assert_eq!(package, "warden");
+                assert_eq!(package, "yubaba");
                 assert_eq!(offenders, vec!["openssl-sys".to_string()]);
             }
             other => panic!("expected NotMuslSafe, got {other:?}"),
@@ -383,9 +389,18 @@ mod tests {
     fn render_markdown_groups_clean_first_then_blocked_with_summary() {
         let audit = WorkspaceAudit {
             rows: vec![
-                AuditRow { package: "warden".into(), offenders: vec![] },
-                AuditRow { package: "yah".into(), offenders: vec!["openssl-sys".into()] },
-                AuditRow { package: "qed".into(), offenders: vec![] },
+                AuditRow {
+                    package: "yubaba".into(),
+                    offenders: vec![],
+                },
+                AuditRow {
+                    package: "yah".into(),
+                    offenders: vec!["openssl-sys".into()],
+                },
+                AuditRow {
+                    package: "qed".into(),
+                    offenders: vec![],
+                },
                 AuditRow {
                     package: "desktop".into(),
                     offenders: vec!["dbus".into(), "hyper-tls".into()],
@@ -397,13 +412,13 @@ mod tests {
         // Header table present.
         assert!(md.contains("| Package | Musl-static | Glibc-only deps |"));
         // Clean rows render with the check icon.
-        assert!(md.contains("| `warden` | ✓ | — |"));
+        assert!(md.contains("| `yubaba` | ✓ | — |"));
         assert!(md.contains("| `qed` | ✓ | — |"));
         // Blocked rows list offenders inline, backtick-wrapped.
         assert!(md.contains("| `yah` | ✗ | `openssl-sys` |"));
         assert!(md.contains("| `desktop` | ✗ | `dbus`, `hyper-tls` |"));
         // Clean group precedes blocked group.
-        let clean_at = md.find("| `warden` |").unwrap();
+        let clean_at = md.find("| `yubaba` |").unwrap();
         let blocked_at = md.find("| `yah` |").unwrap();
         assert!(
             clean_at < blocked_at,
@@ -415,8 +430,14 @@ mod tests {
     fn render_markdown_is_byte_stable_for_the_same_audit() {
         let audit = WorkspaceAudit {
             rows: vec![
-                AuditRow { package: "a".into(), offenders: vec![] },
-                AuditRow { package: "b".into(), offenders: vec!["openssl-sys".into()] },
+                AuditRow {
+                    package: "a".into(),
+                    offenders: vec![],
+                },
+                AuditRow {
+                    package: "b".into(),
+                    offenders: vec!["openssl-sys".into()],
+                },
             ],
         };
         assert_eq!(render_markdown(&audit), render_markdown(&audit));
@@ -426,9 +447,18 @@ mod tests {
     fn workspace_audit_clean_and_blocked_iterators_partition_rows() {
         let audit = WorkspaceAudit {
             rows: vec![
-                AuditRow { package: "a".into(), offenders: vec![] },
-                AuditRow { package: "b".into(), offenders: vec!["dbus".into()] },
-                AuditRow { package: "c".into(), offenders: vec![] },
+                AuditRow {
+                    package: "a".into(),
+                    offenders: vec![],
+                },
+                AuditRow {
+                    package: "b".into(),
+                    offenders: vec!["dbus".into()],
+                },
+                AuditRow {
+                    package: "c".into(),
+                    offenders: vec![],
+                },
             ],
         };
         assert_eq!(audit.clean().count(), 2);

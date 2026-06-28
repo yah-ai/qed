@@ -40,7 +40,7 @@
 //! @yah:next("Wire shape: extend WireQedPipeline (env/types.ts) with outcomes + step names; emit from QedRpc::pipelines (crates/yah/qed/src/lib.rs); drop the BUILTIN_DEFS wire-merge fallback path in QedPanel.tsx so user pipelines source outcomes from the wire instead of a static encoding")
 //! @yah:verify("Run a user pipeline (e.g. desktop-local) with outcomes declared in its TOML; switch to Graph tab during the run; mermaid renders terminal Outcome nodes for that user pipeline (not just built-ins)")
 //! @arch:see(.yah/docs/working/W191-qed-pipeline-ux-tweaks.md)
-//! @yah:handoff("Shipped across 4 files. (1) crates/yah/rpc/src/lib.rs: added QedOutcomeWire enum (warden-deploy/publish/almanac-run), QedArtifactStepWire struct, and three new fields on QedPipelineWire — step_names: Vec<String>, outcomes: Vec<QedOutcomeWire>, artifact_steps: Vec<QedArtifactStepWire> — all #[serde(default)]. (2) app/yah/cli/src/camp.rs: qed_pipelines_handler now populates step_names from pipeline.steps[].name, outcomes by matching qed::Outcome variants to QedOutcomeWire, and artifact_steps from steps[].produces with triple-aware display labels. (3) packages/yah/ui/src/env/types.ts: WireQedOutcome discriminated union + extended WireQedPipeline with step_names?, outcomes?, artifact_steps?. (4) packages/yah/ui/src/components/run/QedPanel.tsx: defs useMemo now builds wireSteps/wireOutcomes/wireArtifactSteps from the wire; user pipelines get full outcomes+steps in their PipelineDef; built-ins refresh all wire-authoritative fields with BUILTIN_DEFS as offline fallback. cargo check -p rpc -p yah -p desktop clean; bun run typecheck clean for touched files; bun test qedMermaid.test.ts 5/5.")
+//! @yah:handoff("Shipped across 4 files. (1) crates/yah/rpc/src/lib.rs: added QedOutcomeWire enum (yubaba-deploy/publish/almanac-run), QedArtifactStepWire struct, and three new fields on QedPipelineWire — step_names: Vec<String>, outcomes: Vec<QedOutcomeWire>, artifact_steps: Vec<QedArtifactStepWire> — all #[serde(default)]. (2) app/yah/cli/src/camp.rs: qed_pipelines_handler now populates step_names from pipeline.steps[].name, outcomes by matching qed::Outcome variants to QedOutcomeWire, and artifact_steps from steps[].produces with triple-aware display labels. (3) packages/yah/ui/src/env/types.ts: WireQedOutcome discriminated union + extended WireQedPipeline with step_names?, outcomes?, artifact_steps?. (4) packages/yah/ui/src/components/run/QedPanel.tsx: defs useMemo now builds wireSteps/wireOutcomes/wireArtifactSteps from the wire; user pipelines get full outcomes+steps in their PipelineDef; built-ins refresh all wire-authoritative fields with BUILTIN_DEFS as offline fallback. cargo check -p rpc -p yah -p desktop clean; bun run typecheck clean for touched files; bun test qedMermaid.test.ts 5/5.")
 //! @yah:verify("Run a user pipeline (e.g. desktop-local with on_success declared) — Graph tab renders terminal Outcome nodes matching the TOML declaration (not just built-ins)")
 //! @yah:verify("Built-in release-build Graph tab still renders 6 steps + WardenDeploy + Publish terminals (daemon wire takes precedence over BUILTIN_DEFS; BUILTIN_DEFS serves as fallback when daemon is down)")
 //!
@@ -60,15 +60,15 @@
 //! @yah:phase(P9)
 //! @yah:parent(R487)
 //! @yah:next("Add StepKind::GhaWorkflow { path, event, inputs } to crates/yah/qed/src/types.rs")
-//! @yah:next("runner.rs: dispatch GhaWorkflow steps to qed_gha::execute, collect GhaRunResult { status, produced, job_outputs }")
+//! @yah:next("runner.rs: dispatch GhaWorkflow steps to yah_qed_gha::execute, collect GhaRunResult { status, produced, job_outputs }")
 //! @yah:next("ProducedArtifact aggregation flows into the outer pipeline's Outcome::Publish exactly like any other producing step")
 //! @yah:next("config.rs: TOML parse for the new step kind")
 //! @yah:verify("yah qed run release (single-step pipeline wrapping release.yml) executes locally and stages to cdn.yah.dev")
 //! @arch:see(.yah/docs/working/W200-qed-gha-action-overrides.md)
 //! @yah:depends_on(R487-F8)
 //! @yah:tier(Warrior)
-//! @yah:handoff("F9 landed: StepKind::GhaWorkflow first-class step kind + qed-runner dispatch + ProducedArtifact bridge. qed --lib: 200 pass (4 new) + 1 pre-existing failure (test_builtin_release_build_pipeline 4-vs-6, documented across R407-T1/R380-T3/R438-T14/R488-F1 handoffs — not introduced by F9). qed-gha: 88/88. cargo check -p yah clean. — types.rs: added StepKind::GhaWorkflow + GhaWorkflowConfig { path, event, inputs } + QedStep.gha_workflow: Option<GhaWorkflowConfig> (#[serde(default)] so existing TOML + literal sites unaffected; sed-inserted None on every QedStep init across builtins/runner/types/cli camp). Two new StepValidationError variants: GhaWorkflowHasArgv + GhaWorkflowMissingConfig (mirrors SubPipeline’s argv/config invariants). — runner.rs: new arm StepKind::GhaWorkflow → execute_step_gha_workflow(); reads workflow YAML at cfg.path (resolved against camp root), parses via qed_gha::parse_workflow, builds qed_gha::Executor with F5–F8 builtins pre-registered, lays inputs + a minimal github context (event_name only, ref/sha/actor empty) onto the executor, calls qed_gha::execute_workflow on a tokio spawn_blocking so docker buildx / git clone / etc. don’t stall the reactor. Each qed_gha::ProducedArtifact { binary, path, triple } lifts to qed::types::ProducedArtifact 1:1 (structurally compatible by F7 design); aggregation goes into the per-pipeline `produced` Vec exactly like a Subprocess `produces` declaration so Outcome::Publish stages them. First-failing-job is surfaced as a clean StepFailed with `gha-workflow <path> failed at job <id>`. — config.rs: LoaderSubPipelineResolver::resolve(SubPipelineRef::GhaWorkflow{path,event,inputs}) now synthesizes a one-step Pipeline carrying a single GhaWorkflow step instead of returning None. Going through SubPipeline preserves propagate.produces / suppress_publish_outcomes plumbing so a child workflow's R2 staging fires from the parent’s terminal publish, not the child’s. — lib.rs: re-exported GhaWorkflowConfig. — qed/Cargo.toml: qed-gha + indexmap path deps. — Tests: validate happy + 2 reject paths in types::tests, resolver synthesis test in config::tests; runner-level end-to-end is left to the integration verify (yah qed run release against a real .github/workflows/release.yml on a host with docker/git/rustup) since hermetic exec would require a stub workflow + an executor injection seam neither crate currently has.")
-//! @yah:next("User: verify F9 — (a) confirm the SubPipeline-synthesis route is the right shape vs a parallel resolver type (preserves propagate.produces + suppress_publish_outcomes for free; alternative was a bypass route that wouldn’t), (b) accept the minimal github-context synthesis (event_name + empty ref/sha/actor — release.yml reads github.ref_name + github.event.inputs.* and the latter comes from the inputs map, but a workflow that touches github.sha will see an empty string), and (c) run the integration verify when next on a host with docker/git/rustup/bun: `yah qed run release` against a release-build pipeline that wraps .github/workflows/release.yml via SubPipelineRef::GhaWorkflow and stages to cdn.yah.dev. After sign-off: archive R487 + R487-S10 (still in review) + R487-F4/F5/F6/F7/F8/F9, then archive R487 itself; R487-T11 (retire .yah/qed/build-yah-warden.toml) is the post-F9 cleanup ticket that closes the relay.")
+//! @yah:handoff("F9 landed: StepKind::GhaWorkflow first-class step kind + qed-runner dispatch + ProducedArtifact bridge. qed --lib: 200 pass (4 new) + 1 pre-existing failure (test_builtin_release_build_pipeline 4-vs-6, documented across R407-T1/R380-T3/R438-T14/R488-F1 handoffs — not introduced by F9). qed-gha: 88/88. cargo check -p yah clean. — types.rs: added StepKind::GhaWorkflow + GhaWorkflowConfig { path, event, inputs } + QedStep.gha_workflow: Option<GhaWorkflowConfig> (#[serde(default)] so existing TOML + literal sites unaffected; sed-inserted None on every QedStep init across builtins/runner/types/cli camp). Two new StepValidationError variants: GhaWorkflowHasArgv + GhaWorkflowMissingConfig (mirrors SubPipeline’s argv/config invariants). — runner.rs: new arm StepKind::GhaWorkflow → execute_step_gha_workflow(); reads workflow YAML at cfg.path (resolved against camp root), parses via yah_qed_gha::parse_workflow, builds yah_qed_gha::Executor with F5–F8 builtins pre-registered, lays inputs + a minimal github context (event_name only, ref/sha/actor empty) onto the executor, calls yah_qed_gha::execute_workflow on a tokio spawn_blocking so docker buildx / git clone / etc. don’t stall the reactor. Each yah_qed_gha::ProducedArtifact { binary, path, triple } lifts to qed::types::ProducedArtifact 1:1 (structurally compatible by F7 design); aggregation goes into the per-pipeline `produced` Vec exactly like a Subprocess `produces` declaration so Outcome::Publish stages them. First-failing-job is surfaced as a clean StepFailed with `gha-workflow <path> failed at job <id>`. — config.rs: LoaderSubPipelineResolver::resolve(SubPipelineRef::GhaWorkflow{path,event,inputs}) now synthesizes a one-step Pipeline carrying a single GhaWorkflow step instead of returning None. Going through SubPipeline preserves propagate.produces / suppress_publish_outcomes plumbing so a child workflow's R2 staging fires from the parent’s terminal publish, not the child’s. — lib.rs: re-exported GhaWorkflowConfig. — qed/Cargo.toml: qed-gha + indexmap path deps. — Tests: validate happy + 2 reject paths in types::tests, resolver synthesis test in config::tests; runner-level end-to-end is left to the integration verify (yah qed run release against a real .github/workflows/release.yml on a host with docker/git/rustup) since hermetic exec would require a stub workflow + an executor injection seam neither crate currently has.")
+//! @yah:next("User: verify F9 — (a) confirm the SubPipeline-synthesis route is the right shape vs a parallel resolver type (preserves propagate.produces + suppress_publish_outcomes for free; alternative was a bypass route that wouldn’t), (b) accept the minimal github-context synthesis (event_name + empty ref/sha/actor — release.yml reads github.ref_name + github.event.inputs.* and the latter comes from the inputs map, but a workflow that touches github.sha will see an empty string), and (c) run the integration verify when next on a host with docker/git/rustup/bun: `yah qed run release` against a release-build pipeline that wraps .github/workflows/release.yml via SubPipelineRef::GhaWorkflow and stages to cdn.yah.dev. After sign-off: archive R487 + R487-S10 (still in review) + R487-F4/F5/F6/F7/F8/F9, then archive R487 itself; R487-T11 (retire .yah/qed/build-yah-yubaba.toml) is the post-F9 cleanup ticket that closes the relay.")
 //!
 //! @yah:ticket(R488-F1, "SubPipeline types + TOML parser + cycle detection (depth-4 cap)")
 //! @yah:assignee(agent:claude)
@@ -142,25 +142,46 @@
 //! @yah:verify("cargo test -p qed --lib -- peer_resolver_remote_peer_surfaces peer_resolver_unknown_camp peer_resolver_unknown_pipeline peer_resolver_unresolved_reason_is_none sub_pipeline_unresolved_surfaces (5/5 pass)")
 //! @yah:verify("cargo check -p qed -p yah -p desktop")
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use chrono::{DateTime, Utc};
-use task::TaskRuntime;
+use velveteen::TaskRuntime;
 
 pub type QedRunId = String;
 pub type ForgeId = String;
+
+/// Schema for a pipeline-manifest field whose type is dynamic or lives in a
+/// crate we deliberately don't pull `schemars` through (`matrix::MatrixSpec`'s
+/// `toml::Value` blobs, `task::TaskRuntime`, the `manifest-bind` bind/value
+/// types). Accepts any JSON so the generated `qed-pipeline.toml.schema.json`
+/// stays permissive there rather than forcing a derive across those edges.
+/// (R533-T10; tightening these to precise sub-schemas is a tracked follow-up.)
+#[cfg(feature = "json-schema")]
+pub(crate) fn permissive_schema(
+    _gen: &mut schemars::gen::SchemaGenerator,
+) -> schemars::schema::Schema {
+    schemars::schema::Schema::Bool(true)
+}
+
+/// Mint a fresh [`QedRunId`]. Same shape (`Uuid::new_v4`) the [`PipelineRunner`]
+/// uses internally, exposed so an orchestrator (e.g. the matrix fan-out parent
+/// in R506-F1, which has no runner of its own) can allocate a run id.
+pub fn new_run_id() -> QedRunId {
+    uuid::Uuid::new_v4().to_string()
+}
 
 /// What can cause a pipeline to start.
 ///
 /// Triggers are *declared* in the pipeline TOML but *dispatched* by the appropriate
 /// scheduler — qed has no polling daemon. Tag triggers are fired by the GHA shim (or a
-/// warden git-mirror hook); schedule triggers are fired by almanac; manual is the default.
+/// yubaba git-mirror hook); schedule triggers are fired by almanac; manual is the default.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub enum Trigger {
     /// `yah qed run <pipeline>` from CLI or desktop — always available.
     Manual,
-    /// Git tag push matching a glob (e.g. `v*.*.*`), fired by the GHA shim or warden hook.
+    /// Git tag push matching a glob (e.g. `v*.*.*`), fired by the GHA shim or yubaba hook.
     Tag { pattern: String },
     /// Cron expression, dispatched by almanac via `["yah", "qed", "run", pipeline]` TaskSpec.
     Schedule { cron: String },
@@ -178,6 +199,7 @@ pub enum Trigger {
 /// the field is omitted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub enum Placement {
     /// Runs on a dev machine; meaningless on CI. The output is "yah.app
     /// installed in /Applications", "files written to the camp tree", etc.
@@ -188,6 +210,37 @@ pub enum Placement {
     /// Pure verification — lint, typecheck, smoke. The gold standard.
     #[default]
     Anywhere,
+}
+
+/// How the runner positions the on-disk tree a pipeline's steps build against,
+/// relative to the run's target branch (the `branch` run-param, default `main`).
+///
+/// A QED run's workspace is normally the live camp root — fine for verifying
+/// whatever is on disk, wrong for cutting a release (which must never ship a
+/// dev's uncommitted edits). This is the per-pipeline knob that picks the right
+/// trade-off; the run carries the *which branch*, the pipeline carries the *how
+/// strict*.
+///
+/// Default is [`WorkspaceMode::Checkout`] — switch to the requested branch but
+/// refuse to run over uncommitted changes, so a stray run never silently builds
+/// the wrong bytes and never clobbers local work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub enum WorkspaceMode {
+    /// Build against the camp root's live working tree exactly as it is on disk
+    /// — no branch switch, no dirty check. For local/dev pipelines that want
+    /// "build what I'm looking at right now".
+    Live,
+    /// Switch the camp root to the run's target branch, but **bail if the tree
+    /// is dirty** (any uncommitted change). The safe default: never builds
+    /// surprise bytes, never discards local work.
+    #[default]
+    Checkout,
+    /// Build in a dedicated git worktree checked out at the target branch; the
+    /// camp root (and any uncommitted work in it) is untouched. The correct
+    /// mode for releases — a tag is always cut from clean committed state.
+    Isolated,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -218,6 +271,13 @@ pub struct Pipeline {
     /// (R435-F2) — the recipe body itself remains environment-agnostic.
     #[serde(default)]
     pub placement: Placement,
+    /// How the runner positions the on-disk tree this pipeline builds against
+    /// (W224). Defaults to [`WorkspaceMode::Checkout`] (switch to the run's
+    /// branch, bail if dirty). Releases set `workspace = "isolated"` so a tag is
+    /// always cut from a clean worktree, never a dev's live edits; local-only
+    /// pipelines may set `workspace = "live"` to build the tree as-is.
+    #[serde(default)]
+    pub workspace: WorkspaceMode,
     /// Optional GHA-workflow this pipeline wraps. Set to `"gha:<rel-path>"`
     /// in TOML (e.g. `wraps = "gha:.github/workflows/release.yml"`) when the
     /// pipeline exists *because* it composes a workflow; the daemon then
@@ -225,6 +285,57 @@ pub struct Pipeline {
     /// both entries. Purely advisory — not interpreted by the runner.
     #[serde(default)]
     pub wraps: Option<String>,
+    /// Native matrix expansion (R505). When present, [`crate::matrix::plan`]
+    /// expands the pipeline into one concrete job per matrix row, with
+    /// `${{ matrix.<key> }}` substituted across each step's `argv` / `env` /
+    /// `cwd`. Absent or empty → single-job plan (no expansion). Mirrors GHA's
+    /// `strategy.matrix` semantics (cartesian product + include/exclude).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matrix: Option<crate::matrix::MatrixSpec>,
+    /// Declarative toolchain pinning (R507, W208 pillar 3). `[pipeline.toolchain]`
+    /// pins tool versions (rust/xcode/ndk/msvc/…) checked against the host at
+    /// plan time, so a release fails fast with an actionable error instead of
+    /// dying mid-build on a missing SDK. Per-step `toolchain.<tool>` overrides
+    /// (see [`QedStep::toolchain`]) layer on top. Absent (the default) ⇒ no
+    /// pins, no check. See [`crate::toolchain`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub toolchain: Option<crate::toolchain::ToolchainSpec>,
+    /// W209: `[[bind]]` tables — pipeline-output → in-tree-manifest write-backs.
+    /// Each bind names a target file/path, a producer step output (or URI
+    /// escape hatch), and an intent predicate. The runner evaluates them
+    /// mid-pipeline as each producing step completes; failed steps simply
+    /// skip the binds that reference them. Defaults to empty for pipelines
+    /// that don't bind anything.
+    #[serde(default)]
+    pub binds: Vec<manifest_bind::BindSpec>,
+    /// W209/R510-F6: `[[on_change]]` hash-change hooks. Each names a bind
+    /// selector (matched against a changed [`manifest_bind::AppliedBind`]'s
+    /// `path`) and an action (fire a pipeline, emit an event, or append to a
+    /// journal). The runner evaluates them after each step's binds commit,
+    /// firing only for binds that actually changed bytes on disk. Empty for
+    /// pipelines without hooks.
+    #[serde(default)]
+    pub on_change: Vec<manifest_bind::OnChangeHook>,
+    /// W207 Gap #6 (R513-F4): always-run teardown steps. Every step here runs
+    /// unconditionally after the main step loop and the background-sidecar reap
+    /// — whether the pipeline passed or failed — making it the home for
+    /// diagnostics/artifact teardown that must happen either way (upload
+    /// Playwright traces, `docker compose down`, collect logs). Sidecar teardown
+    /// itself is already structural (the F2 background reap), so `finally` is for
+    /// the *once-after-loop* work the reap doesn't cover.
+    ///
+    /// Semantics (see [`crate::runner`]): all `finally` steps are attempted
+    /// best-effort — a failing one never aborts the rest (teardown should always
+    /// run to completion). A `finally` step that fails marks the *run* Failed
+    /// (visible in the run tile + `RunFinished`) unless it sets
+    /// `on_fail = "continue"`, but it does **not** change which terminal
+    /// outcomes fire — `on_success` vs `on_fail` is selected from the
+    /// pipeline's *work* result (steps + sidecars), not from teardown. v1
+    /// restricts `finally` steps to [`StepKind::Subprocess`] (the teardown
+    /// shape); composite/background kinds in `finally` are rejected at load
+    /// time.
+    #[serde(default)]
+    pub finally: Vec<QedStep>,
 }
 
 impl Pipeline {
@@ -273,6 +384,7 @@ fn substitute(input: &str, params: &HashMap<String, String>) -> String {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct QedStep {
     pub name: String,
     #[serde(default)]
@@ -297,6 +409,7 @@ pub struct QedStep {
     /// pipeline runs — used by `build-image` steps that must always be
     /// containerised.
     #[serde(default)]
+    #[cfg_attr(feature = "json-schema", schemars(schema_with = "crate::types::permissive_schema"))]
     pub runtime: Option<TaskRuntime>,
     /// Which step variant this is.  Defaults to [`StepKind::Subprocess`] —
     /// existing TOML and Rust literals omit the field.  Set to
@@ -328,7 +441,7 @@ pub struct QedStep {
     #[serde(default)]
     pub triple: Option<String>,
     /// For `kind = musl-static-preflight` (R407-T3): workspace member name
-    /// to gate (e.g. `warden`, `yah`). The runner walks its transitive dep
+    /// to gate (e.g. `yubaba`, `yah`). The runner walks its transitive dep
     /// closure and fails if any crate in
     /// [`crate::preflight::KNOWN_GLIBC_ONLY_CRATES`] appears.
     #[serde(default)]
@@ -337,7 +450,7 @@ pub struct QedStep {
     /// relative to the camp root. Defaults to `.` (camp root itself) when
     /// absent — the same behaviour as before this field existed. Use this
     /// to point at a staging directory assembled by an earlier subprocess
-    /// step (e.g. `context = "target/yah-warden-ctx"`).
+    /// step (e.g. `context = "target/yah-yubaba-ctx"`).
     #[serde(default)]
     pub context: Option<std::path::PathBuf>,
     /// For `kind = build-image`: load the finished image into the local
@@ -368,6 +481,137 @@ pub struct QedStep {
     /// `sub_pipeline` does.
     #[serde(default)]
     pub gha_workflow: Option<GhaWorkflowConfig>,
+    /// For `kind = import` (W224, R533-F1): the imported `workflow.yml` source,
+    /// its pinned blake3 content hash, and the virtual/materialize toggle.
+    /// Required when `kind = import`; `validate()` rejects misconfiguration at
+    /// parse time the same way `gha_workflow` / `sub_pipeline` do. The runner
+    /// re-reads the source, recomputes its hash, and expands it into the native
+    /// subgraph at plan time (`crate::import`).
+    #[serde(default)]
+    pub import: Option<ImportConfig>,
+    /// Step-level matrix (R505). When present, [`crate::matrix::plan`] fans
+    /// this single step out into N step instances within the parent job, each
+    /// carrying its row's coord substituted into `argv` / `env` / `cwd` and
+    /// its name suffixed with the coord pairs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "json-schema", schemars(schema_with = "crate::types::permissive_schema"))]
+    pub matrix: Option<crate::matrix::MatrixSpec>,
+    /// Declarative on/off switch (R506). When `false`, the runner skips the
+    /// step at plan-time: a `StepStatus` with [`RunStatus::Skipped`] is still
+    /// emitted so the dashboard renders the row, but no subprocess / container
+    /// / sub-pipeline is launched. Defaults to `true`. Orthogonal to
+    /// [`Self::activation`] — `enabled = false` means "I explicitly want this
+    /// off for this run"; `status = "stubbed"` means "this is a planned but
+    /// not-yet-implemented surface". The runner treats both as skip; the
+    /// dashboard renders them distinctly.
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+    /// Declarative lifecycle state (R506). `active` (the default) runs the
+    /// step normally; `stubbed` marks the step as a visible-but-skipped row
+    /// — typically a planned target (e.g. `ios-device`, `rpi0`) that hasn't
+    /// been wired up yet but should still appear in the dashboard so bit-rot
+    /// is observable. The runner skips `stubbed` steps the same way it skips
+    /// `enabled = false` steps; the on-demand `--include-stubbed` override
+    /// runs them.
+    #[serde(default, rename = "status")]
+    pub activation: StepActivation,
+    /// Runtime conditional (R506) — a `${{ <expr> }}`-style expression
+    /// evaluated against the W201-F4 context (matrix coords, env, prior
+    /// `steps.<X>.outputs.<Y>`, plus `success()` / `failure()`). When the
+    /// expression evaluates to a falsy value the step is skipped at
+    /// dispatch-time with [`RunStatus::Skipped`]. Bare expressions without
+    /// `${{ }}` delimiters are evaluated as implicit-expression bodies (GHA
+    /// semantics). Layered above [`Self::enabled`] / [`Self::activation`]:
+    /// a step that is `enabled = false` is skipped before `if` is consulted.
+    /// Layered above [`Self::on_fail`]: this gate is *pre-execution*, while
+    /// `on_fail` is post-failure propagation.
+    #[serde(default, rename = "if", skip_serializing_if = "Option::is_none")]
+    pub if_cond: Option<String>,
+    /// Run this step as a long-lived sidecar (R513-F2, W207 Gap #4). A
+    /// background step is *spawned* — `run()` emits its `StepStarted`, kicks
+    /// the subprocess onto its own task, and immediately advances to the next
+    /// step instead of awaiting completion. The classic case is a server a
+    /// later step talks to: `yah-camp`, `vite preview`, a mock auth broker.
+    /// Without this every such step would block the pipeline forever.
+    ///
+    /// Lifecycle: the sidecar lives until it is *reaped*. With
+    /// [`Self::background_until`] unset it is reaped at the end of the step
+    /// loop (after the last foreground step, before terminal outcomes); with
+    /// `background_until = "<step>"` it is reaped the moment that named step
+    /// finishes. Reaping a still-running sidecar kills it (`kill_on_drop`) and
+    /// records [`RunStatus::Success`] — a healthy server torn down on schedule
+    /// is the expected path, not a failure. A sidecar that *exits on its own*
+    /// before reap surfaces its real exit status: clean → `Success`, non-zero
+    /// → `Failed` (a sidecar that crashes mid-pipeline is a genuine problem and
+    /// flips the run to `Failed` so `on_fail` fires).
+    ///
+    /// Log story: a background step's stdout/stderr keep streaming as
+    /// `StepOutput` events tagged with the step index, identical to a
+    /// foreground step — a misbehaving sidecar's logs are exactly what you want
+    /// when triaging, so v1 never silences them; collapsing a chatty sidecar's
+    /// pane is a consumer concern.
+    ///
+    /// v1 scope: background is only valid on [`StepKind::Subprocess`] steps run
+    /// locally (the [`crate::ForgeExecutor`] spawn path). `validate()` rejects
+    /// other kinds; the runner rejects `--where=remote` background steps
+    /// (yubaba-supervised remote sidecars are a separate lifecycle). Defaults
+    /// to `false` — omitted from every existing pipeline.
+    #[serde(default)]
+    pub background: bool,
+    /// Reap this background step right after the named step finishes, rather
+    /// than at the end of the pipeline (R513-F2). Implies [`Self::background`].
+    /// The named step must appear *after* this one in the pipeline — the runner
+    /// rejects a forward-reference to a missing or earlier step at run start, so
+    /// a typo fails loudly instead of silently deferring the reap to pipeline
+    /// end. `None` (the default) ⇒ reap at end of the step loop.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_until: Option<String>,
+    /// For `kind = wait-for` (R513-F3, W207 Gap #5): the network endpoint to
+    /// poll and the timeout/interval budget. Required when `kind = wait-for`;
+    /// `validate()` rejects misconfiguration (missing block, no target, both
+    /// targets) at parse time the same way `sub_pipeline` / `gha_workflow` do.
+    /// `None` for every other step kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub wait_for: Option<WaitForConfig>,
+    /// Structured platform intent (R531-F2, W222): what target this step
+    /// produces and the arch of the base image it pulls. `host` is *not*
+    /// declared here — it's self-detected per runner (R531-T1) and composed
+    /// in at plan time via [`crate::platform::Platform::compose`]. `None` (the
+    /// default, omitted from every existing pipeline file) means host-native /
+    /// no foreign-arch container — the common case. An explicit
+    /// `platform.target` overrides the legacy per-kind `triple` field as the
+    /// composed target.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<crate::platform::PlatformSpec>,
+    /// Per-step toolchain pin overrides (R507, W208 pillar 3). An inline table
+    /// `toolchain.<tool> = "..."` whose entries [`crate::toolchain::effective_pins`]
+    /// overlays on the pipeline-level `[pipeline.toolchain]` — so a single
+    /// `build-android` step can pin `ndk = "r26d"` while the pipeline pins
+    /// `r27`. `None` (the default) ⇒ the step inherits the pipeline pins
+    /// unchanged. See [`crate::toolchain`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "json-schema", schemars(schema_with = "crate::types::permissive_schema"))]
+    pub toolchain: Option<crate::toolchain::ToolchainSpec>,
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
+/// Declarative lifecycle state for a [`QedStep`] (R506). See
+/// [`QedStep::activation`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub enum StepActivation {
+    /// Step runs normally.
+    #[default]
+    Active,
+    /// Step is a visible-but-skipped placeholder — appears in the dashboard
+    /// so the full release surface is observable, but the runner doesn't
+    /// dispatch it. Use for planned targets that aren't wired up yet.
+    /// Overridden by the on-demand `--include-stubbed` runner flag.
+    Stubbed,
 }
 
 /// What a pipeline step does.
@@ -377,6 +621,7 @@ pub struct QedStep {
 /// [`StepKind::Subprocess`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub enum StepKind {
     /// Run `argv` (the existing semantics).
     #[default]
@@ -386,11 +631,11 @@ pub enum StepKind {
     /// `task::ForgeCommand::BuildImage` from the catalog entry.
     BuildImage,
     /// Package a static musl Rust binary + workload-spec manifest into a
-    /// `.tar.gz` for the native runtime under Constable (R407-T2, W154).
+    /// `.tar.gz` for the native runtime under Kamaji (R407-T2, W154).
     /// Catalog entry referenced by `image` must declare
     /// [`ProduceTarget::NativeTarball`](crate::images::ProduceTarget::NativeTarball);
     /// `binary_path` points at the cross-compiled binary an earlier step
-    /// produced. No systemd unit is emitted — Constable directly
+    /// produced. No systemd unit is emitted — Kamaji directly
     /// fork+exec+cgroup+pidfd-supervises the binary at deploy time.
     PackageNativeTarball,
     /// Gate a workspace member against
@@ -421,11 +666,34 @@ pub enum StepKind {
     SubPipeline,
     /// Run a `.github/workflows/*.yml` through the native W200 GHA runtime
     /// (W200-F9). Step config lives on [`QedStep::gha_workflow`]; the runner
-    /// dispatches to `qed_gha::execute_workflow`, then lifts each
-    /// `qed_gha::ProducedArtifact` into [`ProducedArtifact`] and aggregates
+    /// dispatches to `yah_qed_gha::execute_workflow`, then lifts each
+    /// `yah_qed_gha::ProducedArtifact` into [`ProducedArtifact`] and aggregates
     /// into the parent's `Outcome::Publish` — same surface as a producing
     /// `Subprocess` step or a `SubPipeline` child with `propagate.produces`.
     GhaWorkflow,
+    /// Import a `.github/workflows/*.yml` as a QED source and expand it into
+    /// the native subgraph at plan time (W224 "import, don't emulate";
+    /// R533-F1). Step config lives on [`QedStep::import`]: the source path, a
+    /// blake3 content hash pinning that source, and a `materialize` toggle.
+    ///
+    /// Unlike [`StepKind::GhaWorkflow`] — which treats the YAML as a foreign
+    /// runtime to execute as one black-box step — `Import` treats it as an
+    /// *interchange format*. The expansion is **virtual by default**
+    /// (recomputed at plan time, never persisted ⇒ zero drift by
+    /// construction); the pinned hash is the guardrail that detects a drifted
+    /// source. The expansion logic lives in [`crate::import`]; F1's expansion
+    /// delegates to the recast W200 GHA front-end, and R533-F4 swaps in the
+    /// mechanical tier-1/2 → native map.
+    Import,
+    /// Block until a network endpoint becomes reachable, then advance (R513-F3,
+    /// W207 Gap #5). The classic case is a health-gate between a `background`
+    /// sidecar (`yah-camp`, `vite preview`) and the step that talks to it: poll
+    /// the server's `/health` until it answers, so the consumer step never races
+    /// a not-yet-listening port. Config (the target + timeout/interval) lives on
+    /// [`QedStep::wait_for`]; the step runs no `argv` of its own and produces
+    /// nothing — it is a pure gate. `validate()` rejects `argv` and a missing
+    /// `[wait_for]` block the same way [`StepKind::SubPipeline`] does.
+    WaitFor,
 }
 
 /// Maximum allowed sub-pipeline nesting depth, counted as the number of
@@ -438,6 +706,7 @@ pub const MAX_SUB_PIPELINE_DEPTH: usize = 4;
 /// Configuration for a [`StepKind::SubPipeline`] step — what to invoke and
 /// what to roll up. Lives on [`QedStep::sub_pipeline`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct SubPipelineConfig {
     /// What to resolve and run as the child.
     pub target: SubPipelineRef,
@@ -448,6 +717,16 @@ pub struct SubPipelineConfig {
     /// What to collect back up from the child run.
     #[serde(default)]
     pub propagate: SubPipelineCollect,
+    /// Opaque opt-out of transparent inlining (W223 R532-F3). A wrapped
+    /// pipeline is a *disregarded entity* by default — its children (GHA jobs,
+    /// or a child pipeline's steps) are attributed to this step's report +
+    /// graph as inlined rows. Set `opaque = true` to keep the wrapper a single
+    /// black-box node instead: the child still runs and its status still rolls
+    /// up, but the per-child rows are suppressed (the `#[inline(never)]`
+    /// equivalent). Useful for a stable, rarely-failing sub-stage or a vendored
+    /// workflow whose internals are noise. Default `false` (transparent).
+    #[serde(default)]
+    pub opaque: bool,
 }
 
 /// How a [`StepKind::SubPipeline`] step resolves to a runnable child. The
@@ -464,6 +743,7 @@ pub struct SubPipelineConfig {
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "kebab-case")]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub enum SubPipelineRef {
     /// Resolve to a builtin pipeline by name (e.g. `"desktop-release"`).
     Builtin(String),
@@ -481,18 +761,16 @@ pub enum SubPipelineRef {
         inputs: HashMap<String, String>,
     },
     /// Resolve to a pipeline declared in another camp on the same rig (or
-    /// brokered to a remote rig via constable when the peer registry entry
+    /// brokered to a remote rig via kamaji when the peer registry entry
     /// has a `rig` field). `camp` is the registry key in
     /// `<qed_dir>/peers.toml`; `pipeline` is the named pipeline within that
     /// camp's own `.yah/qed/`. Runner-side resolution lives in R494-F2.
-    Peer {
-        camp: String,
-        pipeline: String,
-    },
+    Peer { camp: String, pipeline: String },
 }
 
 /// What the parent rolls up from a SubPipeline child run.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct SubPipelineCollect {
     /// When `true`, [`ProducedArtifact`]s from the child are aggregated into
     /// the parent's [`Outcome::Publish`] and the child's own publish is
@@ -514,6 +792,7 @@ pub struct SubPipelineCollect {
 /// variant goes through a resolver that synthesizes a single GhaWorkflow
 /// step under the hood, so both surfaces resolve to the same runner arm.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct GhaWorkflowConfig {
     /// Workflow YAML path, resolved relative to the camp root (e.g.
     /// `.github/workflows/release.yml`).
@@ -527,6 +806,129 @@ pub struct GhaWorkflowConfig {
     /// expression context. Ignored when `event != "workflow_dispatch"`.
     #[serde(default)]
     pub inputs: HashMap<String, String>,
+}
+
+/// Step-level config for [`StepKind::Import`] (W224, R533-F1). The W224 import
+/// primitive: a QED step whose source is a `workflow.yml`, carrying the content
+/// hash of that yml plus a toggle for whether the expansion is persisted.
+///
+/// ```toml
+/// [[steps]]
+/// name = "release"
+/// kind = "import"
+/// [steps.import]
+/// source = ".github/workflows/release.yml"
+/// hash = "af1349b9f5f9a1a6a0404dea36dcc949..."  # blake3 of the source, pinned
+/// # materialize = false                          # default — virtual expansion
+/// ```
+///
+/// Whether the expansion is persisted is the migration ramp (W224): virtual
+/// (default) recomputes the subgraph at plan time and stores nothing — zero
+/// drift by construction; `materialize` ejects it to generated TOML (R533-F6).
+/// While the yml is canonical the TOML is virtual; once ejected the yml is
+/// gone — never two editable canonical copies at once. The freshness check and
+/// plan-time expansion live in [`crate::import`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct ImportConfig {
+    /// Path to the imported `.github/workflows/*.yml`, resolved relative to the
+    /// camp root.
+    pub source: std::path::PathBuf,
+    /// blake3 content hash of the `source` bytes, pinned at import time
+    /// ([`crate::import::content_hash`]). `None` while unpinned (a first import
+    /// or a hand-authored block). On every run the runner recomputes the source
+    /// hash and compares via [`Self::freshness`]: a mismatch means the source
+    /// drifted since pinning. Under the default virtual expansion a mismatch is
+    /// benign (re-expand + re-pin); for a materialized eject it marks the
+    /// on-disk generated TOML stale (R533-F6).
+    #[serde(default)]
+    pub hash: Option<String>,
+    /// Persist the plan-time expansion as generated, hash-stamped TOML (the
+    /// R533-F6 `eject`), vs. the default virtual expansion computed fresh at
+    /// plan time and never stored. Virtual-by-default is zero-drift by
+    /// construction (W224). F1 only carries the toggle; the eject/materialize
+    /// machinery and its stale-source guard land in R533-F6.
+    #[serde(default)]
+    pub materialize: bool,
+    /// GHA event the expansion impersonates while F1's expansion still routes
+    /// through the recast W200 front-end (`push` | `workflow_dispatch`). `None`
+    /// defaults to `push` at runtime — matches `release.yml`'s tag-push primary
+    /// trigger. Forwarded into the synthesized [`GhaWorkflowConfig`] by
+    /// [`crate::import::expand_import`].
+    #[serde(default)]
+    pub event: Option<String>,
+    /// `workflow_dispatch` inputs forwarded into the expansion context. Ignored
+    /// when `event != "workflow_dispatch"`.
+    #[serde(default)]
+    pub inputs: HashMap<String, String>,
+}
+
+/// Step-level config for [`StepKind::WaitFor`] (R513-F3, W207 Gap #5). Names a
+/// single network endpoint to poll and the time budget for it to come up.
+///
+/// ```toml
+/// [[steps]]
+/// name = "wait:ready"
+/// kind = "wait-for"
+/// [steps.wait_for]
+/// http = "http://localhost:3000/health"   # plaintext HTTP GET, healthy on 2xx/3xx
+/// timeout_secs = 30                        # give up (and fail the step) after this
+/// # interval_ms = 500                      # poll cadence (default 500ms)
+/// # expect_status = 200                    # require an exact status instead of any 2xx/3xx
+/// ```
+///
+/// Exactly one of [`Self::http`] / [`Self::tcp`] must be set. The `http` probe
+/// is a dependency-free plaintext HTTP/1.1 GET (no TLS in v1 — an `https://`
+/// URL is rejected at runtime; use a `tcp` gate or terminate TLS in front);
+/// the `tcp` probe is a bare connect to `host:port`, healthy the moment the
+/// port accepts. [`Self::expect_status`] is HTTP-only.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct WaitForConfig {
+    /// Plaintext-HTTP URL to GET each poll (e.g. `http://localhost:3000/health`).
+    /// Healthy on a 2xx/3xx response, or on an exact match to
+    /// [`Self::expect_status`] when set. Mutually exclusive with [`Self::tcp`].
+    #[serde(default)]
+    pub http: Option<String>,
+    /// `host:port` to connect to each poll (e.g. `127.0.0.1:5432`). Healthy the
+    /// moment the connect succeeds — no bytes are exchanged. Mutually exclusive
+    /// with [`Self::http`].
+    #[serde(default)]
+    pub tcp: Option<String>,
+    /// Require this exact HTTP status to consider the endpoint healthy, instead
+    /// of the default "any 2xx/3xx". HTTP-only — `validate()` rejects it
+    /// alongside a `tcp` target. `None` ⇒ any 2xx/3xx.
+    #[serde(default)]
+    pub expect_status: Option<u16>,
+    /// Total budget, in seconds, for the endpoint to become healthy. The step
+    /// fails with a clear "never became healthy" message once this elapses.
+    /// Defaults to 30s.
+    #[serde(default = "default_wait_timeout_secs")]
+    pub timeout_secs: u64,
+    /// Delay between poll attempts, in milliseconds. Defaults to 500ms — snappy
+    /// enough for a fast-booting dev server without hammering the socket.
+    #[serde(default = "default_wait_interval_ms")]
+    pub interval_ms: u64,
+}
+
+fn default_wait_timeout_secs() -> u64 {
+    30
+}
+
+fn default_wait_interval_ms() -> u64 {
+    500
+}
+
+impl WaitForConfig {
+    /// `true` when an `https://` URL was given — TLS health-gates are out of
+    /// scope for v1 (no HTTP client / TLS stack pulled into qed). The runner
+    /// surfaces this as a clean `StepFailed` rather than silently trying a
+    /// plaintext GET against a TLS port.
+    pub fn http_is_tls(&self) -> bool {
+        self.http
+            .as_deref()
+            .is_some_and(|u| u.trim_start().starts_with("https://"))
+    }
 }
 
 /// Declares a named output that a native [`StepKind::Subprocess`] step may
@@ -544,10 +946,28 @@ pub struct GhaWorkflowConfig {
 /// and, once the W200 expression engine (R487-F2) lands, with type-checked
 /// expression validation.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct OutputDecl {
     pub name: String,
     #[serde(default)]
     pub description: Option<String>,
+    /// W209: declared value type. The runner type-checks the captured value
+    /// against this shape before letting it reach any `[[bind]]` whose
+    /// `from` references this output. Defaults to `string` (i.e. accept
+    /// anything non-empty) for backwards compatibility with R488-F4 outputs
+    /// declared without a `type` key.
+    #[serde(rename = "type", default = "default_value_type")]
+    #[cfg_attr(feature = "json-schema", schemars(schema_with = "crate::types::permissive_schema"))]
+    pub kind: manifest_bind::ValueType,
+    /// Optional override regex for the type's built-in validator (W209).
+    /// Authors rarely need this — the built-in shape regex is right by
+    /// construction for blake3-hex, semver, oci-digest, etc.
+    #[serde(default)]
+    pub validate: Option<String>,
+}
+
+fn default_value_type() -> manifest_bind::ValueType {
+    manifest_bind::ValueType::String
 }
 
 /// Errors surfaced when walking a sub-pipeline graph at parse time
@@ -584,6 +1004,24 @@ pub trait SubPipelineResolver {
     fn unresolved_reason(&self, _target: &SubPipelineRef) -> Option<String> {
         None
     }
+
+    /// The camp root that the resolved child pipeline's steps should
+    /// execute against. The runner uses this as the child runner's
+    /// `camp_root`, which becomes the working directory for subprocess
+    /// steps (and the base for resolving produced-artifact paths).
+    ///
+    /// For [`SubPipelineRef::Peer`] this is the *peer* camp's root, so a
+    /// peer's `cargo` steps run in the peer's workspace rather than the
+    /// parent camp's — without this, `peer-release` runs yubaba's
+    /// `cargo publish -p workload-spec` from yah's root and fails with a
+    /// "package ID did not match any packages" error.
+    ///
+    /// Returns `None` to inherit the parent runner's `camp_root` — the
+    /// correct default for `Builtin`/`Path`/`GhaWorkflow` children, which
+    /// share the parent's camp.
+    fn resolved_camp_root(&self, _target: &SubPipelineRef) -> Option<std::path::PathBuf> {
+        None
+    }
 }
 
 /// Walk a pipeline's SubPipeline graph, rejecting cycles and nesting deeper
@@ -618,7 +1056,9 @@ fn visit_sub_pipeline(
         if chain.contains(&token) {
             let mut full = chain.clone();
             full.push(token);
-            return Err(SubPipelineError::Cycle { chain: full.join(" -> ") });
+            return Err(SubPipelineError::Cycle {
+                chain: full.join(" -> "),
+            });
         }
         // Depth counts SubPipeline edges traversed (chain.len() - 1 = root + edges).
         if chain.len() > MAX_SUB_PIPELINE_DEPTH {
@@ -697,7 +1137,7 @@ pub enum StepValidationError {
     MuslStaticPreflightHasArgv(String),
     #[error(
         "step `{0}`: musl-static-preflight steps require `package = \"<workspace-member>\"` \
-         (e.g. `package = \"warden\"`)"
+         (e.g. `package = \"yubaba\"`)"
     )]
     MuslStaticPreflightMissingPackage(String),
     #[error(
@@ -716,9 +1156,7 @@ pub enum StepValidationError {
     SignNativeTarballContainerRuntime(String),
     #[error("step `{0}`: sub-pipeline steps must omit `argv`")]
     SubPipelineHasArgv(String),
-    #[error(
-        "step `{0}`: sub-pipeline steps require a `[sub_pipeline]` block with `target = ...`"
-    )]
+    #[error("step `{0}`: sub-pipeline steps require a `[sub_pipeline]` block with `target = ...`")]
     SubPipelineMissingConfig(String),
     #[error(
         "step `{0}`: sub-pipeline steps must not declare `produces` directly — \
@@ -728,21 +1166,74 @@ pub enum StepValidationError {
     SubPipelineHasProduces(String),
     #[error("step `{0}`: gha-workflow steps must omit `argv`")]
     GhaWorkflowHasArgv(String),
-    #[error(
-        "step `{0}`: gha-workflow steps require a `[gha_workflow]` block with `path = ...`"
-    )]
+    #[error("step `{0}`: gha-workflow steps require a `[gha_workflow]` block with `path = ...`")]
     GhaWorkflowMissingConfig(String),
+    #[error("step `{0}`: import steps must omit `argv`")]
+    ImportHasArgv(String),
+    #[error("step `{0}`: import steps require an `[import]` block with `source = \"...\"`")]
+    ImportMissingConfig(String),
+    #[error(
+        "step `{0}`: `background` / `background_until` is only valid on subprocess \
+         steps — a background sub-pipeline / gha-workflow / build-image sidecar \
+         has no lifecycle yet (R513-F2)"
+    )]
+    BackgroundRequiresSubprocess(String),
+    #[error("step `{0}`: wait-for steps must omit `argv` (a wait-for is a pure gate)")]
+    WaitForHasArgv(String),
+    #[error(
+        "step `{0}`: wait-for steps require a `[wait_for]` block with `http = ...` or `tcp = ...`"
+    )]
+    WaitForMissingConfig(String),
+    #[error(
+        "step `{0}`: wait-for needs exactly one target — set `http = \"http://…\"` \
+         OR `tcp = \"host:port\"`, not neither"
+    )]
+    WaitForNeedsTarget(String),
+    #[error(
+        "step `{0}`: wait-for accepts only one target — set `http` OR `tcp`, not both"
+    )]
+    WaitForAmbiguousTarget(String),
+    #[error(
+        "step `{0}`: `expect_status` only applies to an `http` wait-for — \
+         a `tcp` gate is healthy on connect, with no status to match"
+    )]
+    WaitForStatusNeedsHttp(String),
+    #[error("step `{0}`: wait-for `timeout_secs` must be greater than zero")]
+    WaitForZeroTimeout(String),
+    #[error(
+        "finally step `{0}`: v1 `[[finally]]` teardown supports only `kind = subprocess` \
+         (and never `background`) — composite / image / sidecar teardown is a follow-up"
+    )]
+    FinallyRequiresSubprocess(String),
 }
 
 impl QedStep {
+    /// `true` when this step runs as a long-lived sidecar (R513-F2) — either
+    /// `background = true` or a `background_until` target is set. See
+    /// [`Self::background`] for the lifecycle.
+    pub fn is_background(&self) -> bool {
+        self.background || self.background_until.is_some()
+    }
+
     /// Validate kind-specific invariants. Called by the TOML loader
     /// (`PipelineLoader::load_from_file`) before the pipeline reaches the
     /// runner — fail loudly at parse time, not at execution time.
     pub fn validate(&self) -> Result<(), StepValidationError> {
+        // R513-F2: background is a Subprocess-only knob in v1. A background
+        // sub-pipeline / gha-workflow / build-image has no spawn-and-detach
+        // lifecycle yet — reject before the runner so the error names the
+        // offending step at parse time rather than mid-run.
+        if self.is_background() && self.kind != StepKind::Subprocess {
+            return Err(StepValidationError::BackgroundRequiresSubprocess(
+                self.name.clone(),
+            ));
+        }
         match self.kind {
             StepKind::Subprocess => {
                 if self.argv.is_empty() {
-                    return Err(StepValidationError::SubprocessMissingArgv(self.name.clone()));
+                    return Err(StepValidationError::SubprocessMissingArgv(
+                        self.name.clone(),
+                    ));
                 }
                 Ok(())
             }
@@ -751,10 +1242,14 @@ impl QedStep {
                     return Err(StepValidationError::BuildImageHasArgv(self.name.clone()));
                 }
                 if self.image.is_none() {
-                    return Err(StepValidationError::BuildImageMissingImage(self.name.clone()));
+                    return Err(StepValidationError::BuildImageMissingImage(
+                        self.name.clone(),
+                    ));
                 }
                 if matches!(self.runtime, Some(TaskRuntime::Native)) {
-                    return Err(StepValidationError::BuildImageNativeRuntime(self.name.clone()));
+                    return Err(StepValidationError::BuildImageNativeRuntime(
+                        self.name.clone(),
+                    ));
                 }
                 Ok(())
             }
@@ -827,7 +1322,9 @@ impl QedStep {
                     ));
                 }
                 if !self.produces.is_empty() {
-                    return Err(StepValidationError::SubPipelineHasProduces(self.name.clone()));
+                    return Err(StepValidationError::SubPipelineHasProduces(
+                        self.name.clone(),
+                    ));
                 }
                 Ok(())
             }
@@ -842,7 +1339,58 @@ impl QedStep {
                 }
                 Ok(())
             }
+            StepKind::Import => {
+                if !self.argv.is_empty() {
+                    return Err(StepValidationError::ImportHasArgv(self.name.clone()));
+                }
+                if self.import.is_none() {
+                    return Err(StepValidationError::ImportMissingConfig(self.name.clone()));
+                }
+                Ok(())
+            }
+            StepKind::WaitFor => {
+                if !self.argv.is_empty() {
+                    return Err(StepValidationError::WaitForHasArgv(self.name.clone()));
+                }
+                let Some(cfg) = self.wait_for.as_ref() else {
+                    return Err(StepValidationError::WaitForMissingConfig(self.name.clone()));
+                };
+                match (cfg.http.is_some(), cfg.tcp.is_some()) {
+                    (false, false) => {
+                        return Err(StepValidationError::WaitForNeedsTarget(self.name.clone()));
+                    }
+                    (true, true) => {
+                        return Err(StepValidationError::WaitForAmbiguousTarget(
+                            self.name.clone(),
+                        ));
+                    }
+                    _ => {}
+                }
+                if cfg.expect_status.is_some() && cfg.tcp.is_some() {
+                    return Err(StepValidationError::WaitForStatusNeedsHttp(self.name.clone()));
+                }
+                if cfg.timeout_secs == 0 {
+                    return Err(StepValidationError::WaitForZeroTimeout(self.name.clone()));
+                }
+                Ok(())
+            }
         }
+    }
+
+    /// Validate a step that lives in a pipeline's `[[finally]]` teardown block
+    /// (R513-F4). Runs the normal kind-specific [`Self::validate`] first, then
+    /// enforces the v1 `finally`-only constraint: teardown is a plain
+    /// [`StepKind::Subprocess`] and never a `background` sidecar (a detached
+    /// teardown step has no one to reap it). Composite / image / sub-pipeline
+    /// teardown is a documented follow-up.
+    pub fn validate_finally(&self) -> Result<(), StepValidationError> {
+        self.validate()?;
+        if self.kind != StepKind::Subprocess || self.is_background() {
+            return Err(StepValidationError::FinallyRequiresSubprocess(
+                self.name.clone(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -855,6 +1403,7 @@ impl QedStep {
 /// they double as the self-update pointer source AND almanac's `R2Channel`
 /// input (see self-updating-binaries.md, `crates/yah/almanac/src/r2.rs`).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct ProducedArtifact {
     /// Logical binary name — becomes the channel sub-path (`yah`, `desktop`,
     /// `camp`). The per-binary `release-manifest.json` lives at this root.
@@ -873,6 +1422,7 @@ pub struct ProducedArtifact {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub enum OnFail {
     Abort,
     Continue,
@@ -886,6 +1436,7 @@ impl Default for OnFail {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct ParamDef {
     #[serde(default)]
     pub required: bool,
@@ -895,6 +1446,7 @@ pub struct ParamDef {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub enum Outcome {
     WardenDeploy {
         service: String,
@@ -923,6 +1475,28 @@ pub enum Outcome {
         #[serde(default)]
         base_url: Option<String>,
     },
+    /// Dispatch a named vendor release adapter (R509) — Apple notarize/staple,
+    /// Authenticode sign, Sparkle appcast, TestFlight/Play/GitHub upload.
+    /// Resolved by `provider` name through the runner's
+    /// [`crate::provider::ProviderRegistry`]; credentials resolve through the
+    /// secrets bridge. Unlike [`Outcome::Publish`] (which syncs a staged tree
+    /// to a bucket), these adapters transform an artifact in place or block on a
+    /// remote vendor ticket — see [`crate::provider`]. A pipeline may chain
+    /// several (`notarize` then `sparkle`): each adapter's transformed
+    /// artifacts feed the next outcome's input set.
+    Provider {
+        /// Adapter name in the [`crate::provider::ProviderRegistry`]
+        /// (`"notarize"`, `"authenticode"`, `"sparkle"`, …).
+        provider: String,
+        /// Vendor-specific config blob (the outcome's `with = { … }` table),
+        /// opaque here — each adapter deserializes its own typed config.
+        #[serde(default)]
+        with: serde_json::Value,
+        /// Public-facing root for absolute URLs an adapter emits (appcast feed
+        /// base, release page). `None` leaves URL construction to the adapter.
+        #[serde(default)]
+        base_url: Option<String>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -943,6 +1517,7 @@ pub struct QedRunMeta {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub enum RunStatus {
     /// Registered but waiting on its `concurrency_key` lock. Emitted as
     /// the very first status after `qed_run_handler` registers the run;
@@ -952,6 +1527,49 @@ pub enum RunStatus {
     Success,
     Failed,
     Cancelled,
+    /// Step (or run) was skipped without executing (R506). Set when
+    /// [`QedStep::enabled`] is `false`, [`QedStep::activation`] is
+    /// [`StepActivation::Stubbed`] (and `--include-stubbed` wasn't passed),
+    /// or [`QedStep::if_cond`] evaluated to a falsy value. A skipped step
+    /// does not flip the run's overall status to `Failed`.
+    Skipped,
+}
+
+impl RunStatus {
+    /// Aggregate child run statuses into a single parent status (R506-F1
+    /// matrix fan-out). Mirrors [`yah_qed_gha::JobResult::aggregate`] exactly so a
+    /// matrixed parent run reports the same overall verdict the GHA graph would
+    /// for the same set of rows: any `Failed` wins, then `Cancelled`, then
+    /// `Success`, and only an all-`Skipped` (or empty) set reports `Skipped`.
+    ///
+    /// `Queued` / `Running` contribute nothing — `aggregate` is meant to be
+    /// called once every child has reached a terminal state.
+    pub fn aggregate<I: IntoIterator<Item = RunStatus>>(children: I) -> RunStatus {
+        let mut seen_success = false;
+        let mut seen_failure = false;
+        let mut seen_cancelled = false;
+        let mut seen_any = false;
+        for r in children {
+            seen_any = true;
+            match r {
+                RunStatus::Failed => seen_failure = true,
+                RunStatus::Cancelled => seen_cancelled = true,
+                RunStatus::Success => seen_success = true,
+                RunStatus::Skipped | RunStatus::Queued | RunStatus::Running => {}
+            }
+        }
+        if !seen_any {
+            RunStatus::Skipped
+        } else if seen_failure {
+            RunStatus::Failed
+        } else if seen_cancelled {
+            RunStatus::Cancelled
+        } else if seen_success {
+            RunStatus::Success
+        } else {
+            RunStatus::Skipped
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -961,12 +1579,74 @@ pub struct StepStatus {
     pub status: RunStatus,
     pub started_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
+    /// Failure reason for a `Failed` step — the `StepFailed.msg` tail (stderr
+    /// tail for subprocess steps, a typed reason for resolver/config errors).
+    /// Persisted on the terminal run meta so `qed.status` / `qed report` can
+    /// surface *why* a step failed long after the live event stream is gone
+    /// (the reason was previously only emitted into the `StepFinished` event,
+    /// which doesn't survive in the meta json). `None` for non-failed steps,
+    /// or when the failure carried no message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     /// Key-value outputs collected from `$YAH_OUTPUTS` after the step ran
     /// (W201-F4). Empty when the step did not write any outputs, when the
     /// step kind doesn't support output collection (container, remote,
     /// sub-pipeline), or when the step failed before writing anything.
     #[serde(default)]
     pub outputs: HashMap<String, String>,
+    /// W209: bind results applied immediately after this step succeeded.
+    /// Each entry records `file`, `path`, `from`, `old`, `new`, and a
+    /// `changed` bool the qed-run tile uses to surface "Bound N values in
+    /// <file> — review diff" (F7) and to drive hash-change hooks (F6).
+    /// Empty when this step had no binds referencing it, when the predicate
+    /// rejected every candidate value (e.g. all binds are pinned), or when
+    /// the step failed before any bind could fire.
+    #[serde(default)]
+    pub applied_binds: Vec<manifest_bind::AppliedBind>,
+    /// Per-job rows for a step that wraps a foreign pipeline (W223 R532-T1).
+    /// Non-empty only when this step wraps a GitHub Actions workflow — whether
+    /// reached as a [`StepKind::GhaWorkflow`] step or a [`StepKind::SubPipeline`]
+    /// whose target is a GHA workflow — which fans out to many jobs. Each row
+    /// carries one job's terminal status and (on failure) its stderr-tail
+    /// detail, so the report renders the wrapped workflow *transparently* (the
+    /// same per-job shape the graph viewer draws) instead of collapsing it into
+    /// one flattened failure string. The R516 skip-count folds into per-row
+    /// [`RunStatus::Skipped`] state rather than a trailing sentence. Empty for
+    /// native steps and for non-GHA sub-pipelines (transparency generalizes to
+    /// the other `SubPipelineRef` kinds in a later phase).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub jobs: Vec<JobRow>,
+}
+
+/// One job within a wrapped foreign pipeline's [`StepStatus`] (W223 R532-T1).
+///
+/// A wrapped GHA workflow is a *disregarded entity*: structurally it is one
+/// QED step, but its internal jobs are attributed to that step's report row as
+/// if the wrapper weren't there. This is the persisted, structured equivalent
+/// of one of those jobs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobRow {
+    /// GHA job id (the `jobs.<id>` key). Combined with the wrapping step's name
+    /// this yields the stable node address `<step>.<job_id>` that the report,
+    /// the graph viewer, and `needs.*` cross-references all name (W223
+    /// §identity — mirrors the existing `<job_id>.<output_key>` output-lifting
+    /// convention).
+    pub id: String,
+    /// This job's terminal status: `Success` / `Failed` / `Skipped`.
+    /// `Cancelled` maps to `Failed`.
+    pub status: RunStatus,
+    /// Failure detail for a `Failed` job — the failing step's name plus its
+    /// stderr tail (the same text the flattened summary used to concatenate).
+    /// `None` for success / skipped rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Logical job ids this job `needs:` — the intra-workflow dependency edges
+    /// already computed by `yah_qed_gha::plan` (W223 R532-F2). The graph viewer
+    /// renders these as real dependency edges between the inlined job nodes, so
+    /// the wave ordering inside the wrapped workflow is visible rather than a
+    /// flat list. Empty for a job with no declared `needs`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub needs: Vec<String>,
 }
 
 #[cfg(test)]
@@ -978,10 +1658,16 @@ mod tests {
             name: "p".into(),
             label: "p".into(),
             steps: vec![QedStep {
+                background: false,
+                background_until: None,
+                wait_for: None,
                 name: "s".into(),
                 argv: argv.into_iter().map(String::from).collect(),
                 cwd: None,
-                env: env.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+                env: env
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect(),
                 timeout: None,
                 on_fail: OnFail::Abort,
                 produces: Vec::new(),
@@ -996,7 +1682,14 @@ mod tests {
                 context: None,
                 load: false,
                 sub_pipeline: None,
-            gha_workflow: None,
+                gha_workflow: None,
+                import: None,
+                matrix: None,
+                enabled: true,
+                activation: StepActivation::Active,
+                if_cond: None,
+                platform: None,
+                toolchain: None,
                 outputs: Vec::new(),
             }],
             params: HashMap::new(),
@@ -1005,13 +1698,22 @@ mod tests {
             triggers: vec![],
             concurrency_key: None,
             placement: Placement::default(),
+            workspace: crate::types::WorkspaceMode::default(),
             wraps: None,
+            matrix: None,
+            toolchain: None,
+            binds: Vec::new(),
+            on_change: Vec::new(),
+            finally: Vec::new(),
         }
     }
 
     #[test]
     fn apply_params_substitutes_argv_and_env() {
-        let mut p = one_step(vec!["run", "--", "{{provider}}"], &[("KEY", "{{provider}}-x")]);
+        let mut p = one_step(
+            vec!["run", "--", "{{provider}}"],
+            &[("KEY", "{{provider}}-x")],
+        );
         let mut params = HashMap::new();
         params.insert("provider".to_string(), "groq".to_string());
         p.apply_params(&params);
@@ -1019,8 +1721,52 @@ mod tests {
         assert_eq!(p.steps[0].env.get("KEY").unwrap(), "groq-x");
     }
 
+    #[test]
+    fn run_status_aggregate_failure_dominates() {
+        use RunStatus::*;
+        assert_eq!(
+            RunStatus::aggregate([Success, Failed, Skipped, Success]),
+            Failed
+        );
+        assert_eq!(RunStatus::aggregate([Cancelled, Failed]), Failed);
+    }
+
+    #[test]
+    fn run_status_aggregate_cancelled_beats_success_and_skipped() {
+        use RunStatus::*;
+        assert_eq!(
+            RunStatus::aggregate([Success, Cancelled, Skipped]),
+            Cancelled
+        );
+    }
+
+    #[test]
+    fn run_status_aggregate_success_beats_skipped() {
+        use RunStatus::*;
+        // A matrix where one row ran and others were if=-gated out is green.
+        assert_eq!(RunStatus::aggregate([Skipped, Success, Skipped]), Success);
+    }
+
+    #[test]
+    fn run_status_aggregate_all_skipped_is_skipped() {
+        use RunStatus::*;
+        assert_eq!(RunStatus::aggregate([Skipped, Skipped]), Skipped);
+        // Empty (vacuous) also reports Skipped, mirroring JobResult::aggregate.
+        assert_eq!(RunStatus::aggregate(std::iter::empty()), Skipped);
+    }
+
+    #[test]
+    fn run_status_aggregate_ignores_non_terminal() {
+        use RunStatus::*;
+        // Queued/Running contribute nothing; a lone Success still wins.
+        assert_eq!(RunStatus::aggregate([Queued, Running, Success]), Success);
+    }
+
     fn build_image_step(name: &str) -> QedStep {
         QedStep {
+            background: false,
+            background_until: None,
+            wait_for: None,
             name: name.into(),
             argv: Vec::new(),
             cwd: None,
@@ -1040,12 +1786,22 @@ mod tests {
             load: false,
             sub_pipeline: None,
             gha_workflow: None,
+            import: None,
+            matrix: None,
+            enabled: true,
+            activation: StepActivation::Active,
+            if_cond: None,
+            platform: None,
+            toolchain: None,
             outputs: Vec::new(),
         }
     }
 
     fn package_native_tarball_step(name: &str) -> QedStep {
         QedStep {
+            background: false,
+            background_until: None,
+            wait_for: None,
             name: name.into(),
             argv: Vec::new(),
             cwd: None,
@@ -1055,22 +1811,32 @@ mod tests {
             produces: Vec::new(),
             runtime: None,
             kind: StepKind::PackageNativeTarball,
-            image: Some("yah-warden".into()),
+            image: Some("yah-yubaba".into()),
             tag: None,
             push: false,
-            binary_path: Some("target/x86_64-unknown-linux-musl/release/warden".into()),
+            binary_path: Some("target/x86_64-unknown-linux-musl/release/yubaba".into()),
             triple: Some("x86_64-unknown-linux-musl".into()),
             package: None,
             context: None,
             load: false,
             sub_pipeline: None,
             gha_workflow: None,
+            import: None,
+            matrix: None,
+            enabled: true,
+            activation: StepActivation::Active,
+            if_cond: None,
+            platform: None,
+            toolchain: None,
             outputs: Vec::new(),
         }
     }
 
     fn musl_static_preflight_step(name: &str) -> QedStep {
         QedStep {
+            background: false,
+            background_until: None,
+            wait_for: None,
             name: name.into(),
             argv: Vec::new(),
             cwd: None,
@@ -1085,11 +1851,18 @@ mod tests {
             push: false,
             binary_path: None,
             triple: None,
-            package: Some("warden".into()),
+            package: Some("yubaba".into()),
             context: None,
             load: false,
             sub_pipeline: None,
             gha_workflow: None,
+            import: None,
+            matrix: None,
+            enabled: true,
+            activation: StepActivation::Active,
+            if_cond: None,
+            platform: None,
+            toolchain: None,
             outputs: Vec::new(),
         }
     }
@@ -1250,6 +2023,9 @@ mod tests {
 
     fn sign_native_tarball_step(name: &str) -> QedStep {
         QedStep {
+            background: false,
+            background_until: None,
+            wait_for: None,
             name: name.into(),
             argv: Vec::new(),
             cwd: None,
@@ -1259,7 +2035,7 @@ mod tests {
             produces: Vec::new(),
             runtime: None,
             kind: StepKind::SignNativeTarball,
-            image: Some("yah-warden".into()),
+            image: Some("yah-yubaba".into()),
             tag: None,
             push: false,
             binary_path: None,
@@ -1269,6 +2045,13 @@ mod tests {
             load: false,
             sub_pipeline: None,
             gha_workflow: None,
+            import: None,
+            matrix: None,
+            enabled: true,
+            activation: StepActivation::Active,
+            if_cond: None,
+            platform: None,
+            toolchain: None,
             outputs: Vec::new(),
         }
     }
@@ -1332,6 +2115,34 @@ mod tests {
     }
 
     #[test]
+    fn step_platform_block_parses_from_toml() {
+        // R531-F2: a step's `[platform]` inline table deserializes into the
+        // structured PlatformSpec; omitting it leaves the field None.
+        let toml_src = r#"
+            name = "p"
+            label = "p"
+            [[steps]]
+            name = "build-musl"
+            argv = ["cargo", "build"]
+            platform = { target = "x86_64-unknown-linux-musl", container_platform = "linux/amd64" }
+            [[steps]]
+            name = "check"
+            argv = ["cargo", "check"]
+        "#;
+        let pipeline: Pipeline = toml::from_str(toml_src).unwrap();
+        let spec = pipeline.steps[0]
+            .platform
+            .as_ref()
+            .expect("platform parsed");
+        assert_eq!(spec.target.as_deref(), Some("x86_64-unknown-linux-musl"));
+        assert_eq!(spec.container_platform.as_deref(), Some("linux/amd64"));
+        assert!(
+            pipeline.steps[1].platform.is_none(),
+            "a step without a [platform] block leaves the field None",
+        );
+    }
+
+    #[test]
     fn placement_defaults_to_anywhere_when_omitted() {
         let toml_src = r#"
             name = "p"
@@ -1366,18 +2177,56 @@ mod tests {
     fn apply_params_leaves_unknown_placeholders_untouched() {
         let mut p = one_step(vec!["{{missing}}"], &[]);
         p.apply_params(&HashMap::new());
-        assert_eq!(p.steps[0].argv, vec!["{{missing}}"], "empty params is a no-op");
+        assert_eq!(
+            p.steps[0].argv,
+            vec!["{{missing}}"],
+            "empty params is a no-op"
+        );
 
         let mut params = HashMap::new();
         params.insert("other".to_string(), "v".to_string());
         p.apply_params(&params);
-        assert_eq!(p.steps[0].argv, vec!["{{missing}}"], "unknown key left as-is");
+        assert_eq!(
+            p.steps[0].argv,
+            vec!["{{missing}}"],
+            "unknown key left as-is"
+        );
+    }
+
+    // ----- background sidecar validation (R513-F2) ----------------------------
+
+    #[test]
+    fn background_on_subprocess_validates_and_reports_is_background() {
+        let mut s = sub_pipeline_step("srv", SubPipelineRef::Builtin("x".into()));
+        s.kind = StepKind::Subprocess;
+        s.argv = vec!["yah-camp".into()];
+        s.background = true;
+        assert!(s.is_background());
+        assert!(s.validate().is_ok(), "background subprocess step is valid");
+
+        s.background = false;
+        s.background_until = Some("test".into());
+        assert!(s.is_background(), "background_until implies background");
+        assert!(s.validate().is_ok());
+    }
+
+    #[test]
+    fn background_on_non_subprocess_is_rejected() {
+        let mut s = sub_pipeline_step("srv", SubPipelineRef::Builtin("x".into()));
+        s.background = true;
+        assert!(matches!(
+            s.validate(),
+            Err(StepValidationError::BackgroundRequiresSubprocess(_))
+        ));
     }
 
     // ----- SubPipeline (W201-F1) ----------------------------------------------
 
     fn sub_pipeline_step(name: &str, target: SubPipelineRef) -> QedStep {
         QedStep {
+            background: false,
+            background_until: None,
+            wait_for: None,
             name: name.into(),
             argv: Vec::new(),
             cwd: None,
@@ -1399,9 +2248,17 @@ mod tests {
                 target,
                 params: HashMap::new(),
                 propagate: SubPipelineCollect::default(),
+                opaque: false,
             }),
             outputs: Vec::new(),
             gha_workflow: None,
+            import: None,
+            matrix: None,
+            enabled: true,
+            activation: crate::types::StepActivation::Active,
+            if_cond: None,
+            platform: None,
+            toolchain: None,
         }
     }
 
@@ -1416,7 +2273,13 @@ mod tests {
             triggers: vec![],
             concurrency_key: None,
             placement: Placement::default(),
+            workspace: crate::types::WorkspaceMode::default(),
             wraps: None,
+            matrix: None,
+            toolchain: None,
+            binds: Vec::new(),
+            on_change: Vec::new(),
+            finally: Vec::new(),
         }
     }
 
@@ -1442,7 +2305,9 @@ mod tests {
         step.sub_pipeline = None;
         assert_eq!(
             step.validate(),
-            Err(StepValidationError::SubPipelineMissingConfig("compose".into()))
+            Err(StepValidationError::SubPipelineMissingConfig(
+                "compose".into()
+            ))
         );
     }
 
@@ -1484,6 +2349,286 @@ mod tests {
         );
     }
 
+    // ── R533-F1 (W224): import step ────────────────────────────────────────
+
+    fn import_step(name: &str) -> QedStep {
+        let mut step = gha_workflow_step(name);
+        step.kind = StepKind::Import;
+        step.gha_workflow = None;
+        step.import = Some(ImportConfig {
+            source: std::path::PathBuf::from(".github/workflows/release.yml"),
+            hash: Some("af1349b9f5f9a1a6a0404dea36dcc949".into()),
+            materialize: false,
+            event: Some("push".into()),
+            inputs: HashMap::new(),
+        });
+        step
+    }
+
+    #[test]
+    fn import_step_validates_when_well_formed() {
+        assert!(import_step("release").validate().is_ok());
+    }
+
+    #[test]
+    fn import_step_rejects_argv() {
+        let mut step = import_step("release");
+        step.argv = vec!["echo".into()];
+        assert_eq!(
+            step.validate(),
+            Err(StepValidationError::ImportHasArgv("release".into()))
+        );
+    }
+
+    #[test]
+    fn import_step_rejects_missing_config() {
+        let mut step = import_step("release");
+        step.import = None;
+        assert_eq!(
+            step.validate(),
+            Err(StepValidationError::ImportMissingConfig("release".into()))
+        );
+    }
+
+    #[test]
+    fn import_step_round_trips_through_toml() {
+        // The `[import]` block survives a TOML serialize → deserialize cycle,
+        // including the pinned hash and the default-false materialize toggle.
+        let step = import_step("release");
+        let toml_str = toml::to_string(&step).expect("serialize import step");
+        assert!(toml_str.contains("kind = \"import\""), "{toml_str}");
+        assert!(
+            toml_str.contains("source = \".github/workflows/release.yml\""),
+            "{toml_str}"
+        );
+        let parsed: QedStep = toml::from_str(&toml_str).expect("deserialize import step");
+        assert_eq!(parsed.kind, StepKind::Import);
+        let cfg = parsed.import.expect("import block present");
+        assert_eq!(
+            cfg.source,
+            std::path::PathBuf::from(".github/workflows/release.yml")
+        );
+        assert_eq!(
+            cfg.hash.as_deref(),
+            Some("af1349b9f5f9a1a6a0404dea36dcc949")
+        );
+        assert!(!cfg.materialize, "materialize defaults false (virtual)");
+        assert_eq!(cfg.event.as_deref(), Some("push"));
+    }
+
+    #[test]
+    fn import_block_defaults_materialize_false_and_unpinned() {
+        // A minimal `[import]` with only `source` parses — hash unpinned,
+        // materialize off (virtual-by-default).
+        let toml_str = r#"
+            name = "release"
+            kind = "import"
+            [import]
+            source = ".github/workflows/release.yml"
+        "#;
+        let step: QedStep = toml::from_str(toml_str).expect("parse minimal import");
+        step.validate().expect("minimal import validates");
+        let cfg = step.import.expect("import block");
+        assert_eq!(cfg.hash, None, "unpinned by default");
+        assert!(!cfg.materialize);
+        assert_eq!(cfg.event, None);
+    }
+
+    // ── R513-F3 (W207 Gap #5): wait-for step ───────────────────────────────
+
+    fn wait_for_step(name: &str, cfg: WaitForConfig) -> QedStep {
+        let mut step = gha_workflow_step(name);
+        step.kind = StepKind::WaitFor;
+        step.gha_workflow = None;
+        step.argv = vec![];
+        step.wait_for = Some(cfg);
+        step
+    }
+
+    fn http_wait(url: &str) -> WaitForConfig {
+        WaitForConfig {
+            http: Some(url.into()),
+            tcp: None,
+            expect_status: None,
+            timeout_secs: 30,
+            interval_ms: 500,
+        }
+    }
+
+    #[test]
+    fn wait_for_step_validates_http_and_tcp() {
+        assert!(wait_for_step("gate", http_wait("http://localhost:3000/health"))
+            .validate()
+            .is_ok());
+        let tcp = WaitForConfig {
+            http: None,
+            tcp: Some("127.0.0.1:5432".into()),
+            ..http_wait("ignored")
+        };
+        // Clear the http set by the spread.
+        let mut step = wait_for_step("gate", tcp);
+        step.wait_for.as_mut().unwrap().http = None;
+        assert!(step.validate().is_ok());
+    }
+
+    #[test]
+    fn wait_for_step_rejects_argv() {
+        let mut step = wait_for_step("gate", http_wait("http://localhost/health"));
+        step.argv = vec!["curl".into()];
+        assert_eq!(
+            step.validate(),
+            Err(StepValidationError::WaitForHasArgv("gate".into()))
+        );
+    }
+
+    #[test]
+    fn wait_for_step_rejects_missing_config() {
+        let mut step = wait_for_step("gate", http_wait("http://localhost/health"));
+        step.wait_for = None;
+        assert_eq!(
+            step.validate(),
+            Err(StepValidationError::WaitForMissingConfig("gate".into()))
+        );
+    }
+
+    #[test]
+    fn wait_for_step_rejects_no_target_and_both_targets() {
+        let neither = wait_for_step(
+            "gate",
+            WaitForConfig {
+                http: None,
+                tcp: None,
+                expect_status: None,
+                timeout_secs: 30,
+                interval_ms: 500,
+            },
+        );
+        assert_eq!(
+            neither.validate(),
+            Err(StepValidationError::WaitForNeedsTarget("gate".into()))
+        );
+
+        let both = wait_for_step(
+            "gate",
+            WaitForConfig {
+                http: Some("http://localhost/health".into()),
+                tcp: Some("localhost:80".into()),
+                expect_status: None,
+                timeout_secs: 30,
+                interval_ms: 500,
+            },
+        );
+        assert_eq!(
+            both.validate(),
+            Err(StepValidationError::WaitForAmbiguousTarget("gate".into()))
+        );
+    }
+
+    #[test]
+    fn wait_for_step_rejects_expect_status_on_tcp() {
+        let step = wait_for_step(
+            "gate",
+            WaitForConfig {
+                http: None,
+                tcp: Some("localhost:5432".into()),
+                expect_status: Some(200),
+                timeout_secs: 30,
+                interval_ms: 500,
+            },
+        );
+        assert_eq!(
+            step.validate(),
+            Err(StepValidationError::WaitForStatusNeedsHttp("gate".into()))
+        );
+    }
+
+    #[test]
+    fn wait_for_step_rejects_zero_timeout() {
+        let mut step = wait_for_step("gate", http_wait("http://localhost/health"));
+        step.wait_for.as_mut().unwrap().timeout_secs = 0;
+        assert_eq!(
+            step.validate(),
+            Err(StepValidationError::WaitForZeroTimeout("gate".into()))
+        );
+    }
+
+    #[test]
+    fn wait_for_block_defaults_timeout_and_interval() {
+        // A minimal `[wait_for]` with only `http` parses — timeout/interval
+        // fall back to their defaults (30s / 500ms).
+        let toml_str = r#"
+            name = "wait:ready"
+            kind = "wait-for"
+            [wait_for]
+            http = "http://localhost:3000/health"
+        "#;
+        let step: QedStep = toml::from_str(toml_str).expect("parse minimal wait-for");
+        step.validate().expect("minimal wait-for validates");
+        let cfg = step.wait_for.expect("wait_for block");
+        assert_eq!(cfg.timeout_secs, 30);
+        assert_eq!(cfg.interval_ms, 500);
+        assert_eq!(cfg.expect_status, None);
+    }
+
+    #[test]
+    fn wait_for_step_round_trips_through_toml() {
+        let step = wait_for_step(
+            "wait:ready",
+            WaitForConfig {
+                http: Some("http://localhost:3000/health".into()),
+                tcp: None,
+                expect_status: Some(204),
+                timeout_secs: 45,
+                interval_ms: 250,
+            },
+        );
+        let toml_str = toml::to_string(&step).expect("serialize wait-for step");
+        assert!(toml_str.contains("kind = \"wait-for\""), "{toml_str}");
+        let parsed: QedStep = toml::from_str(&toml_str).expect("deserialize wait-for step");
+        assert_eq!(parsed.kind, StepKind::WaitFor);
+        let cfg = parsed.wait_for.expect("wait_for block present");
+        assert_eq!(cfg.http.as_deref(), Some("http://localhost:3000/health"));
+        assert_eq!(cfg.expect_status, Some(204));
+        assert_eq!(cfg.timeout_secs, 45);
+        assert_eq!(cfg.interval_ms, 250);
+    }
+
+    // ── R513-F4 (W207 Gap #6): finally teardown step validation ────────────
+
+    /// Build a plain subprocess step from the populated `gha_workflow_step`
+    /// literal so new QedStep fields don't need threading here.
+    fn subprocess_step(name: &str) -> QedStep {
+        let mut step = gha_workflow_step(name);
+        step.kind = StepKind::Subprocess;
+        step.gha_workflow = None;
+        step.argv = vec!["echo".into(), "bye".into()];
+        step
+    }
+
+    #[test]
+    fn finally_accepts_subprocess() {
+        assert!(subprocess_step("teardown").validate_finally().is_ok());
+    }
+
+    #[test]
+    fn finally_rejects_non_subprocess_kind() {
+        let wf = wait_for_step("gate", http_wait("http://localhost/health"));
+        assert_eq!(
+            wf.validate_finally(),
+            Err(StepValidationError::FinallyRequiresSubprocess("gate".into()))
+        );
+    }
+
+    #[test]
+    fn finally_rejects_background_subprocess() {
+        let mut bg = subprocess_step("bg");
+        bg.background = true;
+        assert_eq!(
+            bg.validate_finally(),
+            Err(StepValidationError::FinallyRequiresSubprocess("bg".into()))
+        );
+    }
+
     #[test]
     fn sub_pipeline_step_rejects_direct_produces() {
         let mut step = sub_pipeline_step("compose", SubPipelineRef::Builtin("x".into()));
@@ -1494,7 +2639,9 @@ mod tests {
         }];
         assert_eq!(
             step.validate(),
-            Err(StepValidationError::SubPipelineHasProduces("compose".into()))
+            Err(StepValidationError::SubPipelineHasProduces(
+                "compose".into()
+            ))
         );
     }
 
@@ -1520,11 +2667,17 @@ mod tests {
         let leaf = pipeline_with("child-b", vec![]);
         let mid = pipeline_with(
             "child-a",
-            vec![sub_pipeline_step("descend", SubPipelineRef::Builtin("child-b".into()))],
+            vec![sub_pipeline_step(
+                "descend",
+                SubPipelineRef::Builtin("child-b".into()),
+            )],
         );
         let root = pipeline_with(
             "root",
-            vec![sub_pipeline_step("descend", SubPipelineRef::Builtin("child-a".into()))],
+            vec![sub_pipeline_step(
+                "descend",
+                SubPipelineRef::Builtin("child-a".into()),
+            )],
         );
         let mut map = HashMap::new();
         map.insert("builtin:child-a".to_string(), mid);
@@ -1539,7 +2692,10 @@ mod tests {
         // walker, but a likely real-world mistake)
         let mut root = pipeline_with(
             "self",
-            vec![sub_pipeline_step("loop", SubPipelineRef::Builtin("self".into()))],
+            vec![sub_pipeline_step(
+                "loop",
+                SubPipelineRef::Builtin("self".into()),
+            )],
         );
         // child resolves back to root with same ref token => cycle.
         let mut map = HashMap::new();
@@ -1551,7 +2707,10 @@ mod tests {
         let err = validate_sub_pipeline_graph(&root, &resolver).unwrap_err();
         match err {
             SubPipelineError::Cycle { chain } => {
-                assert!(chain.contains("builtin:self"), "cycle chain reports the ref: {chain}");
+                assert!(
+                    chain.contains("builtin:self"),
+                    "cycle chain reports the ref: {chain}"
+                );
             }
             other => panic!("expected Cycle, got {other:?}"),
         }
@@ -1562,15 +2721,24 @@ mod tests {
         // root -> a -> b -> a
         let a_loops_back = pipeline_with(
             "a",
-            vec![sub_pipeline_step("descend", SubPipelineRef::Builtin("b".into()))],
+            vec![sub_pipeline_step(
+                "descend",
+                SubPipelineRef::Builtin("b".into()),
+            )],
         );
         let b_back_to_a = pipeline_with(
             "b",
-            vec![sub_pipeline_step("loop", SubPipelineRef::Builtin("a".into()))],
+            vec![sub_pipeline_step(
+                "loop",
+                SubPipelineRef::Builtin("a".into()),
+            )],
         );
         let root = pipeline_with(
             "root",
-            vec![sub_pipeline_step("enter", SubPipelineRef::Builtin("a".into()))],
+            vec![sub_pipeline_step(
+                "enter",
+                SubPipelineRef::Builtin("a".into()),
+            )],
         );
         let mut map = HashMap::new();
         map.insert("builtin:a".to_string(), a_loops_back);
@@ -1605,12 +2773,21 @@ mod tests {
         }
         let root = pipeline_with(
             "root",
-            vec![sub_pipeline_step("enter", SubPipelineRef::Builtin("d1".into()))],
+            vec![sub_pipeline_step(
+                "enter",
+                SubPipelineRef::Builtin("d1".into()),
+            )],
         );
         let resolver = MapResolver(map);
         let err = validate_sub_pipeline_graph(&root, &resolver).unwrap_err();
         assert!(
-            matches!(err, SubPipelineError::MaxDepthExceeded { max: MAX_SUB_PIPELINE_DEPTH, .. }),
+            matches!(
+                err,
+                SubPipelineError::MaxDepthExceeded {
+                    max: MAX_SUB_PIPELINE_DEPTH,
+                    ..
+                }
+            ),
             "expected MaxDepthExceeded, got {err:?}"
         );
     }
@@ -1621,7 +2798,10 @@ mod tests {
         // surfaces the resolution failure later.
         let root = pipeline_with(
             "root",
-            vec![sub_pipeline_step("enter", SubPipelineRef::Builtin("nonexistent".into()))],
+            vec![sub_pipeline_step(
+                "enter",
+                SubPipelineRef::Builtin("nonexistent".into()),
+            )],
         );
         let resolver = MapResolver(HashMap::new());
         assert!(validate_sub_pipeline_graph(&root, &resolver).is_ok());

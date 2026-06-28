@@ -17,7 +17,7 @@
 #   ├── amd64/{almanac-serve, issue-tracker}
 #   └── arm64/{almanac-serve, issue-tracker}
 #
-# Runtime env knobs (set defaults here; warden's MesofactDevSpec overrides at run time):
+# Runtime env knobs (set defaults here; yubaba's MesofactDevSpec overrides at run time):
 #   ALMANAC_PORT             default 4323
 #   ALMANAC_DIR              feed TOML dir (bind-mount /etc/almanac read-only)
 #   ALMANAC_PROJECT_ROOT     artifact output root (bind-mount /data)
@@ -28,7 +28,7 @@
 #   ISSUE_TRACKER_DB_PATH    SQLite path (default /data/issues.db)
 #   ISSUES_JSON_PATH         issues.json output (default /data/issues.json)
 #
-# Required bind mounts (warden's MesofactDevSpec sets these):
+# Required bind mounts (yubaba's MesofactDevSpec sets these):
 #   -v <data_dir>:/data             issues SQLite + almanac feed artifacts
 #   -v <almanac_config>:/etc/almanac:ro  feed TOML files
 #

@@ -15,13 +15,18 @@
 # pipeline (R381-T7). Per-arch digests are injected into the yah binary at
 # compile time via YAH_RUST_BUN_DIGEST.
 #
-# Supply-chain: Sigstore keyless OIDC (cosign). Warden's R090-F4
+# Supply-chain: Sigstore keyless OIDC (cosign). Yubaba's R090-F4
 # environment validator verifies the signature before pulling. Inherits
 # the same trust chain forge-minimal had.
 #
 # Catalog spec: crates/yah/qed/images/catalog.toml + W148.
 
-FROM ghcr.io/yah-ai/yah-rust:latest
+# Base defaults to :latest for standalone/local builds; the release pipeline
+# overrides RUST_BASE to the just-built :smoke-<sha> tag so rust-bun builds
+# against the exact rust image from the same run — no dependency on a prior
+# release's :latest (which doesn't exist on a first/fresh-registry release).
+ARG RUST_BASE=ghcr.io/yah-ai/yah-rust:latest
+FROM ${RUST_BASE}
 
 ARG DEBIAN_FRONTEND=noninteractive
 

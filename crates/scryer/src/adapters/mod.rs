@@ -9,10 +9,10 @@
 //!
 //! F2 ships two adapters:
 //!
-//! - [`containerd_logs`] — pulls stdout/stderr from any container warden
+//! - [`containerd_logs`] — pulls stdout/stderr from any container yubaba
 //!   deployed; the `LogSource` trait is the seam so tests don't need a real
 //!   containerd.
-//! - [`warden_rpc`] — receives structured events emitted by warden itself
+//! - [`warden_rpc`] — receives structured events emitted by yubaba itself
 //!   (workload.deploy, mesh.peer_join, raft.term_change, …).
 
 use crate::service::{Scryer, ScryerError};
@@ -239,5 +239,5 @@ pub(crate) fn synth_event(
 
 #[allow(dead_code)]
 pub(crate) fn warden_local_scope() -> EventScope {
-    EventScope::Service(MeshIdent("warden.local".to_string()))
+    EventScope::Service(MeshIdent("yubaba.local".to_string()))
 }

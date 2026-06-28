@@ -1,7 +1,7 @@
 //! Native-tarball packaging (R407-T2, W154).
 //!
 //! Emits a `.tar.gz` containing a static musl Rust binary plus a workload-spec
-//! manifest. Constable consumes the tarball at deploy time and directly
+//! manifest. Kamaji consumes the tarball at deploy time and directly
 //! fork+exec+cgroup+pidfd-supervises the binary — no systemd Portable Service,
 //! no per-workload `.service` unit. The tarball doubles as the deploy artifact
 //! and the manifest-of-record describing how to launch the workload.
@@ -28,11 +28,11 @@ use serde::{Deserialize, Serialize};
 
 /// The `manifest.toml` written into every native-tarball.
 ///
-/// Forward-compatible — Constable readers should accept additive fields. Today
+/// Forward-compatible — Kamaji readers should accept additive fields. Today
 /// this carries the bare minimum needed to launch a workload: the binary's
 /// in-tarball path, the target triple it was built for, and the env vars the
 /// catalog entry declared. Capabilities, drain hooks, and probe shape land
-/// alongside the Constable workload-spec proper.
+/// alongside the Kamaji workload-spec proper.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeTarballManifest {
     /// Catalog entry name (matches `[image].name` in the source TOML).
@@ -44,12 +44,12 @@ pub struct NativeTarballManifest {
     /// Target-triple shorthand the binary was compiled for, e.g.
     /// `x86_64-unknown-linux-musl`.
     pub triple: String,
-    /// Path to the executable *inside the tarball* (e.g. `bin/warden`).
+    /// Path to the executable *inside the tarball* (e.g. `bin/yubaba`).
     pub binary: String,
     /// Short human description (mirrors the catalog entry's `description`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    /// Env vars the catalog entry declared. Constable applies these to the
+    /// Env vars the catalog entry declared. Kamaji applies these to the
     /// child before exec.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
@@ -69,9 +69,8 @@ pub fn pack_native_tarball(
     if let Some(parent) = output_path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let manifest_toml = toml::to_string_pretty(manifest).map_err(|e| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, e)
-    })?;
+    let manifest_toml = toml::to_string_pretty(manifest)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
 
     let file = fs::File::create(output_path)?;
     let gz = GzEncoder::new(file, Compression::default());
@@ -146,7 +145,7 @@ pub fn native_tarball_output_path(camp_root: &Path, image_name: &str, triple: &s
 // via [`crate::runner::PipelineRunner::with_signer`]. The default in every
 // constructor is [`LoggingSigner`] — local `yah qed run` flows write
 // placeholder bytes and log a warning rather than fail when cosign isn't on
-// PATH. A real release pipeline (GHA or warden-run) wires [`CosignSigner`]
+// PATH. A real release pipeline (GHA or yubaba-run) wires [`CosignSigner`]
 // explicitly so an unsigned tarball never silently ships.
 
 /// On-disk paths emitted by a successful [`SigstoreSigner::sign_blob`] call.
@@ -190,7 +189,9 @@ pub struct CosignSigner {
 
 impl Default for CosignSigner {
     fn default() -> Self {
-        Self { cosign_bin: PathBuf::from("cosign") }
+        Self {
+            cosign_bin: PathBuf::from("cosign"),
+        }
     }
 }
 
@@ -204,9 +205,12 @@ impl SigstoreSigner for CosignSigner {
         let status = tokio::process::Command::new(&self.cosign_bin)
             .arg("sign-blob")
             .arg("--yes")
-            .arg("--output-signature").arg(&sig)
-            .arg("--output-certificate").arg(&crt)
-            .arg("--bundle").arg(&bundle)
+            .arg("--output-signature")
+            .arg(&sig)
+            .arg("--output-certificate")
+            .arg(&crt)
+            .arg("--bundle")
+            .arg(&bundle)
             .arg(blob_path)
             .status()
             .await?;
@@ -215,7 +219,8 @@ impl SigstoreSigner for CosignSigner {
                 std::io::ErrorKind::Other,
                 format!(
                     "cosign sign-blob exited with status {} (blob: {})",
-                    status, blob_path.display(),
+                    status,
+                    blob_path.display(),
                 ),
             ));
         }
@@ -245,9 +250,18 @@ impl SigstoreSigner for LoggingSigner {
         let sig = append_suffix(blob_path, ".sig");
         let crt = append_suffix(blob_path, ".crt");
         let bundle = append_suffix(blob_path, ".bundle");
-        fs::write(&sig, b"# yah logging-signer: placeholder signature (NOT a real cosign signature)\n")?;
-        fs::write(&crt, b"# yah logging-signer: placeholder certificate (NOT a real cosign cert)\n")?;
-        fs::write(&bundle, b"{\"_comment\":\"yah logging-signer placeholder bundle\"}\n")?;
+        fs::write(
+            &sig,
+            b"# yah logging-signer: placeholder signature (NOT a real cosign signature)\n",
+        )?;
+        fs::write(
+            &crt,
+            b"# yah logging-signer: placeholder certificate (NOT a real cosign cert)\n",
+        )?;
+        fs::write(
+            &bundle,
+            b"{\"_comment\":\"yah logging-signer placeholder bundle\"}\n",
+        )?;
         tracing::warn!(
             blob = %blob_path.display(),
             "qed sign-native-tarball: LoggingSigner emitted placeholder \
@@ -277,11 +291,11 @@ mod tests {
 
     fn sample_manifest() -> NativeTarballManifest {
         NativeTarballManifest {
-            name: "yah-warden".into(),
+            name: "yah-yubaba".into(),
             version: "0.8.6".into(),
             triple: "x86_64-unknown-linux-musl".into(),
-            binary: "bin/warden".into(),
-            description: Some("Native musl-static warden".into()),
+            binary: "bin/yubaba".into(),
+            description: Some("Native musl-static yubaba".into()),
             env: BTreeMap::from([("RUST_LOG".into(), "info".into())]),
         }
     }
@@ -306,8 +320,10 @@ mod tests {
     #[test]
     fn pack_writes_binary_and_manifest_with_expected_modes() {
         let dir = TempDir::new().unwrap();
-        let bin = write_dummy_binary(dir.path(), "warden", b"\x7fELF-fake-musl-binary");
-        let out = dir.path().join("out/yah-warden-x86_64-unknown-linux-musl.tar.gz");
+        let bin = write_dummy_binary(dir.path(), "yubaba", b"\x7fELF-fake-musl-binary");
+        let out = dir
+            .path()
+            .join("out/yah-yubaba-x86_64-unknown-linux-musl.tar.gz");
 
         let manifest = sample_manifest();
         pack_native_tarball(&bin, &manifest, &out).unwrap();
@@ -315,7 +331,7 @@ mod tests {
         assert!(out.is_file(), "tarball materialised at {}", out.display());
         let entries = list_tar_entries(&out);
         assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].0, "bin/warden");
+        assert_eq!(entries[0].0, "bin/yubaba");
         assert_eq!(entries[0].1, b"\x7fELF-fake-musl-binary");
         assert_eq!(entries[0].2, 0o755);
         assert_eq!(entries[1].0, "manifest.toml");
@@ -325,8 +341,8 @@ mod tests {
     #[test]
     fn pack_manifest_roundtrips_through_toml() {
         let dir = TempDir::new().unwrap();
-        let bin = write_dummy_binary(dir.path(), "warden", b"x");
-        let out = dir.path().join("warden.tar.gz");
+        let bin = write_dummy_binary(dir.path(), "yubaba", b"x");
+        let out = dir.path().join("yubaba.tar.gz");
         let manifest = sample_manifest();
         pack_native_tarball(&bin, &manifest, &out).unwrap();
 
@@ -336,16 +352,15 @@ mod tests {
             .find(|(p, _, _)| p == "manifest.toml")
             .expect("manifest.toml present");
         let text = std::str::from_utf8(&manifest_entry.1).unwrap();
-        let parsed: NativeTarballManifest =
-            toml::from_str(text).expect("manifest.toml parses");
+        let parsed: NativeTarballManifest = toml::from_str(text).expect("manifest.toml parses");
         assert_eq!(parsed, manifest);
     }
 
     #[test]
     fn pack_creates_missing_parent_dirs() {
         let dir = TempDir::new().unwrap();
-        let bin = write_dummy_binary(dir.path(), "warden", b"x");
-        let out = dir.path().join("deeply/nested/path/warden.tar.gz");
+        let bin = write_dummy_binary(dir.path(), "yubaba", b"x");
+        let out = dir.path().join("deeply/nested/path/yubaba.tar.gz");
         pack_native_tarball(&bin, &sample_manifest(), &out).unwrap();
         assert!(out.is_file());
     }
@@ -364,13 +379,13 @@ mod tests {
     #[test]
     fn tarball_stem_replaces_unsafe_chars() {
         assert_eq!(
-            tarball_stem("yah-warden", "x86_64-unknown-linux-musl"),
-            "yah-warden-x86_64-unknown-linux-musl",
+            tarball_stem("yah-yubaba", "x86_64-unknown-linux-musl"),
+            "yah-yubaba-x86_64-unknown-linux-musl",
         );
         // `/` and `:` are not in the [A-Za-z0-9_.-] allowlist — both rewrite.
         assert_eq!(
-            tarball_stem("ghcr.io/yah-ai/yah-warden", "linux:musl"),
-            "ghcr.io_yah-ai_yah-warden-linux_musl",
+            tarball_stem("ghcr.io/yah-ai/yah-yubaba", "linux:musl"),
+            "ghcr.io_yah-ai_yah-yubaba-linux_musl",
         );
     }
 
@@ -380,17 +395,19 @@ mod tests {
         // this helper is the single source of truth, so packaging (T2) and
         // signing (T5) never drift.
         let camp = Path::new("/camp");
-        let out = native_tarball_output_path(camp, "yah-warden", "x86_64-unknown-linux-musl");
+        let out = native_tarball_output_path(camp, "yah-yubaba", "x86_64-unknown-linux-musl");
         assert_eq!(
             out,
-            Path::new("/camp/.yah/cache/native/yah-warden-x86_64-unknown-linux-musl.tar.gz"),
+            Path::new("/camp/.yah/cache/native/yah-yubaba-x86_64-unknown-linux-musl.tar.gz"),
         );
     }
 
     #[tokio::test]
     async fn logging_signer_writes_placeholder_sig_crt_bundle_next_to_blob() {
         let dir = TempDir::new().unwrap();
-        let blob = dir.path().join("yah-warden-x86_64-unknown-linux-musl.tar.gz");
+        let blob = dir
+            .path()
+            .join("yah-yubaba-x86_64-unknown-linux-musl.tar.gz");
         fs::write(&blob, b"<fake tarball bytes>").unwrap();
 
         let signer = LoggingSigner;

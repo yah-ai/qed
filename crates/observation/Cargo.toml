@@ -6,7 +6,6 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Shared event types for the scryer observation substrate (hoisted from task-runs)"
-publish = false
 
 [lib]
 name = "observation"
@@ -16,4 +15,4 @@ path = "src/lib.rs"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 uuid = { version = "1", features = ["v4", "serde"] }
-workload-spec = { version = "0.8.11" }
+workload-spec = { package = "yah-workload-spec", version = "0.8.16" }

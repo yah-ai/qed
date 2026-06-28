@@ -252,7 +252,7 @@ impl Scryer {
     /// all peers matching `rule`, merging results by (offset_ms, seq).
     ///
     /// Peer failures are swallowed — federation is best-effort (arch doc
-    /// §Federation across machines).  ACL gating happens at the warden gRPC
+    /// §Federation across machines).  ACL gating happens at the yubaba gRPC
     /// entry point before this method is called; see [`federation::FederationAcl`].
     pub async fn federated_events(
         &self,
@@ -482,6 +482,7 @@ mod tests {
             initiator: Initiator::Human { camp: "test".to_string() },
             beholder_status: None,
             pinned: false,
+            origin: None,
         };
         task_store.insert_run(&meta).unwrap();
         for i in 0u32..5 {

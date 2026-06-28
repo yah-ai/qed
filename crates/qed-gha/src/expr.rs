@@ -644,11 +644,31 @@ fn compare(op: BinOp, l: &Value, r: &Value) -> bool {
     }
 }
 
+/// GHA numeric coercion for cross-type `==`/`!=` (the rule GHA applies when
+/// the two operand types differ): `null`→0, `false`→0, `true`→1, `""`→0,
+/// numeric strings → their value, and any other string → `None` (NaN, which
+/// never compares equal). Numbers pass through.
+fn gha_to_number(v: &Value) -> Option<f64> {
+    match v {
+        Value::Null => Some(0.0),
+        Value::Bool(b) => Some(if *b { 1.0 } else { 0.0 }),
+        Value::Number(n) => Some(*n),
+        Value::String(s) if s.is_empty() => Some(0.0),
+        Value::String(s) => s.parse::<f64>().ok(),
+        Value::Array(_) | Value::Object(_) => None,
+    }
+}
+
 fn compare_kinds(l: &Value, r: &Value) -> (bool, Option<std::cmp::Ordering>) {
     use Value::*;
     match (l, r) {
         (Null, Null) => (true, Some(std::cmp::Ordering::Equal)),
-        (Null, _) | (_, Null) => (false, None),
+        // GHA coerces across mismatched types to a number for ==/!=. `null`
+        // and `""` both coerce to 0, so `null == ''` is true (and the common
+        // `env.UNSET != ''` gate is therefore false → skip, not run). Any
+        // value that coerces to a non-zero number (or fails to parse → NaN)
+        // differs from null. Ordering against null stays undefined.
+        (Null, other) | (other, Null) => (gha_to_number(other) == Some(0.0), None),
         (Bool(a), Bool(b)) => (a == b, Some(a.cmp(b))),
         (Number(a), Number(b)) => (a == b, a.partial_cmp(b)),
         (String(a), String(b)) => (a == b, Some(a.cmp(b))),
@@ -1242,6 +1262,24 @@ mod tests {
         assert!(ev("github.event_name == 'push'", &c).is_truthy());
         assert!(!ev("github.event_name == 'workflow_dispatch'", &c).is_truthy());
         assert!(ev("github.event_name != 'workflow_dispatch'", &c).is_truthy());
+    }
+
+    #[test]
+    fn null_compares_to_empty_string_as_zero() {
+        // GHA coerces mismatched types to number: null→0, ""→0, so an unset
+        // context value (Null) is `== ''`. This is the `env.UNSET != ''` gate
+        // (e.g. publish-only-on-tag): unset must skip, not run. (R506-F2)
+        let c = ctx();
+        assert_eq!(ev("env.RELEASE_TAG", &c), Value::Null);
+        assert!(ev("env.RELEASE_TAG == ''", &c).is_truthy());
+        assert!(!ev("env.RELEASE_TAG != ''", &c).is_truthy());
+        // A set, non-empty value differs from '' → the gate runs.
+        let mut c2 = ctx();
+        c2.env = obj([("RELEASE_TAG", s("v1.2.3"))]);
+        assert!(ev("env.RELEASE_TAG != ''", &c2).is_truthy());
+        // null also coerces equal to 0 and false.
+        assert!(ev("env.RELEASE_TAG == 0", &c).is_truthy());
+        assert!(ev("env.RELEASE_TAG == false", &c).is_truthy());
     }
 
     #[test]

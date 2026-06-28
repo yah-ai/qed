@@ -1,12 +1,12 @@
-//! `adapter::warden_rpc` — receives structured events emitted by warden.
+//! `adapter::warden_rpc` — receives structured events emitted by yubaba.
 //!
-//! Warden has the structured information for its own actions
+//! Yubaba has the structured information for its own actions
 //! (`workload.deploy`, `mesh.peer_join`, `cloudflared.register`,
 //! `raft.term_change`, …) — re-parsing its logs would lose that. The arch doc
 //! commits scryer to plumb these directly via an in-process channel (when
 //! colocated) or a Unix socket (when split). F2 ships the in-process variant.
 //!
-//! All events from this adapter are scoped to `MeshIdent("warden.local")`.
+//! All events from this adapter are scoped to `MeshIdent("yubaba.local")`.
 
 use crate::adapters::{synth_event, Adapter, AdapterError};
 use crate::service::Scryer;
@@ -21,10 +21,10 @@ use workload_spec::MeshIdent;
 
 // ─── WardenEvent ──────────────────────────────────────────────────────────────
 
-/// Discriminated union of warden's first-party emissions.
+/// Discriminated union of yubaba's first-party emissions.
 ///
 /// Held intentionally narrow at F2 — covers the four listed in the arch doc.
-/// Adding a variant here is the supported way to extend warden's coverage in
+/// Adding a variant here is the supported way to extend yubaba's coverage in
 /// scryer rather than emitting unstructured logs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -51,10 +51,10 @@ pub enum WardenEvent {
 impl WardenEvent {
     pub fn target(&self) -> &'static str {
         match self {
-            WardenEvent::WorkloadDeploy { .. } => "warden.workload.deploy",
-            WardenEvent::MeshPeerJoin { .. } => "warden.mesh.peer_join",
-            WardenEvent::CloudflaredRegister { .. } => "warden.cloudflared.register",
-            WardenEvent::RaftTermChange { .. } => "warden.raft.term_change",
+            WardenEvent::WorkloadDeploy { .. } => "yubaba.workload.deploy",
+            WardenEvent::MeshPeerJoin { .. } => "yubaba.mesh.peer_join",
+            WardenEvent::CloudflaredRegister { .. } => "yubaba.cloudflared.register",
+            WardenEvent::RaftTermChange { .. } => "yubaba.raft.term_change",
         }
     }
 
@@ -82,16 +82,16 @@ impl WardenEvent {
 
 /// Adapter that drains a `mpsc::Receiver<WardenEvent>` into scryer.
 ///
-/// Warden constructs the channel and hands the receiver to scryer at startup;
-/// the sender side stays inside warden's RPC dispatch. When the channel
-/// closes (warden shutting down), the adapter exits with `Ok(())` so the
+/// Yubaba constructs the channel and hands the receiver to scryer at startup;
+/// the sender side stays inside yubaba's RPC dispatch. When the channel
+/// closes (yubaba shutting down), the adapter exits with `Ok(())` so the
 /// supervisor stops cleanly.
 pub struct WardenRpcAdapter {
     scryer: Arc<Scryer>,
     rx: Option<mpsc::Receiver<WardenEvent>>,
     started_at: Instant,
     seq: u32,
-    /// Override for the scope identity. Defaults to `warden.local`.
+    /// Override for the scope identity. Defaults to `yubaba.local`.
     ident: MeshIdent,
 }
 
@@ -102,7 +102,7 @@ impl WardenRpcAdapter {
             rx: Some(rx),
             started_at: Instant::now(),
             seq: 0,
-            ident: MeshIdent("warden.local".to_string()),
+            ident: MeshIdent("yubaba.local".to_string()),
         }
     }
 
@@ -142,7 +142,7 @@ impl Adapter for WardenRpcAdapter {
             self.scryer.push(scope.clone(), event)?;
         }
 
-        // Sender dropped — warden is going away. Clean exit.
+        // Sender dropped — yubaba is going away. Clean exit.
         Ok(())
     }
 }
@@ -189,12 +189,12 @@ mod tests {
         assert!(result.is_ok(), "clean shutdown expected, got {:?}", result);
 
         scryer.flush_ring().unwrap();
-        let scope = EventScope::Service(MeshIdent("warden.local".into()));
+        let scope = EventScope::Service(MeshIdent("yubaba.local".into()));
         let events = scryer.events(&scope, &EventFilter::default()).unwrap();
         assert_eq!(events.len(), 3);
-        assert_eq!(events[0].target, "warden.workload.deploy");
-        assert_eq!(events[1].target, "warden.mesh.peer_join");
-        assert_eq!(events[2].target, "warden.raft.term_change");
+        assert_eq!(events[0].target, "yubaba.workload.deploy");
+        assert_eq!(events[1].target, "yubaba.mesh.peer_join");
+        assert_eq!(events[2].target, "yubaba.raft.term_change");
         // fields round-trip the original WardenEvent shape.
         assert_eq!(events[0].fields["workload"], "api");
         assert_eq!(events[2].fields["term"], 7);

@@ -1,0 +1,55 @@
+# noisetable's draft release.apple pipeline — exercise for R505 (W208 pillar 1,
+# native matrix expansion). The verify-of-record: `qed plan` against this file
+# prints the expected 7 expanded rows.
+#
+#   5 targets × 2 archs            = 10 cartesian rows
+#   - exclude ios-* on x86_64       = 8
+#   - exclude macos-native (both)   = 6
+#   + include macos-native/universal = 7
+#
+# R506 (pillar 2, step gating): exercises both knobs.
+#   - `sign-ios-device` carries `status = "stubbed"` so it appears in the
+#     dashboard as a visible-but-skipped placeholder for the unwired iOS
+#     signing flow. Combined with `if = "matrix.target == 'ios-device'"`
+#     so it would only run on the ios-device row anyway once unstubbed.
+#   - `publish-testflight` carries `if = "env.RELEASE_TAG != ''"` so it
+#     only runs on tag builds.
+# Pillar 3 (toolchain pinning) is still pending — when it lands the same
+# draft grows an `[toolchain]` block pinning xcode/rust.
+
+[pipeline]
+name  = "release.apple"
+label = "Apple-family release"
+
+[pipeline.matrix]
+target = ["winit", "macos-native", "ios-sim", "ios-device", "vst"]
+arch   = ["x86_64", "aarch64"]
+exclude = [
+  { target = "ios-sim",      arch = "x86_64" },
+  { target = "ios-device",   arch = "x86_64" },
+  # mac-native is shipped as a universal binary, not two per-arch builds.
+  { target = "macos-native", arch = "x86_64" },
+  { target = "macos-native", arch = "aarch64" },
+]
+include = [
+  { target = "macos-native", arch = "universal" },
+]
+
+[[pipeline.steps]]
+name = "build"
+argv = [
+  "cargo", "build", "--release",
+  "--target", "${{ matrix.arch }}-apple-${{ matrix.target }}",
+  "-p", "${{ matrix.target }}",
+]
+
+[[pipeline.steps]]
+name = "sign-ios-device"
+status = "stubbed"
+if = "matrix.target == 'ios-device'"
+argv = ["echo", "ios-device signing not wired yet"]
+
+[[pipeline.steps]]
+name = "publish-testflight"
+if = "env.RELEASE_TAG != ''"
+argv = ["echo", "would upload to TestFlight on tag ${{ env.RELEASE_TAG }}"]
