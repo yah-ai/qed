@@ -12,7 +12,7 @@ name = "task_runs"
 path = "src/lib.rs"
 
 [dependencies]
-observation = { path = "../observation", version = "0.8.16" }
+observation = { path = "../observation", version = "0.8.20" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "1.0"

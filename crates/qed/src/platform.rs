@@ -55,6 +55,22 @@ pub struct PlatformSpec {
     /// `linux/amd64`. `None` = no container, or the host-platform default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container_platform: Option<String>,
+    /// R590-F4: when `true`, this step's cross-arch target MUST be built on a
+    /// real machine of that arch. QED disables the cross-compile / emulate
+    /// tiers for the step and routes it to an arch-matched build-worker
+    /// (`Offload`) instead. Defaults `false`, so ordinary steps keep the
+    /// cross-first ladder. Set it only for builds that genuinely can't cross or
+    /// emulate here — e.g. `rusty-v8-musl`, a gn/ninja C++ build that OOMs under
+    /// QEMU on an arm64 host. On the TOML side:
+    /// `platform = { target = "x86_64-unknown-linux-musl", native = true }`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub native: bool,
+}
+
+/// `skip_serializing_if` predicate for a `bool` field that defaults to `false`
+/// — so an all-default [`PlatformSpec`] still emits no TOML keys.
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// A step's fully-composed platform triple-set (R531-F2, W222): where it runs
@@ -279,6 +295,44 @@ pub fn resolve(host: &str, target: Option<&str>, container_platform: Option<&str
     Resolution::NativeCross
 }
 
+/// R590-F4 native-placement policy — the entry point the runner resolves each
+/// step through. Placement is *derived from what the step declares*, not an
+/// imperative `--where` flag.
+///
+/// When `native` is `false` this defers entirely to the cross-first decision
+/// table [`resolve`] (the ~99% path: cross-compile beats emulation).
+///
+/// When `native` is `true` the step demands a real machine of its target arch,
+/// so the cross-compile and emulate tiers are *disabled* and the decision
+/// collapses to a binary:
+/// - host-arch (or absent) target → build locally ([`NativeCross`]);
+/// - foreign-arch target → [`Offload`] to an arch-matched build-worker.
+///
+/// `native = true` deliberately overrides even a declared foreign
+/// `container_platform` (which [`resolve`] would send to [`Emulate`] at its
+/// branch 2): the whole point is "no emulation — put it on real silicon." This
+/// is the `rusty-v8-musl` forcing case — a gn/ninja C++ build that OOMs under
+/// QEMU, so it must land on the x86 build-worker (`us-west-002`) rather than
+/// emulate on an arm64 host.
+pub fn resolve_placement(
+    host: &str,
+    target: Option<&str>,
+    container_platform: Option<&str>,
+    native: bool,
+) -> Resolution {
+    if !native {
+        return resolve(host, target, container_platform);
+    }
+    let host_arch = arch_of(host);
+    match target.map(str::trim).filter(|t| !t.is_empty()) {
+        Some(t) if arch_of(t) != host_arch => Resolution::Offload {
+            target: t.to_string(),
+        },
+        // Host-arch target or no target: a plain native build on this host.
+        _ => Resolution::NativeCross,
+    }
+}
+
 /// Can `target` be built on `host` with a host-native linker
 /// (`cargo-zigbuild` / musl-cross), i.e. no container and no emulation?
 ///
@@ -396,6 +450,55 @@ pub fn arch_of(triple: &str) -> &str {
     triple.split('-').next().unwrap_or(triple)
 }
 
+/// R594: mesh tags that select an arch-matched build-worker for a remote image
+/// build. `arch` is an arch token (as from [`arch_of`]); the returned tags are a
+/// *superset requirement* — a candidate node must carry all of them.
+///
+/// The fleet nodes are tagged in `.yah/infra/machines/*.toml` with
+/// `mesh_tags = ["tag:build-worker", "tag:qed", "tier:x86" | "tier:arm"]`, so an
+/// amd64 image build routes to `us-west-002` (x86) and an arm64 build to the
+/// Pi5s (arm). yubaba admission consumes this set (see
+/// `velveteen::remote::NODE_SELECTOR_MESH_TAGS_ANNOTATION`).
+pub fn build_worker_mesh_tags(arch: &str) -> Vec<String> {
+    let arch_tag = match arch {
+        "x86_64" | "x86" | "i686" | "amd64" => "tier:x86",
+        "aarch64" | "arm64" | "arm" => "tier:arm",
+        // Unknown arch: fall back to the build-worker pool without an arch pin;
+        // yubaba admission picks any build-worker (may emulate).
+        _ => return vec!["tag:build-worker".into()],
+    };
+    vec!["tag:build-worker".into(), arch_tag.into()]
+}
+
+#[cfg(test)]
+mod build_worker_tag_tests {
+    use super::build_worker_mesh_tags;
+
+    #[test]
+    fn amd64_selects_x86_build_worker() {
+        assert_eq!(
+            build_worker_mesh_tags("x86_64"),
+            vec!["tag:build-worker".to_string(), "tier:x86".to_string()]
+        );
+    }
+
+    #[test]
+    fn arm64_selects_arm_build_worker() {
+        assert_eq!(
+            build_worker_mesh_tags("aarch64"),
+            vec!["tag:build-worker".to_string(), "tier:arm".to_string()]
+        );
+    }
+
+    #[test]
+    fn unknown_arch_falls_back_to_pool() {
+        assert_eq!(
+            build_worker_mesh_tags("riscv64"),
+            vec!["tag:build-worker".to_string()]
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -456,6 +559,7 @@ mod tests {
         let spec = PlatformSpec {
             target: Some("x86_64-unknown-linux-musl".into()),
             container_platform: None,
+            native: false,
         };
         let p = Platform::compose("aarch64-apple-darwin", Some(&spec), Some("legacy-triple"));
         assert_eq!(p.target.as_deref(), Some("x86_64-unknown-linux-musl"));
@@ -507,6 +611,7 @@ mod tests {
         let spec = PlatformSpec {
             target: Some("x86_64-unknown-linux-musl".into()),
             container_platform: Some("linux/amd64".into()),
+            native: false,
         };
         let p = Platform::compose("aarch64-apple-darwin", Some(&spec), None);
         assert!(p.container_is_foreign_arch());
@@ -529,6 +634,7 @@ mod tests {
         let spec = PlatformSpec {
             target: Some("x86_64-unknown-linux-musl".into()),
             container_platform: Some("linux/amd64".into()),
+            native: false,
         };
         let toml = toml::to_string(&spec).unwrap();
         let back: PlatformSpec = toml::from_str(&toml).unwrap();
@@ -708,6 +814,94 @@ mod tests {
                 }
             }
         }
+    }
+
+    // ── resolve_placement() native policy (R590-F4) ─────────────────────────
+
+    #[test]
+    fn native_false_defers_to_the_full_decision_table() {
+        // native=false must be byte-identical to resolve() across the board:
+        // the mesofact target still cross-compiles, a foreign container still
+        // emulates a non-crossable target.
+        assert_eq!(
+            resolve_placement(ARM_MAC, Some("x86_64-unknown-linux-musl"), None, false),
+            resolve(ARM_MAC, Some("x86_64-unknown-linux-musl"), None),
+        );
+        assert_eq!(
+            resolve_placement(ARM_MAC, Some("x86_64-pc-windows-msvc"), Some("linux/amd64"), false),
+            resolve(ARM_MAC, Some("x86_64-pc-windows-msvc"), Some("linux/amd64")),
+        );
+    }
+
+    #[test]
+    fn native_foreign_arch_offloads_instead_of_cross_compiling() {
+        // The rusty-v8-musl forcing case: x86_64 musl from an arm64 mac. Without
+        // native this is NativeCross (zig); WITH native it MUST Offload to the
+        // x86 build-worker (the C++ build can't cross/emulate here).
+        assert_eq!(
+            resolve_placement(ARM_MAC, Some("x86_64-unknown-linux-musl"), None, true),
+            Resolution::Offload {
+                target: "x86_64-unknown-linux-musl".into()
+            }
+        );
+    }
+
+    #[test]
+    fn native_forces_past_the_foreign_container_emulate_branch() {
+        // A foreign container_platform would send resolve() to Emulate (branch
+        // 2). native=true overrides that — no emulation, offload to real silicon.
+        assert_eq!(
+            resolve_placement(
+                ARM_MAC,
+                Some("x86_64-unknown-linux-musl"),
+                Some("linux/amd64"),
+                true
+            ),
+            Resolution::Offload {
+                target: "x86_64-unknown-linux-musl".into()
+            }
+        );
+    }
+
+    #[test]
+    fn native_host_arch_target_builds_locally() {
+        // Same arch (different OS is irrelevant) → the native build runs right
+        // here; no offload even under native=true.
+        assert_eq!(
+            resolve_placement(ARM_MAC, Some("aarch64-unknown-linux-musl"), None, true),
+            Resolution::NativeCross
+        );
+        // The x86 build-worker running its own x86 musl build: local native.
+        assert_eq!(
+            resolve_placement(X64_LINUX, Some("x86_64-unknown-linux-musl"), None, true),
+            Resolution::NativeCross
+        );
+    }
+
+    #[test]
+    fn native_absent_or_empty_target_builds_locally() {
+        assert_eq!(
+            resolve_placement(ARM_MAC, None, None, true),
+            Resolution::NativeCross
+        );
+        assert_eq!(
+            resolve_placement(ARM_MAC, Some("  "), None, true),
+            Resolution::NativeCross
+        );
+    }
+
+    #[test]
+    fn native_spec_round_trips_through_toml() {
+        let spec = PlatformSpec {
+            target: Some("x86_64-unknown-linux-musl".into()),
+            container_platform: None,
+            native: true,
+        };
+        let toml = toml::to_string(&spec).unwrap();
+        assert!(toml.contains("native = true"), "toml: {toml:?}");
+        let back: PlatformSpec = toml::from_str(&toml).unwrap();
+        assert_eq!(spec, back);
+        assert!(back.native);
     }
 
     // ── preflight rendering (R531-T4) ────────────────────────────────────────

@@ -113,6 +113,11 @@ grep -q v8_String_WriteFlags_kNullTerminate "$BIND" || { echo "build-v8: binding
 STAGE="$(mktemp -d)"
 cp "$LIB"  "$STAGE/librusty_v8_release_$TARGET.a"
 cp "$BIND" "$STAGE/src_binding_release_$TARGET.rs"
+# OUT may name a not-yet-existing dir (e.g. the recipe's /tmp/rusty-v8-musl/…);
+# the redirect below can't create it, so materialize the parent first.
+mkdir -p "$(dirname "$OUT")"
+# GNU tar (apk add tar) — the deterministic flags below (--sort/--numeric-owner/
+# --mtime) are GNU-only; Alpine's busybox tar applet rejects --sort=name.
 tar -c --sort=name --owner=0 --group=0 --numeric-owner --mtime='2000-01-01 UTC' \
     -C "$STAGE" . | gzip --no-name > "$OUT"
 echo "build-v8: wrote $OUT"

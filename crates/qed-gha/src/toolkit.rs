@@ -18,6 +18,13 @@
 //! tier-3 slug becomes a "replace with native" error, an unrecognized slug a
 //! plain unknown-action error.
 //!
+//! R594 nuance: the docker push family and the artifact actions still classify
+//! tier-3, but the runtime *executes* them when the caller injects an
+//! [`crate::ImageBuilder`] / [`crate::ArtifactStore`] (the qed runner does, so
+//! `yah qed run` can build image jobs + move artifacts for real). Absent an
+//! injected handler — the bare crate, most tests — the tier-3 error stands, so
+//! qed-gha on its own still never shells docker or touches a store.
+//!
 //! Gone from the W200 surface (retired with the tier-3 impls): the per-slug
 //! TOML deny/config overlay (`registry_route` / `registry_auth` were docker-
 //! push machinery), the `Denied` lookup state, and the `produced` artifact

@@ -44,6 +44,7 @@
 //! @yah:verify("cargo test -p task --lib  # 54 pass, 2 ignored")
 //! @yah:verify("cargo test -p task --lib remote_native_refused_at_start_emits_no_events  # the new test in isolation")
 //! @yah:verify("cargo check --workspace  # clean (pre-existing desktop warnings unrelated)")
+//!
 
 // @yah:ticket(R094-F3, "Remote-forge driver: synthesize WorkloadSpec from ForgeSpec, deploy via yubaba RPC, attach containerd-logs scryer adapter scoped to Forge(id)")
 // @yah:assignee(agent:claude)
@@ -99,6 +100,8 @@ pub enum RemoteForgeError {
     Push(String),
     #[error("invalid spec: {0}")]
     InvalidSpec(String),
+    #[error("yubaba artifact fetch: {0}")]
+    Fetch(String),
 }
 
 // ─── WardenClient ─────────────────────────────────────────────────────────────
@@ -149,6 +152,40 @@ pub trait WardenClient: Send + Sync {
     /// Query the exit code of a terminated container.  `None` if still running
     /// or exit code is unavailable.
     async fn exit_code(&self, ident: &MeshIdent) -> Result<Option<i32>, RemoteForgeError>;
+
+    /// Read the full bytes of a file the container produced (R590-F6 leg 2).
+    ///
+    /// A remote build step (e.g. the rusty_v8 musl build on us-west-002) writes
+    /// its output tarball to a path *inside* the build-worker; nothing pulls it
+    /// back to camp. This is the transport seam the runner calls after the step
+    /// exits to retrieve those bytes for content-addressed landing +
+    /// [`crate` publish]. `remote_path` is the container-side path declared on
+    /// the step's `produces`.
+    ///
+    /// # Default is the unwired fallback; the real transport is a host read
+    ///
+    /// The default returns [`RemoteForgeError::Fetch`] for clients that have no
+    /// mesh transport. The production `MeshYubabaClient` (R603-T5) DOES implement
+    /// this: it reads the bytes off the build-worker's **host-persistent**
+    /// produced dir (`/var/lib/yah/qed/produced/<forge_id>/…`, bind-mounted at
+    /// `/yah/produced` in the container) via `GET /workloads/{ident}/produced`.
+    /// Reading the host path — not the container rootfs — is what makes
+    /// retrieval survive kamaji reaping the exited container after a daemon
+    /// outage (the R603-T4 reaping-window failure). This reshapes R590-F6's
+    /// deferred containerd file-read into a plain host read. Test clients
+    /// override this to serve scripted bytes by path.
+    async fn fetch_produced_file(
+        &self,
+        _ident: &MeshIdent,
+        remote_path: &Path,
+    ) -> Result<Vec<u8>, RemoteForgeError> {
+        Err(RemoteForgeError::Fetch(format!(
+            "fetch_produced_file({}) not wired for this WardenClient — R590-F6 \
+             transport is landed but the yubaba containerd file-read RPC is \
+             deferred to post-redeploy integration",
+            remote_path.display(),
+        )))
+    }
 }
 
 // ─── RemoteForgeDriver ────────────────────────────────────────────────────────
@@ -219,6 +256,21 @@ impl RemoteForgeDriver {
     pub async fn kill(&self, forge_id: &ForgeId) -> Result<(), RemoteForgeError> {
         self.yubaba.teardown(&forge_mesh_ident(forge_id)).await
     }
+
+    /// Retrieve the bytes of a file the finished forge container produced
+    /// (R590-F6 leg 2). Resolves the run's mesh identity and delegates to
+    /// [`WardenClient::fetch_produced_file`]. Call after [`ForgeRunHandle::wait`]
+    /// reports a successful terminal status; the caller lands the bytes in a
+    /// content-addressed store.
+    pub async fn fetch_produced_file(
+        &self,
+        forge_id: &ForgeId,
+        remote_path: &Path,
+    ) -> Result<Vec<u8>, RemoteForgeError> {
+        self.yubaba
+            .fetch_produced_file(&forge_mesh_ident(forge_id), remote_path)
+            .await
+    }
 }
 
 // ─── ForgeRunHandle ───────────────────────────────────────────────────────────
@@ -285,10 +337,10 @@ fn build_workload_spec(
         ));
     }
 
-    let tier = match &spec.where_.location {
-        TaskLocation::RemoteAny { tier } => tier.clone(),
+    let (tier, mesh_tags) = match &spec.where_.location {
+        TaskLocation::RemoteAny { tier, mesh_tags } => (tier.clone(), mesh_tags.clone()),
         // Pin to a specific node: tier defaults to infra (conventional for forge).
-        TaskLocation::Remote { .. } => TierTag("infra".into()),
+        TaskLocation::Remote { .. } => (TierTag("infra".into()), vec![]),
         TaskLocation::Local => {
             return Err(RemoteForgeError::InvalidSpec(
                 "RemoteForgeDriver received a local ForgeSpec".into(),
@@ -296,22 +348,65 @@ fn build_workload_spec(
         }
     };
 
-    let ws = match &spec.command {
+    let mut ws = match &spec.command {
         ForgeCommand::Subprocess { argv, image } => {
             let image = image.clone().unwrap_or_else(crate::default_image::default_forge_image);
             let mut ws =
                 WorkloadSpec::for_forge(&forge_id.to_string(), image, tier, vec![]);
             ws.command = Some(argv.clone());
+            // R603-T5: give every remote forge subprocess a durable, host-backed
+            // output dir at the conventional `/yah/produced`. A build that writes
+            // its `produces` there lands the bytes on the worker's host
+            // filesystem, so retrieval (yubaba reading the host path) survives
+            // kamaji reaping the EXITED container after a daemon outage. The
+            // enforcement that declared `produces` sit under this dir lives in
+            // the qed runner (`execute_step_remote`), which has the step.
+            ws.volumes
+                .push(workload_spec::forge_produced::durable_mount(&forge_id.to_string()));
             ws
         }
         ForgeCommand::Workload { spec: inner } => inner.clone(),
-        ForgeCommand::BuildImage { dockerfile, context, tag, push } => {
-            build_image_workload_spec(forge_id, dockerfile, context, tag, *push, tier)?
-        }
+        ForgeCommand::BuildImage {
+            dockerfile,
+            context,
+            tags,
+            platforms,
+            build_args,
+            push,
+            load,
+        } => build_image_workload_spec(
+            forge_id, dockerfile, context, tags, platforms, build_args, *push, *load, tier,
+        )?,
     };
+
+    // R594: carry the mesh-tag node-selector to yubaba as an annotation. yubaba
+    // admission (ticket: mesh-tag+arch admission) reads this to restrict the
+    // candidate nodes to those whose mesh tags ⊇ the requested set — e.g. the
+    // build-worker fleet, arch-matched. Empty ⇒ no annotation ⇒ any node in tier.
+    if !mesh_tags.is_empty() {
+        ws.annotations
+            .insert(NODE_SELECTOR_MESH_TAGS_ANNOTATION.into(), mesh_tags.join(","));
+    }
+
+    // R590-B7: remote forge workloads are ephemeral tier=infra build tasks that
+    // must reach the network to fetch sources (git clone of v8/chromium, cargo
+    // registry, image layers). kamaji gives every container an isolated,
+    // loopback-only netns by default — no egress, no DNS — which fails any build
+    // that pulls from the internet (rusty-v8-musl died at `git clone`, exit 128).
+    // Request host networking so the build shares the node's network stack; the
+    // pairing bind-mount of /etc/resolv.conf lives in kamaji's build_oci_spec.
+    // kamaji guards this annotation to tier=infra, which forge always satisfies.
+    ws.annotations.insert(
+        workload_spec::HOST_NETWORK_ANNOTATION.into(),
+        workload_spec::HOST_NETWORK_VALUE.into(),
+    );
 
     Ok(ws)
 }
+
+/// Annotation key carrying the R594 mesh-tag node-selector (comma-joined) from
+/// [`TaskLocation::RemoteAny::mesh_tags`] to yubaba admission.
+pub const NODE_SELECTOR_MESH_TAGS_ANNOTATION: &str = "yah.node-selector.mesh-tags";
 
 // ─── BuildKit workload synthesis (R381-T5) ────────────────────────────────────
 
@@ -354,14 +449,23 @@ fn default_buildkit_image() -> ImageRef {
 /// Bind volume mounts require `tier == "infra"`, which yubaba's shape
 /// validation enforces; the forge convention picks infra by default so this is
 /// safe for the v1 dogfood path.
+#[allow(clippy::too_many_arguments)]
 fn build_image_workload_spec(
     forge_id: &ForgeId,
     dockerfile: &Path,
     context: &Path,
-    tag: &str,
+    tags: &[String],
+    platforms: &[String],
+    build_args: &[(String, String)],
     push: bool,
+    load: bool,
     tier: TierTag,
 ) -> Result<WorkloadSpec, RemoteForgeError> {
+    let first_tag = tags.first().ok_or_else(|| {
+        RemoteForgeError::InvalidSpec(
+            "build-image spec has no tags — at least one is required".to_string(),
+        )
+    })?;
     let dockerfile_basename = dockerfile
         .file_name()
         .and_then(|n| n.to_str())
@@ -382,9 +486,9 @@ fn build_image_workload_spec(
     let mut ws = WorkloadSpec::for_forge(&forge_id.to_string(), image, tier, vec![]);
 
     // Image builds routinely peak at several hundred MiB; the for_forge
-    // defaults (256MiB / 512 cpu_shares) are too tight for buildkit.
+    // defaults (256MiB / 512m) are too tight for buildkit.
     ws.resources.memory_mb = 2048;
-    ws.resources.cpu_shares = 2048;
+    ws.resources.cpu_millis = 2000;
     ws.resources.ephemeral_storage_mb = 4096;
 
     ws.volumes.push(VolumeMount {
@@ -398,7 +502,10 @@ fn build_image_workload_spec(
         read_only: true,
     });
 
-    let oci_archive_remote = (!push).then(|| {
+    // An OCI archive is only emitted when we neither push nor load into the
+    // worker's local image store — the archive is the sole way an out-of-band
+    // consumer retrieves the bytes. Its basename derives from the first tag.
+    let oci_archive_remote = (!push && !load).then(|| {
         ws.volumes.push(VolumeMount {
             source: VolumeSource::Bind {
                 host_path: PathBuf::from(BUILDKIT_HOST_OUT_DIR),
@@ -406,10 +513,17 @@ fn build_image_workload_spec(
             target: PathBuf::from("/yah/build/out"),
             read_only: false,
         });
-        format!("/yah/build/out/{}", oci_archive_basename(tag))
+        format!("/yah/build/out/{}", oci_archive_basename(first_tag))
     });
 
-    ws.command = Some(buildctl_argv(dockerfile_basename, tag, push, oci_archive_remote.as_deref()));
+    ws.command = Some(buildctl_argv(
+        dockerfile_basename,
+        tags,
+        platforms,
+        build_args,
+        push,
+        oci_archive_remote.as_deref(),
+    ));
     Ok(ws)
 }
 
@@ -431,9 +545,19 @@ fn oci_archive_basename(tag: &str) -> String {
 }
 
 /// `buildctl-daemonless.sh` argv for a one-shot Dockerfile build.
+///
+/// Multi-tag, multi-platform, and build-args are all threaded here (R590-F2):
+/// - `tags` collapse into the output's `name=` attribute. Because the output
+///   descriptor is comma-separated CSV, a multi-tag `name` value is wrapped in
+///   double quotes so buildkit's CSV reader treats the embedded commas as part
+///   of the value, not attribute delimiters (`type=image,"name=a,b",push=true`).
+/// - `platforms` map to `--opt platform=<csv>` (buildkit's multi-platform key).
+/// - `build_args` map to one `--opt build-arg:<KEY>=<VALUE>` per pair.
 fn buildctl_argv(
     dockerfile_basename: &str,
-    tag: &str,
+    tags: &[String],
+    platforms: &[String],
+    build_args: &[(String, String)],
     push: bool,
     oci_archive_path: Option<&str>,
 ) -> Vec<String> {
@@ -449,17 +573,38 @@ fn buildctl_argv(
         "--opt".to_string(),
         format!("filename={dockerfile_basename}"),
     ];
+
+    if !platforms.is_empty() {
+        argv.push("--opt".to_string());
+        argv.push(format!("platform={}", platforms.join(",")));
+    }
+    for (k, v) in build_args {
+        argv.push("--opt".to_string());
+        argv.push(format!("build-arg:{k}={v}"));
+    }
+
+    let name_attr = buildctl_name_attr(tags);
     if push {
         argv.push("--output".to_string());
-        argv.push(format!("type=image,name={tag},push=true"));
+        argv.push(format!("type=image,{name_attr},push=true"));
     } else if let Some(archive) = oci_archive_path {
         argv.push("--output".to_string());
-        argv.push(format!("type=oci,name={tag},dest={archive}"));
+        argv.push(format!("type=oci,{name_attr},dest={archive}"));
     } else {
         argv.push("--output".to_string());
-        argv.push(format!("type=image,name={tag}"));
+        argv.push(format!("type=image,{name_attr}"));
     }
     argv
+}
+
+/// Render the buildkit output `name=` attribute for one or more tags. A single
+/// tag is emitted bare (`name=tag`); multiple tags are comma-joined and the
+/// whole value double-quoted so buildkit's CSV parser keeps them together.
+fn buildctl_name_attr(tags: &[String]) -> String {
+    match tags {
+        [single] => format!("name={single}"),
+        many => format!("\"name={}\"", many.join(",")),
+    }
 }
 
 async fn run_log_task(
@@ -554,6 +699,9 @@ pub mod test_support {
         pub exit_code: i32,
         pub deploy_called: Arc<Mutex<bool>>,
         pub teardown_called: Arc<Mutex<bool>>,
+        /// Container-path → bytes the finished container "produced", served by
+        /// [`WardenClient::fetch_produced_file`] (R590-F6 retrieval tests).
+        pub produced_files: std::collections::HashMap<PathBuf, Vec<u8>>,
     }
 
     impl ScriptedWardenClient {
@@ -563,6 +711,26 @@ pub mod test_support {
                 exit_code,
                 deploy_called: Default::default(),
                 teardown_called: Default::default(),
+                produced_files: Default::default(),
+            })
+        }
+
+        /// Like [`new`](Self::new) but seeds the produced-file map so
+        /// [`WardenClient::fetch_produced_file`] serves `bytes` at `path`.
+        pub fn with_produced_file(
+            lines: Vec<String>,
+            exit_code: i32,
+            path: impl Into<PathBuf>,
+            bytes: Vec<u8>,
+        ) -> Arc<Self> {
+            let mut produced_files = std::collections::HashMap::new();
+            produced_files.insert(path.into(), bytes);
+            Arc::new(Self {
+                lines,
+                exit_code,
+                deploy_called: Default::default(),
+                teardown_called: Default::default(),
+                produced_files,
             })
         }
     }
@@ -601,6 +769,19 @@ pub mod test_support {
             _ident: &MeshIdent,
         ) -> Result<Option<i32>, RemoteForgeError> {
             Ok(Some(self.exit_code))
+        }
+
+        async fn fetch_produced_file(
+            &self,
+            _ident: &MeshIdent,
+            remote_path: &Path,
+        ) -> Result<Vec<u8>, RemoteForgeError> {
+            self.produced_files.get(remote_path).cloned().ok_or_else(|| {
+                RemoteForgeError::Fetch(format!(
+                    "no produced file scripted at {}",
+                    remote_path.display()
+                ))
+            })
         }
     }
 
@@ -690,9 +871,37 @@ mod remote {
 
     fn remote_any_infra() -> TaskPlacement {
         TaskPlacement::new(
-            TaskLocation::RemoteAny { tier: TierTag("infra".into()) },
+            TaskLocation::RemoteAny { tier: TierTag("infra".into()), mesh_tags: vec![] },
             TaskRuntime::Container,
         )
+    }
+
+    /// R603-T5: every remote forge subprocess gets a durable, host-backed
+    /// `/yah/produced` bind mount so a build's output survives kamaji reaping
+    /// the exited container. The host source is the per-forge dir under the
+    /// convention root, and it's writable.
+    #[test]
+    fn subprocess_workload_carries_durable_produced_mount() {
+        let forge_id = ForgeId::new();
+        let spec = subprocess_spec(remote_any_infra(), None);
+        let ws = build_workload_spec(&forge_id, &spec).expect("synthesis ok");
+
+        let mount = ws
+            .volumes
+            .iter()
+            .find(|v| v.target == PathBuf::from(workload_spec::forge_produced::CONTAINER_DIR))
+            .expect("subprocess forge must mount the durable /yah/produced dir");
+        assert!(
+            !mount.read_only,
+            "durable produced mount must be writable so the build can write to it"
+        );
+        assert_eq!(
+            mount.source,
+            VolumeSource::Bind {
+                host_path: workload_spec::forge_produced::host_dir(&forge_id.to_string()),
+            },
+            "host source must be the per-forge durable dir under the convention root"
+        );
     }
 
     /// R094-F3 accept: forge.run with RemoteAny + Subprocess, scripted yubaba
@@ -722,7 +931,7 @@ mod remote {
 
         scryer.flush_ring().unwrap();
         let events =
-            scryer.events(&EventScope::Forge(id), &EventFilter::default()).unwrap();
+            scryer.events(&EventScope::Forge(id), &EventFilter::default()).await.unwrap();
         assert_eq!(events.len(), 2, "expected 2 events");
         assert_eq!(events[0].msg, "line one");
         assert_eq!(events[1].msg, "line two");
@@ -789,7 +998,7 @@ mod remote {
         let driver = RemoteForgeDriver::new(scryer.clone(), yubaba);
         // remote + native — the quadrant this ticket refuses.
         let placement = TaskPlacement::new(
-            TaskLocation::RemoteAny { tier: TierTag("infra".into()) },
+            TaskLocation::RemoteAny { tier: TierTag("infra".into()), mesh_tags: vec![] },
             TaskRuntime::Native,
         );
         let spec = subprocess_spec(placement, None);
@@ -828,7 +1037,7 @@ mod remote {
         // without a wildcard query.
         let probe_id = ForgeId::new();
         let events =
-            scryer.events(&EventScope::Forge(probe_id), &EventFilter::default()).unwrap();
+            scryer.events(&EventScope::Forge(probe_id), &EventFilter::default()).await.unwrap();
         assert!(events.is_empty(), "no events expected; got {events:?}");
     }
 
@@ -841,8 +1050,11 @@ mod remote {
                     "/tmp/camp/.yah/cache/buildkit/yah-rust.Dockerfile",
                 ),
                 context: PathBuf::from("/tmp/camp"),
-                tag: "ghcr.io/yah-ai/yah-rust:dev".into(),
+                tags: vec!["ghcr.io/yah-ai/yah-rust:dev".into()],
+                platforms: vec![],
+                build_args: vec![],
                 push,
+                load: false,
             },
             where_: remote_any_infra(),
             timeout: None,
@@ -852,24 +1064,42 @@ mod remote {
         }
     }
 
+    /// Helper: destructure a `BuildImage` spec into the positional args
+    /// `build_image_workload_spec` now takes.
+    fn build_image_parts(
+        spec: ForgeSpec,
+    ) -> (PathBuf, PathBuf, Vec<String>, Vec<String>, Vec<(String, String)>, bool, bool) {
+        match spec.command {
+            ForgeCommand::BuildImage {
+                dockerfile,
+                context,
+                tags,
+                platforms,
+                build_args,
+                push,
+                load,
+            } => (dockerfile, context, tags, platforms, build_args, push, load),
+            _ => unreachable!(),
+        }
+    }
+
     /// build_image_workload_spec assembles a buildkit-shaped WorkloadSpec:
     /// rootless moby/buildkit image, buildctl one-shot argv, context +
     /// dockerfile bind-mounts, OCI archive output dir when push=false.
     #[test]
     fn build_image_workload_spec_shape_push_false() {
         let forge_id = ForgeId::new();
-        let cmd = match build_image_spec(false).command {
-            ForgeCommand::BuildImage { dockerfile, context, tag, push } => {
-                (dockerfile, context, tag, push)
-            }
-            _ => unreachable!(),
-        };
+        let (df, ctx, tags, platforms, build_args, push, load) =
+            build_image_parts(build_image_spec(false));
         let ws = build_image_workload_spec(
             &forge_id,
-            &cmd.0,
-            &cmd.1,
-            &cmd.2,
-            cmd.3,
+            &df,
+            &ctx,
+            &tags,
+            &platforms,
+            &build_args,
+            push,
+            load,
             TierTag("infra".into()),
         )
         .expect("synthesis ok");
@@ -882,11 +1112,11 @@ mod remote {
             ws.image.tag
         );
 
-        // Resources upsized vs the for_forge default (256MiB / 512 cpu_shares).
+        // Resources upsized vs the for_forge default (256MiB / 512m).
         assert!(ws.resources.memory_mb >= 1024, "memory should be ≥1GiB");
         assert!(
-            ws.resources.cpu_shares >= 1024,
-            "cpu_shares should be ≥ one full core"
+            ws.resources.cpu_millis >= 1000,
+            "cpu_millis should be ≥ one full core"
         );
 
         // Bind mounts: context (ro), dockerfile dir (ro), out dir (rw).
@@ -933,18 +1163,17 @@ mod remote {
     #[test]
     fn build_image_workload_spec_push_true_uses_registry_output() {
         let forge_id = ForgeId::new();
-        let (df, ctx, tag, push) = match build_image_spec(true).command {
-            ForgeCommand::BuildImage { dockerfile, context, tag, push } => {
-                (dockerfile, context, tag, push)
-            }
-            _ => unreachable!(),
-        };
+        let (df, ctx, tags, platforms, build_args, push, load) =
+            build_image_parts(build_image_spec(true));
         let ws = build_image_workload_spec(
             &forge_id,
             &df,
             &ctx,
-            &tag,
+            &tags,
+            &platforms,
+            &build_args,
             push,
+            load,
             TierTag("infra".into()),
         )
         .expect("synthesis ok");
@@ -963,6 +1192,48 @@ mod remote {
             !has_out_dir,
             "push=true must NOT mount the build-out dir: {:?}",
             ws.volumes,
+        );
+    }
+
+    /// R590-F2: multiple tags, target platforms, and build-args all thread
+    /// into the buildctl argv. Multi-tag `name=` is quoted so buildkit's CSV
+    /// reader keeps the comma-joined value together.
+    #[test]
+    fn buildctl_argv_threads_tags_platforms_and_build_args() {
+        let argv = buildctl_argv(
+            "yah-rust.Dockerfile",
+            &["reg/img:a".into(), "reg/img:b".into()],
+            &["linux/amd64".into(), "linux/arm64".into()],
+            &[("RUST_VERSION".into(), "1.85".into())],
+            true,
+            None,
+        );
+        // platform csv
+        assert!(
+            argv.iter().any(|a| a == "platform=linux/amd64,linux/arm64"),
+            "platforms must join into one --opt platform=<csv>: {argv:?}",
+        );
+        // build-arg
+        assert!(
+            argv.iter().any(|a| a == "build-arg:RUST_VERSION=1.85"),
+            "build-args must emit --opt build-arg:K=V: {argv:?}",
+        );
+        // quoted multi-tag name in a pushing image output
+        assert!(
+            argv.iter()
+                .any(|a| a == "type=image,\"name=reg/img:a,reg/img:b\",push=true"),
+            "multi-tag push output must quote the comma-joined name: {argv:?}",
+        );
+    }
+
+    /// A single tag stays bare (unquoted) — the common case, and the shape the
+    /// pre-F2 tests asserted.
+    #[test]
+    fn buildctl_argv_single_tag_is_unquoted() {
+        let argv = buildctl_argv("D.Dockerfile", &["reg/img:x".into()], &[], &[], false, None);
+        assert!(
+            argv.iter().any(|a| a == "type=image,name=reg/img:x"),
+            "single-tag non-push output must be bare name=<tag>: {argv:?}",
         );
     }
 
@@ -997,8 +1268,46 @@ mod remote {
 
         scryer.flush_ring().unwrap();
         let events =
-            scryer.events(&EventScope::Forge(id), &EventFilter::default()).unwrap();
+            scryer.events(&EventScope::Forge(id), &EventFilter::default()).await.unwrap();
         assert_eq!(events.len(), 2, "expected 2 buildkit log lines");
+    }
+
+    /// R590-F6: the finished container's produced file is retrievable verbatim
+    /// through `RemoteForgeDriver::fetch_produced_file` — the bytes come back
+    /// unchanged (byte-preservation is what the content-addressed landing then
+    /// checksums). A path with no scripted file surfaces a clean `Fetch` error,
+    /// and the trait default (no override) also errs rather than silently
+    /// returning empty.
+    #[tokio::test]
+    async fn fetch_produced_file_round_trips_bytes() {
+        let dir = TempDir::new().unwrap();
+        let scryer = make_scryer(&dir);
+
+        let payload = b"librusty_v8 tarball bytes \x00\x01\x02".to_vec();
+        let remote_path = PathBuf::from("/tmp/rusty-v8-musl/librusty_v8.tar.gz");
+        let yubaba = ScriptedWardenClient::with_produced_file(
+            vec!["build done".into()],
+            0,
+            remote_path.clone(),
+            payload.clone(),
+        );
+
+        let driver = RemoteForgeDriver::new(scryer, yubaba);
+        let forge_id = ForgeId::new();
+
+        let got = driver
+            .fetch_produced_file(&forge_id, &remote_path)
+            .await
+            .expect("scripted produced file must be retrievable");
+        assert_eq!(got, payload, "bytes must survive the transport unchanged");
+
+        let missing = driver
+            .fetch_produced_file(&forge_id, Path::new("/tmp/nope"))
+            .await;
+        assert!(
+            matches!(missing, Err(RemoteForgeError::Fetch(_))),
+            "an unscripted path must be a Fetch error, got {missing:?}",
+        );
     }
 
     /// R094-F3 accept: forge.run with a 50ms timeout against a hanging stream.

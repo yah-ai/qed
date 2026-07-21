@@ -51,9 +51,11 @@
 pub mod adapters;
 pub mod beholders;
 pub mod federation;
+pub mod federation_http;
 #[cfg(unix)]
 pub mod ingestion;
 pub mod long_tier;
+pub mod promotion;
 pub mod quota;
 pub mod ring;
 pub mod service;
@@ -76,6 +78,14 @@ pub use beholders::{
 pub use federation::{
     DenyAllAcl, FederationAcl, FederationError, FederationPeer, FederationRule, OperatorTagAcl,
     PeerIdentity, federated_events, merge_events,
+};
+pub use federation_http::{
+    BucketDto, FederateAggregateReq, FederateAggregateResp, FederateEventsReq, FederateEventsResp,
+    FederationState, HealthResp, HttpFederationPeer, OPERATOR_TAG_HEADER, ScopeInfoDto, ScopesResp,
+    router as federation_router, serve as serve_federation,
+};
+pub use promotion::{
+    DEFAULT_PROMOTE_INTERVAL, PromotionConfig, PromotionConsumer,
 };
 pub use quota::{QuotaDecision, ServiceQuotaManager, DEFAULT_QUOTA_PER_SECOND};
 pub use ring::{EventRing, RingConfig};

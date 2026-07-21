@@ -348,7 +348,7 @@ mod tests {
 
         scryer.flush_ring().unwrap();
         let scope = EventScope::Service(ident);
-        let events = scryer.events(&scope, &EventFilter::default()).unwrap();
+        let events = scryer.events(&scope, &EventFilter::default()).await.unwrap();
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].msg, "first line");
         assert_eq!(events[1].msg, "second line");
@@ -382,7 +382,7 @@ mod tests {
         let _ = supervisor.run(&mut adapter).await;
 
         scryer.flush_ring().unwrap();
-        let events = scryer.events(&scope, &EventFilter::default()).unwrap();
+        let events = scryer.events(&scope, &EventFilter::default()).await.unwrap();
 
         // Expected events in this scope:
         // - "before restart" (line)

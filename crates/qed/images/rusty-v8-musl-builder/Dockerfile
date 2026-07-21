@@ -40,7 +40,7 @@ RUN apk add --no-cache \
         libc++ libc++-dev libc++-static libstdc++-dev libatomic \
         rust cargo \
         python3 git curl \
-        glib-dev linux-headers build-base bash grep
+        glib-dev linux-headers build-base bash grep tar
 
 # V8's gn build hardcodes a clang-23 resource dir + an unsuffixed builtins path
 # under a gnu-triple dir; bridge to Alpine's real llvm22 layout. Arch-specific

@@ -36,6 +36,27 @@
 //!
 //! On non-Unix platforms `YAH_TASK_RUN` and `YAH_LOG_PIPE` are not exported.
 //! Shim libraries must treat absent `YAH_TASK_RUN` as "not inside a TaskRun".
+//!
+//! @yah:ticket(R617-F6, "Reattach-by-run_id replaces Lost-on-disappear for origin=terminal shells")
+//! @yah:at(2026-07-20T18:38:27Z)
+//! @yah:status(open)
+//! @yah:phase(P3)
+//! @yah:parent(R617)
+//! @yah:next("TaskDriver::new (driver.rs:199) marks every leftover Running run Lost on construction — correct for ordinary jobs, fatal for a shell meant to survive a restart. Split the behaviour on origin: a terminal shell whose host process is still alive is re-adopted (control channel rebuilt, reader thread restarted against the surviving PTY) rather than tombstoned.")
+//! @yah:verify("Manual: open a shell, run `sleep 300`, quit and relaunch the desktop — the run is still Running, not Lost")
+//! @yah:gotcha("This is an oss/qed crate — changes land in-tree under oss/task-runs and flow outward via scripts/export-oss.sh. Keep the reattach seam generic (origin-agnostic policy hook), not yah-terminal-specific, since the crate ships standalone.")
+//! @yah:gotcha("Reattach only makes sense once the PTY outlives the desktop (S5 decides the host). Landing it before that gives a reattach path with nothing to reattach to.")
+//! @arch:see(.yah/docs/working/W280-durable-terminal-sessions.md)
+//! @yah:depends_on(R617-S5)
+//!
+//! @yah:ticket(R617-B9, "Pre-existing: task-runs log_pipe_events_land_in_store never completes (233 pass / 1 fail)")
+//! @yah:at(2026-07-20T21:19:08Z)
+//! @yah:status(open)
+//! @yah:phase(P1)
+//! @yah:parent(R617)
+//! @yah:next("The run never reaches Done/Lost within the 20s deadline, so the FIFO assertions are never reached. Child writes one JSON line via `printf ... >> \"$YAH_LOG_PIPE\"`; suspect the child blocks or the lifecycle never observes its exit. mkfifo itself works on this machine.")
+//! @yah:verify("cd oss/qed && cargo test -p task-runs --lib log_pipe_events_land_in_store")
+//! @yah:gotcha("Confirmed pre-existing during R617-B1, not caused by the DriverChannels output tap: swapping driver.rs + lib.rs to their HEAD versions reproduces the identical failure. Anyone touching this file (R617-F6 lands here) will meet a red suite that is not theirs.")
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -122,11 +143,33 @@ impl Default for SpawnOpts {
     }
 }
 
+// ─── Driver channels ─────────────────────────────────────────────────────────
+
+/// Optional side-channels a driver can publish to. Both are fire-and-forget:
+/// a closed receiver never stalls or fails a run.
+#[derive(Default)]
+pub struct DriverChannels {
+    /// Fires `(run_id, status)` after each run's lifecycle task writes the
+    /// terminal status. Drives completion listeners (e.g. a triage worker).
+    pub completion: Option<mpsc::UnboundedSender<(TaskRunId, RunStatus)>>,
+    /// Mirrors every PTY output chunk as it is captured, *before* any consumer
+    /// polls the store. Lets a host attach a live view (VT parser, log
+    /// forwarder) to a run without a read-back loop over the store.
+    ///
+    /// The driver deliberately stays ignorant of what the tap is for — the
+    /// chunk carries `run_id`, so the host decides which runs it cares about.
+    pub output: Option<mpsc::UnboundedSender<OutputChunk>>,
+}
+
 // ─── Internal run-control handle ─────────────────────────────────────────────
 
 struct RunControl {
     kill_tx: mpsc::Sender<KillRequest>,
     stdin_tx: Option<mpsc::Sender<Vec<u8>>>,
+    /// Shared with the lifecycle task, which holds the same `Arc` so the PTY fd
+    /// outlives `child.wait()`. `MasterPty::resize` takes `&self`, so a mutex is
+    /// enough to make the `Box<dyn MasterPty + Send>` `Sync` across the two.
+    master: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
 }
 
 #[derive(Debug)]
@@ -186,27 +229,24 @@ unsafe impl Send for FdCloser {}
 pub struct TaskDriver {
     store: Arc<TaskStore>,
     active: Arc<Mutex<HashMap<String, RunControl>>>,
-    /// Fired with `(run_id, final_status)` after each run's lifecycle task writes
-    /// the terminal status. Used by the triage worker to detect completion.
-    completion_tx: Option<tokio::sync::mpsc::UnboundedSender<(TaskRunId, RunStatus)>>,
+    /// Side-channels published to by every run this driver owns.
+    channels: DriverChannels,
 }
 
 impl TaskDriver {
-    /// Create a driver backed by `store`.
+    /// Create a driver backed by `store`, with no side-channels.
     ///
     /// Immediately scans the store for `Running` runs left over from a prior
     /// daemon process and marks them `Lost` ("Lost-on-disappear").
     pub async fn new(store: Arc<TaskStore>) -> Result<Self, DriverError> {
-        Self::new_with_completion(store, None).await
+        Self::with_channels(store, DriverChannels::default()).await
     }
 
-    /// Like `new` but also wires a completion channel. The sender fires with
-    /// `(run_id, status)` after each run's lifecycle task writes the terminal
-    /// status. Pass `Some(tx)` to drive a triage worker or other completion
-    /// listener from outside the driver.
-    pub async fn new_with_completion(
+    /// Like `new` but wires the optional [`DriverChannels`] side-channels
+    /// (completion notifications, live output tap).
+    pub async fn with_channels(
         store: Arc<TaskStore>,
-        completion_tx: Option<tokio::sync::mpsc::UnboundedSender<(TaskRunId, RunStatus)>>,
+        channels: DriverChannels,
     ) -> Result<Self, DriverError> {
         let stale = store.list_runs(&RunFilter {
             status: Some("running".to_string()),
@@ -223,7 +263,7 @@ impl TaskDriver {
         Ok(Self {
             store,
             active: Arc::new(Mutex::new(HashMap::new())),
-            completion_tx,
+            channels,
         })
     }
 
@@ -390,6 +430,11 @@ impl TaskDriver {
         // Drop the parent's slave handle so EOF propagates once the child exits.
         drop(pair.slave);
 
+        // Share the master between the lifecycle task (which must outlive
+        // `child.wait()` so the fd stays open) and `resize_run`.
+        let master: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>> =
+            Arc::new(Mutex::new(pair.master));
+
         let pid = child.process_id().unwrap_or(0);
 
         // ── FIFO: launch receiver thread; pass write-end holder to lifecycle ──
@@ -424,6 +469,7 @@ impl TaskDriver {
             let store_r = Arc::clone(&self.store);
             let id_r = id.clone();
             let mut beholder = attach.beholder;
+            let output_tx = self.channels.output.clone();
             let rt = tokio::runtime::Handle::current();
             tokio::task::spawn_blocking(move || {
                 let mut buf = [0u8; READ_BUF_SIZE];
@@ -440,16 +486,27 @@ impl TaskDriver {
                                 &buf[..n],
                             ));
                             if let Ok(seq) = append_res {
-                                let mut detach_beholder = false;
-                                if let Some(ref mut b) = beholder {
-                                    let chunk = OutputChunk {
+                                /* Both the tap and the beholder want the same
+                                   owned chunk; build it once, and only when
+                                   someone is listening. */
+                                let chunk = (output_tx.is_some() || beholder.is_some()).then(|| {
+                                    OutputChunk {
                                         run_id: id_r.clone(),
                                         seq,
                                         offset_ms: offset,
                                         stream: Stream::Stdout,
                                         bytes: buf[..n].to_vec(),
-                                    };
-                                    for ev in b.parse_chunk(&chunk) {
+                                    }
+                                });
+                                /* Tap first: it feeds live views, where latency
+                                   is visible to a human. Send failure means the
+                                   host dropped its receiver — never fatal. */
+                                if let (Some(tx), Some(c)) = (&output_tx, &chunk) {
+                                    let _ = tx.send(c.clone());
+                                }
+                                let mut detach_beholder = false;
+                                if let (Some(b), Some(chunk)) = (beholder.as_mut(), &chunk) {
+                                    for ev in b.parse_chunk(chunk) {
                                         let _ = rt.block_on(store_r.append_event(
                                             &ev.run_id,
                                             ev.offset_ms,
@@ -509,8 +566,8 @@ impl TaskDriver {
             let store_l = Arc::clone(&self.store);
             let active_l = Arc::clone(&self.active);
             let id_l = id.clone();
-            let master = pair.master;
-            let completion_tx_l = self.completion_tx.clone();
+            let master_l = Arc::clone(&master);
+            let completion_tx_l = self.channels.completion.clone();
             #[cfg(unix)]
             let wfd_l = log_wfd_holder;
             task::spawn(async move {
@@ -520,7 +577,7 @@ impl TaskDriver {
                     id_l,
                     pid,
                     child,
-                    master,
+                    master_l,
                     kill_rx,
                     reader_done_rx,
                     completion_tx_l,
@@ -534,9 +591,40 @@ impl TaskDriver {
         self.active
             .lock()
             .unwrap()
-            .insert(id.to_string(), RunControl { kill_tx, stdin_tx });
+            .insert(id.to_string(), RunControl { kill_tx, stdin_tx, master });
 
         Ok(id)
+    }
+
+    /// Resize a running task's PTY and deliver `SIGWINCH` to the foreground
+    /// process group (portable-pty's `resize` does the ioctl, which is what
+    /// signals the child).
+    ///
+    /// Returns `DriverError::NotFound` when the run is not active on this
+    /// driver instance — the same contract as [`TaskDriver::send_stdin`].
+    pub async fn resize_run(
+        &self,
+        id: &TaskRunId,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(), DriverError> {
+        let master = self
+            .active
+            .lock()
+            .unwrap()
+            .get(&id.to_string())
+            .map(|c| Arc::clone(&c.master));
+
+        match master {
+            Some(m) => {
+                let size = PtySize { rows, cols, pixel_width: 0, pixel_height: 0 };
+                m.lock()
+                    .unwrap()
+                    .resize(size)
+                    .map_err(|e| DriverError::Pty(e.to_string()))
+            }
+            None => Err(DriverError::NotFound(id.to_string())),
+        }
     }
 
     /// Send `signal` to a running task. Defaults to SIGTERM (15).
@@ -654,7 +742,7 @@ async fn run_lifecycle(
     id: TaskRunId,
     pid: u32,
     child: Box<dyn portable_pty::Child + Send>,
-    master: Box<dyn portable_pty::MasterPty + Send>,
+    master: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
     mut kill_rx: mpsc::Receiver<KillRequest>,
     reader_done_rx: oneshot::Receiver<()>,
     completion_tx: Option<tokio::sync::mpsc::UnboundedSender<(TaskRunId, RunStatus)>>,
@@ -706,7 +794,9 @@ async fn run_lifecycle(
     }
 
     // Reap the child (blocking) on a dedicated thread-pool slot.
-    // Move master in here so the PTY fd outlives the wait.
+    // Move our master handle in here so the PTY fd outlives the wait. The
+    // matching `RunControl` (removed from `active` below) holds the other
+    // `Arc`, so the fd actually closes once both are gone.
     let exit_code = task::spawn_blocking(move || {
         let mut c = child;
         let _m = master; // dropped after wait() returns
@@ -1045,6 +1135,86 @@ mod tests {
             text.contains("got_hello"),
             "expected 'got_hello' in output, got: {text:?}"
         );
+    }
+
+    /// `resize_run` must change the geometry the *child* sees, not just the
+    /// master fd — so the assertion reads `stty size` from inside the PTY
+    /// after the resize rather than inspecting the driver's own state.
+    #[tokio::test]
+    async fn resize_run_changes_geometry_the_child_sees() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(&dir).await;
+        let driver = Arc::new(TaskDriver::new(Arc::clone(&store)).await.unwrap());
+
+        // Wait for a line on stdin, then report the geometry as of that moment.
+        let id = driver
+            .spawn_run(
+                "read line && stty size",
+                SpawnOpts {
+                    cwd: "/tmp".into(),
+                    stdin_enabled: true,
+                    // Spawn at the default 80x24 so the assertion can't pass by
+                    // accident if the resize is a no-op.
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        driver.resize_run(&id, 120, 40).await.unwrap();
+        driver.send_stdin(&id, b"go\n".to_vec()).await.unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let meta = store.get_run(&id).await.unwrap().unwrap();
+            if !matches!(meta.status, RunStatus::Running | RunStatus::Pending) {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("run did not complete after stdin input");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let chunks = store.get_chunks(&id, &ChunkFilter::default()).await.unwrap();
+        let raw: Vec<u8> = chunks.into_iter().flat_map(|c| c.bytes).collect();
+        let text = String::from_utf8_lossy(&raw);
+        assert!(
+            text.contains("40 120"),
+            "expected resized geometry '40 120' in output, got: {text:?}"
+        );
+    }
+
+    /// A run that is not active on this driver (finished, or never existed) is
+    /// `NotFound` rather than a panic — same contract as `send_stdin`.
+    #[tokio::test]
+    async fn resize_run_returns_not_found_after_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(&dir).await;
+        let driver = Arc::new(TaskDriver::new(Arc::clone(&store)).await.unwrap());
+
+        let id = driver
+            .spawn_run("true", SpawnOpts { cwd: "/tmp".into(), ..Default::default() })
+            .await
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let meta = store.get_run(&id).await.unwrap().unwrap();
+            if !matches!(meta.status, RunStatus::Running | RunStatus::Pending) {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("run did not exit");
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        assert!(matches!(
+            driver.resize_run(&id, 100, 30).await,
+            Err(DriverError::NotFound(_))
+        ));
     }
 
     // ── Tier-2 side-channel log fd ────────────────────────────────────────────

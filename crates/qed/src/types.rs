@@ -213,15 +213,16 @@ pub enum Placement {
 }
 
 /// How the runner positions the on-disk tree a pipeline's steps build against,
-/// relative to the run's target branch (the `branch` run-param, default `main`).
+/// relative to the run's target ref (the `ref` run-param — a branch, tag, or
+/// SHA; default `HEAD`, i.e. whatever is already checked out).
 ///
 /// A QED run's workspace is normally the live camp root — fine for verifying
 /// whatever is on disk, wrong for cutting a release (which must never ship a
 /// dev's uncommitted edits). This is the per-pipeline knob that picks the right
-/// trade-off; the run carries the *which branch*, the pipeline carries the *how
+/// trade-off; the run carries the *which ref*, the pipeline carries the *how
 /// strict*.
 ///
-/// Default is [`WorkspaceMode::Checkout`] — switch to the requested branch but
+/// Default is [`WorkspaceMode::Checkout`] — switch to the requested ref but
 /// refuse to run over uncommitted changes, so a stray run never silently builds
 /// the wrong bytes and never clobbers local work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -229,15 +230,15 @@ pub enum Placement {
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub enum WorkspaceMode {
     /// Build against the camp root's live working tree exactly as it is on disk
-    /// — no branch switch, no dirty check. For local/dev pipelines that want
+    /// — no ref switch, no dirty check. For local/dev pipelines that want
     /// "build what I'm looking at right now".
     Live,
-    /// Switch the camp root to the run's target branch, but **bail if the tree
+    /// Switch the camp root to the run's target ref, but **bail if the tree
     /// is dirty** (any uncommitted change). The safe default: never builds
     /// surprise bytes, never discards local work.
     #[default]
     Checkout,
-    /// Build in a dedicated git worktree checked out at the target branch; the
+    /// Build in a dedicated git worktree checked out at the target ref; the
     /// camp root (and any uncommitted work in it) is untouched. The correct
     /// mode for releases — a tag is always cut from clean committed state.
     Isolated,
@@ -273,7 +274,7 @@ pub struct Pipeline {
     pub placement: Placement,
     /// How the runner positions the on-disk tree this pipeline builds against
     /// (W224). Defaults to [`WorkspaceMode::Checkout`] (switch to the run's
-    /// branch, bail if dirty). Releases set `workspace = "isolated"` so a tag is
+    /// ref, bail if dirty). Releases set `workspace = "isolated"` so a tag is
     /// always cut from a clean worktree, never a dev's live edits; local-only
     /// pipelines may set `workspace = "live"` to build the tree as-is.
     #[serde(default)]
@@ -393,6 +394,14 @@ pub struct QedStep {
     pub cwd: Option<String>,
     #[serde(default)]
     pub env: HashMap<String, String>,
+    /// Per-step budget **in seconds** (R603-B6). Every pipeline TOML has always
+    /// written seconds (`timeout = 1800` for a 30-minute `cargo check`,
+    /// `timeout = 9000` for the 2.5h rusty-v8 build), but the runner used to
+    /// lower this with `Millis::from_ms`, reading 9000 as 9 *milliseconds*-worth
+    /// of seconds — i.e. 9s. That stayed invisible for local steps (the local
+    /// driver never enforces `spec.timeout`) and silently killed every long
+    /// REMOTE step at 1/1000th of its budget. Lower it with
+    /// [`Millis::from_secs`], never `from_ms`.
     #[serde(default)]
     pub timeout: Option<u64>,
     #[serde(default)]
@@ -573,6 +582,13 @@ pub struct QedStep {
     /// `None` for every other step kind.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait_for: Option<WaitForConfig>,
+    /// For `kind = manifest-stitch` (R590-F2): the arch-agnostic target tag and
+    /// the per-arch source tags to fold into a multi-arch manifest list.
+    /// Required when `kind = manifest-stitch`; `validate()` rejects a missing
+    /// block / empty target / no sources at parse time the same way `wait_for`
+    /// does. `None` for every other step kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_stitch: Option<ManifestStitchConfig>,
     /// Structured platform intent (R531-F2, W222): what target this step
     /// produces and the arch of the base image it pulls. `host` is *not*
     /// declared here — it's self-detected per runner (R531-T1) and composed
@@ -694,6 +710,16 @@ pub enum StepKind {
     /// nothing — it is a pure gate. `validate()` rejects `argv` and a missing
     /// `[wait_for]` block the same way [`StepKind::SubPipeline`] does.
     WaitFor,
+    /// Stitch N per-arch images (already pushed by earlier `build-image` steps
+    /// routed to arch-matched build-workers) into one multi-arch manifest list
+    /// (R590-F2). Config lives on [`QedStep::manifest_stitch`]: the arch-agnostic
+    /// `target` tag consumers pull, and the arch-specific `sources` to fold in.
+    /// The step shells `docker buildx imagetools create` — a registry-only
+    /// operation, so it runs host-native even under `--where=remote` (the fleet
+    /// does the builds; the stitch runs where qed runs). No `argv` of its own;
+    /// `validate()` rejects `argv` and requires a `[manifest_stitch]` block with
+    /// a target + at least one source.
+    ManifestStitch,
 }
 
 /// Maximum allowed sub-pipeline nesting depth, counted as the number of
@@ -929,6 +955,37 @@ impl WaitForConfig {
             .as_deref()
             .is_some_and(|u| u.trim_start().starts_with("https://"))
     }
+}
+
+/// Step-level config for [`StepKind::ManifestStitch`] (R590-F2). Names the
+/// arch-agnostic manifest-list tag to publish and the per-arch source tags to
+/// fold into it.
+///
+/// ```toml
+/// [[steps]]
+/// name = "stitch:multi-arch"
+/// kind = "manifest-stitch"
+/// [steps.manifest_stitch]
+/// target = "ghcr.io/yah-ai/yah-rust:v1"
+/// sources = [
+///   "ghcr.io/yah-ai/yah-rust:v1-amd64",   # pushed by the amd64 build-worker
+///   "ghcr.io/yah-ai/yah-rust:v1-arm64",   # pushed by the arm64 build-worker
+/// ]
+/// ```
+///
+/// `sources` are the arch-specific tags earlier `build-image` steps pushed to
+/// the registry; `target` is the tag consumers pull (docker resolves the arch
+/// at pull time from the manifest list). `validate()` requires a non-empty
+/// `target` and at least one `source`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct ManifestStitchConfig {
+    /// Arch-agnostic manifest-list tag to create/overwrite.
+    pub target: String,
+    /// Per-arch source image tags to fold into the manifest list. Must be
+    /// already pushed to their registry before this step runs.
+    #[serde(default)]
+    pub sources: Vec<String>,
 }
 
 /// Declares a named output that a native [`StepKind::Subprocess`] step may
@@ -1200,6 +1257,20 @@ pub enum StepValidationError {
     WaitForStatusNeedsHttp(String),
     #[error("step `{0}`: wait-for `timeout_secs` must be greater than zero")]
     WaitForZeroTimeout(String),
+    #[error("step `{0}`: manifest-stitch steps must omit `argv` (the stitch is a pure registry op)")]
+    ManifestStitchHasArgv(String),
+    #[error(
+        "step `{0}`: manifest-stitch steps require a `[manifest_stitch]` block with \
+         `target = \"...\"` and `sources = [...]`"
+    )]
+    ManifestStitchMissingConfig(String),
+    #[error("step `{0}`: manifest-stitch requires a non-empty `target` manifest-list tag")]
+    ManifestStitchMissingTarget(String),
+    #[error(
+        "step `{0}`: manifest-stitch requires at least one `sources` entry \
+         (the per-arch tags to fold into the manifest list)"
+    )]
+    ManifestStitchNeedsSources(String),
     #[error(
         "finally step `{0}`: v1 `[[finally]]` teardown supports only `kind = subprocess` \
          (and never `background`) — composite / image / sidecar teardown is a follow-up"
@@ -1374,6 +1445,27 @@ impl QedStep {
                 }
                 Ok(())
             }
+            StepKind::ManifestStitch => {
+                if !self.argv.is_empty() {
+                    return Err(StepValidationError::ManifestStitchHasArgv(self.name.clone()));
+                }
+                let Some(cfg) = self.manifest_stitch.as_ref() else {
+                    return Err(StepValidationError::ManifestStitchMissingConfig(
+                        self.name.clone(),
+                    ));
+                };
+                if cfg.target.trim().is_empty() {
+                    return Err(StepValidationError::ManifestStitchMissingTarget(
+                        self.name.clone(),
+                    ));
+                }
+                if cfg.sources.is_empty() {
+                    return Err(StepValidationError::ManifestStitchNeedsSources(
+                        self.name.clone(),
+                    ));
+                }
+                Ok(())
+            }
         }
     }
 
@@ -1507,6 +1599,17 @@ pub struct QedRunMeta {
     pub created_at: DateTime<Utc>,
     pub completed_at: Option<DateTime<Utc>>,
     pub steps: Vec<StepStatus>,
+    /// Run-level failure reason for a failure that happened *outside* any
+    /// step — a [`RunnerError`] returned before the first `StepStarted`
+    /// (workspace positioning, toolchain preflight, background-sidecar
+    /// validation) or after the last step. Unlike [`StepStatus::error`],
+    /// which explains why a *step* failed, this carries the reason a run
+    /// died with an empty (or partial) `steps` list, so `qed.status` /
+    /// the desktop can surface *why* instead of a bare "failed" with
+    /// nothing to anchor a card on. `None` on success and on step-level
+    /// failures (the reason lives on the failing [`StepStatus`] there).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_reason: Option<String>,
     /// Set on child runs spawned by a [`StepKind::SubPipeline`] step (W201-F5).
     /// Carries the immediate parent's [`QedRunId`] so a consumer can walk
     /// from a child up to its parent (and recursively to the root). `None`
@@ -1661,6 +1764,7 @@ mod tests {
                 background: false,
                 background_until: None,
                 wait_for: None,
+                manifest_stitch: None,
                 name: "s".into(),
                 argv: argv.into_iter().map(String::from).collect(),
                 cwd: None,
@@ -1767,6 +1871,7 @@ mod tests {
             background: false,
             background_until: None,
             wait_for: None,
+            manifest_stitch: None,
             name: name.into(),
             argv: Vec::new(),
             cwd: None,
@@ -1802,6 +1907,7 @@ mod tests {
             background: false,
             background_until: None,
             wait_for: None,
+            manifest_stitch: None,
             name: name.into(),
             argv: Vec::new(),
             cwd: None,
@@ -1837,6 +1943,7 @@ mod tests {
             background: false,
             background_until: None,
             wait_for: None,
+            manifest_stitch: None,
             name: name.into(),
             argv: Vec::new(),
             cwd: None,
@@ -2026,6 +2133,7 @@ mod tests {
             background: false,
             background_until: None,
             wait_for: None,
+            manifest_stitch: None,
             name: name.into(),
             argv: Vec::new(),
             cwd: None,
@@ -2227,6 +2335,7 @@ mod tests {
             background: false,
             background_until: None,
             wait_for: None,
+            manifest_stitch: None,
             name: name.into(),
             argv: Vec::new(),
             cwd: None,
@@ -2432,6 +2541,80 @@ mod tests {
         assert_eq!(cfg.hash, None, "unpinned by default");
         assert!(!cfg.materialize);
         assert_eq!(cfg.event, None);
+    }
+
+    // ── R590-F2: manifest-stitch step ──────────────────────────────────────
+
+    fn manifest_stitch_step(name: &str) -> QedStep {
+        let mut step = gha_workflow_step(name);
+        step.kind = StepKind::ManifestStitch;
+        step.gha_workflow = None;
+        step.argv = vec![];
+        step.manifest_stitch = Some(ManifestStitchConfig {
+            target: "ghcr.io/yah-ai/yah-rust:v1".into(),
+            sources: vec![
+                "ghcr.io/yah-ai/yah-rust:v1-amd64".into(),
+                "ghcr.io/yah-ai/yah-rust:v1-arm64".into(),
+            ],
+        });
+        step
+    }
+
+    #[test]
+    fn manifest_stitch_step_validates_when_well_formed() {
+        assert!(manifest_stitch_step("stitch").validate().is_ok());
+    }
+
+    #[test]
+    fn manifest_stitch_step_rejects_argv() {
+        let mut step = manifest_stitch_step("stitch");
+        step.argv = vec!["docker".into()];
+        assert_eq!(
+            step.validate(),
+            Err(StepValidationError::ManifestStitchHasArgv("stitch".into()))
+        );
+    }
+
+    #[test]
+    fn manifest_stitch_step_rejects_missing_config() {
+        let mut step = manifest_stitch_step("stitch");
+        step.manifest_stitch = None;
+        assert_eq!(
+            step.validate(),
+            Err(StepValidationError::ManifestStitchMissingConfig("stitch".into()))
+        );
+    }
+
+    #[test]
+    fn manifest_stitch_step_rejects_empty_target() {
+        let mut step = manifest_stitch_step("stitch");
+        step.manifest_stitch.as_mut().unwrap().target = "  ".into();
+        assert_eq!(
+            step.validate(),
+            Err(StepValidationError::ManifestStitchMissingTarget("stitch".into()))
+        );
+    }
+
+    #[test]
+    fn manifest_stitch_step_rejects_no_sources() {
+        let mut step = manifest_stitch_step("stitch");
+        step.manifest_stitch.as_mut().unwrap().sources = vec![];
+        assert_eq!(
+            step.validate(),
+            Err(StepValidationError::ManifestStitchNeedsSources("stitch".into()))
+        );
+    }
+
+    #[test]
+    fn manifest_stitch_step_round_trips_through_toml() {
+        let step = manifest_stitch_step("stitch");
+        let toml_str = toml::to_string(&step).expect("serialize manifest-stitch step");
+        assert!(toml_str.contains("kind = \"manifest-stitch\""), "{toml_str}");
+        let parsed: QedStep = toml::from_str(&toml_str).expect("deserialize manifest-stitch step");
+        assert_eq!(parsed.kind, StepKind::ManifestStitch);
+        let cfg = parsed.manifest_stitch.expect("manifest_stitch block present");
+        assert_eq!(cfg.target, "ghcr.io/yah-ai/yah-rust:v1");
+        assert_eq!(cfg.sources.len(), 2);
     }
 
     // ── R513-F3 (W207 Gap #5): wait-for step ───────────────────────────────

@@ -247,7 +247,6 @@ mod tests {
         "yah-node",
         "yah-yubaba",
         "yah-miniflare",
-        "yah-mesofact-dev",
         "yah-cloud-runner",
         "rusty-v8-musl-builder",
     ];

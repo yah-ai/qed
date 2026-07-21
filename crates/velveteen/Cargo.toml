@@ -53,10 +53,10 @@ name = "velveteen"
 path = "src/lib.rs"
 
 [dependencies]
-observation = { path = "../observation", version = "0.8.16" }
-workload-spec = { package = "yah-workload-spec", version = "0.8.16" }
-task-runs = { path = "../task-runs", version = "0.8.16" }
-yah-scryer = { path = "../scryer", version = "0.8.16" }
+observation = { path = "../observation", version = "0.8.20" }
+workload-spec = { package = "yah-workload-spec", version = "0.8.20" }
+task-runs = { path = "../task-runs", version = "0.8.20" }
+yah-scryer = { path = "../scryer", version = "0.8.20" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 async-trait = "0.1"

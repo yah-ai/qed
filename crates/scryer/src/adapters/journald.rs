@@ -353,7 +353,7 @@ mod tests {
 
         scryer.flush_ring().unwrap();
         let scope = EventScope::Service(MeshIdent("sshd.host".to_string()));
-        let events = scryer.events(&scope, &EventFilter::default()).unwrap();
+        let events = scryer.events(&scope, &EventFilter::default()).await.unwrap();
 
         assert_eq!(events.len(), 3, "all three sshd entries should land");
         assert_eq!(events[0].msg, "Accepted publickey for operator");
@@ -392,7 +392,7 @@ mod tests {
         scryer.flush_ring().unwrap();
 
         let scope = EventScope::Service(MeshIdent("sshd.host".to_string()));
-        let events = scryer.events(&scope, &EventFilter::default()).unwrap();
+        let events = scryer.events(&scope, &EventFilter::default()).await.unwrap();
         assert_eq!(events.len(), 1);
     }
 
@@ -422,15 +422,15 @@ mod tests {
 
         // Only sshd events land.
         let sshd_scope = EventScope::Service(MeshIdent("sshd.host".to_string()));
-        let sshd_events = scryer.events(&sshd_scope, &EventFilter::default()).unwrap();
+        let sshd_events = scryer.events(&sshd_scope, &EventFilter::default()).await.unwrap();
         assert_eq!(sshd_events.len(), 1);
 
         let cf_scope = EventScope::Service(MeshIdent("cloudflared.host".to_string()));
-        let cf_events = scryer.events(&cf_scope, &EventFilter::default()).unwrap();
+        let cf_events = scryer.events(&cf_scope, &EventFilter::default()).await.unwrap();
         assert_eq!(cf_events.len(), 0, "cloudflared must not be ingested via journald");
 
         let kern_scope = EventScope::Service(MeshIdent("kernel.host".to_string()));
-        let kern_events = scryer.events(&kern_scope, &EventFilter::default()).unwrap();
+        let kern_events = scryer.events(&kern_scope, &EventFilter::default()).await.unwrap();
         assert_eq!(kern_events.len(), 0, "kernel not in allow-list");
     }
 
@@ -459,13 +459,13 @@ mod tests {
         scryer.flush_ring().unwrap();
 
         let sshd_scope = EventScope::Service(MeshIdent("sshd.host".to_string()));
-        let sshd_events = scryer.events(&sshd_scope, &EventFilter::default()).unwrap();
+        let sshd_events = scryer.events(&sshd_scope, &EventFilter::default()).await.unwrap();
         assert_eq!(sshd_events.len(), 2);
         assert_eq!(sshd_events[0].seq, 0);
         assert_eq!(sshd_events[1].seq, 1);
 
         let kern_scope = EventScope::Service(MeshIdent("kernel.host".to_string()));
-        let kern_events = scryer.events(&kern_scope, &EventFilter::default()).unwrap();
+        let kern_events = scryer.events(&kern_scope, &EventFilter::default()).await.unwrap();
         assert_eq!(kern_events.len(), 2);
         assert_eq!(kern_events[0].seq, 0);
         assert_eq!(kern_events[1].seq, 1);
@@ -522,7 +522,7 @@ mod tests {
         scryer.flush_ring().unwrap();
 
         let scope = EventScope::Service(MeshIdent("sshd.host".to_string()));
-        let events = scryer.events(&scope, &EventFilter::default()).unwrap();
+        let events = scryer.events(&scope, &EventFilter::default()).await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].fields["_PID"], "1234");
         assert_eq!(events[0].fields["SYSLOG_IDENTIFIER"], "sshd");

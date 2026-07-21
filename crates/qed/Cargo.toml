@@ -17,9 +17,9 @@ name = "yah-qed"
 path = "src/bin/qed.rs"
 
 [dependencies]
-velveteen = { path = "../task" }
+velveteen = { path = "../velveteen" }
 task-runs = { path = "../task-runs" }
-workload-spec = { package = "yah-workload-spec", version = "0.8.16" }
+workload-spec = { package = "yah-workload-spec", version = "0.8.20" }
 yah-scryer = { path = "../scryer" }
 observation = { path = "../observation" }
 serde = { version = "1.0", features = ["derive"] }
@@ -57,7 +57,7 @@ indexmap = { version = "2", features = ["serde"] }
 # R487 follow-up: vault-backed `~/.yah/qed/secrets.toml` resolver — maps GHA
 # secret names to vault slot names so workflows that reference
 # ${{ secrets.X }} get the same value GHA's secret store would.
-fob = { version = "0.8.16" }
+fob = { version = "0.8.20" }
 # W209: pipeline outputs → manifest bind. Parse-time schema (BindSpec,
 # OutputDecl, OutputRef, ValueType, Intent) consumed by the pipeline TOML
 # loader; the applier itself runs at step boundaries inside the runner.

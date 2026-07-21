@@ -479,7 +479,7 @@ mod integration {
         let events = loop {
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             scryer.flush_ring().unwrap();
-            let evs = scryer.events(&EventScope::Forge(id.clone()), &EventFilter::default()).unwrap();
+            let evs = scryer.events(&EventScope::Forge(id.clone()), &EventFilter::default()).await.unwrap();
             if evs.len() >= 3 || std::time::Instant::now() > deadline {
                 break evs;
             }

@@ -190,7 +190,7 @@ mod tests {
 
         scryer.flush_ring().unwrap();
         let scope = EventScope::Service(MeshIdent("yubaba.local".into()));
-        let events = scryer.events(&scope, &EventFilter::default()).unwrap();
+        let events = scryer.events(&scope, &EventFilter::default()).await.unwrap();
         assert_eq!(events.len(), 3);
         assert_eq!(events[0].target, "yubaba.workload.deploy");
         assert_eq!(events[1].target, "yubaba.mesh.peer_join");

@@ -15,6 +15,21 @@
 //!
 //! The output shapes (`Diagnostic`, `Triage`) are identical regardless of
 //! species — arch doc §forge-6 guarantee.
+//!
+//! @yah:relay(R598, "velveteen lib-test binary repair: finish the async migration at test call-sites")
+//! @yah:at(2026-07-06T07:54:15Z)
+//! @yah:status(open)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//!
+//! @yah:ticket(R598-B1, "~31 velveteen test call-sites call async fns (scryer.events/TaskStore/forge_triage/forge_list) without .await")
+//! @yah:status(review)
+//! @yah:at(2026-07-06T11:41:18Z)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R598)
+//! @yah:severity(medium)
+//! @yah:verify("cargo test -p velveteen --lib compiles and runs green (incl R590-F2's buildctl_argv/build_image_command/round-trip tests)")
+//! @yah:gotcha("Discovered during R590-F2. On committed HEAD `cargo test -p velveteen --lib` fails to compile (~31 errors), blocking ALL velveteen lib tests. Root cause: scryer.events, TaskStore::open/insert_run, forge_triage, forge_list became `async fn` but their test call-sites still call .unwrap()/.expect() synchronously. Sites: triage.rs(15) list.rs(12) remote.rs(3) integration.rs(1). Fix = add .await + convert enclosing #[test]->#[tokio::test] async fn where needed. Tier: Thief (mechanical).")
+//! @yah:handoff("FIXED. velveteen `cargo test -p velveteen --lib` = 84 pass / 0 fail / 2 ignored (was ~31 compile errors). Added .await to async call-sites: integration.rs(scryer.events), remote.rs(3x scryer.events), list.rs(open_store+insert_local helpers made async fn, all 10 tests -> #[tokio::test], forge_list awaited). triage.rs converged via peer/linter edits on the shared tree. Unblocks R590-F2's velveteen-side unit tests (buildctl_argv_*, build_image_workload_spec_*, build_image_emits_platform_and_build_args all green now).")
 
 use observation::{Diagnostic, Event, EventScope, ForgeId, Level, TaskRunId};
 use yah_scryer::{EventFilter as ScryerEventFilter, Scryer, ScryerError};
@@ -265,7 +280,7 @@ mod diagnostics {
     }
 
     /// Insert run + fixture error events into a `TaskStore` (local-forge path).
-    fn insert_local_failure(task_store: &TaskStore, forge_id: &ForgeId) {
+    async fn insert_local_failure(task_store: &TaskStore, forge_id: &ForgeId) {
         let run_id: TaskRunId = forge_id.clone().into();
         task_store
             .insert_run(&TaskRunMeta {
@@ -281,6 +296,7 @@ mod diagnostics {
                 pinned: false,
                 origin: None,
             })
+            .await
             .unwrap();
         for (i, (level, target, msg)) in fixture_events().iter().enumerate() {
             task_store
@@ -294,23 +310,24 @@ mod diagnostics {
                     None,
                     &EventSource::Synth,
                 )
+                .await
                 .unwrap();
         }
     }
 
-    #[test]
-    fn cross_species() {
+    #[tokio::test]
+    async fn cross_species() {
         let fixture = fixture_events();
 
         let local_diags = {
             let dir = TempDir::new().unwrap();
             let forge_id = ForgeId::new();
-            let arc_ts = Arc::new(TaskStore::open(&dir.path().join("tr.db")).unwrap());
-            insert_local_failure(&arc_ts, &forge_id);
+            let arc_ts = Arc::new(TaskStore::open(&dir.path().join("tr.db")).await.unwrap());
+            insert_local_failure(&arc_ts, &forge_id).await;
             let scryer =
                 Scryer::new(ScryerConfig::new(dir.path().join("scryer.db")), Some(Arc::clone(&arc_ts)))
                     .unwrap();
-            forge_diagnostics(&scryer, Some(&arc_ts), &forge_id).unwrap()
+            forge_diagnostics(&scryer, Some(&arc_ts), &forge_id).await.unwrap()
         };
 
         let remote_diags = {
@@ -318,7 +335,7 @@ mod diagnostics {
             let forge_id = ForgeId::new();
             let scryer = Scryer::new(ScryerConfig::new(dir.path().join("scryer.db")), None).unwrap();
             push_forge_events(&scryer, &forge_id);
-            forge_diagnostics(&scryer, None, &forge_id).unwrap()
+            forge_diagnostics(&scryer, None, &forge_id).await.unwrap()
         };
 
         let integration_diags = {
@@ -326,7 +343,7 @@ mod diagnostics {
             let forge_id = ForgeId::new();
             let scryer = Scryer::new(ScryerConfig::new(dir.path().join("scryer.db")), None).unwrap();
             push_forge_events(&scryer, &forge_id);
-            forge_diagnostics(&scryer, None, &forge_id).unwrap()
+            forge_diagnostics(&scryer, None, &forge_id).await.unwrap()
         };
 
         // All three species must produce the same number of diagnostics.
@@ -399,7 +416,7 @@ mod triage {
         scryer.flush_ring().unwrap();
     }
 
-    fn insert_local_failure(task_store: &TaskStore, forge_id: &ForgeId) {
+    async fn insert_local_failure(task_store: &TaskStore, forge_id: &ForgeId) {
         let run_id: TaskRunId = forge_id.clone().into();
         task_store
             .insert_run(&TaskRunMeta {
@@ -415,6 +432,7 @@ mod triage {
                 pinned: false,
                 origin: None,
             })
+            .await
             .unwrap();
         for (i, (level, target, msg)) in fixture_events().iter().enumerate() {
             task_store
@@ -428,24 +446,26 @@ mod triage {
                     None,
                     &EventSource::Synth,
                 )
+                .await
                 .unwrap();
         }
     }
 
-    #[test]
-    fn cross_species() {
+    #[tokio::test]
+    async fn cross_species() {
         let fixture = fixture_events();
         let first_msg = fixture[0].2;
 
         let local_triage = {
             let dir = TempDir::new().unwrap();
             let forge_id = ForgeId::new();
-            let arc_ts = Arc::new(TaskStore::open(&dir.path().join("tr.db")).unwrap());
-            insert_local_failure(&arc_ts, &forge_id);
+            let arc_ts = Arc::new(TaskStore::open(&dir.path().join("tr.db")).await.unwrap());
+            insert_local_failure(&arc_ts, &forge_id).await;
             let scryer =
                 Scryer::new(ScryerConfig::new(dir.path().join("scryer.db")), Some(Arc::clone(&arc_ts)))
                     .unwrap();
             forge_triage(&scryer, Some(&arc_ts), &forge_id, false)
+                .await
                 .unwrap()
                 .expect("local triage should be Some")
         };
@@ -456,6 +476,7 @@ mod triage {
             let scryer = Scryer::new(ScryerConfig::new(dir.path().join("scryer.db")), None).unwrap();
             push_forge_events(&scryer, &forge_id);
             forge_triage(&scryer, None, &forge_id, false)
+                .await
                 .unwrap()
                 .expect("remote triage should be Some")
         };
@@ -466,6 +487,7 @@ mod triage {
             let scryer = Scryer::new(ScryerConfig::new(dir.path().join("scryer.db")), None).unwrap();
             push_forge_events(&scryer, &forge_id);
             forge_triage(&scryer, None, &forge_id, false)
+                .await
                 .unwrap()
                 .expect("integration triage should be Some")
         };
@@ -504,16 +526,16 @@ mod triage {
         }
     }
 
-    #[test]
-    fn local_returns_cached_triage() {
+    #[tokio::test]
+    async fn local_returns_cached_triage() {
         use task_runs::{KeepRange, SeqRange, Triage};
 
         let dir = TempDir::new().unwrap();
         let forge_id = ForgeId::new();
         let run_id: TaskRunId = forge_id.clone().into();
 
-        let arc_ts = Arc::new(TaskStore::open(&dir.path().join("tr.db")).unwrap());
-        insert_local_failure(&arc_ts, &forge_id);
+        let arc_ts = Arc::new(TaskStore::open(&dir.path().join("tr.db")).await.unwrap());
+        insert_local_failure(&arc_ts, &forge_id).await;
 
         // Write a cached (LLM) triage for this run.
         let cached = Triage {
@@ -526,12 +548,13 @@ mod triage {
             cached_at: 9_000_000,
             partial: false,
         };
-        arc_ts.upsert_triage(&cached).unwrap();
+        arc_ts.upsert_triage(&cached).await.unwrap();
 
         let scryer =
             Scryer::new(ScryerConfig::new(dir.path().join("scryer.db")), Some(Arc::clone(&arc_ts)))
                 .unwrap();
         let result = forge_triage(&scryer, Some(&arc_ts), &forge_id, false)
+            .await
             .unwrap()
             .expect("should return cached triage");
 
@@ -541,13 +564,13 @@ mod triage {
         assert_eq!(result.synopsis, "LLM-produced summary");
     }
 
-    #[test]
-    fn clean_run_returns_none() {
+    #[tokio::test]
+    async fn clean_run_returns_none() {
         let dir = TempDir::new().unwrap();
         let forge_id = ForgeId::new();
         // No events written → forge_triage should return None.
         let scryer = Scryer::new(ScryerConfig::new(dir.path().join("scryer.db")), None).unwrap();
-        let result = forge_triage(&scryer, None, &forge_id, false).unwrap();
+        let result = forge_triage(&scryer, None, &forge_id, false).await.unwrap();
         assert!(result.is_none(), "clean run with no warn/error events should return None");
     }
 }

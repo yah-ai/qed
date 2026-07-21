@@ -15,7 +15,7 @@ pub mod store;
 pub mod types;
 pub mod user_beholders;
 
-pub use driver::{DriverError, SpawnOpts, TaskDriver};
+pub use driver::{DriverChannels, DriverError, SpawnOpts, TaskDriver};
 pub use beholders::{
     AttachResult, Beholder, BeholderFactory, BeholderMode, BeholderRegistry, BeholderSelect,
     CargoBeholder, CargoBeholderFactory, ToolVersionRange, default_registry,

@@ -231,10 +231,13 @@
 //! @yah:verify("yah qed list  # with daemon: tabular history; without: 'no camp daemon' message")
 //! @yah:verify("yah qed status <run_id>  # with daemon: pipeline+steps; without: clear error")
 
+pub mod artifact_local;
+pub mod artifact_retrieval;
 pub mod config;
 pub mod eject;
 pub mod events;
 pub mod export;
+pub mod image_overlay;
 pub mod images;
 pub mod import;
 pub mod matrix;
@@ -276,7 +279,7 @@ pub use peers::{PeerConfig, PeerConfigError, PeerEntry};
 pub use placement_gate::{evaluate as evaluate_placement_gate, GateOutcome, RunnerEnv};
 pub use platform::{
     arch_of, detect_host_triple, gha_runner_arch, host_native_crossable, preflight_line,
-    resolve as resolve_platform, Platform, PlatformSpec, Resolution,
+    resolve as resolve_platform, resolve_placement, Platform, PlatformSpec, Resolution,
 };
 pub use ports::{
     workflow_ports, PortError, PortInput, PortOutput, PortSecret, WorkflowPorts,
@@ -299,8 +302,14 @@ pub use publish::{
 pub use yah_qed_gha;
 pub use registries::{extract_registry_host, RegistryConfig, RegistryConfigError, RegistryEntry};
 pub use runner::{
-    LoggingOutcomeDispatcher, OutcomeDispatcher, PipelineRunner, RunWhere, RunnerError,
+    pipeline_needs_offload, LoggingOutcomeDispatcher, OutcomeDispatcher, PipelineRunner, RunWhere,
+    RunnerError,
 };
+/// Re-exported so daemon glue (camp.rs boot-reconcile, R603-T4) can parse a
+/// persisted bare-uuid `task_run_id` back into the workload identity that
+/// [`PipelineRunner::resume_terminal_publish_for_remote_step`] takes, without a
+/// direct `observation` dep edge.
+pub use observation::ForgeId;
 pub use velveteen::TaskRuntime;
 pub use velveteen::{
     RecipeError, RecipeLocation, RecipePlacement, RecipeStep, TransformRecipe,
@@ -316,10 +325,10 @@ pub use transform::{
 };
 pub use types::{
     new_run_id, sub_pipeline_ref_token, validate_sub_pipeline_graph, GhaWorkflowConfig,
-    ImportConfig, JobRow, Outcome, OutputDecl, Pipeline, Placement, ProducedArtifact, QedRunId,
-    QedRunMeta, QedStep, RunStatus, StepActivation, StepKind, StepStatus, StepValidationError,
-    SubPipelineCollect, SubPipelineConfig, SubPipelineError, SubPipelineRef, SubPipelineResolver,
-    Trigger, WaitForConfig, MAX_SUB_PIPELINE_DEPTH,
+    ImportConfig, JobRow, ManifestStitchConfig, Outcome, OutputDecl, Pipeline, Placement,
+    ProducedArtifact, QedRunId, QedRunMeta, QedStep, RunStatus, StepActivation, StepKind,
+    StepStatus, StepValidationError, SubPipelineCollect, SubPipelineConfig, SubPipelineError,
+    SubPipelineRef, SubPipelineResolver, Trigger, WaitForConfig, MAX_SUB_PIPELINE_DEPTH,
 };
 
 /// Returns the argv that an external scheduler (e.g. almanac) should submit as a TaskSpec

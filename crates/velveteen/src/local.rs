@@ -66,10 +66,14 @@ use crate::executor::{
 use crate::{ForgeCommand, ForgeSpec, ForgeStatus, TaskRuntime};
 
 /// Format an [`ImageRef`] as the single positional argument passed to
-/// `docker run`. Always digest-pinned per R438-T3 — the tag is preserved
-/// alongside the digest for human readability.
+/// `docker run`. Pinned images resolve content-addressed (`repo:tag@digest`);
+/// unpinned images (the all-zeros [`ImageRef::UNPINNED_DIGEST`] sentinel — a
+/// dev build or a not-yet-published catalog image) fall back to tag-only, since
+/// docker holds a locally-built or tag-pulled image under `repo:tag`, never
+/// under the sentinel digest (R590-B5). Delegates to [`ImageRef::pull_ref`] so
+/// the tag-fallback rule lives in one place.
 pub fn image_ref_arg(image: &ImageRef) -> String {
-    format!("{}/{}:{}@{}", image.registry, image.repository, image.tag, image.digest)
+    image.pull_ref()
 }
 
 /// Build a `tokio::process::Command` for `docker run --rm` that, when
@@ -149,6 +153,12 @@ pub struct BuildImageOptions<'a> {
     /// where the image must be immediately runnable by `docker run`. When
     /// `true`, `oci_archive` is typically `None` (caller's responsibility).
     pub load: bool,
+    /// Target platforms (`--platform linux/amd64,linux/arm64`), R590-F2. Empty
+    /// slice ⇒ no `--platform` flag (host-native build). Multi-platform buildx
+    /// builds cannot be `--load`ed into the local daemon.
+    pub platforms: &'a [String],
+    /// `--build-arg KEY=VALUE` pairs, order-preserving (R590-F2).
+    pub build_args: &'a [(String, String)],
 }
 
 /// Build a `docker buildx build …` command for a build-image step.
@@ -159,6 +169,8 @@ pub struct BuildImageOptions<'a> {
 /// docker buildx build \
 ///   --file <dockerfile> \
 ///   --tag <tag> \
+///   [--platform <csv>] \
+///   [--build-arg KEY=VALUE]... \
 ///   [--push] \
 ///   [--cache-to type=local,dest=<cache>] \
 ///   [--cache-from type=local,src=<cache>] \
@@ -174,6 +186,13 @@ pub fn build_image_command(opts: &BuildImageOptions<'_>) -> Command {
 
     cmd.arg("--file").arg(opts.dockerfile);
     cmd.arg("--tag").arg(opts.tag);
+
+    if !opts.platforms.is_empty() {
+        cmd.arg("--platform").arg(opts.platforms.join(","));
+    }
+    for (k, v) in opts.build_args {
+        cmd.arg("--build-arg").arg(format!("{k}={v}"));
+    }
 
     if opts.push {
         cmd.arg("--push");
@@ -196,6 +215,41 @@ pub fn build_image_command(opts: &BuildImageOptions<'_>) -> Command {
     }
 
     cmd.arg(opts.context);
+    cmd.kill_on_drop(true);
+    cmd
+}
+
+// ─── docker buildx imagetools (R590-F2 multi-arch stitch) ─────────────────────
+
+/// Build a `docker buildx imagetools create` command that stitches N per-arch
+/// source images (already pushed to a registry) into one multi-arch manifest
+/// list published under `target`.
+///
+/// This is a registry-only operation — it reads the source images' manifests
+/// and writes a new manifest-list tag; it does NOT need a build worker or the
+/// build context, only registry access + a local `docker buildx`. That is why
+/// the qed runner runs it host-native even for a `--where=remote` pipeline: the
+/// per-arch builds fan out to the arch-matched fleet, but the manifest stitch
+/// runs where qed runs.
+///
+/// The shape is:
+///
+/// ```text
+/// docker buildx imagetools create \
+///   --tag <target> \
+///   <source0> <source1> ...
+/// ```
+///
+/// Sources are the arch-specific tags each per-arch build pushed (e.g.
+/// `ghcr.io/yah-ai/img:v1-amd64`, `…:v1-arm64`); `target` is the arch-agnostic
+/// tag (`…:v1`) consumers pull. Caller guarantees ≥1 source.
+pub fn imagetools_create_command(target: &str, sources: &[String]) -> Command {
+    let mut cmd = Command::new("docker");
+    cmd.arg("buildx").arg("imagetools").arg("create");
+    cmd.arg("--tag").arg(target);
+    for src in sources {
+        cmd.arg(src);
+    }
     cmd.kill_on_drop(true);
     cmd
 }
@@ -411,6 +465,22 @@ mod tests {
     }
 
     #[test]
+    fn image_ref_arg_unpinned_falls_back_to_tag_only() {
+        // A not-yet-published catalog image (all-zeros sentinel) pulls by tag;
+        // docker holds it under `repo:tag`, not `repo@sha256:0000…` (R590-B5).
+        let img = img(
+            "ghcr.io",
+            "yah-ai/rusty-v8-musl-builder",
+            "latest",
+            workload_spec::testing::TEST_DIGEST,
+        );
+        assert_eq!(
+            image_ref_arg(&img),
+            "ghcr.io/yah-ai/rusty-v8-musl-builder:latest",
+        );
+    }
+
+    #[test]
     fn command_program_is_docker() {
         let image = img(
             "ghcr.io",
@@ -513,6 +583,8 @@ mod tests {
             load: false,
             cache_dir: None,
             oci_archive: None,
+            platforms: &[],
+            build_args: &[],
         }
     }
 
@@ -591,6 +663,51 @@ mod tests {
         let cmd = build_image_command(&o);
         let args = args_of(&cmd);
         assert!(args.iter().any(|a| a == "--load"), "missing --load in {args:?}");
+    }
+
+    #[test]
+    fn build_image_emits_platform_and_build_args() {
+        let dockerfile = PathBuf::from("/work/Dockerfile");
+        let context = PathBuf::from(".");
+        let platforms = vec!["linux/amd64".to_string(), "linux/arm64".to_string()];
+        let build_args = vec![("RUST_VERSION".to_string(), "1.85".to_string())];
+        let mut o = opts(&dockerfile, &context, "yah-rust:dev");
+        o.platforms = &platforms;
+        o.build_args = &build_args;
+        let cmd = build_image_command(&o);
+        let args = args_of(&cmd);
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--platform" && w[1] == "linux/amd64,linux/arm64"),
+            "missing --platform <csv>: {args:?}",
+        );
+        assert!(
+            args.windows(2)
+                .any(|w| w[0] == "--build-arg" && w[1] == "RUST_VERSION=1.85"),
+            "missing --build-arg K=V: {args:?}",
+        );
+    }
+
+    #[test]
+    fn imagetools_create_stitches_target_and_sources() {
+        let sources = vec![
+            "ghcr.io/yah-ai/img:v1-amd64".to_string(),
+            "ghcr.io/yah-ai/img:v1-arm64".to_string(),
+        ];
+        let cmd = imagetools_create_command("ghcr.io/yah-ai/img:v1", &sources);
+        assert_eq!(cmd.as_std().get_program(), "docker");
+        assert_eq!(
+            args_of(&cmd),
+            vec![
+                "buildx",
+                "imagetools",
+                "create",
+                "--tag",
+                "ghcr.io/yah-ai/img:v1",
+                "ghcr.io/yah-ai/img:v1-amd64",
+                "ghcr.io/yah-ai/img:v1-arm64",
+            ],
+        );
     }
 
     #[test]
@@ -833,8 +950,11 @@ mod tests {
             command: ForgeCommand::BuildImage {
                 dockerfile: PathBuf::from("/tmp/Dockerfile"),
                 context: PathBuf::from("."),
-                tag: "x:y".into(),
+                tags: vec!["x:y".into()],
+                platforms: vec![],
+                build_args: vec![],
                 push: false,
+                load: false,
             },
             where_: TaskPlacement::new(TaskLocation::Local, crate::TaskRuntime::Container),
             timeout: None,

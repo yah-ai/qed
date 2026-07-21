@@ -17,14 +17,14 @@
 #   .
 #   ├── Dockerfile
 #   ├── pond-supervise.sh
-#   ├── amd64/{yah-yubaba, kamaji}
-#   └── arm64/{yah-yubaba, kamaji}
+#   ├── amd64/{yubaba, kamaji}
+#   └── arm64/{yubaba, kamaji}
 #
 # Layout inside the image:
 #   /usr/bin/tini                          # PID 1
-#   /usr/local/bin/yah-yubaba              # Yubaba-proper (mesh/raft/admission)
+#   /usr/local/bin/yubaba                  # Yubaba-proper (mesh/raft/admission)
 #   /usr/local/bin/kamaji               # Kamaji (process supervisor + UDS)
-#   /usr/local/bin/yah-yubaba-pond-supervise
+#   /usr/local/bin/yubaba-pond-supervise
 #                                          # bash launcher: starts both as siblings
 #   /run/kamaji/                        # UDS rendezvous (kamaji.sock here)
 #
@@ -48,6 +48,25 @@
 # Catalog spec: crates/yah/qed/images/catalog.toml + W148.
 # Arch doc: .yah/docs/working/W154-yubaba-dual-runtime.md
 
+# Fetch stage: static docker CLI. The pond yubaba drives sibling MinIO/
+# miniflare containers through the host docker socket (R408-T2 contract),
+# and local-driver's LocalRuntime shells out to `docker` with DOCKER_HOST
+# set — so the CLI binary must exist in the image. Static build from
+# download.docker.com keeps the runtime image slim (no containerd/runc).
+FROM debian:bookworm-slim AS docker-cli
+ARG TARGETARCH
+ARG DOCKER_CLI_VERSION=27.5.1
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && case "${TARGETARCH}" in \
+         amd64) DOCKER_ARCH=x86_64 ;; \
+         arm64) DOCKER_ARCH=aarch64 ;; \
+         *) echo "unsupported TARGETARCH ${TARGETARCH}" >&2; exit 1 ;; \
+       esac \
+    && curl -fsSL "https://download.docker.com/linux/static/stable/${DOCKER_ARCH}/docker-${DOCKER_CLI_VERSION}.tgz" \
+       | tar -xz --strip-components=1 -C /usr/local/bin docker/docker
+
 FROM debian:bookworm-slim
 
 ARG DEBIAN_FRONTEND=noninteractive
@@ -64,27 +83,31 @@ RUN apt-get update \
         procps \
     && rm -rf /var/lib/apt/lists/*
 
-COPY ${TARGETARCH}/yah-yubaba /usr/local/bin/yah-yubaba
+# Docker CLI only (client, no daemon) — pond sibling-container contract.
+COPY --from=docker-cli /usr/local/bin/docker /usr/local/bin/docker
+
+COPY ${TARGETARCH}/yubaba /usr/local/bin/yubaba
 COPY ${TARGETARCH}/kamaji  /usr/local/bin/kamaji
-COPY pond-supervise.sh        /usr/local/bin/yah-yubaba-pond-supervise
-RUN chmod +x /usr/local/bin/yah-yubaba \
+COPY pond-supervise.sh        /usr/local/bin/yubaba-pond-supervise
+RUN chmod +x /usr/local/bin/yubaba \
              /usr/local/bin/kamaji \
-             /usr/local/bin/yah-yubaba-pond-supervise
+             /usr/local/bin/yubaba-pond-supervise
 
 # UDS rendezvous dir. Kamaji creates the socket; yubaba dials in. Kept on
 # a tmpfs-friendly path so a container restart leaves no stale socket file.
 RUN mkdir -p /run/kamaji /var/lib/yah-yubaba
-ENV CONSTABLE_SOCK=/run/kamaji/kamaji.sock
+ENV KAMAJI_SOCK=/run/kamaji/kamaji.sock
 
 # Smoke-test that the binaries link cleanly and respond to --version. This
 # fails the build if either binary is missing a runtime dep. (Cross-arch
 # binaries still execute under buildx's QEMU layer during `RUN`.)
-RUN /usr/local/bin/yah-yubaba --version \
-    && /usr/local/bin/kamaji --version
+RUN /usr/local/bin/yubaba --version \
+    && /usr/local/bin/kamaji --version \
+    && /usr/local/bin/docker --version
 
 # Yubaba's HTTP surface (pond/state, raft RPC if exposed). Operators map this
 # to a host port; the catalog/pond reconciler picks 0 and reads back.
 EXPOSE 8800
 
 ENTRYPOINT ["/usr/bin/tini", "--"]
-CMD ["/usr/local/bin/yah-yubaba-pond-supervise"]
+CMD ["/usr/local/bin/yubaba-pond-supervise"]

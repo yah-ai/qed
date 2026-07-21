@@ -774,6 +774,7 @@ target = ["x86_64", "aarch64"]
             background: false,
             background_until: None,
             wait_for: None,
+            manifest_stitch: None,
             name: name.into(),
             argv: argv.iter().map(|s| (*s).into()).collect(),
             cwd: None,
@@ -814,6 +815,7 @@ target = ["x86_64", "aarch64"]
         step.platform = Some(crate::platform::PlatformSpec {
             target: Some("${{ matrix.target }}".into()),
             container_platform: None,
+            native: false,
         });
         let mut spec = MatrixSpec::default();
         spec.dimensions.insert(

@@ -10,6 +10,19 @@
 //! service action becomes a [`RuntimeError::Tier3RequiresNative`] (import it as
 //! a native QED step, don't run it); an unrecognized slug stays a loud
 //! [`RuntimeError::UnknownAction`].
+//!
+//! @yah:ticket(R605-F2, "Docker/buildx-capable QED runner substrate for the image-yah-{base,rust,rust-bun} jobs (retire GitHub-hosted builders)")
+//! @yah:at(2026-07-16T01:32:20Z)
+//! @yah:status(open)
+//! @yah:assignee(agent:bundle-anthropic-glimmerstone)
+//! @yah:parent(R605)
+//! @yah:next("The setup-buildx/qemu `uses:` verifiers are already overridden in qed-gha (toolkit_builtin), but the image jobs still need a live docker/buildx daemon to run the builds. Provision QED runners with docker on the remote-runner tier rather than re-implementing a builder here.")
+//! @yah:next("Route the image-yah-{base,rust,rust-bun} legs to a docker-capable node via the R555 remote-run placement + tier/quota grant, kamaji-admitted (signed recipes only, R555-F4).")
+//! @yah:next("Reuse the R546 build-worker tier pattern (us-west-002) as the amd64 docker-capable substrate proof; measure pull+build+push to ghcr/registry.yah.dev.")
+//! @yah:verify("A `yah qed run release` image slice builds and pushes image-yah-base to the registry from a QED-provisioned docker-capable runner with no GitHub-hosted builder in the loop")
+//! @yah:depends_on(R555)
+//! @yah:depends_on(R546)
+//! @yah:depends_on(R563)
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -99,6 +112,17 @@ pub struct Executor {
     /// default — a workflow that references an undefined secret evaluates
     /// to the empty string (matches GHA behavior for unset secrets).
     pub secrets: crate::expr::Value,
+    /// Optional injected image builder for the docker push family (R594). When
+    /// `Some`, `docker/login-action` + `docker/build-push-action` route here
+    /// (registry route/auth + local-buildx or remote-fleet build) instead of
+    /// the tier-3 `RegistryPublish` error. `None` (the default) preserves the
+    /// honest "replace with a native build-image step" error, so the bare crate
+    /// still never shells `docker`. Set via [`Executor::with_image_builder`].
+    pub image_builder: Option<std::sync::Arc<dyn crate::image_builder::ImageBuilder>>,
+    /// Optional injected artifact store for `actions/upload-artifact` /
+    /// `actions/download-artifact` (R594). Same injection gate as
+    /// [`Self::image_builder`]: `None` (default) keeps the tier-3 error.
+    pub artifact_store: Option<std::sync::Arc<dyn crate::artifact_store::ArtifactStore>>,
 }
 
 impl Executor {
@@ -128,6 +152,8 @@ impl Executor {
             included_instance_keys: None,
             events: None,
             secrets: Value::object(),
+            image_builder: None,
+            artifact_store: None,
         }
     }
 
@@ -145,6 +171,26 @@ impl Executor {
         self
     }
 
+    /// Inject an image builder for the docker push family (R594). Enables the
+    /// runtime to actually build + push the image jobs in a workflow instead of
+    /// declining them. See [`Executor::image_builder`].
+    pub fn with_image_builder(
+        mut self,
+        builder: std::sync::Arc<dyn crate::image_builder::ImageBuilder>,
+    ) -> Self {
+        self.image_builder = Some(builder);
+        self
+    }
+
+    /// Inject an artifact store for `actions/upload-artifact` /
+    /// `actions/download-artifact` (R594). See [`Executor::artifact_store`].
+    pub fn with_artifact_store(
+        mut self,
+        store: std::sync::Arc<dyn crate::artifact_store::ArtifactStore>,
+    ) -> Self {
+        self.artifact_store = Some(store);
+        self
+    }
 }
 
 fn detect_runner_os() -> &'static str {
@@ -1010,19 +1056,59 @@ fn run_uses_step(
                 // the workspace, honoring `ref` / `path` / `fetch-depth`.
                 return run_native_checkout(step, &typed_with, executor);
             }
-            return Err(match disposition {
-                Disposition::ReplaceWithNative(nr) => RuntimeError::Tier3RequiresNative {
+            // R594: retired tier-3 *services* the qed runner executes for real
+            // when it injects a handler — the docker push family (via
+            // `image_builder`) and the artifact actions (via `artifact_store`).
+            // Each is gated on injection: with no handler (the bare crate, most
+            // tests) we fall through to the honest tier-3 error below, so
+            // qed-gha on its own still never shells docker or touches a store.
+            let injected: Option<Result<crate::toolkit::ToolkitOutcome, String>> =
+                if crate::image_builder::is_image_push_action(slug) {
+                    executor.image_builder.as_ref().map(|builder| {
+                        let call = crate::image_builder::ImageBuildCall {
+                            slug,
+                            with: &typed_with,
+                            env,
+                            workspace: &executor.workspace,
+                        };
+                        builder.handle(&call)
+                    })
+                } else if crate::artifact_store::is_artifact_action(slug) {
+                    executor.artifact_store.as_ref().map(|store| {
+                        let call = crate::artifact_store::ArtifactCall {
+                            with: &typed_with,
+                            workspace: &executor.workspace,
+                        };
+                        if slug == "actions/upload-artifact" {
+                            store.upload(&call)
+                        } else {
+                            store.download(&call)
+                        }
+                    })
+                } else {
+                    None
+                };
+            match injected {
+                Some(res) => res.map_err(|message| RuntimeError::ToolkitFailed {
                     slug: slug.into(),
-                    replacement: nr.label().into(),
-                    stanza: nr.stanza_hint().into(),
-                },
-                // Compute/Unknown that has no registered toolkit impl: we have
-                // no executor for it. Surface it for human review rather than
-                // guessing (e.g. a tier-1 `uses:` we haven't wired an impl for).
-                Disposition::Compute | Disposition::Unknown => {
-                    RuntimeError::UnknownAction { slug: slug.into() }
+                    message,
+                })?,
+                None => {
+                    return Err(match disposition {
+                        Disposition::ReplaceWithNative(nr) => RuntimeError::Tier3RequiresNative {
+                            slug: slug.into(),
+                            replacement: nr.label().into(),
+                            stanza: nr.stanza_hint().into(),
+                        },
+                        // Compute/Unknown with no registered toolkit impl: we
+                        // have no executor for it. Surface for human review
+                        // rather than guessing.
+                        Disposition::Compute | Disposition::Unknown => {
+                            RuntimeError::UnknownAction { slug: slug.into() }
+                        }
+                    });
                 }
-            });
+            }
         }
     };
 
@@ -1538,6 +1624,84 @@ jobs:
             }
             other => panic!("expected Tier3RequiresNative, got {other}"),
         }
+    }
+
+    #[test]
+    fn docker_build_push_without_builder_is_tier3() {
+        // R594: with no injected image builder, the docker push family stays a
+        // tier-3 error — the bare crate never shells docker.
+        let yaml = r#"
+on: [push]
+jobs:
+  one:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: docker/build-push-action@v5
+        with:
+          push: true
+          tags: ghcr.io/yah-ai/x:dev
+"#;
+        let wf = workflow(yaml);
+        let mut e = Executor::new(workspace_path());
+        e.env_passthrough = true;
+        let err = execute_workflow(&wf, &e).expect_err("no builder ⇒ tier-3");
+        match err {
+            RuntimeError::Tier3RequiresNative { slug, .. } => {
+                assert_eq!(slug, "docker/build-push-action");
+            }
+            other => panic!("expected Tier3RequiresNative, got {other}"),
+        }
+    }
+
+    #[test]
+    fn docker_build_push_with_injected_builder_runs_and_surfaces_outputs() {
+        // R594: an injected ImageBuilder handles the docker push family — the
+        // step runs (not a tier-3 error) and its outputs (digest/…) flow through
+        // to steps.<id>.outputs.* exactly like a toolkit action's.
+        use crate::image_builder::{ImageBuildCall, ImageBuilder};
+        use crate::toolkit::{StepConclusion, ToolkitOutcome};
+
+        struct FakeBuilder;
+        impl ImageBuilder for FakeBuilder {
+            fn handle(&self, call: &ImageBuildCall<'_>) -> Result<ToolkitOutcome, String> {
+                assert_eq!(call.slug, "docker/build-push-action");
+                // The `with:` inputs are evaluated before we see them.
+                assert_eq!(
+                    call.with.get("tags"),
+                    Some(&Value::String("ghcr.io/yah-ai/x:dev".into()))
+                );
+                let mut outputs = IndexMap::new();
+                outputs.insert("digest".into(), Value::String("sha256:deadbeef".into()));
+                Ok(ToolkitOutcome {
+                    outputs,
+                    log: "built".into(),
+                    conclusion: StepConclusion::Success,
+                })
+            }
+        }
+
+        let yaml = r#"
+on: [push]
+jobs:
+  one:
+    runs-on: ubuntu-latest
+    steps:
+      - id: build
+        uses: docker/build-push-action@v5
+        with:
+          push: true
+          tags: ghcr.io/yah-ai/x:dev
+"#;
+        let wf = workflow(yaml);
+        let e = Executor::new(workspace_path())
+            .with_image_builder(std::sync::Arc::new(FakeBuilder));
+        let run = execute_workflow(&wf, &e).expect("builder handles the step");
+        let s = &run.instance("one").unwrap().steps[0];
+        assert_eq!(s.conclusion, StepConclusion::Success);
+        assert_eq!(
+            s.outputs.get("digest"),
+            Some(&Value::String("sha256:deadbeef".into()))
+        );
     }
 
     #[test]

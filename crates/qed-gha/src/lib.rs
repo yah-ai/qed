@@ -15,11 +15,27 @@
 //! The tier-3 *service* override impls W200 shipped (`checkout`, `cache`,
 //! `upload-artifact`, `gh-release`, the docker push family) are **retired** —
 //! QED replaces those with native facilities at import time.
+//!
+//! @yah:relay(R605, "GHA→QED release migration: take GitHub off the release critical path (OIDC signing + docker substrate)")
+//! @yah:at(2026-07-16T01:31:43Z)
+//! @yah:status(open)
+//! @yah:assignee(agent:bundle-anthropic-glimmerstone)
+//! @yah:next("Engine is DONE and runnable: R487 native GHA runtime + R488 SubPipeline composition mean `yah qed run release` (P013) executes release.yml/ci.yml off-GitHub today. GitHub remains canonical ONLY for (a) OIDC keyless signing and (b) the docker/buildx build substrate — the two children here.")
+//! @yah:next("F1 = QED-side OIDC identity so cosign keyless works without token.actions.githubusercontent.com (camp-keystore workload-identity path). Today CosignSigner defaults to LoggingSigner placeholder + GHA signs OCI images out-of-band per release.yml.")
+//! @yah:next("F2 = docker/buildx-capable QED runner for the image-yah-{base,rust,rust-bun} jobs; tracks against R555/R546 remote-runner substrate rather than re-implementing.")
+//! @yah:next("Already-homed adjacent legs (do NOT re-file): registry redirect ghcr.io→registry.yah.dev = yah-cr pull-through (token Workers-Scripts scope fixed 2026-07-15); Darwin/macOS GHA retirement = R577; cross-build recipe = P015 (ci-only).")
+//! @yah:verify("`yah qed run release` single-slice (e.g. yubaba matrix via run-subset) executes the native GHA runtime end-to-end with no GitHub round-trip")
+//! @yah:verify("A tagged release cut entirely on QED produces cosign-verifiable signatures (cosign verify / verify-blob green) without GitHub OIDC")
+//! @yah:depends_on(R555)
+//! @yah:depends_on(R546)
+//! @yah:depends_on(R577)
 
+mod artifact_store;
 mod events;
 mod expr;
 mod expr_str;
 mod graph;
+mod image_builder;
 mod parse;
 mod runtime;
 mod schema;
@@ -34,6 +50,8 @@ pub use expr::{
     eval, evaluate, obj, parse as parse_expr, BinOp, Context, Expr, ExprError, JobStatus, Value,
 };
 pub use expr_str::{ExprString, ExprToken};
+pub use artifact_store::{is_artifact_action, ArtifactCall, ArtifactStore};
+pub use image_builder::{is_image_push_action, ImageBuildCall, ImageBuilder};
 pub use graph::{
     build_context_for_instance, build_needs_value, eval_exprstring, evaluate_outputs,
     expand_matrix, plan, should_run_job, topo_sort, CompletedInstance, GraphError, JobInstance,

@@ -93,6 +93,20 @@
 //! @yah:status(open)
 //! @arch:see(.yah/docs/working/W164-derived-static-assets.md)
 //! @arch:see(.yah/docs/working/W165-mesofact-build-mode-lowering.md)
+//!
+//! @yah:relay(R619, "Carve velveteen into vocabulary + velveteen-exec drivers")
+//! @yah:at(2026-07-20T23:34:18Z)
+//! @yah:status(open)
+//! @arch:see(.yah/docs/working/W276-susuwatari-task-queue.md)
+//! @yah:next("WHY: velveteen ships the task vocabulary AND the execution drivers in one crate, so any consumer that only wants to *describe* a task (a queue, a scheduler, a dashboard, a wire client) drags in tokio/process, docker shims, task-runs and yah-scryer. W276 susuwatari is the forcing consumer, but the split stands on its own merits — a task is a description of work, not a process supervisor.")
+//! @yah:next("THE CUT LINE ALREADY EXISTS. src/lib.rs:123-125 — the type layer imports only serde, std::path::PathBuf, and workload_spec. Every other import (lines 107-121) is a pub-use re-export of a driver module. This is close to a file-level split.")
+//! @yah:next("velveteen KEEPS the vocabulary: ForgeSpec, ForgeCommand, TaskPlacement, TaskLocation, TaskRuntime, ForgeStatus, plus re-exports of ForgeId and Initiator. Deps shrink to serde + workload-spec + observation. Do NOT name this half velveteen-core — the good name must sit on the widely-consumable crate, not the narrow one.")
+//! @yah:next("New sibling crate velveteen-exec takes the drivers: local, remote, integration, executor, triage, transforms, list, meta, default_image. Deps: velveteen + tokio/process + task-runs + yah-scryer + async-trait + toml.")
+//! @yah:next("Move Initiator out of oss/qed/crates/task-runs/src/types.rs:36 into the observation crate, beside ForgeId. Same argument this crate's own module doc already makes for ForgeId ('lives in observation so scryer can reference it in EventScope::Forge without depending on this crate') — Initiator is pure data (four String-y variants) sitting in a crate that carries a SQLite store, and it is W276's fairness partition_key.")
+//! @yah:next("Three driver consumers gain a velveteen-exec dep line: oss/yubaba/crates/cloud (reconciler materialize step), oss/qed/crates/qed (runner), app/yah/cli. None of their Rust `use` statements should need to change if the re-export surface is preserved per-half.")
+//! @yah:gotcha("SEQUENCING vs R610. velveteen is on R610's UNBLOCK-2 republish list (the oss 0.8.20 wave). This carve is a BREAKING change to velveteen's published surface, so it must land BEFORE that republish — otherwise 0.8.20 ships the fat crate and the split becomes a breaking 0.8.21 against a just-published API. velveteen is currently 0.8.16 on crates.io with ~21 downloads (effectively only us), so re-carving is free right now and will not be later.")
+//! @yah:gotcha("Do NOT let this relay grow into 'also rename task-runs / task-sessions'. Those carry the same pre-velveteen `task-*` vocabulary and task-runs is published under that generic name, but that is an R610 naming call with its own blast radius. Note it, do not absorb it.")
+//! @yah:assumes("The observation crate stays featherweight (serde, serde_json, uuid, workload-spec). If Initiator's move tempts anything heavier in there, stop — observation is load-bearing precisely because it is thin.")
 
 pub mod default_image;
 pub mod executor;
@@ -218,7 +232,19 @@ pub enum TaskLocation {
 
     /// Run on any yubaba node in the requested tier; yubaba picks based on
     /// capacity admission control (R090-F3).
-    RemoteAny { tier: TierTag },
+    ///
+    /// `mesh_tags` narrows the candidate set to nodes whose mesh tags are a
+    /// **superset** of the requested ones (R594) — e.g.
+    /// `["tag:build-worker", "tier:x86"]` routes an amd64 image build to the
+    /// x86 build-worker fleet. Empty (the default) means "any node in `tier`",
+    /// preserving the pre-R594 behavior. Arch is expressed as a mesh tag
+    /// (`tier:x86` / `tier:arm`), matching how the fleet nodes are tagged in
+    /// `.yah/infra/machines/*.toml`.
+    RemoteAny {
+        tier: TierTag,
+        #[serde(default)]
+        mesh_tags: Vec<String>,
+    },
 }
 
 /// How a task is sandboxed.  Independent of where it runs — combine with
@@ -309,12 +335,38 @@ pub enum ForgeCommand {
     /// `dockerfile` and `context` are paths resolved by the caller — the qed
     /// runner uses the catalog (R381-T1) to translate a catalog name into
     /// these paths before constructing the spec.
+    ///
+    /// R590-F2 widened this from a single `tag` to the full buildx surface the
+    /// arch-matched-fleet path needs: multiple `tags` on one build, explicit
+    /// target `platforms`, and `build_args`. `platforms` empty ⇒ build for the
+    /// worker's native arch (the per-arch-native case — a multi-arch image is
+    /// produced by stitching N native single-platform builds with `buildx
+    /// imagetools`, not by one cross-arch build).
     BuildImage {
         dockerfile: PathBuf,
         context: PathBuf,
-        tag: String,
+        /// One or more image tags to apply. All tags reference the same built
+        /// image; a single build emits every tag. Non-empty by convention —
+        /// the qed runner always supplies at least one.
+        tags: Vec<String>,
+        /// Target platforms in buildkit form (`linux/amd64`, `linux/arm64`).
+        /// Empty ⇒ the worker's native platform. A non-native single entry
+        /// requires the worker to have QEMU/binfmt; the fleet path prefers
+        /// native-per-arch placement and leaves this empty.
+        #[serde(default)]
+        platforms: Vec<String>,
+        /// `--build-arg KEY=VALUE` pairs, order-preserving. Kept as a `Vec` of
+        /// pairs (not a map) so the postcard wire encoding to kamaji stays
+        /// positional and deterministic (see R590-B3).
+        #[serde(default)]
+        build_args: Vec<(String, String)>,
         #[serde(default)]
         push: bool,
+        /// Load the finished image into the worker's local docker/containerd
+        /// image store (`--load`). Mutually exclusive with multi-platform and
+        /// with `push`.
+        #[serde(default)]
+        load: bool,
     },
 }
 
@@ -430,7 +482,7 @@ mod types {
                 image: None,
             },
             where_: TaskPlacement::new(
-                TaskLocation::RemoteAny { tier: TierTag("infra".into()) },
+                TaskLocation::RemoteAny { tier: TierTag("infra".into()), mesh_tags: vec![] },
                 TaskRuntime::Container,
             ),
             timeout: Some(Millis::from_secs(300)),
@@ -493,8 +545,14 @@ mod types {
         let cmd = ForgeCommand::BuildImage {
             dockerfile: PathBuf::from("crates/yah/qed/images/yah-rust/Dockerfile"),
             context: PathBuf::from("."),
-            tag: "ghcr.io/yah-ai/yah-rust:dev".into(),
+            tags: vec![
+                "ghcr.io/yah-ai/yah-rust:dev".into(),
+                "ghcr.io/yah-ai/yah-rust:latest".into(),
+            ],
+            platforms: vec!["linux/amd64".into()],
+            build_args: vec![("RUST_VERSION".into(), "1.85".into())],
             push: true,
+            load: false,
         };
         let json = serde_json::to_string(&cmd).unwrap();
         let back: ForgeCommand = serde_json::from_str(&json).unwrap();

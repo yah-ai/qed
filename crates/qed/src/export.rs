@@ -147,6 +147,7 @@ fn kind_tag(kind: &StepKind) -> &'static str {
         StepKind::GhaWorkflow => "gha-workflow",
         StepKind::Import => "import",
         StepKind::WaitFor => "wait-for",
+        StepKind::ManifestStitch => "manifest-stitch",
     }
 }
 

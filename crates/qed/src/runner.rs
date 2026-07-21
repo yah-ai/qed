@@ -162,6 +162,85 @@
 //! @yah:verify("cargo test -p qed --lib config::tests::peer_resolver")
 //! @yah:verify("cargo test -p qed --lib  # 211 pass + 1 pre-existing")
 //! @yah:verify("cargo check -p qed -p yah -p desktop")
+//!
+//! @yah:ticket(R590-F2, "cross-host build-context transport + QedImageBuilder remote dispatch + multi-arch stitch")
+//! @yah:status(review)
+//! @yah:at(2026-07-09T10:04:14Z)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R590)
+//! @yah:verify("yah qed run release --where=remote routes amd64→us-west-002 + arm64→Pi5, each builds natively, artifacts transported, multi-arch manifest pushed. (Currently blocked at deploy by R590-B3.)")
+//! @yah:depends_on(R590-B3)
+//! @yah:gotcha("yah-qed --lib has 5 PRE-EXISTING failures unrelated to F2, from the qed->yah-qed package rename: preflight tests do PackageNotFound{package:\"qed\"} (hardcode old crate name), plus config::parses_on_success_outcomes_from_toml, transform::release_yml_transforms_end_to_end, preflight::audit_workspace..., runner::musl_static_preflight.... F2's own paths (build_image*, remote_subprocess*, velveteen widening) are all green. Don't attribute these to F2.")
+//! @yah:gotcha("Shared working tree churns fast: execute_step_remote was edited concurrently by another session (image-override half) while I did the mesh_tags half -- both R590-F2 helpers now coexist. Expect transient broken builds mid-edit.")
+//! @yah:gotcha("Before rusty-v8-musl on-box green, two image-resolution details need reconciling (in the image-on-box slice, not the wiring): (1) NAMING: step.image='rusty-v8-musl-builder' resolves via catalog_image to ghcr.io/yah-ai/rusty-v8-musl-builder:latest, but the gha builds it locally as 'rusty-v8-musl-builder:ci' -- the box's containerd must hold it under the ghcr.io/yah-ai ref, OR extend step.image to accept a full registry/repo:tag ref. (2) DIGEST: catalog_image fills the all-zeros test-sentinel digest for unpinned names (no YAH_RUSTY_V8_MUSL_BUILDER_DIGEST), and B3 made kamaji resolve tag@digest -- an unpinned builder image won't match by digest unless kamaji falls back to tag.")
+//! @yah:next("FIRST: examine the rusty-v8 build result on us-west-002. `ssh -i ~/.ssh/yah struc@100.64.0.4`. Was launched ~2026-07-11 17:12 local (UTC-7), ETA ~1h49m so it's long done by pickup. Check: `sudo ctr -n yah tasks ls` (STOPPED=done/died), `sudo ctr -n yah tasks delete forge-695667cc-213d-4a26-8f56-702fd373ed39` prints the exit code, `sudo journalctl -u kamaji --since '3 hours ago' | grep -iE 'build-v8|ninja|tar|librusty|error|signal'` for the tail. SUCCESS = build-v8.sh wrote /tmp/rusty-v8-musl/librusty_v8-x86_64-unknown-linux-musl.tar.gz INSIDE the (now-exited) container — note: /tmp is the container's tmpfs, gone once the task is deleted, so if it completed, the proof is the exit-0 + the 'wrote tar' log line, not a retrievable file (retrieval is the deferred ArtifactStore leg). If it FAILED, diagnose from the kamaji journal (next likely walls: tmpfs /tmp 24G too small for a full V8 build → ENOSPC; or a gn/ninja/clang toolchain gap in the builder image).")
+//! @yah:next("THEN B9 (yubaba state-poll 404, in the open column): the clean fix is READ-PATH, not a name change (I tried dotting for_forge's name -> DNS-label validation rejected it, reverted). kamaji stamps a yah.ident label = mesh identity (forge.<uuid>) on each container; make kamaji-bin's list() return that label as WorkloadEntry.id (instead of container_id forge-<uuid>), OR make yubaba get_workload_state match against the yah.ident label. Needs a kamaji (or yubaba) cross-build + redeploy — recipe below. This makes `yah qed run rusty-v8-musl` REPORT green instead of 404-timeout-Failed.")
+//! @yah:next("THEN B8 (kamaji ignores image ENTRYPOINT/ENV, open): merge image OCI config into build_oci_spec (process.args = image.Entrypoint ++ argv; env = image.Env overlaid by spec env). Then delete the throwaway .yah/qed/P018-rusty-v8-musl-verify.toml and the real P018-rusty-v8-musl.toml runs as authored.")
+//! @yah:next("CLEANUP: delete .yah/qed/P018-rusty-v8-musl-verify.toml once B8 lands. Archive R590-B3/B5/B7/B10 (all review, signed off) + this relay's reviewed children once the human confirms. B10's 32GB is a stopgap — proper fix is per-step memory from the pipeline.")
+//! @yah:handoff("SESSION 2026-07-11 END STATE. GOAL REACHED: `yah qed run rusty-v8-musl` (no --where) on an arm64 Mac offloads to us-west-002 and builds V8 natively on x86 — proven live, compiling `v8 v149.4.0` when this baton was written. The FULL remote-qed path works: placement Offload -> yubaba admission -> kamaji -> containerd -> image pull -> host-net container -> build-v8.sh clone+compile.")
+//! @yah:handoff("us-west-002 (gamer, x86_64 Debian13, struc@100.64.0.4 via ~/.ssh/yah, passwordless sudo) NOW runs yubaba+kamaji 0.8.19 with ALL of B3/B5/B7 + the B10 client-side fix live. Backups on-box: /usr/local/bin/{yubaba,kamaji}.0.8.18.bak + kamaji.b7-prev.bak; drop-in /tmp/20-mesh-bind.conf.bak. kamaji.service.d/10-log-dir.conf adds ReadWritePaths=/var/log/yah (B7 sibling fix). Builder image ghcr.io/yah-ai/rusty-v8-musl-builder:latest (PRIVATE pkg) is loaded into containerd ns 'yah' (docker pull on Mac -> save|ctr import; nothing auto-pulls it — see below).")
+//! @yah:handoff("FIXES THIS SESSION: B3/B5 (decode+tag-fallback, review). B7 (review): task/remote.rs sets yah.network=host on forge workloads + kamaji build_oci_spec bind-mounts /etc/resolv.conf under host-net. B10 (review): for_forge memory_mb 256->32768 (was SIGKILL'ing builds). Filed still-open: B8 (kamaji drops image ENTRYPOINT/ENV, worked around in P018-verify), B9 (state-poll 404 dot/dash ident mismatch).")
+//! @yah:handoff("CROSS-BUILD + REDEPLOY RECIPE (arm64 Mac): `cd oss/kamaji && DOCKER_DEFAULT_PLATFORM=linux/amd64 YAH_REPO_ROOT=/Users/leif/ss/yah cross build --release -p kamaji-bin --features containerd-integration --target x86_64-unknown-linux-musl` (yubaba: -p yubaba in oss/yubaba). The two env vars are MANDATORY (Cross.toml :main images are amd64-only; repo-root mount for ../qed+../yah-base path-deps). Deploy: scp to /tmp, backup, `sudo install -m0755`, `systemctl restart kamaji` THEN `systemctl restart yubaba` (order dodges the UDS boot-race). yah CLI changes (task/remote.rs, workload-spec) are picked up by a plain `cargo build -p yah` — the fleet run is in-process (F4 offload bypasses the desktop daemon), so NO desktop rebuild needed.")
+//! @yah:handoff("GOTCHA: don't run the plain `yah qed run rusty-v8-musl` for a clean demo until B8 lands — P018 relies on the image entrypoint kamaji drops. Use `rusty-v8-musl-verify` (the throwaway, self-contained argv+env) meanwhile. Both correctly offload; only the container exec differs.")
+//!
+//! @yah:ticket(R590-B11, "rusty-v8-musl build-v8.sh packaging tail fails on Alpine (no mkdir, busybox tar)")
+//! @yah:at(2026-07-12T16:11:54Z)
+//! @yah:status(review)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R590)
+//! @yah:severity(low)
+//! @yah:next("Fix landed in source: build-v8.sh adds mkdir -p $(dirname $OUT) before the tar; Dockerfile apk-adds tar (GNU tar at /usr/bin shadows busybox /bin/tar). Remaining: rebuild+push rusty-v8-musl-builder image (buildx amd64,arm64), re-pin digest in recipe, re-import to box, re-run to prove exit-0 + 'wrote tar' line.")
+//! @yah:verify("yah qed run rusty-v8-musl offloads to us-west-002; build-v8.sh emits 'build-v8: wrote …/librusty_v8-x86_64-unknown-linux-musl.tar.gz' and exits 0.")
+//! @yah:gotcha("V8 itself builds fine — proven on us-west-002 2026-07-11: native x86 cargo build produced target/release/gn_out/obj/librusty_v8.a (145.5M) after ~54m. Only the packaging tail of images/rusty-v8-musl-builder/build-v8.sh failed (exit 1).")
+//! @yah:gotcha("Two Alpine-image regressions (the 2026-06-20 145MB proof ran on the earlier debian image w/ GNU tar): (1) build-v8.sh:116 redirect dies 'nonexistent directory' — the recipe's /tmp/rusty-v8-musl/ parent is never mkdir'd; (2) 'tar: unrecognized option: sort=name' — Alpine default tar is the busybox applet, which rejects GNU --sort/--numeric-owner/--mtime.")
+//!
+//! @yah:ticket(R603-T1, "Persist run+workload binding at remote dispatch: emit yubaba ident on StepStarted + write non-terminal meta")
+//! @yah:status(review)
+//! @yah:at(2026-07-14T23:00:42Z)
+//! @yah:assignee(agent:claude)
+//! @yah:parent(R603)
+//! @yah:next("execute_step_remote (runner.rs ~line 401+): after `let handle = driver.dispatch(...).await?` and `forge_id = handle.id.clone()`, emit a new event carrying the workload binding BEFORE `handle.wait()`. Options: extend QedEvent::StepStarted with `remote_workload: Option<{node,ident}>` OR add QedEvent::StepRemoteDispatched{index,ident,node,at}. Prefer extending StepStarted-adjacent so the events.jsonl records it.")
+//! @yah:next("qed events.rs + rpc QedEventWire: mirror the new field/variant (kebab-case, RFC3339). camp.rs qed_event_to_wire + apply_qed_event_to_meta updated to stamp step.task_run_id at START (not just finish).")
+//! @yah:next("camp drain (spawn_qed_event_drain) + persist: on RunStarted/first StepStarted for a run, write a NON-TERMINAL <run_id>.json (status=running) so load_qed_history surfaces it after restart; include the remote binding (either in meta or a <run_id>.remote.json sidecar). Today persist_qed_run (camp.rs:4608) only writes on terminal.")
+//! @yah:next("Tests: remote step records ident at start; non-terminal meta is written+reloadable; events.jsonl carries the binding.")
+//! @yah:handoff("DONE + verified. Remote qed steps now publish their yubaba workload identity mid-flight so a daemon restart can reattach instead of orphaning the build. Changes: (1) qed events.rs: new QedEvent::StepRemoteDispatched{index,name,forge_id,at}. (2) qed runner.rs execute_step_remote: emits it right after handle.id is known, BEFORE handle.wait(). (3) rpc: mirrored QedEventWire::StepRemoteDispatched (kebab 'step-remote-dispatched'). (4) camp.rs: qed_event_to_wire arm; apply_qed_event_to_meta stamps step.task_run_id at dispatch (was finish-only); drain persists a NON-terminal <run_id>.json on StepRemoteDispatched so load_qed_history surfaces interrupted runs (updated its doc comment too). Terminal persist still overwrites on normal completion.")
+//! @yah:handoff("Verified: cargo check -p qed -p rpc -p yah all clean. New test remote_step_emits_workload_binding_before_finish + the 4 existing remote_step tests all pass (5/5).")
+//! @yah:verify("cargo test --manifest-path oss/qed/crates/qed/Cargo.toml --lib remote_step  # 5/5 pass incl. remote_step_emits_workload_binding_before_finish")
+//! @yah:verify("cargo check -p yah  # clean")
+//! @yah:gotcha("PRE-EXISTING (not this ticket): 5 qed --lib preflight/musl-gate tests fail because they hard-code package name \"qed\" (preflight.rs:361/379/401, runner.rs:7208 musl_preflight_pipeline(\"qed\")) but the crate was renamed to yah-qed. cargo metadata confirms package is 'yah-qed'. Rename-drift from the qed->yah-qed crates.io-prefix migration; independent of R603. Worth a Thief cleanup ticket.")
+//! @yah:gotcha("Tier: Warrior -- delivered.")
+//!
+//! @yah:ticket(R603-T5, "Durable build-worker artifact volume so reconcile resume survives container reaping")
+//! @yah:status(review)
+//! @yah:at(2026-07-15T22:28:31Z)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R603)
+//! @yah:gotcha("Surfaced by R603-T4: resume_terminal_publish_for_remote_step retrieves the produced tar off the build-worker via retrieve_remote_artifacts, but kamaji reaps EXITED containers, so a remote build that finished DURING a daemon outage has its container (and tar) already gone by the time boot-reconcile resumes -> fetch_produced_file errs -> run left Success-but-UNPUBLISHED. T4 handles this best-effort (logs + re-run); this ticket is the robust fix.")
+//! @yah:handoff("MECHANISM (operator-chosen): Option 1 — durable host bind-mount + host read. A remote forge subprocess mounts a host-persistent dir (/var/lib/yah/qed/produced/<forge_id>) at the conventional /yah/produced; the build writes its produced tar there, so the bytes land on the worker HOST fs and outlive kamaji reaping the exited container. Retrieval reads the host path via yubaba (not the container rootfs), which is the R590-F6 deferred transport reshaped as a host read.")
+//! @yah:handoff("SHIPPED (code-complete, unit-tested; NOT yet proven on-box). New shared convention module yah-workload-spec::forge_produced (CONTAINER_DIR=/yah/produced, HOST_ROOT=/var/lib/yah/qed/produced, forge_id_from_ident, host_dir, host_path w/ traversal guard, durable_mount). qed task remote.rs build_workload_spec: Subprocess arm adds the durable produced bind mount. qed runner.rs execute_step_remote: guard rejects a produces path not under /yah/produced at dispatch (InvalidConfig) so it can't silently orphan. yubaba lib.rs: GET /workloads/{ident}/produced host-read handler + deploy mkdirs the dir (ensure_durable_produced_dirs) + reap-on-destroy + 3-day TTL sweep. cloud-client: CloudClient::fetch_produced_file. yubaba_client.rs: MeshYubabaClient::fetch_produced_file sweeps nodes for the ARTIFACT (state 404s post-reap) + re-seeds route.")
+//! @yah:verify("cargo test -p yah-workload-spec --lib forge_produced  # 5/5")
+//! @yah:verify("cargo test -p velveteen --lib remote  # 12/12 (incl. subprocess_workload_carries_durable_produced_mount)")
+//! @yah:verify("cargo test -p yah-qed --lib remote_step  # 6/6 (incl. remote_step_rejects_non_durable_produces_path)")
+//! @yah:verify("cargo test -p yah --lib fetch_produced_file  # 2/2 (sweep + no-node-has-it)")
+//! @yah:verify("cargo test -p yubaba --lib  # 178/178 (deploy handler unbroken)")
+//! @yah:next("ON-BOX PROOF (can't be done from the Mac): cross-build musl yubaba+kamaji carrying these changes (recipe in R590 handoff), redeploy us-west-002, deploy a forge subprocess writing produces under /yah/produced, kill the daemon post-build, restart, confirm boot-reconcile retrieves the tar off the host dir AFTER the container is reaped.")
+//! @yah:next("rusty-v8 recipe: point its output path (YAH_TRANSFORM_OUT / produces) at /yah/produced/… once R590-F6/B11 lands its produces; the new dispatch guard enforces the convention.")
+//! @yah:next("Tune retention once real runs exist: destroy-reap covers the happy path; the 3-day TTL sweep (yubaba PRODUCED_RETENTION) covers orphans — confirm the window fits real build cadence.")
+//!
+//! @yah:ticket(R603-B7, "qed.tail CLI stream dies on long remote steps (os error 35) — a ~58min offloaded build always ends with a spurious error despite succeeding")
+//! @yah:status(review)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:at(2026-07-20T23:46:40Z)
+//! @yah:parent(R603)
+//! @yah:handoff("Root cause was the wire timeout, not the socket mode. `qed.tail` was NOT in daemon_client's timeout_for_method allowlist, so every poll ran on the 500ms RPC_TIMEOUT fast-path floor. The CLI follow loop polls ~5/s, so an hour-long offloaded build issues ~15k calls — at 500ms a single transient daemon hiccup is effectively certain, and the loop treated the resulting EAGAIN as fatal (bail 'qed.tail failed'). Same family as R477-F11 / R606-T4.")
+//! @yah:handoff("FIX 1 (crates/yah/agent-tools/src/daemon_client.rs): renamed WRITE_TIMEOUT -> MID_TIMEOUT (it is no longer writes-only) and added QED_TAIL + QED_STATUS to that 10s tier, with the rationale that these are hot poll loops rather than slow single calls. Test timeout_for_method_gives_gated_writes_middle_tier extended to cover both. cargo test -p yah-agent-tools --lib daemon_client GREEN 29/29.")
+//! @yah:handoff("FIX 2 (app/yah/cli/src/qed.rs, run_via_camp_daemon): the tail stream is now treated as a VIEW, not the run. Ok(None) (socket gone, daemon restarting) and Err (wire error) both enter a degraded state instead of bailing: warn once, retry every 2s for up to TAIL_DEGRADED_BUDGET=120s, print 'tail stream reattached' on recovery. Only after the budget expires does it consult qed.status once via the new poll_run_status helper — if the run went terminal while we were blind it finishes normally with that snapshot; otherwise it bails with an honest 'the run may still be executing — check yah qed status <run_id>' rather than implying the build failed.")
+//! @yah:handoff("Together this also makes the CLI follow loop survive a daemon restart, which is the R603 thesis applied to the operator's view: cursor-based qed.tail cold-reads the JSONL log on a fresh DaemonState (camp.rs replay test), so reattach resumes at the right cursor with no duplicate output.")
+//! @yah:verify("cargo test -p yah-agent-tools --lib daemon_client (29/29)")
+//! @yah:verify("cargo check -p yah --bin yah")
+//! @yah:verify("End-to-end (needs a yah rebuild + daemon restart): `yah qed run rusty-v8-musl` should stream for ~58min and exit 0 with '==> pipeline passed', matching `yah qed status <run_id>` instead of dying with os error 35.")
+//! @yah:gotcha("COSMETIC ONLY — never harmed the run. Surfaced 2026-07-20 during the first green rusty-v8-musl build: the CLI died with `qed.tail failed: daemon I/O: Resource temporarily unavailable (os error 35)` at ~51min while the daemon carried the run to success at 58m21s.")
+//! @yah:gotcha("Takes effect only after a `yah` rebuild AND a camp-daemon restart — the fix spans the CLI binary (follow loop) and the shared daemon_client timeout table baked into both.")
 
 use std::sync::Arc;
 
@@ -259,12 +338,78 @@ pub enum RunnerError {
 }
 
 /// Where pipeline steps execute.
+///
+/// This is now the operator's **force-override lattice** (R590-F4), not the
+/// router itself: [`Auto`](Self::Auto) is the default, and per-step placement
+/// is *derived* from what each step declares (via
+/// [`resolve_placement`](crate::platform::resolve_placement)). `--where` only
+/// exists to pin the whole run one way for testing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunWhere {
-    /// Steps run as local subprocesses on this machine.
+    /// Policy-derived placement (default, no `--where`): each step runs locally
+    /// unless its declared platform resolves to
+    /// [`Offload`](crate::platform::Resolution::Offload) — a `native = true`
+    /// cross-arch build that can't cross/emulate here — in which case it's
+    /// dispatched to an arch-matched build-worker.
+    Auto,
+    /// Force every step local (`--where=local`): a testing override that
+    /// suppresses offload even for a `native = true` cross-arch step.
     Local,
-    /// Steps run as `task::remote` workloads on a yubaba node.
+    /// Force every step remote (`--where=remote`): dispatch all steps as
+    /// `task::remote` workloads on a yubaba node.
     Remote,
+}
+
+/// Pure placement policy (R590-F4): fold the operator's `--where` force-mode
+/// together with a step's platform [`Resolution`] into a concrete
+/// [`Local`](RunWhere::Local) / [`Remote`](RunWhere::Remote) decision. Never
+/// returns [`Auto`](RunWhere::Auto) — that's the *input* mode, resolved away
+/// here.
+///
+/// - `Local` / `Remote` force-modes pass straight through (the `--where`
+///   override wins over policy, by design).
+/// - `Auto` derives from the step: an [`Offload`](crate::platform::Resolution::Offload)
+///   resolution — a `native = true` cross-arch build — routes to the fleet;
+///   every other verdict (NativeCross / CrossDocker / Emulate / Skip) stays
+///   local, where its existing cross/emulate handling applies.
+pub(crate) fn policy_placement(
+    mode: RunWhere,
+    resolution: &crate::platform::Resolution,
+) -> RunWhere {
+    match mode {
+        RunWhere::Local => RunWhere::Local,
+        RunWhere::Remote => RunWhere::Remote,
+        RunWhere::Auto => match resolution {
+            crate::platform::Resolution::Offload { .. } => RunWhere::Remote,
+            _ => RunWhere::Local,
+        },
+    }
+}
+
+/// True when any step in `pipeline` resolves to
+/// [`Offload`](crate::platform::Resolution::Offload) on `host` — i.e. a default
+/// (`--where=auto`) run of it needs fleet access even without `--where=remote`
+/// (R590-F4). The CLI uses this to decide whether to stand up a mesh dispatcher
+/// (via [`PipelineRunner::new_auto`]) or stay on the driverless local path: a
+/// pipeline of ordinary cross-compilable steps needs no cloud wiring at all.
+pub fn pipeline_needs_offload(pipeline: &Pipeline, host: &str) -> bool {
+    pipeline.steps.iter().any(|step| {
+        let p = crate::platform::Platform::compose(
+            host,
+            step.platform.as_ref(),
+            step.triple.as_deref(),
+        );
+        let native = step.platform.as_ref().map(|s| s.native).unwrap_or(false);
+        matches!(
+            crate::platform::resolve_placement(
+                &p.host,
+                p.target.as_deref(),
+                p.container_platform.as_deref(),
+                native,
+            ),
+            crate::platform::Resolution::Offload { .. }
+        )
+    })
 }
 
 /// Map a Docker image tag (`reg/repo:ver`) to a filesystem-safe stem for
@@ -290,6 +435,39 @@ struct PreparedBuildImage {
     buildkit_dir: std::path::PathBuf,
     archive_path: std::path::PathBuf,
     tag: String,
+}
+
+/// Placement mesh-tags for a remote **subprocess** step (R590-F2).
+///
+/// When the step declares a target arch via `[platform].target`, return the
+/// arch-matched build-worker selector (`tag:build-worker` + `tier:x86|arm`) so
+/// the run is placed on a node of that arch and executes *natively* — the whole
+/// point of the fleet path is that an arm64 host can drive an
+/// `x86_64-unknown-linux-musl` build on the x86 box (us-west-002) instead of
+/// emulating it locally. No `platform.target` ⇒ empty tags ⇒ any infra node.
+///
+/// Mirrors the build-image path's placement, but keyed off the step's declared
+/// *target* rather than the runner's host triple.
+fn remote_subprocess_mesh_tags(step: &crate::types::QedStep) -> Vec<String> {
+    match step.platform.as_ref().and_then(|p| p.target.as_deref()) {
+        Some(target) => crate::platform::build_worker_mesh_tags(crate::platform::arch_of(target)),
+        None => Vec::new(),
+    }
+}
+
+/// Per-step container image override (R590-F2, finishing the R381 `step.image`
+/// seam). When a step names a catalog image via `image = "<name>"`, resolve it
+/// to a pinned [`workload_spec::ImageRef`] (`ghcr.io/yah-ai/<name>` +
+/// compile-time digest, or the test-fixture sentinel on unpinned dev builds) so
+/// the argv runs *inside that image* — e.g. `rusty-v8-musl-builder` executing
+/// `build-v8.sh`. `None` ⇒ fall back to the default forge image
+/// (`yah-rust-bun`), preserving the pre-seam behaviour for plain steps. Used by
+/// both the local-container and remote subprocess paths so `image` behaves the
+/// same regardless of `--where`.
+fn step_image_override(step: &crate::types::QedStep) -> Option<workload_spec::ImageRef> {
+    step.image
+        .as_deref()
+        .map(velveteen::default_image::catalog_image)
 }
 
 pub struct PipelineRunner {
@@ -402,13 +580,19 @@ pub struct PipelineRunner {
     /// [`crate::secrets_bridge::SecretsConfig`] over the vault via
     /// [`Self::with_release_providers`].
     secrets: Arc<dyn crate::provider::SecretSource>,
-    /// Target git branch for this run (W224). Drives how the runner positions
-    /// the workspace before a `gha-workflow` step runs, per the pipeline's
-    /// [`WorkspaceMode`](crate::types::WorkspaceMode). `None` ⇒ `main`. Set by
-    /// the launch surface (`yah qed run --branch`, the QED-tab selector).
-    branch: Option<String>,
+    /// Target git ref for this run (W224, R330-B27) — a branch, tag, or SHA;
+    /// `git checkout` / `git worktree add` already accept any committish, so
+    /// workspace mode (Live/Checkout/Isolated) and ref kind are orthogonal
+    /// axes (don't add a 4th mode for this — fix the ref parameter). Drives
+    /// how the runner positions the workspace before a `gha-workflow` step
+    /// runs, per the pipeline's [`WorkspaceMode`](crate::types::WorkspaceMode).
+    /// `None` ⇒ `HEAD` — build the commit that's already checked out, never
+    /// silently jump to `main` (that would ship the wrong bytes for a
+    /// tag-triggered release). Set by the launch surface (`yah qed run
+    /// --ref`, the QED-tab selector).
+    git_ref: Option<String>,
     /// The on-disk tree this run actually builds against, positioned once at
-    /// run start per the pipeline's [`WorkspaceMode`] + target branch (W224
+    /// run start per the pipeline's [`WorkspaceMode`] + target ref (W224
     /// R533-F11). Set by [`Self::run_inner`] before any step executes; every
     /// step kind then resolves its root through [`Self::resolve_camp_root`],
     /// which prefers this. Unset until positioned (and on child runners, which
@@ -514,7 +698,7 @@ impl PipelineRunner {
             host_toolchains: std::sync::OnceLock::new(),
             provider_registry: Arc::new(crate::provider::ProviderRegistry::new()),
             secrets: Arc::new(crate::provider::MapSecrets::default()),
-            branch: None,
+            git_ref: None,
             positioned_workspace: std::sync::OnceLock::new(),
         }
     }
@@ -544,7 +728,7 @@ impl PipelineRunner {
             host_toolchains: std::sync::OnceLock::new(),
             provider_registry: Arc::new(crate::provider::ProviderRegistry::new()),
             secrets: Arc::new(crate::provider::MapSecrets::default()),
-            branch: None,
+            git_ref: None,
             positioned_workspace: std::sync::OnceLock::new(),
         }
     }
@@ -559,6 +743,15 @@ impl PipelineRunner {
         self
     }
 
+    /// Override the [`OutcomeDispatcher`]. Composes with any constructor —
+    /// notably [`new_remote`](Self::new_remote), which defaults to the
+    /// log-only dispatcher, so a remote run can share the same publishing
+    /// dispatcher the local in-process path uses (R590-F2).
+    pub fn with_dispatcher(mut self, dispatcher: Arc<dyn OutcomeDispatcher>) -> Self {
+        self.outcome_dispatcher = dispatcher;
+        self
+    }
+
     /// Override the camp root used to resolve per-camp catalog overrides and
     /// the BuildKit cache + OCI archive output directories. Production
     /// callers leave this unset (falls back to [`std::env::current_dir`]);
@@ -569,18 +762,22 @@ impl PipelineRunner {
         self
     }
 
-    /// Set the target git branch for this run (W224). Drives workspace
-    /// positioning for `gha-workflow` steps per the pipeline's
-    /// [`WorkspaceMode`](crate::types::WorkspaceMode). `None` / unset ⇒ `main`.
-    /// Composes with any constructor.
-    pub fn with_branch(mut self, branch: Option<String>) -> Self {
-        self.branch = branch.filter(|b| !b.trim().is_empty());
+    /// Set the target git ref for this run (W224, R330-B27) — a branch, tag,
+    /// or commit SHA; `git checkout` / `git worktree add` accept any
+    /// committish. Drives workspace positioning for `gha-workflow` steps per
+    /// the pipeline's [`WorkspaceMode`](crate::types::WorkspaceMode). `None` /
+    /// unset ⇒ `HEAD` (whatever is already checked out). Composes with any
+    /// constructor.
+    pub fn with_ref(mut self, r#ref: Option<String>) -> Self {
+        self.git_ref = r#ref.filter(|r| !r.trim().is_empty());
         self
     }
 
-    /// The run's effective target branch — the requested `branch`, or `main`.
-    fn target_branch(&self) -> &str {
-        self.branch.as_deref().unwrap_or("main")
+    /// The run's effective target ref — the requested ref, or `HEAD` (build
+    /// the commit that's already checked out; never silently jump to `main`,
+    /// which would build the wrong bytes for a tag-triggered release).
+    fn target_ref(&self) -> &str {
+        self.git_ref.as_deref().unwrap_or("HEAD")
     }
 
     /// Attach a Sigstore signer (R407-T5). Composes with any constructor:
@@ -614,7 +811,7 @@ impl PipelineRunner {
     fn resolve_camp_root(&self) -> Result<std::path::PathBuf, RunnerError> {
         // Once a run has positioned its workspace (W224 R533-F11), every step
         // builds against that tree — for `Isolated` the throwaway worktree, for
-        // `Checkout`/`Live` the (possibly branch-switched) camp root. This is
+        // `Checkout`/`Live` the (possibly ref-switched) camp root. This is
         // the single seam all step kinds share, so threading it here lifts
         // positioning from the gha-workflow step to the whole run.
         if let Some(ws) = self.positioned_workspace.get() {
@@ -640,8 +837,8 @@ impl PipelineRunner {
     }
 
     /// Position the on-disk tree this *run* builds against, per the pipeline's
-    /// [`WorkspaceMode`] and the run's target branch (W224). Called once at run
-    /// start (R533-F11) — every step kind (subprocess, build-image, sign,
+    /// [`WorkspaceMode`] and the run's target ref (W224, R330-B27). Called once
+    /// at run start (R533-F11) — every step kind (subprocess, build-image, sign,
     /// sub-pipeline, gha-workflow) then builds from the returned tree, so an
     /// `Isolated` release positions the whole run into one worktree rather than
     /// only its gha-workflow step.
@@ -657,11 +854,11 @@ impl PipelineRunner {
         &self,
         camp_root: &std::path::Path,
     ) -> Result<(std::path::PathBuf, Option<WorktreeGuard>), RunnerError> {
-        let branch = self.target_branch();
+        let git_ref = self.target_ref();
         match self.pipeline.workspace {
-            // Build whatever is on disk — no branch switch, no dirty check.
+            // Build whatever is on disk — no ref switch, no dirty check.
             WorkspaceMode::Live => Ok((camp_root.to_path_buf(), None)),
-            // Switch the camp root to the branch, but never over local edits.
+            // Switch the camp root to the ref, but never over local edits.
             WorkspaceMode::Checkout => {
                 if git_tree_is_dirty(camp_root)? {
                     return Err(RunnerError::InvalidConfig(format!(
@@ -671,11 +868,12 @@ impl PipelineRunner {
                         camp_root.display()
                     )));
                 }
-                run_git(camp_root, &["checkout", branch])
-                    .map_err(|e| RunnerError::InvalidConfig(format!("git checkout {branch}: {e}")))?;
+                run_git(camp_root, &["checkout", git_ref]).map_err(|e| {
+                    RunnerError::InvalidConfig(format!("git checkout {git_ref}: {e}"))
+                })?;
                 Ok((camp_root.to_path_buf(), None))
             }
-            // Build in a dedicated worktree at the branch; camp root untouched.
+            // Build in a dedicated worktree at the ref; camp root untouched.
             WorkspaceMode::Isolated => {
                 let worktree = std::env::temp_dir().join(format!("qed-worktree-{}", self.run_id));
                 // A prior crashed run may have left this path registered; clear
@@ -687,10 +885,10 @@ impl PipelineRunner {
                     .output();
                 run_git(
                     camp_root,
-                    &["worktree", "add", "--force", &worktree.to_string_lossy(), branch],
+                    &["worktree", "add", "--force", &worktree.to_string_lossy(), git_ref],
                 )
                 .map_err(|e| {
-                    RunnerError::InvalidConfig(format!("git worktree add at {branch}: {e}"))
+                    RunnerError::InvalidConfig(format!("git worktree add at {git_ref}: {e}"))
                 })?;
                 let guard = WorktreeGuard {
                     camp_root: camp_root.to_path_buf(),
@@ -1018,9 +1216,23 @@ impl PipelineRunner {
         if matches!(step.kind, crate::types::StepKind::SignNativeTarball) {
             return TaskRuntime::Native;
         }
-        step.runtime.unwrap_or(match self.run_where {
-            RunWhere::Local => TaskRuntime::Native,
+        // manifest-stitch shells `docker buildx imagetools create` on the host —
+        // a registry-only op (R590-F2). It runs where qed runs even under
+        // `--where=remote` (the per-arch builds fan out to the fleet; the stitch
+        // does not), so force Native so the implicit `None` doesn't resolve to
+        // Container on a Remote runner.
+        if matches!(step.kind, crate::types::StepKind::ManifestStitch) {
+            return TaskRuntime::Native;
+        }
+        // R590-F4: default runtime follows the step's *effective* placement, not
+        // the raw run_where — an Auto runner that offloads a step to the fleet
+        // must default it to Container (it runs remote), while its local steps
+        // stay Native. For a forced Local/Remote runner effective_placement is a
+        // constant, so this is byte-identical to the pre-F4 default.
+        step.runtime.unwrap_or(match self.effective_placement(step) {
             RunWhere::Remote => TaskRuntime::Container,
+            // Local, and the unreachable Auto (effective_placement resolves it).
+            RunWhere::Local | RunWhere::Auto => TaskRuntime::Native,
         })
     }
 
@@ -1055,9 +1267,28 @@ impl PipelineRunner {
             host_toolchains: std::sync::OnceLock::new(),
             provider_registry: Arc::new(crate::provider::ProviderRegistry::new()),
             secrets: Arc::new(crate::provider::MapSecrets::default()),
-            branch: None,
+            git_ref: None,
             positioned_workspace: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Policy-derived execution (R590-F4, the default `yah qed run` mode). Like
+    /// [`new_remote`](Self::new_remote) it wires a fleet dispatcher, but leaves
+    /// placement on [`RunWhere::Auto`]: local steps run as local subprocesses and
+    /// only a `native = true` cross-arch step (resolving to
+    /// [`Offload`](crate::platform::Resolution::Offload)) is dispatched to an
+    /// arch-matched build-worker — no `--where=remote` flag required. The CLI
+    /// stands this up only when the pipeline actually needs offload (see
+    /// [`pipeline_needs_offload`]); a pipeline with no offload step stays on the
+    /// driverless local path.
+    pub fn new_auto(
+        pipeline: Pipeline,
+        scryer: Arc<Scryer>,
+        yubaba: Arc<dyn WardenClient>,
+    ) -> Self {
+        let mut runner = Self::new_remote(pipeline, scryer, yubaba);
+        runner.run_where = RunWhere::Auto;
+        runner
     }
 
     /// Attach a custom [`ForgeExecutor`] for local subprocess steps
@@ -1256,11 +1487,32 @@ impl PipelineRunner {
     /// preflight and (P2) the container-seam wiring.
     pub fn resolve_step(&self, step: &crate::types::QedStep) -> crate::platform::Resolution {
         let p = self.step_platform(step);
-        crate::platform::resolve(
+        // R590-F4: thread the step's `native` flag so a `native = true` cross-arch
+        // build resolves to Offload (real silicon) rather than NativeCross/Emulate.
+        let native = step.platform.as_ref().map(|s| s.native).unwrap_or(false);
+        crate::platform::resolve_placement(
             &p.host,
             p.target.as_deref(),
             p.container_platform.as_deref(),
+            native,
         )
+    }
+
+    /// Concrete placement for a step (R590-F4): fold this runner's `--where`
+    /// force-mode with the step's [`resolve_step`](Self::resolve_step) verdict.
+    /// Returns [`Local`](RunWhere::Local) or [`Remote`](RunWhere::Remote) only
+    /// (never `Auto`). For a `Local`/`Remote` runner this is a constant — every
+    /// step follows the forced mode, preserving the pre-F4 all-local / all-remote
+    /// behaviour — so only an `Auto` runner routes per-step.
+    fn effective_placement(&self, step: &crate::types::QedStep) -> RunWhere {
+        match self.run_where {
+            // Fast path: a forced runner never inspects the step, so we skip the
+            // resolve() work (and keep the many resolve_runtime test callers on
+            // Local/Remote runners resolving to exactly their old default).
+            RunWhere::Local => RunWhere::Local,
+            RunWhere::Remote => RunWhere::Remote,
+            RunWhere::Auto => policy_placement(RunWhere::Auto, &self.resolve_step(step)),
+        }
     }
 
     /// Plan the host-native cross build for a step that resolves to the
@@ -1317,11 +1569,7 @@ impl PipelineRunner {
             .iter()
             .map(|step| {
                 let platform = self.step_platform(step);
-                let resolution = crate::platform::resolve(
-                    &platform.host,
-                    platform.target.as_deref(),
-                    platform.container_platform.as_deref(),
-                );
+                let resolution = self.resolve_step(step);
                 crate::platform::preflight_line(&step.name, &platform, &resolution)
             })
             .collect()
@@ -1415,7 +1663,11 @@ impl PipelineRunner {
             if !step.is_background() {
                 continue;
             }
-            if self.run_where != RunWhere::Local {
+            // R590-F4: gate on the step's *effective* placement, not the raw
+            // run_where — an Auto runner is fine for a background step that
+            // resolves local; only a background step that would offload to the
+            // fleet is rejected (remote sidecars are a separate lifecycle).
+            if self.effective_placement(step) != RunWhere::Local {
                 return Err(RunnerError::InvalidConfig(format!(
                     "step `{}`: background steps run locally only (R513-F2) — \
                      remote sidecars are yubaba-supervised, a separate lifecycle",
@@ -1533,6 +1785,11 @@ impl PipelineRunner {
             }
 
             let runtime = self.resolve_runtime(step);
+            // R590-F4: derive this step's concrete placement (Local/Remote) from
+            // the `--where` force-mode + its declared platform. Under the default
+            // Auto mode a `native = true` cross-arch step routes to the fleet
+            // here without any `--where=remote` flag.
+            let placement = self.effective_placement(step);
 
             // R513-F2: a background sidecar is *spawned*, not awaited. Emit only
             // its StepStarted (already done above), kick the subprocess onto its
@@ -1579,6 +1836,12 @@ impl PipelineRunner {
             // step_jobs: per-job rows when this step wraps a GHA workflow
             // (W223 R532-T1); stays empty for every other step kind.
             let mut step_jobs: Vec<crate::types::JobRow> = Vec::new();
+            // R590-F6: when a remote step's produced artifacts are retrieved off
+            // the build-worker, the path-rewritten list lands here and replaces
+            // the raw `step.produces` declarations at the aggregation point
+            // below. Stays `None` for local steps and remote steps with no
+            // produced artifacts (the common case).
+            let mut remote_produced: Option<Vec<ProducedArtifact>> = None;
             let (result, task_run_id, step_outputs) = match step.kind {
                 crate::types::StepKind::BuildImage => {
                     match self.execute_step_build_image(event_index, step).await {
@@ -1669,7 +1932,12 @@ impl PipelineRunner {
                     None,
                     std::collections::HashMap::new(),
                 ),
-                crate::types::StepKind::Subprocess => match (self.run_where, runtime) {
+                crate::types::StepKind::ManifestStitch => (
+                    self.execute_step_manifest_stitch(event_index, step).await,
+                    None,
+                    std::collections::HashMap::new(),
+                ),
+                crate::types::StepKind::Subprocess => match (placement, runtime) {
                     (RunWhere::Local, TaskRuntime::Native) => {
                         // Inject $YAH_OUTPUTS so the step can write key=value
                         // output lines (W201-F4). Read back after exit regardless
@@ -1693,12 +1961,26 @@ impl PipelineRunner {
                         None,
                         std::collections::HashMap::new(),
                     ),
-                    (RunWhere::Remote, _) => match self.execute_step_remote(event_index, step, runtime).await {
-                        Ok(forge_id) => (
-                            Ok(()),
-                            Some(forge_id.to_string()),
-                            std::collections::HashMap::new(),
-                        ),
+                    // Auto is resolved to Local/Remote by effective_placement.
+                    (RunWhere::Remote | RunWhere::Auto, _) => match self.execute_step_remote(event_index, step, runtime).await {
+                        Ok(forge_id) => {
+                            // R590-F6 leg 2: retrieve any produced artifacts off
+                            // the build-worker into camp's content-addressed
+                            // store before they feed the publish leg. No-op when
+                            // the step declares no `produces`.
+                            let retrieve = if step.produces.is_empty() {
+                                Ok(())
+                            } else {
+                                match self.retrieve_remote_artifacts(&forge_id, step).await {
+                                    Ok(rp) => {
+                                        remote_produced = Some(rp);
+                                        Ok(())
+                                    }
+                                    Err(e) => Err(e),
+                                }
+                            };
+                            (retrieve, Some(forge_id.to_string()), std::collections::HashMap::new())
+                        }
                         Err(e) => (Err(e), None, std::collections::HashMap::new()),
                     },
                 },
@@ -1713,7 +1995,13 @@ impl PipelineRunner {
 
             let (status, msg) = match &result {
                 Ok(_) => {
-                    produced.extend(step.produces.iter().cloned());
+                    // R590-F6: a remote step's retrieved (path-rewritten)
+                    // artifacts replace the raw container-path declarations, so
+                    // the publish leg reads the bytes landed in camp.
+                    match remote_produced.take() {
+                        Some(rp) => produced.extend(rp),
+                        None => produced.extend(step.produces.iter().cloned()),
+                    }
                     (RunStatus::Success, None)
                 }
                 Err(e) => {
@@ -1914,14 +2202,17 @@ impl PipelineRunner {
             }
 
             let runtime = self.resolve_runtime(step);
-            let result = match (self.run_where, runtime) {
+            // R590-F4: per-step placement (see the main loop above).
+            let placement = self.effective_placement(step);
+            let result = match (placement, runtime) {
                 (RunWhere::Local, TaskRuntime::Native) => {
                     self.execute_step_local(event_index, step, None).await
                 }
                 (RunWhere::Local, TaskRuntime::Container) => {
                     self.execute_step_local_container(event_index, step).await
                 }
-                (RunWhere::Remote, _) => self
+                // Auto is resolved to Local/Remote by effective_placement.
+                (RunWhere::Remote | RunWhere::Auto, _) => self
                     .execute_step_remote(event_index, step, runtime)
                     .await
                     .map(|_| ()),
@@ -1965,9 +2256,53 @@ impl PipelineRunner {
             });
         }
 
-        // Outcome selection keys off the *work* status, not the post-finally
-        // status (a teardown failure marks the run Failed but doesn't redirect
-        // which terminal outcomes fire).
+        // Terminal outcomes (publish / vendor ship / warden deploy) fire off
+        // the *work* status snapshotted before `finally` ran, so a flaky
+        // teardown never redirects `on_success` → `on_fail`. Extracted to
+        // `dispatch_terminal_outcomes` (R603-T4) so the boot reconciler can
+        // replay this exact chain for a remote run that reached terminal
+        // Success while the daemon was down.
+        self.dispatch_terminal_outcomes(work_status, &produced)
+            .await?;
+
+        let completed_at = Utc::now();
+        self.emit(QedEvent::RunFinished {
+            status: overall_status,
+            at: completed_at,
+        });
+
+        Ok((
+            QedRunMeta {
+                id: self.run_id.clone(),
+                pipeline: self.pipeline.name.clone(),
+                status: overall_status,
+                created_at,
+                completed_at: Some(completed_at),
+                steps: step_statuses,
+                // Step-level failures carry their reason on the failing
+                // `StepStatus.error`; a run that completes the step loop has
+                // no run-level (outside-any-step) failure to report.
+                failure_reason: None,
+                parent_run_id: self.parent_run_id.clone(),
+            },
+            produced,
+        ))
+    }
+
+    /// R603-T4: dispatch the pipeline's terminal outcomes (Publish / Provider /
+    /// WardenDeploy / AlmanacRun) against a run's produced artifacts. Extracted
+    /// verbatim from `run_inner` so the boot reconciler can replay the publish
+    /// leg for a remote run that reached terminal Success while the daemon was
+    /// down — see [`Self::resume_terminal_publish_for_remote_step`].
+    ///
+    /// Outcome selection keys off `work_status` (steps + sidecars, snapshotted
+    /// before `finally`), so a flaky teardown never redirects `on_success` →
+    /// `on_fail`.
+    async fn dispatch_terminal_outcomes(
+        &self,
+        work_status: RunStatus,
+        produced: &[ProducedArtifact],
+    ) -> Result<(), RunnerError> {
         let outcomes = match work_status {
             RunStatus::Success => &self.pipeline.on_success,
             _ => &self.pipeline.on_fail,
@@ -1997,7 +2332,7 @@ impl PipelineRunner {
                 })
                 .collect()
         } else {
-            produced.clone()
+            produced.to_vec()
         };
 
         for outcome in outcomes {
@@ -2090,24 +2425,51 @@ impl PipelineRunner {
             }
         }
 
-        let completed_at = Utc::now();
-        self.emit(QedEvent::RunFinished {
-            status: overall_status,
-            at: completed_at,
-        });
+        Ok(())
+    }
 
-        Ok((
-            QedRunMeta {
-                id: self.run_id.clone(),
-                pipeline: self.pipeline.name.clone(),
-                status: overall_status,
-                created_at,
-                completed_at: Some(completed_at),
-                steps: step_statuses,
-                parent_run_id: self.parent_run_id.clone(),
-            },
-            produced,
-        ))
+    /// R603-T4: replay the terminal publish for a remote step that finished
+    /// while the camp daemon was down. The boot reconciler
+    /// (`camp.rs::finalize_reconciled_run`) rebuilds a fleet-wired runner and
+    /// calls this once it confirms the persisted yubaba workload reached a
+    /// terminal Success — retrieving the artifact the build produced off the
+    /// (possibly already-exited) build-worker and pushing it through the same
+    /// `on_success` outcome chain a live run would have fired.
+    ///
+    /// `step_index` is the pipeline-local index of the remote step whose
+    /// `produces` we retrieve; `forge_id` is the persisted workload identity
+    /// (the bare `ObsForgeId` uuid — the mesh `forge.<uuid>` prefix is derived
+    /// internally by `retrieve_remote_artifacts`).
+    ///
+    /// Best-effort on the retrieval leg: kamaji reaps exited containers, so a
+    /// build that finished *during* the outage may be un-retrievable. This
+    /// surfaces that as a `RunnerError` (which the caller renders as "artifact
+    /// reaped, re-run") rather than silently claiming published. The robust fix
+    /// — the build writing its tar to a durable host volume so retrieval
+    /// survives reaping — is tracked as follow-up (see the ticket's reaping-
+    /// window fork).
+    pub async fn resume_terminal_publish_for_remote_step(
+        &self,
+        step_index: usize,
+        forge_id: &ObsForgeId,
+    ) -> Result<(), RunnerError> {
+        let step = self.pipeline.steps.get(step_index).ok_or_else(|| {
+            RunnerError::InvalidConfig(format!(
+                "resume: step index {step_index} out of range for pipeline `{}` ({} steps)",
+                self.pipeline.name,
+                self.pipeline.steps.len(),
+            ))
+        })?;
+        // A remote step with no `produces` still fires its terminal outcomes
+        // (a WardenDeploy / AlmanacRun that needs no artifact); retrieval is
+        // skipped in that case exactly like the live path (run_inner ~1939).
+        let produced = if step.produces.is_empty() {
+            Vec::new()
+        } else {
+            self.retrieve_remote_artifacts(forge_id, step).await?
+        };
+        self.dispatch_terminal_outcomes(RunStatus::Success, &produced)
+            .await
     }
 
     /// Resolve, configure, and run a SubPipeline child step (R488-F2).
@@ -2313,10 +2675,10 @@ impl PipelineRunner {
             // (propagate.produces = false) can still resolve its adapter.
             provider_registry: self.provider_registry.clone(),
             secrets: self.secrets.clone(),
-            // Inherit the run's target branch so a sub-pipeline whose child is a
+            // Inherit the run's target ref so a sub-pipeline whose child is a
             // gha-workflow positions its workspace at the same ref the parent
             // run requested (W224).
-            branch: self.branch.clone(),
+            git_ref: self.git_ref.clone(),
             // Child skips repositioning (parent_run_id is Some ⇒ run_inner
             // leaves this unset) and inherits the parent's positioned tree via
             // camp_root above (W224 R533-F11).
@@ -2462,10 +2824,10 @@ impl PipelineRunner {
         RunnerError,
     > {
         // W224 R533-F11: the run already positioned its workspace once (in
-        // run_inner, per the pipeline's WorkspaceMode + branch); read the
+        // run_inner, per the pipeline's WorkspaceMode + ref); read the
         // effective tree here rather than repositioning per gha step. For an
         // Isolated run this resolves to the run's worktree, so the workflow
-        // reads the branch's copy of release.yml from the same tree every other
+        // reads the ref's copy of release.yml from the same tree every other
         // step builds in. The run-scoped WorktreeGuard (held in run_inner)
         // outlives this step.
         let workspace = self.resolve_camp_root()?;
@@ -2527,19 +2889,33 @@ impl PipelineRunner {
                 msg: format!("parse {}: {e}", workflow_path.display()),
             })?;
             let secrets = crate::secrets_bridge::SecretsConfig::load_default().resolve_all();
+            // R594: inject the docker push-family image builder so the runtime
+            // actually builds + pushes the workflow's image jobs (local buildx
+            // now; arch-matched build-worker fleet dispatch in phase C) instead
+            // of declining them with a tier-3 error. It reads the W200 overlay
+            // (`.yah/qed/gha-actions.toml` registry_route / registry_auth) to
+            // retarget the workflow's hard-coded ghcr.io push to a registry the
+            // local token can write — the Dockerfiles + release.yml stay ghcr.io.
+            let image_builder = std::sync::Arc::new(crate::image_overlay::QedImageBuilder::new(
+                &workspace,
+                secrets.clone(),
+            ));
+            // R594: single-host content-addressed artifact store so a job that
+            // uploads binaries and a later job that downloads them move files
+            // through an on-disk store — the retired upload/download-artifact
+            // actions, executed for real. Fleet phase swaps in a transport-backed
+            // store for cross-host (build-worker) fetches.
+            let artifact_store =
+                std::sync::Arc::new(crate::artifact_local::LocalArtifactStore::new());
             let mut executor = yah_qed_gha::Executor::new(&workspace)
                 .with_events(gha_tx)
-                .with_secrets(secrets);
+                .with_secrets(secrets)
+                .with_image_builder(image_builder)
+                .with_artifact_store(artifact_store);
             executor.inputs = inputs_to_value(&inputs);
             executor.github = github_context(&event, &workspace);
             executor.runner_arch = host_arch;
             executor.included_instance_keys = matrix_subset;
-            // W224 R533-T7 retired the W200 per-camp override overlay
-            // (`.yah/qed/gha-actions.toml` registry_route / deny rules) along
-            // with the tier-3 docker-push reimplementation it configured. The
-            // executor now runs only tier-1/2 toolkit actions; tier-3 service
-            // steps error with a native-replacement hint (import-time concern,
-            // not a runtime overlay).
             let run = yah_qed_gha::execute_workflow(&workflow, &executor).map_err(|e| {
                 RunnerError::StepFailed {
                     step: step_name.clone(),
@@ -3000,6 +3376,32 @@ impl PipelineRunner {
         if step.argv.is_empty() {
             return Err(RunnerError::InvalidConfig("step argv is empty".to_string()));
         }
+        // R590-F4/R546: a `native = true` cross-arch step demands real silicon of
+        // its target arch — its whole contract is "no QEMU" (the rusty-v8-musl
+        // forcing case OOMs under emulation). If such a step reaches the
+        // local-container path anyway — e.g. a forced `--where local` runner, which
+        // `effective_placement` resolves to Local WITHOUT inspecting the step and
+        // so bypasses the Offload routing — running it here can only mean Docker
+        // silently emulating a foreign-arch image (the `WARNING: The requested
+        // image's platform (linux/amd64) does not match the detected host platform
+        // (linux/arm64/v8)` case). That is a hard failure, not a warning: refuse to
+        // emulate rather than start a build that can't succeed on this host.
+        if let crate::platform::Resolution::Offload { target } = self.resolve_step(step) {
+            let tier = crate::platform::build_worker_mesh_tags(crate::platform::arch_of(&target))
+                .into_iter()
+                .find(|t| t.starts_with("tier:"))
+                .unwrap_or_else(|| "tier:?".to_string());
+            return Err(RunnerError::StepFailed {
+                step: step.name.clone(),
+                msg: format!(
+                    "step '{}' declares a native `{target}` build but is running locally on \
+                     host `{}`: a native cross-arch build must offload to an arch-matched \
+                     build-worker (`{tier}`), not emulate under QEMU. Re-run with `--where auto` \
+                     (policy routes native steps to the fleet) or on a `{target}`-arch host.",
+                    step.name, self.host_triple,
+                ),
+            });
+        }
         // Resolve the cwd that gets bind-mounted into the container. The
         // step's optional `cwd` (typically a relative path like
         // `packages/yah/ui`) joins onto the camp root so the mount is always
@@ -3009,7 +3411,10 @@ impl PipelineRunner {
             Some(rel) => camp_root.join(rel),
             None => camp_root,
         };
-        let image = velveteen::default_image::default_forge_image();
+        // R590-F2: honor a per-step `image = "<name>"` override (R381 seam);
+        // fall back to the default forge image (`yah-rust-bun`) for plain steps.
+        let image = step_image_override(step)
+            .unwrap_or_else(velveteen::default_image::default_forge_image);
         let spec = build_subprocess_spec(step, TaskRuntime::Container, Some(image));
         let ctx = ExecContext::default().with_cwd(mount_cwd).with_env(
             step.env
@@ -3362,9 +3767,19 @@ fn run_git(dir: &std::path::Path, args: &[&str]) -> Result<(), String> {
     }
 }
 
-/// True when the working tree has uncommitted *tracked* changes. Untracked
-/// files are ignored (`--untracked-files=no`): they don't change which
-/// committed bytes a build sees, and a working camp almost always carries some.
+/// Porcelain path prefixes that are camp *runtime* state, not build source:
+/// the daemon rewrites the turso databases under `.yah/db/` continuously (and
+/// the shared-tree peer model sweeps them into `wip` commits), so they show as
+/// tracked-dirty on essentially every run. They never change which source bytes
+/// a build compiles or a release tags, so gating a `checkout`/`isolated` run on
+/// them would refuse every pipeline in a live camp for no safety benefit.
+const DIRTY_CHECK_IGNORED_PREFIXES: &[&str] = &[".yah/db/"];
+
+/// True when the working tree has uncommitted *tracked* changes that matter to
+/// a build. Untracked files are ignored (`--untracked-files=no`): they don't
+/// change which committed bytes a build sees, and a working camp almost always
+/// carries some. Tracked changes confined to [`DIRTY_CHECK_IGNORED_PREFIXES`]
+/// (camp runtime DBs) are also ignored — see that constant for why.
 fn git_tree_is_dirty(dir: &std::path::Path) -> Result<bool, RunnerError> {
     let out = std::process::Command::new("git")
         .current_dir(dir)
@@ -3378,7 +3793,32 @@ fn git_tree_is_dirty(dir: &std::path::Path) -> Result<bool, RunnerError> {
             String::from_utf8_lossy(&out.stderr).trim()
         )));
     }
-    Ok(!out.stdout.is_empty())
+    let dirty = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .any(|line| !porcelain_path_is_ignored(line));
+    Ok(dirty)
+}
+
+/// Given one `git status --porcelain` line (`XY <path>`, or `XY orig -> new`
+/// for a rename), return true when its path is under a
+/// [`DIRTY_CHECK_IGNORED_PREFIXES`] runtime prefix. Unknown/short lines are
+/// treated as *not* ignored (fail safe: a line we can't parse still counts as
+/// dirty). A rename is ignored only when its destination path is runtime state.
+fn porcelain_path_is_ignored(line: &str) -> bool {
+    // Porcelain v1: 2 status columns + a space, then the path (byte 3 on).
+    let Some(rest) = line.get(3..) else {
+        return false;
+    };
+    // Rename/copy entries read `orig -> new`; the destination is what the tree
+    // now carries, so key the decision off it.
+    let path = rest.rsplit(" -> ").next().unwrap_or(rest);
+    // Git quotes paths with unusual chars ("path"); strip a leading quote so
+    // the prefix match still fires on the (plain-ASCII) runtime DB paths.
+    let path = path.trim().trim_start_matches('"');
+    DIRTY_CHECK_IGNORED_PREFIXES
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
 }
 
 /// Synthesize a `github` expression context for a GhaWorkflow step from the
@@ -3452,7 +3892,7 @@ fn build_subprocess_spec(
             image,
         },
         where_: TaskPlacement::new(TaskLocation::Local, runtime),
-        timeout: step.timeout.map(Millis::from_ms),
+        timeout: step.timeout.map(Millis::from_secs),
         label: Some(step.name.clone()),
         initiator: Initiator::Human { camp: "qed".into() },
         mesh_access: MeshAccess::None,
@@ -3587,6 +4027,11 @@ impl PipelineRunner {
                 } else {
                     Some(&prepared.archive_path)
                 },
+                // The local catalog build-image path is host-native + no
+                // build-args (R590-F2 widened the option surface; the step model
+                // doesn't yet expose these knobs — a follow-up wires TOML→here).
+                platforms: &[],
+                build_args: &[],
             };
             velveteen::local::build_image_command(&opts)
         };
@@ -3655,6 +4100,107 @@ impl PipelineRunner {
             });
         }
         Ok(None)
+    }
+
+    /// `kind = manifest-stitch` (R590-F2): fold N per-arch source images into
+    /// one multi-arch manifest list via `docker buildx imagetools create`.
+    ///
+    /// Registry-only — the per-arch builds already pushed their arch-specific
+    /// tags to the registry (routed to the arch-matched build-worker fleet);
+    /// this step just writes the manifest-list tag. It always runs host-native
+    /// (see [`Self::resolve_runtime`]) even under `--where=remote`, so it shells
+    /// `docker buildx` on the qed host and streams output like the local
+    /// build-image path.
+    async fn execute_step_manifest_stitch(
+        &self,
+        event_index: usize,
+        step: &crate::types::QedStep,
+    ) -> Result<(), RunnerError> {
+        use std::process::Stdio;
+        use tokio::io::{AsyncBufReadExt, BufReader};
+
+        let Some(cfg) = step.manifest_stitch.as_ref() else {
+            return Err(RunnerError::InvalidConfig(format!(
+                "step `{}`: kind=manifest-stitch with no [manifest_stitch] block (validate() should have caught this)",
+                step.name,
+            )));
+        };
+
+        self.emit(QedEvent::StepOutput {
+            index: event_index,
+            name: step.name.clone(),
+            stream: OutputStream::Stdout,
+            line: format!(
+                "manifest-stitch: creating `{}` from [{}]",
+                cfg.target,
+                cfg.sources.join(", "),
+            ),
+        });
+
+        let mut cmd = velveteen::local::imagetools_create_command(&cfg.target, &cfg.sources);
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+
+        let mut child = cmd.spawn().map_err(|e| RunnerError::StepFailed {
+            step: step.name.clone(),
+            msg: format!("failed to spawn `docker buildx imagetools create`: {e}"),
+        })?;
+        let stdout = child.stdout.take().expect("stdout piped above");
+        let stderr = child.stderr.take().expect("stderr piped above");
+
+        let stdout_task = {
+            let events = self.events.clone();
+            let name = step.name.clone();
+            tokio::spawn(async move {
+                let mut lines = BufReader::new(stdout).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    if let Some(tx) = &events {
+                        let _ = tx.send(QedEvent::StepOutput {
+                            index: event_index,
+                            name: name.clone(),
+                            stream: OutputStream::Stdout,
+                            line,
+                        });
+                    }
+                }
+            })
+        };
+
+        let stderr_task = {
+            let events = self.events.clone();
+            let name = step.name.clone();
+            tokio::spawn(async move {
+                let mut captured: Vec<String> = Vec::new();
+                let mut lines = BufReader::new(stderr).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    if let Some(tx) = &events {
+                        let _ = tx.send(QedEvent::StepOutput {
+                            index: event_index,
+                            name: name.clone(),
+                            stream: OutputStream::Stderr,
+                            line: line.clone(),
+                        });
+                    }
+                    captured.push(line);
+                }
+                captured
+            })
+        };
+
+        let status = child.wait().await.map_err(|e| RunnerError::StepFailed {
+            step: step.name.clone(),
+            msg: format!("waiting on `docker buildx imagetools create` failed: {e}"),
+        })?;
+        let _ = stdout_task.await;
+        let stderr_lines = stderr_task.await.unwrap_or_default();
+
+        if !status.success() {
+            return Err(RunnerError::StepFailed {
+                step: step.name.clone(),
+                msg: stderr_lines.join("\n").trim().to_string(),
+            });
+        }
+        Ok(())
     }
 
     /// Shared catalog-lookup + Dockerfile-staging path used by both local and
@@ -3744,25 +4290,44 @@ impl PipelineRunner {
         step: &crate::types::QedStep,
         prepared: &PreparedBuildImage,
     ) -> Result<ObsForgeId, RunnerError> {
-        let driver = self
-            .remote_driver
-            .as_ref()
-            .expect("remote_driver is Some when run_where == Remote");
+        let driver = self.remote_driver.as_ref().ok_or_else(|| {
+            RunnerError::InvalidConfig(format!(
+                "build-image step `{}` dispatched remote but no remote dispatcher \
+                 is wired",
+                step.name,
+            ))
+        })?;
 
         let spec = ForgeSpec {
             command: ForgeCommand::BuildImage {
                 dockerfile: prepared.dockerfile_path.clone(),
                 context: prepared.camp_root.clone(),
-                tag: prepared.tag.clone(),
+                tags: vec![prepared.tag.clone()],
+                // The catalog build-image path targets the worker's native arch
+                // (placement below routes to an arch-matched build-worker), so
+                // no explicit `--platform`. Multi-arch is stitched from N native
+                // builds by the imagetools step, not requested here. Catalog
+                // images take no build-args today.
+                platforms: vec![],
+                build_args: vec![],
                 push: step.push,
+                load: step.load,
             },
             where_: TaskPlacement::new(
                 TaskLocation::RemoteAny {
                     tier: TierTag("infra".into()),
+                    // R594: route to an arch-matched build-worker. The catalog
+                    // build-image path has no explicit target platform, so it
+                    // builds for the runner's host arch on a matching worker.
+                    // (The gha build-push path threads `with.platforms` through
+                    // QedImageBuilder instead.)
+                    mesh_tags: crate::platform::build_worker_mesh_tags(
+                        crate::platform::arch_of(&self.host_triple),
+                    ),
                 },
                 TaskRuntime::Container,
             ),
-            timeout: step.timeout.map(Millis::from_ms),
+            timeout: step.timeout.map(Millis::from_secs),
             label: Some(step.name.clone()),
             initiator: Initiator::Human { camp: "qed".into() },
             mesh_access: MeshAccess::None,
@@ -4077,23 +4642,67 @@ impl PipelineRunner {
         step: &crate::types::QedStep,
         runtime: TaskRuntime,
     ) -> Result<ObsForgeId, RunnerError> {
-        let driver = self
-            .remote_driver
-            .as_ref()
-            .expect("remote_driver is Some when run_where == Remote");
+        // R590-F4: a forced-remote runner always has a driver, but an Auto runner
+        // that policy-routed this step to the fleet needs one wired too. Surface a
+        // clear config error instead of panicking when a policy-derived offload
+        // ran without a mesh dispatcher.
+        let driver = self.remote_driver.as_ref().ok_or_else(|| {
+            RunnerError::InvalidConfig(format!(
+                "step `{}` resolves to Offload (needs an arch-matched build-worker) \
+                 but no remote dispatcher is wired — run with fleet access, or force \
+                 `--where=local` to build it here",
+                step.name,
+            ))
+        })?;
+
+        // R590-F2: when the step declares a cross-arch target via
+        // `[platform].target`, pin placement to an arch-matched build-worker so
+        // an arm64 host can drive an x86 build on the x86 box (us-west-002).
+        let mesh_tags = remote_subprocess_mesh_tags(step);
+
+        // R590-F2 milestone-1 (2): per-step container image override (finishing
+        // the R381 `step.image` seam). A subprocess step may name its own
+        // catalog image (e.g. `rusty-v8-musl-builder`) to run its argv inside,
+        // instead of the default forge image (`yah-rust-bun`). `None` keeps the
+        // default-image behaviour for plain steps.
+        let image = step_image_override(step);
+
+        // R603-T5: a remote step's declared `produces` must be written under the
+        // durable produced dir (`/yah/produced`), which build_workload_spec
+        // host-bind-mounts so the bytes survive kamaji reaping the exited
+        // container. A produces path outside it would be retrieved off the
+        // container rootfs — lost the moment the container is reaped after a
+        // daemon outage (the exact R603-T4 failure this ticket closes). Fail
+        // fast at dispatch with a clear pointer rather than silently orphan.
+        for artifact in &step.produces {
+            let path = std::path::Path::new(&artifact.path);
+            if !workload_spec::forge_produced::is_durable_path(path) {
+                return Err(RunnerError::InvalidConfig(format!(
+                    "step `{}` declares produced artifact `{}`, but remote produced \
+                     artifacts must be written under `{}` so they survive the \
+                     build-worker reaping the container (R603-T5). Point the \
+                     build's output path at `{}/…`.",
+                    step.name,
+                    artifact.path,
+                    workload_spec::forge_produced::CONTAINER_DIR,
+                    workload_spec::forge_produced::CONTAINER_DIR,
+                )));
+            }
+        }
 
         let spec = ForgeSpec {
             command: ForgeCommand::Subprocess {
                 argv: step.argv.clone(),
-                image: None,
+                image,
             },
             where_: TaskPlacement::new(
                 TaskLocation::RemoteAny {
                     tier: TierTag("infra".into()),
+                    mesh_tags,
                 },
                 runtime,
             ),
-            timeout: step.timeout.map(Millis::from_ms),
+            timeout: step.timeout.map(Millis::from_secs),
             label: Some(step.name.clone()),
             // Camp name will be threaded through once yubaba RPC stabilises (R091).
             initiator: Initiator::Human { camp: "qed".into() },
@@ -4133,6 +4742,16 @@ impl PipelineRunner {
             .map_err(|e| RunnerError::Remote(e.to_string()))?;
 
         let forge_id = handle.id.clone();
+        // R603-T1: publish the workload identity the moment it exists, before we
+        // block on `wait()`. The camp daemon persists this as a non-terminal run
+        // record so a daemon restart mid-build can reattach to the workload
+        // (R603-T2) rather than orphaning it.
+        self.emit(QedEvent::StepRemoteDispatched {
+            index,
+            name: step.name.clone(),
+            forge_id: forge_id.to_string(),
+            at: Utc::now(),
+        });
         let status = handle.wait().await;
         // Drain any remaining buffered lines before the step is marked done.
         let _ = adapter.await;
@@ -4159,6 +4778,58 @@ impl PipelineRunner {
                 unreachable!("ForgeRunHandle::wait returns a terminal status")
             }
         }
+    }
+
+    /// R590-F6 leg 2: after a remote step exits successfully, pull the files it
+    /// declared in [`QedStep::produces`] off the build-worker and land them in
+    /// camp's content-addressed store (`<camp_root>/.yah/cache/artifacts/`).
+    ///
+    /// Returns the produced-artifact list with each `path` rewritten to the
+    /// landed local file, so the publish leg ([`crate::types::Outcome::Publish`]
+    /// / the W164 derived-static-asset reconciler) reads the retrieved bytes
+    /// instead of the unreachable container-side path — this FEEDS R546-T3's
+    /// bootstrap publish, it does not duplicate it.
+    ///
+    /// Only called for remote steps that actually declare `produces`; a step
+    /// with none (rusty-v8-musl today) never enters this path, so retrieval
+    /// cannot regress the on-box green that R590-B5 unblocks.
+    async fn retrieve_remote_artifacts(
+        &self,
+        forge_id: &ObsForgeId,
+        step: &crate::types::QedStep,
+    ) -> Result<Vec<ProducedArtifact>, RunnerError> {
+        let driver = self.remote_driver.as_ref().ok_or_else(|| {
+            RunnerError::InvalidConfig(format!(
+                "step `{}` declares produced artifacts to retrieve but no remote \
+                 dispatcher is wired",
+                step.name,
+            ))
+        })?;
+        let store = crate::artifact_retrieval::ContentAddressedStore::new(
+            self.resolve_camp_root()?.join(".yah/cache/artifacts"),
+        );
+
+        let mut retrieved = Vec::with_capacity(step.produces.len());
+        for artifact in &step.produces {
+            let remote_path = std::path::Path::new(&artifact.path);
+            let bytes = driver
+                .fetch_produced_file(forge_id, remote_path)
+                .await
+                .map_err(|e| RunnerError::StepFailed {
+                    step: step.name.clone(),
+                    msg: format!(
+                        "retrieving produced artifact `{}` off the build-worker: {e}",
+                        artifact.path
+                    ),
+                })?;
+            let landed = store.land(&bytes).map_err(RunnerError::Io)?;
+            retrieved.push(ProducedArtifact {
+                binary: artifact.binary.clone(),
+                path: landed.path.to_string_lossy().into_owned(),
+                triple: artifact.triple.clone(),
+            });
+        }
+        Ok(retrieved)
     }
 }
 
@@ -4210,6 +4881,7 @@ mod tests {
                 background: false,
                 background_until: None,
                 wait_for: None,
+                manifest_stitch: None,
                 name: "step-1".to_string(),
                 argv,
                 cwd: None,
@@ -4375,6 +5047,22 @@ mod tests {
     struct ScriptedWarden {
         lines: Vec<String>,
         exit_code: i32,
+        /// R590-F6: container-path → bytes the finished container produced,
+        /// served by `fetch_produced_file`.
+        produced_files: HashMap<std::path::PathBuf, Vec<u8>>,
+    }
+
+    impl ScriptedWarden {
+        fn new(lines: Vec<String>, exit_code: i32) -> Self {
+            Self { lines, exit_code, produced_files: HashMap::new() }
+        }
+
+        /// Seed a produced file so `fetch_produced_file` serves `bytes` at
+        /// `path` (R590-F6 retrieval test).
+        fn with_produced_file(mut self, path: impl Into<std::path::PathBuf>, bytes: Vec<u8>) -> Self {
+            self.produced_files.insert(path.into(), bytes);
+            self
+        }
     }
 
     #[async_trait::async_trait]
@@ -4410,6 +5098,19 @@ mod tests {
         ) -> Result<Option<i32>, velveteen::RemoteForgeError> {
             Ok(Some(self.exit_code))
         }
+
+        async fn fetch_produced_file(
+            &self,
+            _ident: &MeshIdent,
+            remote_path: &std::path::Path,
+        ) -> Result<Vec<u8>, velveteen::RemoteForgeError> {
+            self.produced_files.get(remote_path).cloned().ok_or_else(|| {
+                velveteen::RemoteForgeError::Fetch(format!(
+                    "no produced file scripted at {}",
+                    remote_path.display()
+                ))
+            })
+        }
     }
 
     /// Remote path happy: single step exits 0, task_run_id populated in step status.
@@ -4420,6 +5121,7 @@ mod tests {
         let yubaba = Arc::new(ScriptedWarden {
             lines: vec!["build ok".to_string()],
             exit_code: 0,
+            produced_files: HashMap::new(),
         });
 
         let pipeline = one_step_pipeline("test-remote", vec!["true".to_string()]);
@@ -4434,6 +5136,50 @@ mod tests {
         );
     }
 
+    /// R590-F6 leg 2 end-to-end: a remote step that declares `produces` has its
+    /// output tarball retrieved off the (scripted) build-worker and landed in
+    /// camp's content-addressed store — the landed file's BLAKE3 equals the
+    /// hash of the bytes the worker emitted (no bytes lost/rewritten in
+    /// transit). This is the retrieval unit path the ticket's verify names.
+    #[tokio::test]
+    async fn remote_step_retrieves_produced_artifact_content_addressed() {
+        let dir = TempDir::new().unwrap();
+        let camp = TempDir::new().unwrap();
+        let scryer = make_scryer(&dir);
+
+        // R603-T5: produced artifacts must live under the durable dir so they
+        // survive the build-worker reaping the container.
+        let container_path = "/yah/produced/librusty_v8-x86_64-unknown-linux-musl.tar.gz";
+        let payload = b"deterministic librusty_v8 tar bytes \x00\x01\x02\xff".to_vec();
+        let expected_blake3 = blake3::hash(&payload).to_hex().to_string();
+
+        let yubaba = Arc::new(
+            ScriptedWarden::new(vec!["v8 build complete".into()], 0)
+                .with_produced_file(container_path, payload.clone()),
+        );
+
+        let mut pipeline = one_step_pipeline("rusty-v8-musl", vec!["build-v8.sh".to_string()]);
+        pipeline.steps[0].produces = vec![ProducedArtifact {
+            binary: "rusty-v8".into(),
+            path: container_path.into(),
+            triple: Some("x86_64-unknown-linux-musl".into()),
+        }];
+
+        let runner = PipelineRunner::new_remote(pipeline, scryer, yubaba)
+            .with_camp_root(camp.path().to_path_buf());
+        let meta = runner.run().await.unwrap();
+
+        assert_eq!(meta.status, RunStatus::Success, "retrieval must not fail the step");
+
+        // The tar landed content-addressed under camp's artifact store, and its
+        // on-disk bytes re-hash to the worker's BLAKE3 — preservation proven.
+        let landed = camp.path().join(".yah/cache/artifacts").join(&expected_blake3);
+        assert!(landed.exists(), "retrieved artifact must land at <camp>/.yah/cache/artifacts/<blake3>");
+        let on_disk = std::fs::read(&landed).unwrap();
+        assert_eq!(on_disk, payload, "bytes must survive the transport unchanged");
+        assert_eq!(blake3::hash(&on_disk).to_hex().to_string(), expected_blake3);
+    }
+
     /// Remote path failure: non-zero exit code propagates as Failed status.
     #[tokio::test]
     async fn remote_step_failure() {
@@ -4442,6 +5188,7 @@ mod tests {
         let yubaba = Arc::new(ScriptedWarden {
             lines: vec!["error: something went wrong".to_string()],
             exit_code: 1,
+            produced_files: HashMap::new(),
         });
 
         let pipeline = one_step_pipeline("test-remote-fail", vec!["false".to_string()]);
@@ -4463,6 +5210,7 @@ mod tests {
         let yubaba = Arc::new(ScriptedWarden {
             lines: vec!["remote line 1".to_string(), "remote line 2".to_string()],
             exit_code: 0,
+            produced_files: HashMap::new(),
         });
 
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -4486,6 +5234,90 @@ mod tests {
         );
     }
 
+    /// R603-T1: a remote step publishes its yubaba workload id via
+    /// `StepRemoteDispatched` BEFORE the step finishes, so the camp daemon can
+    /// persist a reattachable non-terminal record. Asserts the event carries a
+    /// non-empty forge id and arrives strictly before `StepFinished` for that
+    /// index (the ordering boot-reconcile relies on).
+    #[tokio::test]
+    async fn remote_step_emits_workload_binding_before_finish() {
+        let dir = TempDir::new().unwrap();
+        let scryer = make_scryer(&dir);
+        let yubaba = Arc::new(ScriptedWarden {
+            lines: vec!["build ok".to_string()],
+            exit_code: 0,
+            produced_files: HashMap::new(),
+        });
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let pipeline = one_step_pipeline("test-remote-binding", vec!["true".to_string()]);
+        let runner = PipelineRunner::new_remote(pipeline, scryer, yubaba).with_events(tx);
+        let meta = runner.run().await.unwrap();
+        assert_eq!(meta.status, RunStatus::Success);
+
+        // Walk the event stream in order: the dispatch event must appear, carry a
+        // non-empty forge id, and precede the StepFinished for index 0.
+        let mut dispatched_forge: Option<String> = None;
+        let mut saw_finished = false;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                QedEvent::StepRemoteDispatched { index, forge_id, .. } => {
+                    assert_eq!(index, 0, "single-step pipeline → index 0");
+                    assert!(!forge_id.is_empty(), "dispatch event must carry a workload id");
+                    assert!(!saw_finished, "dispatch must precede StepFinished");
+                    dispatched_forge = Some(forge_id);
+                }
+                QedEvent::StepFinished { index: 0, .. } => saw_finished = true,
+                _ => {}
+            }
+        }
+        let forge = dispatched_forge.expect("remote step must emit StepRemoteDispatched");
+        // The same id ends up on the terminal step status (task_run_id), so the
+        // persisted record and the live binding agree.
+        assert_eq!(
+            meta.steps[0].task_run_id.as_deref(),
+            Some(forge.as_str()),
+            "dispatched forge id must match the step's recorded task_run_id",
+        );
+    }
+
+    /// R603-T5: a remote step whose `produces` path is NOT under the durable
+    /// dir (`/yah/produced`) is rejected at dispatch — its output would be read
+    /// off the container rootfs and lost the moment the worker reaps the exited
+    /// container. The run fails with a clear pointer instead of silently
+    /// orphaning the artifact.
+    #[tokio::test]
+    async fn remote_step_rejects_non_durable_produces_path() {
+        let dir = TempDir::new().unwrap();
+        let scryer = make_scryer(&dir);
+        let yubaba = Arc::new(ScriptedWarden {
+            lines: vec![],
+            exit_code: 0,
+            produced_files: HashMap::new(),
+        });
+
+        let mut pipeline = one_step_pipeline("test-bad-produces", vec!["true".to_string()]);
+        pipeline.steps[0].produces = vec![ProducedArtifact {
+            binary: "rusty-v8".to_string(),
+            // Under /tmp, not /yah/produced → not reap-durable.
+            path: "/tmp/librusty_v8.tar.gz".to_string(),
+            triple: None,
+        }];
+
+        let runner = PipelineRunner::new_remote(pipeline, scryer, yubaba);
+        let meta = runner.run().await.unwrap();
+        assert_eq!(
+            meta.status,
+            RunStatus::Failed,
+            "a non-durable produces path must fail the run"
+        );
+        let err = meta.steps[0].error.clone().unwrap_or_default();
+        assert!(
+            err.contains("/yah/produced"),
+            "error must point at the durable dir convention; got {err:?}"
+        );
+    }
+
     /// Remote path: second step skipped when first fails with on_fail=Abort.
     #[tokio::test]
     async fn remote_abort_on_fail() {
@@ -4494,6 +5326,7 @@ mod tests {
         let yubaba = Arc::new(ScriptedWarden {
             lines: vec![],
             exit_code: 1,
+            produced_files: HashMap::new(),
         });
 
         let mut pipeline = one_step_pipeline("test-abort", vec!["false".to_string()]);
@@ -4501,6 +5334,7 @@ mod tests {
             background: false,
             background_until: None,
             wait_for: None,
+            manifest_stitch: None,
             name: "step-2".to_string(),
             argv: vec!["true".to_string()],
             cwd: None,
@@ -4604,6 +5438,7 @@ mod tests {
                 background: false,
                 background_until: None,
                 wait_for: None,
+                manifest_stitch: None,
                 name: "step-1".to_string(),
                 argv,
                 cwd: None,
@@ -4734,6 +5569,117 @@ mod tests {
 
         assert_eq!(meta.status, RunStatus::Success);
         assert_eq!(dispatcher.recorded(), vec!["publish:yah-releases:1"]);
+    }
+
+    /// R603-T4: `resume_terminal_publish_for_remote_step` replays the terminal
+    /// publish for a remote step that finished while the daemon was down. It
+    /// retrieves the step's `produces` off the (scripted) build-worker and fires
+    /// the pipeline's `on_success` Outcome::Publish against the LANDED artifact —
+    /// exactly one publish carrying the one retrieved artifact — WITHOUT
+    /// re-running the build step. This is the durable-resume path R603-T2's boot
+    /// reconciler calls once it confirms a persisted remote run reached Success.
+    #[tokio::test]
+    async fn resume_publishes_retrieved_remote_artifact() {
+        let dir = TempDir::new().unwrap();
+        let camp = TempDir::new().unwrap();
+        let scryer = make_scryer(&dir);
+
+        let container_path = "/tmp/out/librusty_v8-x86_64-unknown-linux-musl.tar.gz";
+        let payload = b"resumed build tar bytes \x00\x01\x02\xff".to_vec();
+        let expected_blake3 = blake3::hash(&payload).to_hex().to_string();
+
+        let yubaba = Arc::new(
+            ScriptedWarden::new(vec!["v8 build complete".into()], 0)
+                .with_produced_file(container_path, payload.clone()),
+        );
+
+        let mut pipeline = pipeline_with_outcomes(
+            vec![Outcome::Publish {
+                provider: "r2".into(),
+                bucket: "yah-releases".into(),
+                prefix: None,
+                base_url: None,
+            }],
+            vec![],
+            vec!["build-v8.sh".to_string()],
+        );
+        pipeline.steps[0].produces = vec![ProducedArtifact {
+            binary: "rusty-v8".into(),
+            path: container_path.into(),
+            triple: Some("x86_64-unknown-linux-musl".into()),
+        }];
+
+        let dispatcher = RecordingDispatcher::new();
+        let runner = PipelineRunner::new_remote(pipeline, scryer, yubaba)
+            .with_camp_root(camp.path().to_path_buf())
+            .with_dispatcher(dispatcher.clone());
+
+        // The daemon persisted this bare-uuid workload id at dispatch (R603-T1);
+        // reconcile hands it back as an ObsForgeId. Resume does NOT run the
+        // pipeline — the build already finished remotely.
+        let forge_id = ObsForgeId(Uuid::new_v4());
+        runner
+            .resume_terminal_publish_for_remote_step(0, &forge_id)
+            .await
+            .expect("resume publishes the retrieved artifact");
+
+        // Exactly one publish, carrying the single retrieved artifact.
+        assert_eq!(dispatcher.recorded(), vec!["publish:yah-releases:1"]);
+        // The bytes the publish leg saw came off the worker and landed
+        // content-addressed in camp, not the unreachable container path.
+        let landed = camp.path().join(".yah/cache/artifacts").join(&expected_blake3);
+        assert!(landed.exists(), "resume must land the retrieved artifact in camp's store");
+    }
+
+    /// R603-T4 reaping-window fork: if the build finished DURING the outage and
+    /// kamaji already reaped the container, the produced artifact is
+    /// un-retrievable. Resume must surface that as an error and fire NO publish —
+    /// never silently claim published. (Retrieval runs before outcome dispatch,
+    /// so the `?` short-circuits the publish.)
+    #[tokio::test]
+    async fn resume_errors_and_skips_publish_when_artifact_reaped() {
+        let dir = TempDir::new().unwrap();
+        let camp = TempDir::new().unwrap();
+        let scryer = make_scryer(&dir);
+
+        // No produced file scripted → fetch_produced_file errors, modelling a
+        // container kamaji already reaped.
+        let yubaba = Arc::new(ScriptedWarden::new(vec![], 0));
+
+        let mut pipeline = pipeline_with_outcomes(
+            vec![Outcome::Publish {
+                provider: "r2".into(),
+                bucket: "yah-releases".into(),
+                prefix: None,
+                base_url: None,
+            }],
+            vec![],
+            vec!["build-v8.sh".to_string()],
+        );
+        pipeline.steps[0].produces = vec![ProducedArtifact {
+            binary: "rusty-v8".into(),
+            path: "/tmp/out/reaped.tar.gz".into(),
+            triple: Some("x86_64-unknown-linux-musl".into()),
+        }];
+
+        let dispatcher = RecordingDispatcher::new();
+        let runner = PipelineRunner::new_remote(pipeline, scryer, yubaba)
+            .with_camp_root(camp.path().to_path_buf())
+            .with_dispatcher(dispatcher.clone());
+
+        let forge_id = ObsForgeId(Uuid::new_v4());
+        let err = runner
+            .resume_terminal_publish_for_remote_step(0, &forge_id)
+            .await
+            .expect_err("a reaped artifact must surface as an error, not a silent success");
+        assert!(
+            matches!(err, RunnerError::StepFailed { .. }),
+            "retrieval failure should map to StepFailed, got {err:?}",
+        );
+        assert!(
+            dispatcher.recorded().is_empty(),
+            "no publish may fire when the artifact was reaped",
+        );
     }
 
     /// A failing step's `produces` is dropped — publish only ever runs on
@@ -4970,6 +5916,218 @@ mod tests {
         let mut s = p.steps.remove(0);
         s.name = name.to_string();
         s
+    }
+
+    /// R590-F2: a remote subprocess step's placement mesh-tags come from its
+    /// declared `[platform].target` arch — so an arm64 host targeting
+    /// x86_64-unknown-linux-musl is pinned to an x86 build-worker (us-west-002),
+    /// not left to emulate. No target ⇒ empty (any infra node).
+    #[test]
+    fn remote_subprocess_mesh_tags_pins_arch_matched_worker_from_target() {
+        use crate::platform::PlatformSpec;
+
+        let plain = mk_step("plain", &["cargo", "build"]);
+        assert!(
+            remote_subprocess_mesh_tags(&plain).is_empty(),
+            "no platform.target must leave placement unpinned",
+        );
+
+        let mut x86 = mk_step("v8", &["build-v8.sh", "x86_64-unknown-linux-musl", "out.tar.gz"]);
+        x86.platform = Some(PlatformSpec {
+            target: Some("x86_64-unknown-linux-musl".into()),
+            container_platform: None,
+            native: false,
+        });
+        assert_eq!(
+            remote_subprocess_mesh_tags(&x86),
+            vec!["tag:build-worker".to_string(), "tier:x86".to_string()],
+        );
+
+        let mut arm = mk_step("arm", &["true"]);
+        arm.platform = Some(PlatformSpec {
+            target: Some("aarch64-unknown-linux-musl".into()),
+            container_platform: None,
+            native: false,
+        });
+        assert_eq!(
+            remote_subprocess_mesh_tags(&arm),
+            vec!["tag:build-worker".to_string(), "tier:arm".to_string()],
+        );
+    }
+
+    /// A `native = true` step whose cross-arch target forces the offload branch
+    /// of the policy — the `rusty-v8-musl` shape.
+    fn native_offload_step() -> crate::types::QedStep {
+        use crate::platform::PlatformSpec;
+        let mut s = mk_step(
+            "build-v8",
+            &["build-v8.sh", "x86_64-unknown-linux-musl", "out.tar.gz"],
+        );
+        s.platform = Some(PlatformSpec {
+            target: Some("x86_64-unknown-linux-musl".into()),
+            container_platform: None,
+            native: true,
+        });
+        s
+    }
+
+    // ── R590-F4 policy routing ───────────────────────────────────────────────
+
+    /// `policy_placement` folds the `--where` force-mode with a step's
+    /// resolution: force-modes pass through, and Auto routes only Offload
+    /// verdicts to the fleet.
+    #[test]
+    fn policy_placement_forces_and_derives() {
+        use crate::platform::Resolution;
+        let offload = Resolution::Offload {
+            target: "x86_64-unknown-linux-musl".into(),
+        };
+        // Force-modes ignore the resolution entirely.
+        assert_eq!(policy_placement(RunWhere::Local, &offload), RunWhere::Local);
+        assert_eq!(
+            policy_placement(RunWhere::Remote, &Resolution::NativeCross),
+            RunWhere::Remote
+        );
+        // Auto derives: Offload → Remote, everything else → Local.
+        assert_eq!(policy_placement(RunWhere::Auto, &offload), RunWhere::Remote);
+        assert_eq!(
+            policy_placement(RunWhere::Auto, &Resolution::NativeCross),
+            RunWhere::Local
+        );
+        assert_eq!(
+            policy_placement(
+                RunWhere::Auto,
+                &Resolution::Emulate {
+                    docker_platform: "linux/amd64".into()
+                }
+            ),
+            RunWhere::Local
+        );
+    }
+
+    /// On an arm64 host, the default (Auto) runner routes a `native = true`
+    /// x86 musl step to the fleet — no `--where=remote` — while an ordinary
+    /// cross-compilable step stays local. A forced `--where=local` runner keeps
+    /// even the native step local (the testing override).
+    #[test]
+    fn effective_placement_routes_native_offload_under_auto() {
+        let pipeline = bg_pipeline("v8", vec![native_offload_step()]);
+        let auto = PipelineRunner::new(pipeline.clone())
+            .with_host_triple("aarch64-apple-darwin");
+        // new()/new_with_dispatcher default to Local; flip to Auto to model the
+        // default CLI mode without standing up a real dispatcher.
+        let auto = PipelineRunner {
+            run_where: RunWhere::Auto,
+            ..auto
+        };
+        let step = &auto.pipeline.steps[0];
+        assert_eq!(auto.effective_placement(step), RunWhere::Remote);
+        // Runtime for an offloaded step defaults to Container.
+        assert_eq!(auto.resolve_runtime(step), TaskRuntime::Container);
+
+        // An ordinary cross step (native=false) stays local under Auto.
+        let mut plain = native_offload_step();
+        plain.platform.as_mut().unwrap().native = false;
+        let plain_pipeline = bg_pipeline("plain", vec![plain]);
+        let auto_plain = PipelineRunner {
+            run_where: RunWhere::Auto,
+            ..PipelineRunner::new(plain_pipeline).with_host_triple("aarch64-apple-darwin")
+        };
+        assert_eq!(
+            auto_plain.effective_placement(&auto_plain.pipeline.steps[0]),
+            RunWhere::Local
+        );
+
+        // Force-local keeps the native step local.
+        let forced = PipelineRunner::new(pipeline).with_host_triple("aarch64-apple-darwin");
+        assert_eq!(
+            forced.effective_placement(&forced.pipeline.steps[0]),
+            RunWhere::Local
+        );
+    }
+
+    /// On the x86 build-worker itself the native x86 step is host-arch → it runs
+    /// locally, never re-dispatched (the offload target *is* this host).
+    #[test]
+    fn effective_placement_native_step_runs_local_on_matching_host() {
+        let pipeline = bg_pipeline("v8", vec![native_offload_step()]);
+        let auto = PipelineRunner {
+            run_where: RunWhere::Auto,
+            ..PipelineRunner::new(pipeline).with_host_triple("x86_64-unknown-linux-gnu")
+        };
+        assert_eq!(
+            auto.effective_placement(&auto.pipeline.steps[0]),
+            RunWhere::Local
+        );
+    }
+
+    /// `pipeline_needs_offload` tells the CLI whether an Auto run must stand up a
+    /// mesh dispatcher: true when any native cross step offloads on this host,
+    /// false for an all-cross-compilable pipeline.
+    #[test]
+    fn pipeline_needs_offload_detects_native_cross_step() {
+        let with_native = bg_pipeline("v8", vec![native_offload_step()]);
+        assert!(pipeline_needs_offload(&with_native, "aarch64-apple-darwin"));
+        // Same step on the matching host: host-arch build, no offload.
+        assert!(!pipeline_needs_offload(&with_native, "x86_64-unknown-linux-gnu"));
+
+        let mut plain = native_offload_step();
+        plain.platform.as_mut().unwrap().native = false;
+        let no_native = bg_pipeline("plain", vec![plain]);
+        assert!(!pipeline_needs_offload(&no_native, "aarch64-apple-darwin"));
+    }
+
+    /// An Auto runner that policy-routes a step to Offload but has no dispatcher
+    /// wired fails with a clear config error instead of panicking.
+    #[tokio::test]
+    async fn offload_without_dispatcher_errors_cleanly() {
+        let pipeline = bg_pipeline("v8", vec![native_offload_step()]);
+        let auto = PipelineRunner {
+            run_where: RunWhere::Auto,
+            ..PipelineRunner::new(pipeline).with_host_triple("aarch64-apple-darwin")
+        };
+        let step = auto.pipeline.steps[0].clone();
+        let err = auto
+            .execute_step_remote(0, &step, TaskRuntime::Container)
+            .await
+            .expect_err("no dispatcher wired must error, not panic");
+        match err {
+            RunnerError::InvalidConfig(m) => {
+                assert!(m.contains("Offload"), "message: {m}");
+                assert!(m.contains("no remote dispatcher"), "message: {m}");
+            }
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+    }
+
+    /// A forced `--where=local` runner keeps a `native = true` cross-arch step
+    /// Local (effective_placement never inspects the step), so it would reach
+    /// the local-container path. That path must REFUSE rather than let Docker
+    /// silently emulate the foreign-arch image under QEMU — the "fail not a
+    /// warning" contract for the rusty-v8-musl forcing case. No docker daemon
+    /// is touched: the guard fires before any container is started.
+    #[tokio::test]
+    async fn native_offload_step_refuses_local_container_emulation() {
+        let pipeline = bg_pipeline("v8", vec![native_offload_step()]);
+        // Default runner is forced-Local; arm64 host + x86 native target ⇒ the
+        // step resolves to Offload, so local-container execution == emulation.
+        let forced = PipelineRunner::new(pipeline).with_host_triple("aarch64-apple-darwin");
+        let step = forced.pipeline.steps[0].clone();
+        assert_eq!(forced.effective_placement(&step), RunWhere::Local);
+
+        let err = forced
+            .execute_step_local_container(0, &step)
+            .await
+            .expect_err("a native cross-arch step must not emulate locally");
+        match err {
+            RunnerError::StepFailed { step: s, msg } => {
+                assert_eq!(s, "build-v8");
+                assert!(msg.contains("must offload"), "message: {msg}");
+                assert!(msg.contains("tier:x86"), "message: {msg}");
+                assert!(msg.contains("aarch64-apple-darwin"), "message: {msg}");
+            }
+            other => panic!("expected StepFailed, got {other:?}"),
+        }
     }
 
     /// A multi-step local pipeline (Live workspace, no outcomes) from the
@@ -5490,6 +6648,7 @@ mod tests {
         step.platform = Some(crate::platform::PlatformSpec {
             target: Some("x86_64-unknown-linux-musl".into()),
             container_platform: Some("linux/amd64".into()),
+            native: false,
         });
         let p = runner.step_platform(&step);
         assert_eq!(p.host, "aarch64-apple-darwin");
@@ -5515,6 +6674,7 @@ mod tests {
         steps[0].platform = Some(crate::platform::PlatformSpec {
             target: Some("x86_64-unknown-linux-musl".into()),
             container_platform: None,
+            native: false,
         });
         runner.pipeline.steps = steps;
 
@@ -5545,6 +6705,7 @@ mod tests {
         foreign.platform = Some(crate::platform::PlatformSpec {
             target: Some("x86_64-unknown-linux-musl".into()),
             container_platform: Some("linux/amd64".into()),
+            native: false,
         });
         let plan = runner
             .native_cross_plan(&foreign, &crate::nativecross::ToolAvailability::FULL)
@@ -5559,6 +6720,7 @@ mod tests {
         native.platform = Some(crate::platform::PlatformSpec {
             target: Some("aarch64-unknown-linux-gnu".into()),
             container_platform: None,
+            native: false,
         });
         assert!(runner
             .native_cross_plan(&native, &crate::nativecross::ToolAvailability::FULL)
@@ -5615,6 +6777,7 @@ mod tests {
         pipeline.steps[0].platform = Some(crate::platform::PlatformSpec {
             target: Some(target.to_string()),
             container_platform: None,
+            native: false,
         });
         PipelineRunner::new(pipeline)
             .with_host_triple("aarch64-apple-darwin")
@@ -5714,6 +6877,7 @@ mod tests {
         let yubaba = Arc::new(ScriptedWarden {
             lines: vec![],
             exit_code: 0,
+            produced_files: HashMap::new(),
         });
         let remote_pipeline = one_step_pipeline("remote", vec!["true".to_string()]);
         let remote_runner = PipelineRunner::new_remote(remote_pipeline, scryer, yubaba);
@@ -5734,6 +6898,20 @@ mod tests {
             TaskRuntime::Container,
             "step.runtime=Container must override --where=local default Native",
         );
+    }
+
+    /// R590-F2: a subprocess step's `image = "<name>"` resolves to a catalog
+    /// ImageRef (the R381 seam) so the argv runs inside that image; no `image`
+    /// ⇒ None (driver uses the default forge image).
+    #[test]
+    fn step_image_override_resolves_catalog_image() {
+        let mut step = mk_step("v8", &["build-v8.sh"]);
+        assert!(step_image_override(&step).is_none(), "no image ⇒ None");
+
+        step.image = Some("rusty-v8-musl-builder".into());
+        let img = step_image_override(&step).expect("image override resolves");
+        assert_eq!(img.registry, "ghcr.io");
+        assert_eq!(img.repository, "yah-ai/rusty-v8-musl-builder");
     }
 
     /// Local + container routes through `task::local::local_container_command`
@@ -5769,6 +6947,7 @@ mod tests {
                 background: false,
                 background_until: None,
                 wait_for: None,
+                manifest_stitch: None,
                 name: "bake".to_string(),
                 argv: Vec::new(),
                 cwd: None,
@@ -5847,6 +7026,7 @@ mod tests {
         let yubaba = Arc::new(ScriptedWarden {
             lines: vec![],
             exit_code: 0,
+            produced_files: HashMap::new(),
         });
         let pipeline = build_image_pipeline("yah-rust");
         let runner = PipelineRunner::new_remote(pipeline, scryer, yubaba)
@@ -5868,6 +7048,7 @@ mod tests {
         let yubaba = Arc::new(ScriptedWarden {
             lines: vec!["dockerfile parse error".into()],
             exit_code: 2,
+            produced_files: HashMap::new(),
         });
         let pipeline = build_image_pipeline("yah-rust");
         let runner = PipelineRunner::new_remote(pipeline, scryer, yubaba)
@@ -5979,6 +7160,7 @@ description = "smoke test image"
                 background: false,
                 background_until: None,
                 wait_for: None,
+                manifest_stitch: None,
                 name: "pack".to_string(),
                 argv: Vec::new(),
                 cwd: None,
@@ -6215,6 +7397,7 @@ produces    = ["native-tarball"]
         let yubaba = Arc::new(ScriptedWarden {
             lines: vec![],
             exit_code: 0,
+            produced_files: HashMap::new(),
         });
         let pipeline = package_native_tarball_pipeline(
             "yah-yubaba",
@@ -6238,6 +7421,7 @@ produces    = ["native-tarball"]
                 background: false,
                 background_until: None,
                 wait_for: None,
+                manifest_stitch: None,
                 name: "musl-gate".to_string(),
                 argv: Vec::new(),
                 cwd: None,
@@ -6318,6 +7502,7 @@ produces    = ["native-tarball"]
         let yubaba = Arc::new(ScriptedWarden {
             lines: vec![],
             exit_code: 0,
+            produced_files: HashMap::new(),
         });
         let pipeline = musl_preflight_pipeline("yubaba");
         let runner = PipelineRunner::new_remote(pipeline, scryer, yubaba);
@@ -6361,6 +7546,7 @@ produces    = ["native-tarball"]
                     background: false,
                     background_until: None,
                     wait_for: None,
+                    manifest_stitch: None,
                     name: "pack".to_string(),
                     argv: Vec::new(),
                     cwd: None,
@@ -6393,6 +7579,7 @@ produces    = ["native-tarball"]
                     background: false,
                     background_until: None,
                     wait_for: None,
+                    manifest_stitch: None,
                     name: "sign".to_string(),
                     argv: Vec::new(),
                     cwd: None,
@@ -6448,6 +7635,7 @@ produces    = ["native-tarball"]
                 background: false,
                 background_until: None,
                 wait_for: None,
+                manifest_stitch: None,
                 name: "sign".to_string(),
                 argv: Vec::new(),
                 cwd: None,
@@ -6580,6 +7768,7 @@ produces    = ["native-tarball"]
         let yubaba = Arc::new(ScriptedWarden {
             lines: vec![],
             exit_code: 0,
+            produced_files: HashMap::new(),
         });
         let pipeline = sign_only_pipeline("yah-yubaba", "x86_64-unknown-linux-musl");
         let runner = PipelineRunner::new_remote(pipeline, scryer, yubaba);
@@ -6655,6 +7844,7 @@ produces    = ["native-tarball"]
             background: false,
             background_until: None,
             wait_for: None,
+            manifest_stitch: None,
             name: name.into(),
             argv: argv.into_iter().map(String::from).collect(),
             cwd: None,
@@ -6695,6 +7885,30 @@ produces    = ["native-tarball"]
         s
     }
 
+    /// R603-B6: `QedStep::timeout` is SECONDS. The runner used to lower it with
+    /// `Millis::from_ms`, so P018's `timeout = 9000` ("2.5h cap") became 9
+    /// seconds and killed every long remote step at 1/1000th of its budget —
+    /// the rusty-v8 build died at ~9s after ~57min of real work on the worker.
+    /// Latent locally only because the local driver never enforces
+    /// `spec.timeout`. Lock the unit at the lowering boundary.
+    #[test]
+    fn step_timeout_is_seconds_not_millis() {
+        let mut s = shell_step("build-v8-musl", vec!["true"]);
+        s.timeout = Some(9000); // P018's real value: a 2.5h cap
+        let spec = build_subprocess_spec(&s, TaskRuntime::Container, None);
+        assert_eq!(
+            spec.timeout.expect("timeout lowered").as_ms(),
+            9_000_000,
+            "9000s must lower to 9_000_000ms (2.5h); from_ms would give 9000ms = 9s"
+        );
+
+        // No timeout stays absent (unbounded), not zero.
+        let none = shell_step("no-budget", vec!["true"]);
+        assert!(build_subprocess_spec(&none, TaskRuntime::Native, None)
+            .timeout
+            .is_none());
+    }
+
     fn sub_step(
         name: &str,
         target: SubPipelineRef,
@@ -6704,6 +7918,7 @@ produces    = ["native-tarball"]
             background: false,
             background_until: None,
             wait_for: None,
+            manifest_stitch: None,
             name: name.into(),
             argv: Vec::new(),
             cwd: None,
@@ -6809,7 +8024,7 @@ produces    = ["native-tarball"]
     }
 
     #[test]
-    fn workspace_checkout_clean_switches_to_branch_in_place() {
+    fn workspace_checkout_clean_switches_to_ref_in_place() {
         let repo = init_git_repo();
         let runner =
             PipelineRunner::new(pipeline_with_workspace(crate::types::WorkspaceMode::Checkout))
@@ -6846,6 +8061,63 @@ produces    = ["native-tarball"]
     }
 
     #[test]
+    fn workspace_checkout_ignores_dirty_runtime_db_only() {
+        let repo = init_git_repo();
+        let git = |args: &[&str]| {
+            assert!(
+                std::process::Command::new("git")
+                    .current_dir(repo.path())
+                    .args(args)
+                    .output()
+                    .unwrap()
+                    .status
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        // Commit a runtime DB file so it is *tracked* (mirrors the real camp,
+        // where the daemon's turso DBs are swept into wip commits).
+        std::fs::create_dir_all(repo.path().join(".yah/db")).unwrap();
+        std::fs::write(repo.path().join(".yah/db/task-runs.turso-wal"), b"v1").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "track runtime db"]);
+        // Now dirty ONLY the runtime DB — as the daemon does on every run.
+        std::fs::write(repo.path().join(".yah/db/task-runs.turso-wal"), b"v2-churn").unwrap();
+        let runner =
+            PipelineRunner::new(pipeline_with_workspace(crate::types::WorkspaceMode::Checkout))
+                .with_camp_root(repo.path().to_path_buf());
+        assert!(
+            runner.prepare_workspace(repo.path()).is_ok(),
+            "a dirty tree confined to .yah/db runtime state must not bail checkout"
+        );
+        // But a real source edit alongside the DB churn still bails.
+        std::fs::write(repo.path().join("f.txt"), "real edit").unwrap();
+        assert!(
+            matches!(
+                runner.prepare_workspace(repo.path()),
+                Err(RunnerError::InvalidConfig(m)) if m.contains("uncommitted")
+            ),
+            "a tracked source edit must still refuse checkout even amid DB churn"
+        );
+    }
+
+    #[test]
+    fn porcelain_path_is_ignored_classifies_runtime_vs_source() {
+        // Runtime DB churn → ignored.
+        assert!(porcelain_path_is_ignored(" M .yah/db/task-runs.turso-wal"));
+        assert!(porcelain_path_is_ignored("MM .yah/db/gnome_queue.turso"));
+        // Source edits → not ignored.
+        assert!(!porcelain_path_is_ignored(" M src/main.rs"));
+        assert!(!porcelain_path_is_ignored(" M .yah/qed/P018-rusty-v8-musl.toml"));
+        // A rename INTO the runtime dir keys off the destination.
+        assert!(porcelain_path_is_ignored("R  old.db -> .yah/db/task-runs.turso"));
+        assert!(!porcelain_path_is_ignored("R  .yah/db/x.turso -> src/moved.rs"));
+        // Unparseable/short lines fail safe (counted as dirty).
+        assert!(!porcelain_path_is_ignored(""));
+        assert!(!porcelain_path_is_ignored("M"));
+    }
+
+    #[test]
     fn workspace_isolated_builds_in_a_worktree_and_guard_cleans_up() {
         let repo = init_git_repo();
         let runner =
@@ -6875,6 +8147,121 @@ produces    = ["native-tarball"]
             std::fs::read_to_string(ws.join("f.txt")).unwrap(),
             "v1",
             "worktree has committed bytes"
+        );
+        drop(guard);
+    }
+
+    // ── R330-B27: ref (not hardcoded "main") drives Checkout/Isolated ───────
+
+    /// Build a `main`-branch git repo with two commits: `v1.0.0` tags the
+    /// first, `main` moves on to a second. Distinguishes "the tag's commit"
+    /// from "main's commit" for the tests below — before this ticket,
+    /// `target_branch()` silently fell back to `"main"` whenever no ref was
+    /// requested, so a tag-triggered release would build main's bytes.
+    fn init_git_repo_with_tag() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let ok = std::process::Command::new("git")
+                .current_dir(tmp.path())
+                .args(args)
+                .output()
+                .unwrap()
+                .status
+                .success();
+            assert!(ok, "git {args:?} failed");
+        };
+        git(&["init", "-b", "main"]);
+        git(&["config", "user.email", "t@t.t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(tmp.path().join("f.txt"), "v1").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "v1"]);
+        git(&["tag", "v1.0.0"]);
+        std::fs::write(tmp.path().join("f.txt"), "v2-on-main").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-m", "advance main"]);
+        tmp
+    }
+
+    fn git_rev_parse(dir: &std::path::Path, rev: &str) -> String {
+        let out = std::process::Command::new("git")
+            .current_dir(dir)
+            .args(["rev-parse", rev])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git rev-parse {rev} failed");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    }
+
+    #[test]
+    fn workspace_checkout_with_no_ref_positions_at_head_not_main() {
+        let repo = init_git_repo_with_tag();
+        // Detach HEAD at the tag — mirrors a CI runner that already checked
+        // out a tag push before invoking `yah qed run`.
+        run_git(repo.path(), &["checkout", "v1.0.0"]).unwrap();
+        let tag_sha = git_rev_parse(repo.path(), "HEAD");
+        let main_sha = git_rev_parse(repo.path(), "main");
+        assert_ne!(tag_sha, main_sha, "fixture sanity: tag and main differ");
+
+        // No with_ref() call — must not fall back to "main".
+        let runner =
+            PipelineRunner::new(pipeline_with_workspace(crate::types::WorkspaceMode::Checkout))
+                .with_camp_root(repo.path().to_path_buf());
+        let (ws, _guard) = runner.prepare_workspace(repo.path()).unwrap();
+        assert_eq!(ws, repo.path());
+        assert_eq!(
+            git_rev_parse(repo.path(), "HEAD"),
+            tag_sha,
+            "checkout with no explicit ref stays at the checked-out tag, not main"
+        );
+    }
+
+    #[test]
+    fn workspace_isolated_with_no_ref_positions_at_head_not_main() {
+        let repo = init_git_repo_with_tag();
+        // Same detached-HEAD-at-a-tag setup as the Checkout test above.
+        run_git(repo.path(), &["checkout", "v1.0.0"]).unwrap();
+        let tag_sha = git_rev_parse(repo.path(), "HEAD");
+        let main_sha = git_rev_parse(repo.path(), "main");
+        assert_ne!(tag_sha, main_sha, "fixture sanity: tag and main differ");
+
+        // No with_ref() call — the pre-fix code would `git worktree add
+        // <path> main` here and silently build main's bytes.
+        let runner =
+            PipelineRunner::new(pipeline_with_workspace(crate::types::WorkspaceMode::Isolated))
+                .with_camp_root(repo.path().to_path_buf());
+        let (ws, guard) = runner.prepare_workspace(repo.path()).unwrap();
+        assert_eq!(
+            git_rev_parse(&ws, "HEAD"),
+            tag_sha,
+            "isolated worktree with no explicit ref positions at HEAD (the tag), not main"
+        );
+        drop(guard);
+    }
+
+    #[test]
+    fn workspace_isolated_with_explicit_ref_builds_worktree_at_that_commit() {
+        let repo = init_git_repo_with_tag();
+        // HEAD stays on main; the run explicitly requests the tag instead —
+        // the R330-B27 "plumb the trigger ref" shape (a tag-fired run passing
+        // its tag explicitly rather than relying on ambient HEAD state).
+        let tag_sha = git_rev_parse(repo.path(), "v1.0.0");
+        let main_sha = git_rev_parse(repo.path(), "main");
+        assert_ne!(tag_sha, main_sha, "fixture sanity: tag and main differ");
+
+        let runner =
+            PipelineRunner::new(pipeline_with_workspace(crate::types::WorkspaceMode::Isolated))
+                .with_camp_root(repo.path().to_path_buf())
+                .with_ref(Some("v1.0.0".to_string()));
+        let (ws, guard) = runner.prepare_workspace(repo.path()).unwrap();
+        let worktree_sha = git_rev_parse(&ws, "HEAD");
+        assert_eq!(
+            worktree_sha, tag_sha,
+            "explicit ref=<tag> builds the worktree at the tag's commit"
+        );
+        assert_ne!(
+            worktree_sha, main_sha,
+            "must not build main's bytes when a tag ref is requested"
         );
         drop(guard);
     }
@@ -7208,6 +8595,7 @@ jobs:
             background: false,
             background_until: None,
             wait_for: None,
+            manifest_stitch: None,
             name: "gha-workflow".to_string(),
             argv: Vec::new(),
             cwd: None,
@@ -7391,6 +8779,7 @@ jobs:
             background: false,
             background_until: None,
             wait_for: None,
+            manifest_stitch: None,
             name: "gha-workflow".to_string(),
             argv: Vec::new(),
             cwd: None,
@@ -8482,6 +9871,7 @@ jobs:
             background: false,
             background_until: None,
             wait_for: None,
+            manifest_stitch: None,
             name: name.to_string(),
             // echo always succeeds — distinguishes "ran" from "skipped" by
             // looking at the terminal status, not by relying on a failure.

@@ -1,8 +1,3 @@
-//! @yah:ticket(R513-F3, "QED wait_for step kind / modifier (http health-gate, timeout)")
-//! @yah:at(2026-06-20T00:00:00Z)
-//! @yah:status(review)
-//! @yah:phase(P1)
-//! @yah:parent(R513)
 //! @arch:see(.yah/docs/working/W207-dashboard-e2e-in-qed.md)
 //!
 //! The `wait_for` health-gate primitive (W207 Gap #5). A [`StepKind::WaitFor`]

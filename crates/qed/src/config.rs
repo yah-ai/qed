@@ -545,6 +545,7 @@ fn synthesise_gha_pipeline(entry: &GhaWorkflowEntry) -> Pipeline {
         background: false,
         background_until: None,
         wait_for: None,
+        manifest_stitch: None,
         name: "gha-workflow".to_string(),
         argv: Vec::new(),
         cwd: None,
@@ -671,6 +672,7 @@ impl SubPipelineResolver for LoaderSubPipelineResolver {
                     background: false,
                     background_until: None,
                     wait_for: None,
+                    manifest_stitch: None,
                     name: "gha-workflow".into(),
                     argv: Vec::new(),
                     cwd: None,
@@ -1893,6 +1895,51 @@ push    = false
         assert_eq!(step.context, Some(PathBuf::from("target/yah-yubaba-ctx")));
         assert!(step.load);
         assert!(!step.push);
+    }
+
+    /// R590-F4: the `rusty-v8-musl` pipeline shape parses — a subprocess step
+    /// carrying a per-step `image`, `runtime = "container"`, and a
+    /// `platform = { target = "…", native = true }` inline table — and that
+    /// declaration resolves to Offload on an arm64 host (so `pipeline_needs_offload`
+    /// tells the CLI to stand up the fleet path). Mirrors
+    /// `.yah/qed/P018-rusty-v8-musl.toml`.
+    #[test]
+    fn native_container_run_step_parses_and_offloads() {
+        let loader = PipelineLoader::new(".yah/qed");
+        let toml = r#"
+[pipeline]
+name  = "rusty-v8-musl"
+label = "Build rusty_v8 static lib for x86_64-unknown-linux-musl"
+placement = "anywhere"
+
+[[pipeline.steps]]
+name     = "build-v8-musl"
+image    = "rusty-v8-musl-builder"
+runtime  = "container"
+platform = { target = "x86_64-unknown-linux-musl", native = true }
+argv     = ["build-v8.sh 'x86_64-unknown-linux-musl' '/tmp/out.tar.gz'"]
+timeout  = 9000
+"#;
+        let pipeline = loader
+            .load_from_str(toml)
+            .expect("rusty-v8-musl pipeline shape must parse");
+        assert_eq!(pipeline.steps.len(), 1);
+        let step = &pipeline.steps[0];
+        assert_eq!(step.image.as_deref(), Some("rusty-v8-musl-builder"));
+        let plat = step.platform.as_ref().expect("platform declared");
+        assert_eq!(plat.target.as_deref(), Some("x86_64-unknown-linux-musl"));
+        assert!(plat.native, "native flag must round-trip from the inline table");
+
+        // On an arm64 host the native x86 step offloads → the CLI needs the fleet.
+        assert!(crate::runner::pipeline_needs_offload(
+            &pipeline,
+            "aarch64-apple-darwin"
+        ));
+        // On the x86 build-worker it's host-arch → no offload (runs there).
+        assert!(!crate::runner::pipeline_needs_offload(
+            &pipeline,
+            "x86_64-unknown-linux-gnu"
+        ));
     }
 
     #[test]

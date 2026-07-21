@@ -35,14 +35,21 @@
 //! @yah:gotcha("QedRunMeta.parent_run_id is serde(default, skip_serializing_if=Option::is_none) so existing on-disk shards in .yah/jit/qed/ load fine; no migration.")
 //!
 //! @yah:ticket(R365-F20, "session_started: record dispatchKind (assist|dispatch); mirror into meta.json")
+//! @yah:status(review)
+//! @yah:assignee(agent:claude)
 //! @yah:at(2026-06-10T01:58:23Z)
-//! @yah:status(open)
 //! @yah:parent(R365)
 //! @yah:next("Add dispatchKind: 'assist' | 'dispatch' field to session_started event in crates/yah/qed/src/events.rs and emit it from the party.assist / party.dispatch / subagent.spawn paths in crates/yah/agent-tools/src/tools.rs.")
 //! @yah:next("Mirror parentSessionId + dispatchDepth + dispatchKind from session_started into the meta.json sidecar so board.session and sidecar-readers see parentage without parsing the jsonl head.")
 //! @yah:next("Backfill: existing sessions have parentSessionId in jsonl but no dispatchKind — default unknown sessions to 'dispatch' on read (the common case) so old sessions don't crash the renderer.")
 //! @yah:gotcha("Observed 2026-06-09 on R365-T14: party.assist and subagent.spawn produce byte-identical session_started events for the same Yamli character (parentSessionId, dispatchDepth, agentId all match). UI can't tell which back-link should produce nesting in non-compact Party Column rendering. meta.json sidecar carries no parentage info at all — anything reading sessions via sidecar (board.session lookups, future tooling) is parent-blind.")
 //! @arch:see(.yah/docs/working/W167-smoke-matrix-plan.md)
+//! @yah:handoff("Added dispatchKind (Assist|Dispatch) to AgentEvent::SessionStarted and mirrored parentSessionId/dispatchDepth/dispatchKind into the meta.json sidecar.\n\nPath correction: the ticket's source pointer (crates/yah/qed/src/events.rs, and agent-tools/src/tools.rs for the tool paths) was wrong on both counts -- those are unrelated types (qed's pipeline-run QedEvent; tools.rs is the read-only KG tool registry). The real session_started type is AgentEvent::SessionStarted in crates/yah/party/src/agent.rs; the real party.assist/party.dispatch/subagent.spawn implementations are PartyAssist/PartyDispatch/AgentSpawn in crates/yah/agent-tools/src/agent_dispatch_tools.rs, which all funnel through one daemon-side fn (subagent_spawn in app/yah/cli/src/camp.rs) via party_dispatch.\n\nSemantics: party.assist, party.dispatch, and subagent.spawn ALL mint the identical sub-relationship child today (parent_session_id + dispatch_depth+1, nest-worthy) -- confirmed by the PartyDispatch tool docstring ('sub-relationship... assistant') and by the FE's own isAssistRelationship fallback comment in nestedAssistChildren.test.ts ('gate on parentInfo.dispatchKind === \"assist\"'). So all three stamp DispatchKind::Assist; DispatchKind::Dispatch is reserved for the not-yet-built peer-booking party.book verb.\n\nPlumbing (mirrors the existing parent_session_id/dispatch_depth rails exactly): RPC method match in camp.rs -> subagent_spawn/party_dispatch (new dispatch_kind param) -> LaunchCharacterParams.dispatch_kind -> launch_character_session's 4 engine forks -> start_claude_session/start_runner_session/start_codex_oauth_session/agent_process::start_process_session (new trailing param) -> ClaudeSessionInit/RunnerSessionInit.dispatch_kind -> register_claude_session/register_runner_session stamp AgentEvent::SessionStarted.dispatch_kind AND SessionPromptMeta.dispatch_kind. Also extended recover_dispatch_lineage (desktop/agent.rs, R534-B5 helper) to a 3-tuple so all 6 resume/fork/rewind paths re-emit dispatch_kind, not just parent_session_id/dispatch_depth.\n\nBackfill: dispatch_kind is Option<DispatchKind> with #[serde(default)] end to end -- old JSONL/meta.json missing the field deserialize as None, never crash. Per the ticket's literal instruction, documented on the field that a reader needing a concrete value for a parented session should default a missing value to Dispatch (guidance for the consumer, e.g. R365-F21's renderer).\n\nEvery AgentEvent::SessionStarted construction site in the repo was updated and verified programmatically: party, runner, agent-tools, hub, hub-tauri crates + the yah CLI daemon (camp.rs, 4 RunnerSessionInit sites) + desktop (agent.rs, agent_process.rs, agent_eval.rs, keepalive_subsystem.rs, camp_socket.rs).")
+//! @yah:verify("cargo test -p party --lib -- agent:: (5/5 pass)")
+//! @yah:verify("cargo test -p runner --lib -- sessions:: session:: sink:: (56/56 pass, incl. list_summaries_preserves_claude_path_dispatch_lineage)")
+//! @yah:verify("cargo test -p hub --lib (43/43 pass)")
+//! @yah:verify("cargo check clean on party, hub-tauri, hub, agent-tools, yah (lib), desktop (lib)")
+//! @yah:gotcha("Two pre-existing/unrelated blockers on this shared tree (confirmed via git diff showing Cargo.toml churn from a concurrent peer, R409-T9): (1) turso-vs-yah #[global_allocator] conflict blocks any test-profile build of yah/desktop (lib-only cargo check unaffected); (2) agent-tools' envoy_tools.rs test module references an undeclared anyhow dev-dependency, blocking cargo test -p agent-tools --lib (verified by hand that all 7 test-fixture edits there set dispatch_kind; cargo check -p agent-tools non-test is clean).")
 
 use chrono::{DateTime, Utc};
 
@@ -175,6 +182,19 @@ pub enum QedEvent {
         name: String,
         argv: Vec<String>,
         env_keys: Vec<String>,
+        at: DateTime<Utc>,
+    },
+    /// A step was dispatched to a remote build-worker and now has a durable
+    /// yubaba workload identity (`forge_id`), emitted BEFORE the runner blocks
+    /// on `handle.wait()`. This is the reattach anchor (R603-T1): the camp
+    /// daemon stamps `forge_id` onto the running step's `task_run_id` and
+    /// persists a non-terminal `<run_id>.json` so that, if the daemon restarts
+    /// mid-build, boot reconcile (R603-T2) can re-poll the workload by this id
+    /// instead of orphaning it. Local steps never emit this.
+    StepRemoteDispatched {
+        index: usize,
+        name: String,
+        forge_id: String,
         at: DateTime<Utc>,
     },
     /// One line of stdout/stderr captured from the executing step (local runs).

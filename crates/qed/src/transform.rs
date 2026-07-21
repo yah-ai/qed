@@ -352,7 +352,11 @@ fn lift_target(job: &Job, script: &str) -> (Option<PlatformSpec>, Option<MatrixS
     let Some(raw_target) = extract_target(script) else {
         return (None, None, None);
     };
-    let platform = Some(PlatformSpec { target: Some(raw_target.clone()), container_platform: None });
+    let platform = Some(PlatformSpec {
+        target: Some(raw_target.clone()),
+        container_platform: None,
+        native: false,
+    });
 
     // A concrete triple needs no matrix; a matrix reference whose dimension we
     // can resolve carries the target values so QED expands them natively.
@@ -462,6 +466,7 @@ fn base_step(name: String) -> QedStep {
         background: false,
         background_until: None,
         wait_for: None,
+        manifest_stitch: None,
         name,
         argv: Vec::new(),
         cwd: None,

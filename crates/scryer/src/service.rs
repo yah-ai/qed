@@ -6,6 +6,21 @@
 //! ingesters and spills to short-disk on the flush threshold.
 //!
 //! F2 will add Service scope via the containerd_logs and warden_rpc adapters.
+//!
+//! @yah:ticket(R556-F7-T2, "scryer: /federate/{events,aggregate} + /scopes HTTP listener + cross-scope rollup helper + HttpFederationPeer impl")
+//! @yah:status(review)
+//! @yah:at(2026-06-30T06:20:17Z)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:phase(P1)
+//! @yah:parent(R556-F7)
+//! @yah:next("Add an HTTP listener with: POST /federate/events {filter, scopes?} -> {events}, POST /federate/aggregate {filter, group_by, scopes?} -> {buckets}, GET /scopes?limit=N -> {scopes}, GET /health -> {status:'ok'}. Scope-omitted = cross-scope rollup (the missing mesh-wide-by-level case at crates/yah/hub/src/in_process.rs:46).")
+//! @yah:next("Land the cross-scope rollup helper in scryer::service (cleanest spot per W264); HTTP layer just exposes it.")
+//! @yah:next("Gate the listener with OperatorTagAcl from scryer::federation (W264 §Trust boundary — gate sits at scryer's HTTP listener, not yubaba).")
+//! @yah:next("Add HttpFederationPeer: production FederationPeer impl, reqwest-based, name() = node tailnet hostname, events()/aggregate() POST to the new routes. Mock impls in federation.rs stay for tests.")
+//! @yah:next("Tests: integration suite starts an in-process scryer, POST /federate/events asserts payload, ACL rejection without operator tag.")
+//! @yah:next("Tier: Warrior — net-new HTTP surface + production FederationPeer + ACL wiring + integration tests; clear spec from W264 but real implementation breadth.")
+//! @arch:see(.yah/docs/working/W264-kamaji-managed-scryer.md)
+//! @arch:see(.yah/docs/architecture/A049-yah-scryer.md)
 
 use crate::federation::{FederationPeer, FederationRule};
 use crate::long_tier::{LongTierError, LongTierStore};
@@ -58,7 +73,7 @@ pub enum ScryerError {
 // ─── Filter / cursor types ────────────────────────────────────────────────────
 
 /// Filter for `Scryer::events`.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct EventFilter {
     pub min_level: Option<Level>,
     /// Exact target match (mirrors task-runs::EventFilter::target).
@@ -272,6 +287,53 @@ impl Scryer {
         Ok(self.store.list_scopes(limit)?)
     }
 
+    /// Cross-scope event query — concatenate `events()` results across every
+    /// scope returned by `list_scopes()`, merged by `(offset_ms, seq)`.
+    ///
+    /// This is the mesh-wide-by-level case W264 §Wire shape calls out: the
+    /// `/federate/events` route with `scopes` omitted maps to this. Iterates
+    /// per scope rather than introducing a no-scope SQL path so the store-layer
+    /// query surface stays scope-keyed (the indexes are too).
+    pub async fn events_all(
+        &self,
+        filter: &EventFilter,
+    ) -> Result<Vec<Event>, ScryerError> {
+        let scope_limit = filter.limit.map(|l| l as usize).unwrap_or(1000);
+        let mut merged: Vec<Event> = Vec::new();
+        for info in self.store.list_scopes(1000)? {
+            let local = self.events(&info.scope, filter).await?;
+            merged = crate::federation::merge_events(merged, local);
+            if merged.len() >= scope_limit {
+                merged.truncate(scope_limit);
+                break;
+            }
+        }
+        Ok(merged)
+    }
+
+    /// Cross-scope aggregate — sum `aggregate()` buckets across every scope
+    /// returned by `list_scopes()`. Backs the `/federate/aggregate` route when
+    /// `scopes` is omitted.
+    pub fn aggregate_all(
+        &self,
+        since_ms: u64,
+        group_by: &str,
+    ) -> Result<Vec<AggregateBucket>, ScryerError> {
+        let mut counts: std::collections::HashMap<String, u64> =
+            std::collections::HashMap::new();
+        for info in self.store.list_scopes(1000)? {
+            for bucket in self.aggregate(&info.scope, since_ms, group_by)? {
+                *counts.entry(bucket.key).or_insert(0) += bucket.count;
+            }
+        }
+        let mut buckets: Vec<AggregateBucket> = counts
+            .into_iter()
+            .map(|(key, count)| AggregateBucket { key, count })
+            .collect();
+        buckets.sort_by(|a, b| b.count.cmp(&a.count).then(a.key.cmp(&b.key)));
+        Ok(buckets)
+    }
+
     /// Aggregate events for `scope` across both short-disk and, when a long tier
     /// is configured and `since_ms` predates `short_disk_retention_ms`, the
     /// Parquet tier as well.
@@ -365,8 +427,8 @@ mod tests {
         Scryer::new(cfg, None).unwrap()
     }
 
-    #[test]
-    fn scryer_push_and_events_via_store() {
+    #[tokio::test]
+    async fn scryer_push_and_events_via_store() {
         let dir = TempDir::new().unwrap();
         let scryer = open_scryer(&dir);
         let run_id = TaskRunId::new();
@@ -378,12 +440,12 @@ mod tests {
         }
         scryer.flush_ring().unwrap();
 
-        let events = scryer.events(&scope, &EventFilter::default()).unwrap();
+        let events = scryer.events(&scope, &EventFilter::default()).await.unwrap();
         assert_eq!(events.len(), 5);
     }
 
-    #[test]
-    fn scryer_tail_from_ring() {
+    #[tokio::test]
+    async fn scryer_tail_from_ring() {
         let dir = TempDir::new().unwrap();
         let scryer = open_scryer(&dir);
         let run_id = TaskRunId::new();
@@ -393,7 +455,7 @@ mod tests {
             scryer.push(scope.clone(), make_event(run_id.clone(), i)).unwrap();
         }
 
-        let result = scryer.tail(&scope, QueryCursor::beginning(), 100).unwrap();
+        let result = scryer.tail(&scope, QueryCursor::beginning(), 100).await.unwrap();
         assert_eq!(result.events.len(), 5);
         assert_eq!(result.next_cursor.ring_cursor, 5);
     }
@@ -422,8 +484,8 @@ mod tests {
         /// scope, and does not bleed rows from a different ForgeId.
         ///
         /// This is the R093-F9 acceptance criterion from the arch doc.
-        #[test]
-        fn forge_scope() {
+        #[tokio::test]
+        async fn forge_scope() {
             let dir = TempDir::new().unwrap();
             let cfg = ScryerConfig::new(dir.path().join("events.db"));
             let scryer = Scryer::new(cfg, None).unwrap();
@@ -447,14 +509,14 @@ mod tests {
             }
             scryer.flush_ring().unwrap();
 
-            let events = scryer.events(&scope, &EventFilter::default()).unwrap();
+            let events = scryer.events(&scope, &EventFilter::default()).await.unwrap();
             assert_eq!(events.len(), 4, "expected 4 forge events");
             assert_eq!(events[0].target, "forge::test");
             assert_eq!(events[3].seq, 3);
 
             // A different ForgeId must return no rows (isolation check).
             let other_scope = EventScope::Forge(ForgeId::new());
-            let other = scryer.events(&other_scope, &EventFilter::default()).unwrap();
+            let other = scryer.events(&other_scope, &EventFilter::default()).await.unwrap();
             assert!(other.is_empty(), "different forge id must return no events");
         }
     }
@@ -462,12 +524,12 @@ mod tests {
     /// Verify: scryer.events(TaskRun(id)) returns the same rows as task.events(id).
     ///
     /// This is the F1 acceptance criterion from the arch doc.
-    #[test]
-    fn scryer_events_taskrun_matches_task_events() {
+    #[tokio::test]
+    async fn scryer_events_taskrun_matches_task_events() {
         use task_runs::{EventFilter as TF, Initiator, RunStatus, TaskRunMeta, TaskStore};
 
         let dir = TempDir::new().unwrap();
-        let task_store = Arc::new(TaskStore::open(&dir.path().join("task-runs.db")).unwrap());
+        let task_store = Arc::new(TaskStore::open(&dir.path().join("task-runs.db")).await.unwrap());
 
         // Insert a run + events into the task-runs store.
         let run_id = TaskRunId::new();
@@ -484,7 +546,7 @@ mod tests {
             pinned: false,
             origin: None,
         };
-        task_store.insert_run(&meta).unwrap();
+        task_store.insert_run(&meta).await.unwrap();
         for i in 0u32..5 {
             use observation::{EventSource, Level};
             use serde_json::json;
@@ -499,6 +561,7 @@ mod tests {
                     None,
                     &EventSource::Synth,
                 )
+                .await
                 .unwrap();
         }
 
@@ -507,8 +570,8 @@ mod tests {
         let scryer = Scryer::new(cfg, Some(task_store.clone())).unwrap();
 
         let scope = EventScope::TaskRun(run_id.clone());
-        let scryer_events = scryer.events(&scope, &EventFilter::default()).unwrap();
-        let task_events = task_store.query_events(&run_id, &TF::default()).unwrap();
+        let scryer_events = scryer.events(&scope, &EventFilter::default()).await.unwrap();
+        let task_events = task_store.query_events(&run_id, &TF::default()).await.unwrap();
 
         assert_eq!(scryer_events.len(), task_events.len());
         for (se, te) in scryer_events.iter().zip(task_events.iter()) {
@@ -540,8 +603,8 @@ mod tests {
 
         /// Verify condition 2 (R093-F5):
         /// A 30-day aggregate query returns rows from both short-disk and long-tier shards.
-        #[test]
-        fn cross_boundary() {
+        #[tokio::test]
+        async fn cross_boundary() {
             let dir = TempDir::new().unwrap();
             let cfg = ScryerConfig::new(dir.path().join("events.db"));
             let scryer = Scryer::new(cfg, None).unwrap();
@@ -569,7 +632,7 @@ mod tests {
             assert_eq!(promoted, 3, "3 old events promoted to long tier");
 
             // Verify short-disk no longer has the old events.
-            let after_rollover = scryer.events(&scope, &EventFilter::default()).unwrap();
+            let after_rollover = scryer.events(&scope, &EventFilter::default()).await.unwrap();
             assert!(after_rollover.is_empty(), "old events removed from short-disk");
 
             // RECENT events: offset_ms = 10 days → above cutoff → stays in short-disk.

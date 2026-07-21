@@ -3,7 +3,7 @@ members = [
     "crates/observation",
     "crates/task-runs",
     "crates/task-sessions",
-    "crates/task",
+    "crates/velveteen",
     "crates/scryer",
     "crates/qed-gha",
     "crates/qed",
@@ -12,7 +12,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.8.16"
+version = "0.8.20"
 edition = "2021"
 authors = ["yah Dev <human@yah.dev>"]
 license = "MIT OR Apache-2.0"
@@ -24,6 +24,8 @@ repository = "https://github.com/yah-ai/qed"
 # published to crates.io.
 [workspace.dependencies]
 # Turso pin — keep in lockstep with yah root and external/turso-backup (0.6.1).
-turso = "0.6.1"
+# default-features off drops turso's bundled mimalloc #[global_allocator];
+# the yah binary owns the process-wide allocator (R365-F20).
+turso = { version = "0.6.1", default-features = false, features = ["fts"] }
 turso_core = { version = "0.6.1", features = [] }
 

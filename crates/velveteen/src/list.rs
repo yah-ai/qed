@@ -157,11 +157,11 @@ mod list {
         )
     }
 
-    fn open_store(dir: &std::path::Path) -> TaskStore {
-        TaskStore::open(&dir.join("task-runs.db")).expect("open store")
+    async fn open_store(dir: &std::path::Path) -> TaskStore {
+        TaskStore::open(&dir.join("task-runs.db")).await.expect("open store")
     }
 
-    fn insert_local(store: &TaskStore, label: &str, status: RunStatus, started_at: u64) -> TaskRunId {
+    async fn insert_local(store: &TaskStore, label: &str, status: RunStatus, started_at: u64) -> TaskRunId {
         let id = TaskRunId::new();
         let meta = TaskRunMeta {
             id: id.clone(),
@@ -176,7 +176,7 @@ mod list {
             pinned: false,
             origin: None,
         };
-        store.insert_run(&meta).expect("insert_run");
+        store.insert_run(&meta).await.expect("insert_run");
         id
     }
 
@@ -214,16 +214,16 @@ mod list {
         }
     }
 
-    #[test]
-    fn all_species_returned_when_no_filter() {
+    #[tokio::test]
+    async fn all_species_returned_when_no_filter() {
         let dir = tempdir().unwrap();
-        let store = open_store(dir.path());
-        insert_local(&store, "local-run", RunStatus::Running, 1000);
+        let store = open_store(dir.path()).await;
+        insert_local(&store, "local-run", RunStatus::Running, 1000).await;
 
         let remote = [make_remote_meta("remote-run", ForgeStatus::Running, 2000)];
         let integration = [make_integration_meta("int-run", ForgeStatus::Running, 3000)];
 
-        let result = forge_list(&store, &remote, &integration, &ForgeListFilter::default()).unwrap();
+        let result = forge_list(&store, &remote, &integration, &ForgeListFilter::default()).await.unwrap();
         assert_eq!(result.len(), 3);
 
         let species: Vec<_> = result.iter().map(|m| m.species).collect();
@@ -232,11 +232,11 @@ mod list {
         assert!(species.contains(&ForgeSpecies::Integration));
     }
 
-    #[test]
-    fn filter_by_species_local() {
+    #[tokio::test]
+    async fn filter_by_species_local() {
         let dir = tempdir().unwrap();
-        let store = open_store(dir.path());
-        insert_local(&store, "local-run", RunStatus::Running, 1000);
+        let store = open_store(dir.path()).await;
+        insert_local(&store, "local-run", RunStatus::Running, 1000).await;
 
         let remote = [make_remote_meta("remote-run", ForgeStatus::Running, 2000)];
         let integration = [make_integration_meta("int-run", ForgeStatus::Running, 3000)];
@@ -245,16 +245,16 @@ mod list {
             species: Some(ForgeSpecies::Local),
             ..Default::default()
         };
-        let result = forge_list(&store, &remote, &integration, &filter).unwrap();
+        let result = forge_list(&store, &remote, &integration, &filter).await.unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].species, ForgeSpecies::Local);
     }
 
-    #[test]
-    fn filter_by_species_remote() {
+    #[tokio::test]
+    async fn filter_by_species_remote() {
         let dir = tempdir().unwrap();
-        let store = open_store(dir.path());
-        insert_local(&store, "local-run", RunStatus::Running, 1000);
+        let store = open_store(dir.path()).await;
+        insert_local(&store, "local-run", RunStatus::Running, 1000).await;
 
         let remote = [make_remote_meta(
             "remote-run",
@@ -267,16 +267,16 @@ mod list {
             species: Some(ForgeSpecies::Remote),
             ..Default::default()
         };
-        let result = forge_list(&store, &remote, &integration, &filter).unwrap();
+        let result = forge_list(&store, &remote, &integration, &filter).await.unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].species, ForgeSpecies::Remote);
     }
 
-    #[test]
-    fn filter_by_species_integration() {
+    #[tokio::test]
+    async fn filter_by_species_integration() {
         let dir = tempdir().unwrap();
-        let store = open_store(dir.path());
-        insert_local(&store, "local-run", RunStatus::Running, 1000);
+        let store = open_store(dir.path()).await;
+        insert_local(&store, "local-run", RunStatus::Running, 1000).await;
 
         let remote = [make_remote_meta("remote-run", ForgeStatus::Running, 2000)];
         let integration =
@@ -286,49 +286,49 @@ mod list {
             species: Some(ForgeSpecies::Integration),
             ..Default::default()
         };
-        let result = forge_list(&store, &remote, &integration, &filter).unwrap();
+        let result = forge_list(&store, &remote, &integration, &filter).await.unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].species, ForgeSpecies::Integration);
     }
 
-    #[test]
-    fn filter_by_status() {
+    #[tokio::test]
+    async fn filter_by_status() {
         let dir = tempdir().unwrap();
-        let store = open_store(dir.path());
-        insert_local(&store, "running-run", RunStatus::Running, 1000);
-        insert_local(&store, "done-run", RunStatus::Done { exit_code: 0, ended_at: 5000 }, 900);
+        let store = open_store(dir.path()).await;
+        insert_local(&store, "running-run", RunStatus::Running, 1000).await;
+        insert_local(&store, "done-run", RunStatus::Done { exit_code: 0, ended_at: 5000 }, 900).await;
 
         let remote = [make_remote_meta("remote-running", ForgeStatus::Running, 2000)];
         let integration = [make_integration_meta("int-done", ForgeStatus::Done { exit_code: 1, ended_at: 8000 }, 800)];
 
         let filter = ForgeListFilter { status: Some("running".into()), ..Default::default() };
-        let result = forge_list(&store, &remote, &integration, &filter).unwrap();
+        let result = forge_list(&store, &remote, &integration, &filter).await.unwrap();
         assert_eq!(result.len(), 2, "should include local running + remote running");
         assert!(result.iter().all(|m| m.status.discriminant() == "running"));
     }
 
-    #[test]
-    fn filter_by_label() {
+    #[tokio::test]
+    async fn filter_by_label() {
         let dir = tempdir().unwrap();
-        let store = open_store(dir.path());
-        insert_local(&store, "target", RunStatus::Running, 1000);
-        insert_local(&store, "other", RunStatus::Running, 900);
+        let store = open_store(dir.path()).await;
+        insert_local(&store, "target", RunStatus::Running, 1000).await;
+        insert_local(&store, "other", RunStatus::Running, 900).await;
 
         let remote = [make_remote_meta("target", ForgeStatus::Running, 2000)];
         let integration = [];
 
         let filter = ForgeListFilter { label: Some("target".into()), ..Default::default() };
-        let result = forge_list(&store, &remote, &integration, &filter).unwrap();
+        let result = forge_list(&store, &remote, &integration, &filter).await.unwrap();
         assert_eq!(result.len(), 2);
         assert!(result.iter().all(|m| m.label.as_deref() == Some("target")));
     }
 
-    #[test]
-    fn filter_by_since() {
+    #[tokio::test]
+    async fn filter_by_since() {
         let dir = tempdir().unwrap();
-        let store = open_store(dir.path());
-        insert_local(&store, "old", RunStatus::Done { exit_code: 0, ended_at: 500 }, 100);
-        insert_local(&store, "new", RunStatus::Running, 2000);
+        let store = open_store(dir.path()).await;
+        insert_local(&store, "old", RunStatus::Done { exit_code: 0, ended_at: 500 }, 100).await;
+        insert_local(&store, "new", RunStatus::Running, 2000).await;
 
         let remote = [
             make_remote_meta("old-remote", ForgeStatus::Done { exit_code: 0, ended_at: 600 }, 200),
@@ -337,45 +337,45 @@ mod list {
         let integration = [];
 
         let filter = ForgeListFilter { since: Some(1500), ..Default::default() };
-        let result = forge_list(&store, &remote, &integration, &filter).unwrap();
+        let result = forge_list(&store, &remote, &integration, &filter).await.unwrap();
         assert_eq!(result.len(), 2);
         assert!(result.iter().all(|m| m.started_at >= 1500));
     }
 
-    #[test]
-    fn limit_applied_after_merge() {
+    #[tokio::test]
+    async fn limit_applied_after_merge() {
         let dir = tempdir().unwrap();
-        let store = open_store(dir.path());
-        insert_local(&store, "a", RunStatus::Running, 1000);
-        insert_local(&store, "b", RunStatus::Running, 900);
+        let store = open_store(dir.path()).await;
+        insert_local(&store, "a", RunStatus::Running, 1000).await;
+        insert_local(&store, "b", RunStatus::Running, 900).await;
 
         let remote = [make_remote_meta("c", ForgeStatus::Running, 2000)];
         let integration = [make_integration_meta("d", ForgeStatus::Running, 3000)];
 
         let filter = ForgeListFilter { limit: Some(2), ..Default::default() };
-        let result = forge_list(&store, &remote, &integration, &filter).unwrap();
+        let result = forge_list(&store, &remote, &integration, &filter).await.unwrap();
         assert_eq!(result.len(), 2);
     }
 
-    #[test]
-    fn running_sorted_first() {
+    #[tokio::test]
+    async fn running_sorted_first() {
         let dir = tempdir().unwrap();
-        let store = open_store(dir.path());
-        insert_local(&store, "done-local", RunStatus::Done { exit_code: 0, ended_at: 5000 }, 500);
-        insert_local(&store, "running-local", RunStatus::Running, 1000);
+        let store = open_store(dir.path()).await;
+        insert_local(&store, "done-local", RunStatus::Done { exit_code: 0, ended_at: 5000 }, 500).await;
+        insert_local(&store, "running-local", RunStatus::Running, 1000).await;
 
         let remote = [];
         let integration = [];
 
-        let result = forge_list(&store, &remote, &integration, &ForgeListFilter::default()).unwrap();
+        let result = forge_list(&store, &remote, &integration, &ForgeListFilter::default()).await.unwrap();
         assert_eq!(result.len(), 2);
         assert!(matches!(result[0].status, ForgeStatus::Running));
     }
 
-    #[test]
-    fn timed_out_status_filter() {
+    #[tokio::test]
+    async fn timed_out_status_filter() {
         let dir = tempdir().unwrap();
-        let store = open_store(dir.path());
+        let store = open_store(dir.path()).await;
         // TaskStore has no timed_out — only remote/integration can produce it.
         let remote = [
             make_remote_meta("timed", ForgeStatus::TimedOut { ended_at: 9000 }, 1000),
@@ -384,7 +384,7 @@ mod list {
         let integration = [];
 
         let filter = ForgeListFilter { status: Some("timed_out".into()), ..Default::default() };
-        let result = forge_list(&store, &remote, &integration, &filter).unwrap();
+        let result = forge_list(&store, &remote, &integration, &filter).await.unwrap();
         assert_eq!(result.len(), 1);
         assert!(matches!(result[0].status, ForgeStatus::TimedOut { .. }));
     }

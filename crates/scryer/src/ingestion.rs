@@ -207,7 +207,7 @@ mod tests {
         scryer.flush_ring().unwrap();
 
         let scope = EventScope::Service(MeshIdent("my-service.host".to_string()));
-        let events = scryer.events(&scope, &EventFilter::default()).unwrap();
+        let events = scryer.events(&scope, &EventFilter::default()).await.unwrap();
         assert_eq!(events.len(), 1, "expected 1 service-scope event; got {:?}", events.len());
         assert_eq!(events[0].level, ObsLevel::Info);
         assert_eq!(events[0].target, "ingestion::test");
@@ -246,7 +246,7 @@ mod tests {
         scryer.flush_ring().unwrap();
 
         let scope = EventScope::Service(MeshIdent("svc.host".to_string()));
-        let events = scryer.events(&scope, &EventFilter::default()).unwrap();
+        let events = scryer.events(&scope, &EventFilter::default()).await.unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].level, ObsLevel::Warn);
     }
@@ -289,7 +289,7 @@ mod tests {
         scryer.flush_ring().unwrap();
 
         let scope = EventScope::Service(MeshIdent("seq.host".to_string()));
-        let events = scryer.events(&scope, &EventFilter::default()).unwrap();
+        let events = scryer.events(&scope, &EventFilter::default()).await.unwrap();
         assert_eq!(events.len(), 2);
         assert!(events[0].seq < events[1].seq, "seq must be monotonically increasing");
     }

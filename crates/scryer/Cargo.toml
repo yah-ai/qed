@@ -11,23 +11,34 @@ description = "Per-machine event store: ring buffer + short-disk SQLite + cross-
 name = "yah_scryer"
 path = "src/lib.rs"
 
+# R556-F7-T1: per-node scryer binary, supervised by the kamaji-managed
+# `yah-scryer.service` systemd unit. Hosts the federation HTTP listener
+# (T2) backed by the local short-disk events.db.
+[[bin]]
+name = "yah-scryer"
+path = "src/bin/yah_scryer.rs"
+
 [dependencies]
-observation = { path = "../observation", version = "0.8.16" }
-task-runs = { path = "../task-runs", version = "0.8.16" }
-workload-spec = { package = "yah-workload-spec", version = "0.8.16" }
-yah-object-store = { version = "0.8.16" }
+observation = { path = "../observation", version = "0.8.20" }
+task-runs = { path = "../task-runs", version = "0.8.20" }
+workload-spec = { package = "yah-workload-spec", version = "0.8.20" }
+yah-object-store = { version = "0.8.20" }
 async-trait = "0.1"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "1.0"
 uuid = { version = "1", features = ["v4", "serde"] }
 rusqlite = { version = "0.31", features = ["bundled"] }
-tokio = { version = "1", features = ["sync", "rt", "time", "macros", "net", "io-util", "process"] }
+tokio = { version = "1", features = ["sync", "rt", "rt-multi-thread", "time", "macros", "net", "io-util", "process", "signal"] }
 # Long-tier Parquet (R093-F5) — Apache-2.0, opt-in feature
 parquet = { version = "58", default-features = false, features = ["arrow"] }
 arrow-array = "58"
 arrow-schema = "58"
 bytes = "1"
+# R556-F7-T2: federation HTTP listener + client (W264 §Wire shape).
+axum = { version = "0.7", default-features = false, features = ["http1", "json", "tokio", "query"] }
+tower = { version = "0.5", default-features = false }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 [dev-dependencies]
 async-trait = "0.1"

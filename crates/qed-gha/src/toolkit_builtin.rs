@@ -19,6 +19,12 @@
 //! such steps with native-replacement stanzas; the runtime declines to run them
 //! (see [`crate::tier`] + the dispatch in [`crate::runtime`]).
 //!
+//! R594 re-adds *execution* for two of these — the docker push family (via an
+//! injected [`crate::ImageBuilder`]) and the artifact actions (via an injected
+//! [`crate::ArtifactStore`]) — but as runner-injected handlers, NOT toolkit
+//! actions. They stay unregistered here; `register_toolkit` remains the tier-1/2
+//! compute-only set, so without an injected handler the tier-3 error still fires.
+//!
 //! Design notes:
 //! - **No external downloads.** `dtolnay/rust-toolchain` shells `rustup`
 //!   (already on the runner); `oven-sh/setup-bun` / `sigstore/cosign-installer`

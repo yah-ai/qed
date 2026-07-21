@@ -8,20 +8,6 @@
 # Per-camp entries at `.yah/qed/images/<name>/` override these by name.
 # See `.yah/docs/working/W148-qed-container-builds.md`.
 #
-# @yah:ticket(R455-F2, "yah-mesofact-dev container image: almanac + issue-tracker side-by-side under tini")
-# @yah:assignee(agent:claude)
-# @yah:at(2026-06-05T08:24:30Z)
-# @yah:status(review)
-# @yah:phase(D)
-# @yah:parent(R455)
-# @yah:next("New crates/yah/qed/images/yah-mesofact-dev/{Dockerfile, supervise.sh}; multi-stage build emitting both binaries; tini PID 1; bash supervisor starts almanac then issue-tracker, wait -n for either")
-# @yah:next("Register in catalog.toml + EXPECTED_BUNDLED test array (mirror R408-T1's yah-yubaba pattern)")
-# @yah:next("GHA image-yah-mesofact-dev job in .github/workflows/release.yml (mirror image-yah-yubaba once that lands)")
-# @yah:verify("cargo test -p qed --lib images::catalog::tests")
-# @yah:verify("docker buildx build the image locally; both binaries respond on their configured ports")
-# @arch:see(.yah/docs/working/W180-pond-richer-topology.md)
-# @yah:depends_on(R443-F7)
-
 [[image]]
 name        = "yah-base"
 base        = "debian:bookworm-slim"
@@ -68,19 +54,13 @@ tools       = ["bash", "git", "curl", "npm", "pnpm", "yarn"]
 name        = "yah-yubaba"
 base        = "debian:bookworm-slim"
 description = "Pond-tier yubaba+kamaji container (tini PID 1, both binaries baked in) — see W154"
-tools       = ["tini", "yah-yubaba", "kamaji"]
+tools       = ["tini", "yubaba", "kamaji"]
 
 [[image]]
 name        = "yah-miniflare"
 base        = "oven/bun:1-debian"
 description = "Pond-tier miniflare (workerd) container — bun + tini + baked miniflare; Worker bundle bind-mounted at runtime (R455-F1; W180)"
 tools       = ["tini", "bun", "miniflare"]
-
-[[image]]
-name        = "yah-mesofact-dev"
-base        = "debian:bookworm-slim"
-description = "Pond-tier mesofact backend (almanac-serve + issue-tracker under tini) — W180 Phase D"
-tools       = ["tini", "almanac-serve", "issue-tracker"]
 
 [[image]]
 name        = "yah-cloud-runner"
