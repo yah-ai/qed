@@ -17,7 +17,7 @@
 //!
 //! **Feeds, does not duplicate, the publish leg.** The landed file is exactly
 //! R546-T3's bootstrap-publish input — the bytes behind the zero-sentinel
-//! hashes in `build/rusty-v8/workload.toml`. The W164 derived-static-asset
+//! hashes in `.yah/services/yah-cloud/components/rusty-v8-musl/workload.toml`. The W164 derived-static-asset
 //! reconciler / [`crate::types::Outcome::Publish`] consume the landed path; this
 //! module does not itself upload anything.
 

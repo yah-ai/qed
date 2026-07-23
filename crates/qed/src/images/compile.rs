@@ -50,6 +50,53 @@ pub fn catalog_image_ref(entry_name: &str) -> String {
     format!("ghcr.io/yah-ai/{entry_name}:latest")
 }
 
+/// Where a catalog entry's build context can live, relative to the camp root,
+/// most-specific first (R633).
+///
+/// Per-camp entries own the first slot — a camp that drops a Dockerfile at
+/// `.yah/qed/images/<name>/` is overriding, and must win. The other two are the
+/// **bundled** entries' own source directories: the catalog manifest is
+/// `include_str!`'d into the binary, but the Dockerfiles it describes are plain
+/// files in the qed crate, and nothing looked for them. That is not a cosmetic
+/// gap — before this list existed, building `rusty-v8-musl-builder` through qed
+/// silently produced a bare `FROM alpine:edge` image (the layering shorthand)
+/// instead of the toolbox image the entry documents, because the only Dockerfile
+/// lookup was the per-camp one and the entry declares no `apt`/`env` shorthand
+/// at all. The image was only ever built by pointing `docker build` at this path
+/// by hand from `.github/workflows/`.
+///
+/// Both spellings are listed because this crate is developed inside the yah
+/// monorepo at `oss/qed/` and exported standalone; the same source tree answers
+/// to both prefixes depending on which root you are standing in.
+pub const IMAGE_DIR_SEARCH_PATH: &[&str] = &[
+    ".yah/qed/images",
+    // yah monorepo (this crate vendored under oss/).
+    "oss/qed/crates/qed/images",
+    // standalone qed checkout.
+    "crates/qed/images",
+];
+
+/// First directory on [`IMAGE_DIR_SEARCH_PATH`] that holds a `Dockerfile` for
+/// `entry_name`, **relative to `camp_root`** — or `None` when the entry is
+/// layering-shorthand only (or the binary is running outside any source tree
+/// that carries the contexts).
+///
+/// Relative because the result is used two ways: joined onto the camp root for
+/// I/O, and stored as a step's `context` (which the runner itself joins onto the
+/// camp root). Returning the absolute path would make the second use double-join
+/// or force the caller to un-join it.
+///
+/// The returned directory is both the Dockerfile's location *and* the build
+/// context: `rusty-v8-musl-builder`'s Dockerfile `COPY build-v8.sh`s from its
+/// own directory, so resolving one without the other builds an image missing
+/// the script that is the entire point of it.
+pub fn resolve_image_dir(camp_root: &Path, entry_name: &str) -> Option<std::path::PathBuf> {
+    IMAGE_DIR_SEARCH_PATH
+        .iter()
+        .map(|rel| Path::new(rel).join(entry_name))
+        .find(|rel| camp_root.join(rel).join("Dockerfile").is_file())
+}
+
 /// Generate a Dockerfile from a [`CatalogEntry`]'s layering shorthand.
 ///
 /// - Entries with `base` start `FROM <base>` (the upstream image).

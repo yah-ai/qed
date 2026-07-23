@@ -11,6 +11,6 @@
 pub mod types;
 
 pub use types::{
-    ChunkRef, Diagnostic, Event, EventScope, EventSource, ForgeId, Level, TaskRunId,
-    RESERVED_FIELD_PATHS,
+    ChunkRef, Diagnostic, Event, EventScope, EventSource, ForgeId, Initiator, Level, RunStatus,
+    TaskRunId, RESERVED_FIELD_PATHS,
 };

@@ -41,7 +41,7 @@ use thiserror::Error;
 use tokio::sync::mpsc;
 use workload_spec::{MeshIdent, WorkloadSpec};
 
-use crate::{ForgeStatus, IntegrationForgeSpec, TeardownPolicy};
+use velveteen::{ForgeStatus, IntegrationForgeSpec, TeardownPolicy};
 
 // ─── Error ────────────────────────────────────────────────────────────────────
 

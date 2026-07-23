@@ -6,7 +6,6 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Native Rust GHA YAML workflow runtime for QED (parser + types; F1)"
-publish = false
 
 [lib]
 name = "yah_qed_gha"

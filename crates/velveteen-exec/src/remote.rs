@@ -82,7 +82,7 @@ use tokio::sync::{mpsc, watch};
 use workload_spec::{ImageRef, MeshIdent, TierTag, VolumeMount, VolumeSource, WorkloadSpec};
 
 use crate::executor::{ExecEvent, OutputStream};
-use crate::{ForgeCommand, ForgeSpec, ForgeStatus, TaskLocation, TaskRuntime};
+use velveteen::{ForgeCommand, ForgeSpec, ForgeStatus, TaskLocation, TaskRuntime};
 
 // ─── Error ────────────────────────────────────────────────────────────────────
 
@@ -843,7 +843,7 @@ pub mod test_support {
 mod remote {
     use super::test_support::*;
     use super::*;
-    use crate::TaskPlacement;
+    use velveteen::TaskPlacement;
     use observation::EventScope;
     use yah_scryer::service::{EventFilter, Scryer, ScryerConfig};
     use task_runs::Initiator;
@@ -865,7 +865,7 @@ mod remote {
             timeout,
             label: None,
             initiator: Initiator::Human { camp: "test-camp".into() },
-            mesh_access: crate::MeshAccess::None,
+            mesh_access: velveteen::MeshAccess::None,
         }
     }
 
@@ -1060,7 +1060,7 @@ mod remote {
             timeout: None,
             label: None,
             initiator: Initiator::Human { camp: "test-camp".into() },
-            mesh_access: crate::MeshAccess::None,
+            mesh_access: velveteen::MeshAccess::None,
         }
     }
 

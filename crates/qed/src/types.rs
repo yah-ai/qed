@@ -1,3 +1,27 @@
+//! @yah:relay(R623, "Migrate QED run history from .yah/jit/qed/*.json to turso")
+//! @yah:assignee(bundle-anthropic-miravel)
+//! @yah:kind(task)
+//! @yah:at(2026-07-23T03:17:22Z)
+//! @yah:gotcha("QED run history is the ODD ONE OUT: task-runs, task-sessions and gnome_queue are all turso-backed (.yah/db/*.turso), but qed runs persist as flat per-run files in .yah/jit/qed/ — <run_id>.json + <run_id>.events.jsonl, 342 of them as of 2026-07-21.")
+//! @yah:next("Migrate persist_qed_run + load_qed_history (app/yah/cli/src/camp.rs) onto a turso store, following the task-runs store shape (oss/qed/crates/task-runs/src/store.rs).")
+//! @yah:next("Needs a migration story for the 342 existing run files — import-on-boot or a one-shot, not a silent drop.")
+//! @yah:next("NOT a blocker for R622 (manual steps). R622's parked-run durability is satisfied by a non-terminal JSON persist reusing the R603 pattern, which a turso migration would carry over anyway. Deliberately decoupled — see W282 'The turso question is real, but separate'.")
+//!
+//! @yah:relay(R622, "QED manual steps: pipelines with a human in the middle (release wizard)")
+//! @yah:status(open)
+//! @yah:at(2026-07-21T18:30:00Z)
+//! @arch:see(.yah/docs/working/W282-qed-manual-steps.md)
+//! @yah:gotcha("runner.rs:20 says 'all qed runs are still in-memory (run-history persistence is R325-F3)'. That is STALE — R325-F3 landed and sits at status(review) on this file. Real state: terminal runs persist as .yah/jit/qed/<run_id>.json + .events.jsonl (342 files today, NOT turso); in-flight runs are not durable in general (camp.rs:851), except R603's non-terminal persist on StepRemoteDispatched. Fix that comment as part of this work.")
+//! @yah:gotcha("A manual step is a COORDINATION point, not an authorization gate. It does not know who clicked Continue. Do not let it grow into a permissions system — that is an explicit non-goal in W282.")
+//! @yah:next("T1: StepKind::Manual + [manual] config block (prompt/terminal/advance/checklist) + validate() rejecting argv, mirroring StepKind::WaitFor which is the existing pure-gate precedent.")
+//! @yah:next("T2: RunStatus::AwaitingHuman + extend RunStatus::aggregate. Add cases to the existing run_status_aggregate_* decision-table tests rather than reasoning about precedence in prose. AwaitingHuman is non-terminal, so like Queued/Running it contributes nothing to an aggregate.")
+//! @yah:next("T3: runner park/resume with LOCK RELEASE. Decided: a parked step releases its concurrency_key and reacquires on resume (Running -> AwaitingHuman -> Queued -> Running). Holding cargo-target through an overnight park would stall every cargo pipeline in the camp, including other agents on the shared tree. Consequence to handle: the tree can move while parked, so resume MUST re-evaluate `advance` rather than blindly continue.")
+//! @yah:next("T4: the human surface is the ANSWER QUEUE — do not build a second one. A manual step mints a Form (crates/yah/forms, W111) and parks on it. Durability then falls out free: .yah/forms/ already holds 7,383 durable camp-scoped forms, so the run only records form_id. Form's by/job/session_id/character are ALL Option and documented as None for scope-unaware callers, so a QED run (not a session, not a subclass) can legally mint one.")
+//! @yah:next("T5: wire — QedEvent::StepAwaitingHuman{index,name,form_id,advance} + QedEventWire kebab 'step-awaiting-human'. THE ONLY GENUINELY NEW MECHANISM: a new OnSubmit variant. Today OnSubmit::Continue routes the answer back to the form's `by` SUBCLASS, which a QED run does not have — needs OnSubmit::ResumeQedRun{run_id,step_index}. Keep qed.resume RPC as the headless path.")
+//! @yah:next("T6: UI is nearly free, and the highest-leverage item is ONE small fix. Markdown.tsx:439 already renders a RunInTerminalButton on any shell code-fence, which mounts an InlineTerminalPanel (ghostty-web) inline. But AnswerModal.tsx:2234 renders form.framing as PLAIN TEXT (<p className='mono ... whitespace-pre-wrap'>), so the chain breaks at the last link. Route framing through Markdown and a form carrying ```sh fences gets working run-buttons + inline terminals with no new UI code. It improves every existing form too — a hint it is the right change, not a carve-out.")
+//! @yah:next("T7: author .yah/qed/release-wizard.toml composing version-bump + oss-publish (both exist, R620) via sub-pipeline steps, with manual steps between. Do not duplicate their steps.")
+//! @yah:next("OPEN QUESTIONS (W282): park timeout (leaning none, but pair park with a party.notify or runs get forgotten); desktop notification on park; whether validate() should reject manual steps on --where=remote or force host-native like SignNativeTarball.")
+//!
 //! @yah:ticket(R325-F3, "Backend: run-history persistence — QedRunId + step results queryable")
 //! @yah:at(2026-05-26T04:09:53Z)
 //! @yah:status(review)
@@ -244,7 +268,7 @@ pub enum WorkspaceMode {
     Isolated,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Pipeline {
     pub name: String,
     pub label: String,
@@ -438,6 +462,19 @@ pub struct QedStep {
     /// after a successful build.  Ignored for other kinds.
     #[serde(default)]
     pub push: bool,
+    /// For `kind = build-image`: docker `--platform` values the image is built
+    /// for (e.g. `["linux/amd64"]`). Empty (the default) means host-native —
+    /// buildx picks the daemon's own platform, which is what every pre-existing
+    /// build-image step got.
+    ///
+    /// This is the *image* platform, distinct from `platform.target` (the Rust
+    /// triple a build produces). A foreign-arch entry here does NOT authorize
+    /// emulation: the runner refuses to build a foreign platform on a local
+    /// docker daemon (that is QEMU by another name) unless the step also
+    /// declares `platform = { native = true, … }`, which routes it to an
+    /// arch-matched build-worker instead.
+    #[serde(default)]
+    pub platforms: Vec<String>,
     /// For `kind = package-native-tarball` (R407-T2): filesystem path to the
     /// static musl Rust binary produced by an earlier build step. Resolved
     /// relative to the camp root.
@@ -1278,6 +1315,24 @@ pub enum StepValidationError {
     FinallyRequiresSubprocess(String),
 }
 
+/// Deliberately **not** `#[derive(Default)]`.
+///
+/// `enabled` carries `#[serde(default = "default_enabled")]` = `true`, and a
+/// derived `Default` would give it `false` — so `QedStep { name, argv,
+/// ..Default::default() }` would build a step that the runner silently *skips*,
+/// and a pipeline made only of such steps reports `Success` having run nothing.
+/// (R633 hit exactly that: a synthesized image build "succeeded" in 40 ms.)
+///
+/// Round-tripping serde's own defaults makes the two definitions the same
+/// definition, so a future `#[serde(default = …)]` on some other field cannot
+/// reintroduce the divergence. `name` is the only field without a serde default.
+impl Default for QedStep {
+    fn default() -> Self {
+        serde_json::from_str(r#"{"name":""}"#)
+            .expect("every QedStep field but `name` has a serde default")
+    }
+}
+
 impl QedStep {
     /// `true` when this step runs as a long-lived sidecar (R513-F2) — either
     /// `background = true` or a `background_until` target is set. See
@@ -1780,6 +1835,7 @@ mod tests {
                 image: None,
                 tag: None,
                 push: false,
+                platforms: Vec::new(),
                 binary_path: None,
                 triple: None,
                 package: None,
@@ -1884,6 +1940,7 @@ mod tests {
             image: Some("yah-rust".into()),
             tag: None,
             push: false,
+            platforms: Vec::new(),
             binary_path: None,
             triple: None,
             package: None,
@@ -1920,6 +1977,7 @@ mod tests {
             image: Some("yah-yubaba".into()),
             tag: None,
             push: false,
+            platforms: Vec::new(),
             binary_path: Some("target/x86_64-unknown-linux-musl/release/yubaba".into()),
             triple: Some("x86_64-unknown-linux-musl".into()),
             package: None,
@@ -1956,6 +2014,7 @@ mod tests {
             image: None,
             tag: None,
             push: false,
+            platforms: Vec::new(),
             binary_path: None,
             triple: None,
             package: Some("yubaba".into()),
@@ -2146,6 +2205,7 @@ mod tests {
             image: Some("yah-yubaba".into()),
             tag: None,
             push: false,
+            platforms: Vec::new(),
             binary_path: None,
             triple: Some("x86_64-unknown-linux-musl".into()),
             package: None,
@@ -2348,6 +2408,7 @@ mod tests {
             image: None,
             tag: None,
             push: false,
+            platforms: Vec::new(),
             binary_path: None,
             triple: None,
             package: None,

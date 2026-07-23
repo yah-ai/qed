@@ -479,6 +479,7 @@ fn base_step(name: String) -> QedStep {
         image: None,
         tag: None,
         push: false,
+        platforms: Vec::new(),
         binary_path: None,
         triple: None,
         package: None,

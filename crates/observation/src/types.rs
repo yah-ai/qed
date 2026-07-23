@@ -84,6 +84,38 @@ impl From<TaskRunId> for ForgeId {
     }
 }
 
+// ─── Initiator ────────────────────────────────────────────────────────────────
+
+/// Who or what initiated a run.
+///
+/// Lives here rather than in `task-runs` for the same reason [`ForgeId`] does:
+/// it is pure data that describers of work (queues, schedulers, wire clients)
+/// need without dragging in a SQLite store. `task-runs` re-exports it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Initiator {
+    Human { camp: String },
+    Agent { camp: String, agent: String, session: String },
+    Gnome { camp: String, shift: String },
+    Cron { camp: String, schedule: String },
+}
+
+// ─── RunStatus ────────────────────────────────────────────────────────────────
+
+/// Terminal + in-flight status of a run.
+///
+/// Hoisted alongside [`Initiator`] so the task vocabulary can describe a run's
+/// lifecycle without depending on the store crate. `task-runs` re-exports it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum RunStatus {
+    Pending,
+    Running,
+    Done { exit_code: i32, ended_at: u64 },
+    Killed { signal: i32, ended_at: u64 },
+    Lost { reason: String },
+}
+
 // ─── EventScope ───────────────────────────────────────────────────────────────
 
 /// The scope an event row belongs to — stored as `(scope_kind, scope_id)` in

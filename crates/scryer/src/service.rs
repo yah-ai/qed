@@ -22,7 +22,7 @@
 //! @arch:see(.yah/docs/working/W264-kamaji-managed-scryer.md)
 //! @arch:see(.yah/docs/architecture/A049-yah-scryer.md)
 
-use crate::federation::{FederationPeer, FederationRule};
+use crate::federation::{FederationPeer, FederationRule, ScopedEvent};
 use crate::long_tier::{LongTierError, LongTierStore};
 use crate::ring::{EventRing, RingConfig};
 use crate::store::{EventStore, ScryerStoreError, ScopeFilter, ScopeInfo};
@@ -269,14 +269,17 @@ impl Scryer {
     /// Peer failures are swallowed — federation is best-effort (arch doc
     /// §Federation across machines).  ACL gating happens at the yubaba gRPC
     /// entry point before this method is called; see [`federation::FederationAcl`].
+    /// Each returned row carries the [`EventScope`] it came from (R585-F2):
+    /// the local rows are tagged with `scope`, remote rows with whatever scope
+    /// the peer stored them under, which need not match.
     pub async fn federated_events(
         &self,
         scope: &EventScope,
         filter: &EventFilter,
         rule: &FederationRule,
         peers: &[Arc<dyn FederationPeer>],
-    ) -> Result<Vec<Event>, ScryerError> {
-        let local = self.events(scope, filter).await?;
+    ) -> Result<Vec<ScopedEvent>, ScryerError> {
+        let local = ScopedEvent::tag_all(scope, self.events(scope, filter).await?);
         Ok(crate::federation::federated_events(local, peers, filter, rule).await)
     }
 
@@ -294,21 +297,33 @@ impl Scryer {
     /// `/federate/events` route with `scopes` omitted maps to this. Iterates
     /// per scope rather than introducing a no-scope SQL path so the store-layer
     /// query surface stays scope-keyed (the indexes are too).
-    pub async fn events_all(
+    /// Each row keeps the scope it was found under (R585-F2) — without that the
+    /// rollup's whole output is scope-blind, which is what left
+    /// `AnalyticsEvent.scope_kind` / `scope_id` empty. Use [`Self::events_all`]
+    /// when the caller genuinely doesn't need it.
+    pub async fn events_all_scoped(
         &self,
         filter: &EventFilter,
-    ) -> Result<Vec<Event>, ScryerError> {
+    ) -> Result<Vec<ScopedEvent>, ScryerError> {
         let scope_limit = filter.limit.map(|l| l as usize).unwrap_or(1000);
-        let mut merged: Vec<Event> = Vec::new();
+        let mut merged: Vec<ScopedEvent> = Vec::new();
         for info in self.store.list_scopes(1000)? {
-            let local = self.events(&info.scope, filter).await?;
-            merged = crate::federation::merge_events(merged, local);
+            let local = ScopedEvent::tag_all(&info.scope, self.events(&info.scope, filter).await?);
+            merged = crate::federation::merge_ordered(merged, local);
             if merged.len() >= scope_limit {
                 merged.truncate(scope_limit);
                 break;
             }
         }
         Ok(merged)
+    }
+
+    /// [`Self::events_all_scoped`] with the scope envelope discarded.
+    pub async fn events_all(
+        &self,
+        filter: &EventFilter,
+    ) -> Result<Vec<Event>, ScryerError> {
+        Ok(ScopedEvent::into_events(self.events_all_scoped(filter).await?))
     }
 
     /// Cross-scope aggregate — sum `aggregate()` buckets across every scope

@@ -1,9 +1,20 @@
+# @yah:ticket(R633, "Remove the dead task-sessions crate from oss/qed (+ stale oss/yubaba patch line)")
+# @yah:kind(task)
+# @yah:parent(Q538)
+# @yah:assignee(agent:bundle-anthropic-ashguard)
+# @yah:status(review)
+# @yah:handoff("DONE. Deleted oss/qed/crates/task-sessions/ (dead since R536 — store collapsed out of yah, no live Rust dependency) and dropped it from this [workspace] members list. The deletion orphaned the stale [patch.crates-io] line in oss/yubaba/Cargo.toml that pointed at ../qed/crates/task-sessions, breaking oss/yubaba cargo metadata; that line was removed too (concurrently by @Glimmerstone:dragon's live R542 yubaba work — the two removals had to land together), and the stale Cross.toml:17 comment listing it was corrected to the real patch set (velveteen / velveteen-exec / task-runs / observation / scryer). NOTE: this ticket's original annotation home was oss/qed/crates/task-sessions/src/lib.rs:9, deleted with the crate — re-homed here.")
+# @yah:verify("cargo metadata --format-version 1 at repo root exits 0 — VERIFIED")
+# @yah:verify("cargo metadata --manifest-path oss/yubaba/Cargo.toml exits 0 — VERIFIED (was broken by the deletion until the patch line came out)")
+# @yah:verify("rg --fixed-strings 'task-sessions' over *.toml returns no dependency declarations, only prose/annotations — VERIFIED")
+# @yah:verify("DRY_RUN=1 scripts/oss-publish.sh oss/qed lists the 8 real members, task-sessions absent — VERIFIED")
+# @yah:cleanup("Optional (R536): stale runtime artifacts .yah/db/task-sessions.turso and .yah/cache/task-sessions.db* remain on disk, not git-tracked. Left in place — removing live DB files could disturb a running daemon.")
 [workspace]
 members = [
     "crates/observation",
     "crates/task-runs",
-    "crates/task-sessions",
     "crates/velveteen",
+    "crates/velveteen-exec",
     "crates/scryer",
     "crates/qed-gha",
     "crates/qed",
@@ -12,7 +23,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.8.20"
+version = "0.8.21"
 edition = "2021"
 authors = ["yah Dev <human@yah.dev>"]
 license = "MIT OR Apache-2.0"

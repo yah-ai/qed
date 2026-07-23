@@ -3,9 +3,10 @@
 //! These mirror the data model in `.yah/docs/working/yah-task-runs.md`.
 //! Intentionally kept free of I/O — the store layer owns persistence.
 //!
-//! The types `TaskRunId`, `Level`, `EventSource`, `ChunkRef`, `Event`, and
-//! `Diagnostic` live in `crates/yah/observation/` and are re-exported here
-//! for backward compatibility.
+//! The types `TaskRunId`, `Level`, `EventSource`, `ChunkRef`, `Event`,
+//! `Diagnostic`, `Initiator`, and `RunStatus` live in
+//! `crates/yah/observation/` and are re-exported here for backward
+//! compatibility.
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -13,32 +14,9 @@ use std::path::PathBuf;
 // Re-export the hoisted observation types so all existing callers continue to
 // work via `use task_runs::{TaskRunId, Event, ...}`.
 pub use observation::{
-    ChunkRef, Diagnostic, Event, EventScope, EventSource, ForgeId, Level, TaskRunId,
-    RESERVED_FIELD_PATHS,
+    ChunkRef, Diagnostic, Event, EventScope, EventSource, ForgeId, Initiator, Level, RunStatus,
+    TaskRunId, RESERVED_FIELD_PATHS,
 };
-
-// ─── RunStatus ────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum RunStatus {
-    Pending,
-    Running,
-    Done { exit_code: i32, ended_at: u64 },
-    Killed { signal: i32, ended_at: u64 },
-    Lost { reason: String },
-}
-
-// ─── Initiator ────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum Initiator {
-    Human { camp: String },
-    Agent { camp: String, agent: String, session: String },
-    Gnome { camp: String, shift: String },
-    Cron { camp: String, schedule: String },
-}
 
 // ─── BeholderStatus ───────────────────────────────────────────────────────────
 

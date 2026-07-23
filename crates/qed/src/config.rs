@@ -558,6 +558,7 @@ fn synthesise_gha_pipeline(entry: &GhaWorkflowEntry) -> Pipeline {
         image: None,
         tag: None,
         push: false,
+        platforms: Vec::new(),
         binary_path: None,
         triple: None,
         package: None,
@@ -685,6 +686,7 @@ impl SubPipelineResolver for LoaderSubPipelineResolver {
                     image: None,
                     tag: None,
                     push: false,
+                    platforms: Vec::new(),
                     binary_path: None,
                     triple: None,
                     package: None,
@@ -1914,7 +1916,7 @@ placement = "anywhere"
 
 [[pipeline.steps]]
 name     = "build-v8-musl"
-image    = "rusty-v8-musl-builder"
+image    = "cr.yah.dev/rusty-v8-musl-builder:v149.4.0-amd64@sha256:a1fb9d9cc631dcb844fbbb949dc65a80be1d532fa80868c4df5ed4b21939f9a4"
 runtime  = "container"
 platform = { target = "x86_64-unknown-linux-musl", native = true }
 argv     = ["build-v8.sh 'x86_64-unknown-linux-musl' '/tmp/out.tar.gz'"]
@@ -1925,7 +1927,14 @@ timeout  = 9000
             .expect("rusty-v8-musl pipeline shape must parse");
         assert_eq!(pipeline.steps.len(), 1);
         let step = &pipeline.steps[0];
-        assert_eq!(step.image.as_deref(), Some("rusty-v8-musl-builder"));
+        assert_eq!(
+            step.image.as_deref(),
+            Some(
+                "cr.yah.dev/rusty-v8-musl-builder:v149.4.0-amd64\
+                 @sha256:a1fb9d9cc631dcb844fbbb949dc65a80be1d532fa80868c4df5ed4b21939f9a4"
+            ),
+            "the full digest-pinned ref survives the loader verbatim (R590-B5)",
+        );
         let plat = step.platform.as_ref().expect("platform declared");
         assert_eq!(plat.target.as_deref(), Some("x86_64-unknown-linux-musl"));
         assert!(plat.native, "native flag must round-trip from the inline table");

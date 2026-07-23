@@ -46,25 +46,21 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Transient execution umbrella: local, remote, and integration task species sharing TaskId + scryer scope"
+description = "Task vocabulary: ForgeSpec, ForgeCommand, and the TaskPlacement (location x runtime) axis, sharing TaskId + scryer scope"
 
 [lib]
 name = "velveteen"
 path = "src/lib.rs"
 
+# R619: this crate is the *vocabulary* half — a task is a description of work,
+# not a process supervisor. Deps stay at serde + workload-spec + observation so
+# a queue, scheduler, dashboard, or wire client can describe a task without
+# pulling in tokio/process, the docker shim, task-runs' SQLite store, or
+# yah-scryer. Those live in the `velveteen-exec` sibling; add driver deps there.
 [dependencies]
-observation = { path = "../observation", version = "0.8.20" }
-workload-spec = { package = "yah-workload-spec", version = "0.8.20" }
-task-runs = { path = "../task-runs", version = "0.8.20" }
-yah-scryer = { path = "../scryer", version = "0.8.20" }
+observation = { path = "../observation", version = "0.8.21" }
+workload-spec = { package = "yah-workload-spec", version = "0.8.21" }
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-async-trait = "0.1"
-thiserror = "1.0"
-toml = "0.8"
-tokio = { version = "1", features = ["sync", "rt", "time", "macros", "process"] }
 
 [dev-dependencies]
 serde_json = "1.0"
-tempfile = "3"
-tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }

@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use observation::{Event, EventScope, EventSource, Level, TaskRunId};
 use yah_scryer::federation::{
     DenyAllAcl, FederationAcl, FederationError, FederationPeer, FederationRule, OperatorTagAcl,
-    PeerIdentity, federated_events,
+    PeerIdentity, ScopedEvent, federated_events,
 };
 use yah_scryer::service::{EventFilter, Scryer, ScryerConfig};
 use serde_json::json;
@@ -33,11 +33,20 @@ fn make_event(run_id: &TaskRunId, seq: u32, offset_ms: u32) -> Event {
     }
 }
 
+/// Same event wrapped in the R585-F2 scope envelope — the shape federation
+/// speaks in now that `/federate/events` carries `{scope, event}` rows.
+fn make_scoped(run_id: &TaskRunId, seq: u32, offset_ms: u32) -> ScopedEvent {
+    ScopedEvent::new(
+        EventScope::TaskRun(run_id.clone()),
+        make_event(run_id, seq, offset_ms),
+    )
+}
+
 // ─── Mock peer ────────────────────────────────────────────────────────────────
 
 struct MockPeer {
     peer_name: String,
-    events: Vec<Event>,
+    events: Vec<ScopedEvent>,
 }
 
 #[async_trait]
@@ -45,7 +54,7 @@ impl FederationPeer for MockPeer {
     fn name(&self) -> &str {
         &self.peer_name
     }
-    async fn events(&self, _filter: &EventFilter) -> Result<Vec<Event>, FederationError> {
+    async fn events(&self, _filter: &EventFilter) -> Result<Vec<ScopedEvent>, FederationError> {
         Ok(self.events.clone())
     }
 }
@@ -57,7 +66,7 @@ impl FederationPeer for FailingPeer {
     fn name(&self) -> &str {
         "failing-peer"
     }
-    async fn events(&self, _filter: &EventFilter) -> Result<Vec<Event>, FederationError> {
+    async fn events(&self, _filter: &EventFilter) -> Result<Vec<ScopedEvent>, FederationError> {
         Err(FederationError::Rpc("simulated gRPC error".to_string()))
     }
 }
@@ -72,18 +81,18 @@ async fn scryer_federation__local() {
 
     // Machine A's local events at odd offset_ms (1, 3, 5).
     let local = vec![
-        make_event(&run_id, 0, 1),
-        make_event(&run_id, 2, 3),
-        make_event(&run_id, 4, 5),
+        make_scoped(&run_id, 0, 1),
+        make_scoped(&run_id, 2, 3),
+        make_scoped(&run_id, 4, 5),
     ];
 
     // Machine B (peer) has events at even offset_ms (2, 4, 6).
     let peer_b: Arc<dyn FederationPeer> = Arc::new(MockPeer {
         peer_name: "yubaba-pdx-2".to_string(),
         events: vec![
-            make_event(&run_id, 1, 2),
-            make_event(&run_id, 3, 4),
-            make_event(&run_id, 5, 6),
+            make_scoped(&run_id, 1, 2),
+            make_scoped(&run_id, 3, 4),
+            make_scoped(&run_id, 5, 6),
         ],
     });
 
@@ -91,8 +100,13 @@ async fn scryer_federation__local() {
     let result = federated_events(local, &[peer_b], &filter, &FederationRule::All).await;
 
     assert_eq!(result.len(), 6, "3 local + 3 from peer B");
-    let offsets: Vec<u32> = result.iter().map(|e| e.offset_ms).collect();
+    let offsets: Vec<u32> = result.iter().map(|r| r.event.offset_ms).collect();
     assert_eq!(offsets, vec![1, 2, 3, 4, 5, 6], "events must be interleaved in time order");
+    // R585-F2: every merged row still knows the scope it came from.
+    assert!(
+        result.iter().all(|r| r.scope == EventScope::TaskRun(run_id.clone())),
+        "scope envelope must survive the federated merge",
+    );
 }
 
 /// Verify: Scryer::federated_events delegates local query + fan-out correctly.
@@ -115,9 +129,9 @@ async fn scryer_federated_events_method() {
     let peer_b: Arc<dyn FederationPeer> = Arc::new(MockPeer {
         peer_name: "peer-b".to_string(),
         events: vec![
-            make_event(&run_id, 1, 20),
-            make_event(&run_id, 3, 40),
-            make_event(&run_id, 5, 60),
+            make_scoped(&run_id, 1, 20),
+            make_scoped(&run_id, 3, 40),
+            make_scoped(&run_id, 5, 60),
         ],
     });
 
@@ -128,15 +142,17 @@ async fn scryer_federated_events_method() {
         .unwrap();
 
     assert_eq!(result.len(), 6);
-    let offsets: Vec<u32> = result.iter().map(|e| e.offset_ms).collect();
+    let offsets: Vec<u32> = result.iter().map(|r| r.event.offset_ms).collect();
     assert_eq!(offsets, vec![10, 20, 30, 40, 50, 60]);
+    // Local rows are tagged with the queried scope, not left blank.
+    assert!(result.iter().all(|r| r.scope == scope));
 }
 
 /// Verify: a failing peer is skipped (best-effort); local results still returned.
 #[tokio::test]
 async fn scryer_federation__failing_peer_is_skipped() {
     let run_id = TaskRunId::new();
-    let local = vec![make_event(&run_id, 0, 1)];
+    let local = vec![make_scoped(&run_id, 0, 1)];
 
     let peer: Arc<dyn FederationPeer> = Arc::new(FailingPeer);
     let filter = EventFilter::default();
@@ -149,15 +165,15 @@ async fn scryer_federation__failing_peer_is_skipped() {
 #[tokio::test]
 async fn scryer_federation__tag_rule_filters_peers() {
     let run_id = TaskRunId::new();
-    let local = vec![make_event(&run_id, 0, 1)];
+    let local = vec![make_scoped(&run_id, 0, 1)];
 
     let matching_peer: Arc<dyn FederationPeer> = Arc::new(MockPeer {
         peer_name: "yubaba-tier=public-1".to_string(),
-        events: vec![make_event(&run_id, 1, 2)],
+        events: vec![make_scoped(&run_id, 1, 2)],
     });
     let excluded_peer: Arc<dyn FederationPeer> = Arc::new(MockPeer {
         peer_name: "yubaba-private-1".to_string(),
-        events: vec![make_event(&run_id, 2, 3)],
+        events: vec![make_scoped(&run_id, 2, 3)],
     });
 
     let filter = EventFilter::default();
@@ -170,8 +186,8 @@ async fn scryer_federation__tag_rule_filters_peers() {
     .await;
 
     assert_eq!(result.len(), 2, "local + matching peer only");
-    assert_eq!(result[0].offset_ms, 1);
-    assert_eq!(result[1].offset_ms, 2);
+    assert_eq!(result[0].event.offset_ms, 1);
+    assert_eq!(result[1].event.offset_ms, 2);
 }
 
 // ─── ACL integration (mirrors unit tests in federation.rs::acl) ──────────────

@@ -6,7 +6,6 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 description = "Apply pipeline outputs to in-tree manifests as content-addressed receipts (W209). Per-file transactional, idempotent, predicate-gated write-back."
-publish = false
 
 [dependencies]
 anyhow = "1.0"

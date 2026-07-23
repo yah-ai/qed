@@ -63,7 +63,7 @@ use workload_spec::ImageRef;
 use crate::executor::{
     ExecContext, ExecEvent, ExecOutcome, ForgeExecutor, ForgeExecutorError, OutputStream,
 };
-use crate::{ForgeCommand, ForgeSpec, ForgeStatus, TaskRuntime};
+use velveteen::{ForgeCommand, ForgeSpec, ForgeStatus, TaskRuntime};
 
 /// Format an [`ImageRef`] as the single positional argument passed to
 /// `docker run`. Pinned images resolve content-addressed (`repo:tag@digest`);
@@ -757,11 +757,11 @@ mod tests {
     // ── LocalForgeDriver ──────────────────────────────────────────────────
 
     use crate::executor::{ExecContext, ExecEvent, ForgeExecutor, ForgeExecutorError};
-    use crate::{ForgeCommand, ForgeSpec, ForgeStatus, MeshAccess, TaskLocation, TaskPlacement};
+    use velveteen::{ForgeCommand, ForgeSpec, ForgeStatus, MeshAccess, TaskLocation, TaskPlacement};
     use task_runs::Initiator;
     use tokio::sync::mpsc;
 
-    fn subprocess_spec(argv: Vec<String>, runtime: crate::TaskRuntime) -> ForgeSpec {
+    fn subprocess_spec(argv: Vec<String>, runtime: velveteen::TaskRuntime) -> ForgeSpec {
         ForgeSpec {
             command: ForgeCommand::Subprocess { argv, image: None },
             where_: TaskPlacement::new(TaskLocation::Local, runtime),
@@ -777,7 +777,7 @@ mod tests {
         let driver = LocalForgeDriver::new();
         let spec = subprocess_spec(
             vec!["sh".into(), "-c".into(), "echo hello-native".into()],
-            crate::TaskRuntime::Native,
+            velveteen::TaskRuntime::Native,
         );
         let (tx, mut rx) = mpsc::unbounded_channel();
         let outcome = driver
@@ -819,7 +819,7 @@ mod tests {
                 "-c".into(),
                 "echo boom-native >&2; exit 3".into(),
             ],
-            crate::TaskRuntime::Native,
+            velveteen::TaskRuntime::Native,
         );
         let outcome = driver
             .execute(spec, ExecContext::default(), None)
@@ -846,7 +846,7 @@ mod tests {
                 "-c".into(),
                 r#"echo cwd=$(pwd); echo env=$YAH_TEST_VAR"#.into(),
             ],
-            crate::TaskRuntime::Native,
+            velveteen::TaskRuntime::Native,
         );
         let ctx = ExecContext::default()
             .with_cwd(tmp.path().to_path_buf())
@@ -883,7 +883,7 @@ mod tests {
     #[tokio::test]
     async fn empty_argv_rejected() {
         let driver = LocalForgeDriver::new();
-        let spec = subprocess_spec(vec![], crate::TaskRuntime::Native);
+        let spec = subprocess_spec(vec![], velveteen::TaskRuntime::Native);
         let err = driver
             .execute(spec, ExecContext::default(), None)
             .await
@@ -894,7 +894,7 @@ mod tests {
     #[tokio::test]
     async fn container_subprocess_without_image_rejected() {
         let driver = LocalForgeDriver::new();
-        let spec = subprocess_spec(vec!["true".into()], crate::TaskRuntime::Container);
+        let spec = subprocess_spec(vec!["true".into()], velveteen::TaskRuntime::Container);
         let err = driver
             .execute(spec, ExecContext::default(), None)
             .await
@@ -924,7 +924,7 @@ mod tests {
                 argv: vec!["__nonexistent_binary_for_docker_test__".into()],
                 image: Some(image),
             },
-            where_: TaskPlacement::new(TaskLocation::Local, crate::TaskRuntime::Container),
+            where_: TaskPlacement::new(TaskLocation::Local, velveteen::TaskRuntime::Container),
             timeout: None,
             label: None,
             initiator: Initiator::Human { camp: "test".into() },
@@ -956,7 +956,7 @@ mod tests {
                 push: false,
                 load: false,
             },
-            where_: TaskPlacement::new(TaskLocation::Local, crate::TaskRuntime::Container),
+            where_: TaskPlacement::new(TaskLocation::Local, velveteen::TaskRuntime::Container),
             timeout: None,
             label: None,
             initiator: Initiator::Human { camp: "test".into() },
@@ -982,7 +982,7 @@ mod tests {
         let workload = WorkloadSpec::for_forge("test-workload", image, TierTag("infra".into()), vec![]);
         let spec = ForgeSpec {
             command: ForgeCommand::Workload { spec: workload },
-            where_: TaskPlacement::new(TaskLocation::Local, crate::TaskRuntime::Native),
+            where_: TaskPlacement::new(TaskLocation::Local, velveteen::TaskRuntime::Native),
             timeout: None,
             label: None,
             initiator: Initiator::Human { camp: "test".into() },

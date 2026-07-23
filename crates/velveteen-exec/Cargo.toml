@@ -1,0 +1,30 @@
+[package]
+name = "velveteen-exec"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Execution drivers for the velveteen task vocabulary: local subprocess/container, remote yubaba workload, and integration stand-up"
+
+[lib]
+name = "velveteen_exec"
+path = "src/lib.rs"
+
+[dependencies]
+velveteen = { path = "../velveteen", version = "0.8.21" }
+observation = { path = "../observation", version = "0.8.21" }
+workload-spec = { package = "yah-workload-spec", version = "0.8.21" }
+task-runs = { path = "../task-runs", version = "0.8.21" }
+yah-scryer = { path = "../scryer", version = "0.8.21" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+async-trait = "0.1"
+thiserror = "1.0"
+toml = "0.8"
+tokio = { version = "1", features = ["sync", "rt", "time", "macros", "process"] }
+
+[dev-dependencies]
+serde_json = "1.0"
+tempfile = "3"
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "sync"] }

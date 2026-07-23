@@ -2,17 +2,27 @@
 //! @arch:role(runtime)
 //! @arch:see(.yah/docs/architecture/A035-yah-forge.md)
 //!
-//! `task` — transient execution umbrella for all three task species.
+//! `velveteen` — the task vocabulary: how work is *described*.
 //!
-//! Three species share `ForgeId`, `EventScope::Forge`, and the agent-facing
-//! query surface (`forge.run/status/events/diagnostics/triage/kill/list`) (tool names remain "forge" for now):
+//! A task is a description of work, not a process supervisor. This crate holds
+//! the nouns — [`ForgeSpec`], [`ForgeCommand`], [`TaskPlacement`]
+//! ([`TaskLocation`] × [`TaskRuntime`]), [`ForgeStatus`], [`ForgeSpecies`],
+//! [`MeshAccess`], [`IntegrationForgeSpec`] — and nothing that runs them. Its
+//! dependency set is deliberately serde + `workload-spec` + `observation`, so a
+//! queue, scheduler, dashboard, or wire client can speak the vocabulary without
+//! dragging in tokio/process, the docker shim, `task-runs`' SQLite store, or
+//! `yah-scryer` (R619).
 //!
-//! - **local-forge**: subprocess on the dev box; backed by `crates/yah/task-runs/`.
+//! The drivers that execute these specs live in the `velveteen-exec` sibling
+//! crate, one module per species:
+//!
+//! - **local-forge**: subprocess on the dev box; backed by `task-runs`.
 //! - **remote-forge**: one-shot workload on a yubaba machine (R094-F3).
 //! - **integration-forge**: N-workload stand-up scoped to a test or flow (R094-F4).
 //!
-//! `ForgeId` lives in `crates/yah/observation/` so scryer can reference it in
-//! `EventScope::Forge` without depending on this crate.
+//! [`ForgeId`] and [`Initiator`] live in `observation` so scryer can reference
+//! them in `EventScope::Forge` without depending on this crate; both are
+//! re-exported here.
 //!
 //! @yah:ticket(R299-T1, "Rename crates/yah/forge/ → crates/yah/task/")
 //! @yah:assignee(agent:claude)
@@ -95,8 +105,9 @@
 //! @arch:see(.yah/docs/working/W165-mesofact-build-mode-lowering.md)
 //!
 //! @yah:relay(R619, "Carve velveteen into vocabulary + velveteen-exec drivers")
-//! @yah:at(2026-07-20T23:34:18Z)
-//! @yah:status(open)
+//! @yah:status(review)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:at(2026-07-23T03:55:55Z)
 //! @arch:see(.yah/docs/working/W276-susuwatari-task-queue.md)
 //! @yah:next("WHY: velveteen ships the task vocabulary AND the execution drivers in one crate, so any consumer that only wants to *describe* a task (a queue, a scheduler, a dashboard, a wire client) drags in tokio/process, docker shims, task-runs and yah-scryer. W276 susuwatari is the forcing consumer, but the split stands on its own merits — a task is a description of work, not a process supervisor.")
 //! @yah:next("THE CUT LINE ALREADY EXISTS. src/lib.rs:123-125 — the type layer imports only serde, std::path::PathBuf, and workload_spec. Every other import (lines 107-121) is a pub-use re-export of a driver module. This is close to a file-level split.")
@@ -107,32 +118,20 @@
 //! @yah:gotcha("SEQUENCING vs R610. velveteen is on R610's UNBLOCK-2 republish list (the oss 0.8.20 wave). This carve is a BREAKING change to velveteen's published surface, so it must land BEFORE that republish — otherwise 0.8.20 ships the fat crate and the split becomes a breaking 0.8.21 against a just-published API. velveteen is currently 0.8.16 on crates.io with ~21 downloads (effectively only us), so re-carving is free right now and will not be later.")
 //! @yah:gotcha("Do NOT let this relay grow into 'also rename task-runs / task-sessions'. Those carry the same pre-velveteen `task-*` vocabulary and task-runs is published under that generic name, but that is an R610 naming call with its own blast radius. Note it, do not absorb it.")
 //! @yah:assumes("The observation crate stays featherweight (serde, serde_json, uuid, workload-spec). If Initiator's move tempts anything heavier in there, stop — observation is load-bearing precisely because it is thin.")
+//! @yah:handoff("R619 COMPLETE. velveteen carved in two. VOCABULARY HALF (velveteen, oss/qed/crates/velveteen/src/lib.rs) keeps ForgeSpec, ForgeCommand, TaskPlacement/TaskLocation/TaskRuntime, ForgeStatus, ForgeSpecies, MeshAccess, IntegrationForgeSpec/TopologyHints/FixtureRef/TeardownPolicy, plus re-exports of ForgeId + Initiator. Deps shrank from 10 to 3: serde + workload-spec + observation (dropped task-runs, yah-scryer, async-trait, thiserror, toml, tokio; serde_json is now dev-only). DRIVER HALF (new crate velveteen-exec, oss/qed/crates/velveteen-exec/) took all nine driver modules verbatim via git mv: local, remote, integration, executor, triage, transforms, list, meta, default_image.")
+//! @yah:handoff("INITIATOR MOVED as specified, and RunStatus had to come with it. Initiator + RunStatus both hoisted from oss/qed/crates/task-runs/src/types.rs into oss/qed/crates/observation/src/types.rs; task-runs re-exports both so every existing `task_runs::Initiator` / `task_runs::RunStatus` caller is untouched. RunStatus was NOT in the ticket but was forced: velveteen keeps `impl From<RunStatus> for ForgeStatus`, and leaving RunStatus in task-runs would have kept the task-runs dep on the vocabulary half — defeating the whole carve. The orphan rule forbids relocating that impl into velveteen-exec (both types would be foreign). RunStatus is pure data (5 serde variants, no I/O), so it moves for exactly the reason Initiator does. observation stayed featherweight per the relay's @yah:assumes — still serde + serde_json + uuid + workload-spec, no new deps.")
+//! @yah:handoff("THE TICKET'S 'no use statements should need to change' PREMISE WAS WRONG, as expected once you see why: velveteen cannot re-export velveteen-exec (that is a dependency cycle), so consumers of driver items must switch crate prefix. Rewrote them: oss/qed/crates/qed (runner.rs, lib.rs, platform.rs), oss/yubaba/crates/cloud (config.rs, reconciler/{mesofact_static,static_asset,lowering_golden}.rs, tests/whisper_derive_e2e.rs), app/yah/cli (camp.rs, qed.rs, lib.rs, yubaba_client.rs, tests/camp_qed_image_pins.rs). Split is mechanical: vocabulary items stay `velveteen::`, driver items become `velveteen_exec::`. All three consumers gained a velveteen-exec dep line as the ticket predicted.")
+//! @yah:handoff("REGISTRATION: velveteen-exec added to oss/qed/Cargo.toml [workspace] members, to root Cargo.toml [patch.crates-io], and to oss/yubaba/Cargo.toml [workspace.dependencies]. Also registered in the two LIVE operator publish scripts — scripts/set-trusted-publishers.sh (velveteen-exec -> qed mirror) and scripts/reserve-crate-names.sh. Deliberately did NOT touch scripts/commit-oss-split.sh / commit-oss-publish-prep.sh / fix-oss-prep-commit.sh — those are one-shot R582 historical staging scripts, not maintained lists.")
+//! @yah:handoff("DISCOVERED WORK — A035 arch doc 'Where things live' table was stale by several renames (still said crates/yah/task/, crates/yah/forge/src/remote.rs, crates/yah/workload-spec/, all pre-dating the oss/ move AND the velveteen rename). Rewrote it at .yah/docs/architecture/A035-yah-forge.md:295 to the real post-carve paths and added a paragraph stating the two-crate split rationale. Also swept stale `crates/velveteen/src/<mod>.rs` file-path references in app/yah/cli/src/camp.rs and .yah/docs/working/W283-scheduled-plugin-category.md.")
+//! @yah:handoff("VERIFIED: `cargo test -p velveteen` 12/12 pass. `cargo test -p velveteen-exec` 75 pass + 2 ignored (the docker smokes). `cargo test -p task-runs` 237/237. `cargo test -p observation` 1/1. `cargo test -p yah-qed --lib` 610 pass / 5 fail — those 5 are EXACTLY the pre-existing set already documented in the gotcha at oss/qed/crates/qed/src/runner.rs:173 (config::parses_on_success_outcomes_from_toml, transform::release_yml_transforms_end_to_end, both preflight:: tests, runner::musl_static_preflight), unchanged by this relay. `cargo check --workspace` at the yah root exits 0. `cargo check -p yah --lib` and `cargo check -p yah-cloud --lib/--tests` all exit 0.")
+//! @yah:handoff("Tree anchor at handoff: 28fdb630f8412168f9b5927ad3c5c4f48719ae6d. Quote this SHA, not `HEAD`, in any revert instruction — this is a shared tree.")
+//! @yah:verify("cargo test -p velveteen  # 12 pass (from oss/qed)")
+//! @yah:verify("cargo test -p velveteen-exec  # 75 pass, 2 ignored (from oss/qed)")
+//! @yah:verify("cargo test -p observation -p task-runs  # 238 pass")
+//! @yah:verify("cargo check --workspace  # exits 0 from the yah root")
+//! @yah:verify("grep -rn 'velveteen::\\(executor\\|local\\|remote\\|integration\\|meta\\|transforms\\|triage\\|default_image\\|list\\)' --include='*.rs' .  # zero hits — no stale driver paths")
 
-pub mod default_image;
-pub mod executor;
-pub mod integration;
-pub mod list;
-pub mod local;
-pub mod meta;
-pub mod remote;
-pub mod transforms;
-pub mod triage;
-
-pub use executor::{
-    ExecContext, ExecEvent, ExecOutcome, ForgeExecutor, ForgeExecutorError, OutputStream,
-};
-pub use integration::{ClusterClient, IntegrationForgeDriver, IntegrationForgeError, IntegrationRunHandle};
-pub use list::{ForgeListFilter, forge_list};
-pub use local::LocalForgeDriver;
-pub use meta::ForgeMeta;
-pub use observation::ForgeId;
-pub use task_runs::Initiator;
-pub use remote::{ForgeRunHandle, RemoteForgeDriver, RemoteForgeError, WardenClient};
-pub use transforms::{
-    substitute_argv, RecipeError, RecipeLocation, RecipePlacement, RecipeStep, TransformRecipe,
-    TransformRecipeLoader, ENV_TRANSFORM_IN_0, ENV_TRANSFORM_OUT,
-};
-pub use triage::{ForgeTriageError, event_to_diagnostic, forge_diagnostics, forge_triage};
+pub use observation::{ForgeId, Initiator};
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -142,8 +141,9 @@ use workload_spec::{ImageRef, Millis, MeshIdent, TierTag, WorkloadSpec};
 
 /// Terminal + in-flight status for a forge run.
 ///
-/// Extends `task_runs::RunStatus` with `TimedOut` — a forge run that exceeds
-/// its `timeout` field produces this status rather than `Lost`.
+/// Extends [`observation::RunStatus`] with `TimedOut` — a forge run that
+/// exceeds its `timeout` field produces this status rather than `Lost`.
+/// (`task_runs::RunStatus` is a re-export of the same type.)
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum ForgeStatus {
@@ -179,18 +179,18 @@ impl ForgeStatus {
     }
 }
 
-impl From<task_runs::RunStatus> for ForgeStatus {
-    fn from(s: task_runs::RunStatus) -> Self {
+impl From<observation::RunStatus> for ForgeStatus {
+    fn from(s: observation::RunStatus) -> Self {
         match s {
-            task_runs::RunStatus::Pending => ForgeStatus::Pending,
-            task_runs::RunStatus::Running => ForgeStatus::Running,
-            task_runs::RunStatus::Done { exit_code, ended_at } => {
+            observation::RunStatus::Pending => ForgeStatus::Pending,
+            observation::RunStatus::Running => ForgeStatus::Running,
+            observation::RunStatus::Done { exit_code, ended_at } => {
                 ForgeStatus::Done { exit_code, ended_at }
             }
-            task_runs::RunStatus::Killed { signal, ended_at } => {
+            observation::RunStatus::Killed { signal, ended_at } => {
                 ForgeStatus::Killed { signal, ended_at }
             }
-            task_runs::RunStatus::Lost { reason } => ForgeStatus::Lost { reason },
+            observation::RunStatus::Lost { reason } => ForgeStatus::Lost { reason },
         }
     }
 }
@@ -199,7 +199,7 @@ impl From<task_runs::RunStatus> for ForgeStatus {
 
 /// Which forge species a run belongs to.
 ///
-/// Sibling to [`TaskPlacement`] on [`ForgeMeta`]: the placement says *where*
+/// Sibling to [`TaskPlacement`] on `ForgeMeta` (in `velveteen-exec`): the placement says *where*
 /// and *how* the run executes; the species says *which driver* produced it.
 /// The two are orthogonal — a `Remote` species always runs as a containerd
 /// workload on yubaba, but a `Local` species can run native or container per
@@ -209,9 +209,10 @@ impl From<task_runs::RunStatus> for ForgeStatus {
 pub enum ForgeSpecies {
     /// Subprocess on the dev box, driven by `task-runs`.
     Local,
-    /// One-shot workload on a yubaba node, driven by [`RemoteForgeDriver`].
+    /// One-shot workload on a yubaba node, driven by
+    /// `velveteen_exec::RemoteForgeDriver`.
     Remote,
-    /// N-workload stand-up driven by [`IntegrationForgeDriver`].
+    /// N-workload stand-up driven by `velveteen_exec::IntegrationForgeDriver`.
     Integration,
 }
 
@@ -487,7 +488,7 @@ mod types {
             ),
             timeout: Some(Millis::from_secs(300)),
             label: Some("ci-check".into()),
-            initiator: task_runs::Initiator::Human { camp: "my-camp".into() },
+            initiator: Initiator::Human { camp: "my-camp".into() },
             mesh_access: MeshAccess::None,
         }
     }

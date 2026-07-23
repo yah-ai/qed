@@ -23,7 +23,7 @@ use serde::Deserialize;
 use thiserror::Error;
 use workload_spec::ImageRef;
 
-use crate::TaskRuntime;
+use velveteen::TaskRuntime;
 
 /// Substitution key bound to the resolved fetched input (always present).
 pub const ENV_TRANSFORM_IN_0: &str = "YAH_TRANSFORM_IN_0";
@@ -116,7 +116,7 @@ pub enum RecipeError {
 
 /// Loader for `.yah/qed/transforms/*.toml` files.
 ///
-/// Kept *separate* from [`PipelineLoader`](crate::PipelineLoader) per W164
+/// Kept *separate* from `PipelineLoader` (in `yah-qed`) per W164
 /// OQ#1: pipelines and transforms have different IO contracts and conflating
 /// them in one loader forces every pipeline to branch on "is this actually a
 /// transform?".

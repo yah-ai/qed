@@ -23,6 +23,18 @@
 //! F2 builds the structured `Platform { host, target, container_platform }`
 //! field on steps atop [`detect_host_triple`]; F3 builds the `resolve(...)`
 //! decision table that consumes the host triple this module produces.
+//!
+//! @arch:see(.yah/docs/working/W235-remote-qed.md)
+//!
+//! @yah:relay(R631, "Placement mesh-tags carry no OS dimension — a darwin target routes to Linux build-workers")
+//! @yah:at(2026-07-23T03:13:00Z)
+//! @yah:status(open)
+//! @yah:next("Surfaced 2026-07-22 by enrolling us-west-015, the fleet's first macOS node. Until then every build-worker was Linux, so arch alone was an adequate proxy for capability and the gap could not manifest.")
+//! @yah:next("Start at build_worker_mesh_tags (this file, ~line 464): it maps arch to a tier only — aarch64 yields [tag:build-worker, tier:arm] with no OS term. Extend it to emit os:<os> from the target triple's OS segment, then teach the machine inventory and any placement spec that consumes it.")
+//! @yah:gotcha("The failure is silent and picks the WRONG node rather than none. An aarch64-apple-darwin offload requests exactly the tag set the Raspberry Pi 5s (us-west-011/013/014) already carry; candidates are filtered by tag superset and ties break on declaration order, so a Linux Pi wins and then cannot emit Mach-O.")
+//! @yah:gotcha("qed already knows darwin cannot be cross-built from Linux — platform.rs resolve() sends such a target to Offload (see resolve_darwin_target_from_linux_host_offloads). So the placement decision is correct in isolation; it is only the TAG DERIVATION that loses the OS, which is why this survived.")
+//! @yah:gotcha("us-west-015 already declares os:darwin and tag:mac-builder, but nothing selects on them — they are descriptive until this lands. Its inventory file says so explicitly; update that note when the gap closes.")
+//! @arch:see(.yah/infra/machines/us-west-015.toml)
 
 use serde::{Deserialize, Serialize};
 
@@ -458,7 +470,7 @@ pub fn arch_of(triple: &str) -> &str {
 /// `mesh_tags = ["tag:build-worker", "tag:qed", "tier:x86" | "tier:arm"]`, so an
 /// amd64 image build routes to `us-west-002` (x86) and an arm64 build to the
 /// Pi5s (arm). yubaba admission consumes this set (see
-/// `velveteen::remote::NODE_SELECTOR_MESH_TAGS_ANNOTATION`).
+/// `velveteen_exec::remote::NODE_SELECTOR_MESH_TAGS_ANNOTATION`).
 pub fn build_worker_mesh_tags(arch: &str) -> Vec<String> {
     let arch_tag = match arch {
         "x86_64" | "x86" | "i686" | "amd64" => "tier:x86",

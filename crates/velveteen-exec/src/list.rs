@@ -7,7 +7,8 @@
 //!
 //! Sorting: running first, then by `started_at` descending.
 
-use crate::{ForgeMeta, ForgeSpecies, ForgeStatus};
+use crate::ForgeMeta;
+use velveteen::{ForgeSpecies, ForgeStatus};
 use task_runs::{RunFilter, StoreError, TaskStore};
 
 // ─── ForgeListFilter ─────────────────────────────────────────────────────────
@@ -143,7 +144,7 @@ fn meta_matches(meta: &ForgeMeta, filter: &ForgeListFilter) -> bool {
 #[cfg(test)]
 mod list {
     use super::*;
-    use crate::{ForgeSpecies, ForgeStatus, TaskLocation, TaskPlacement, TaskRuntime};
+    use velveteen::{ForgeSpecies, ForgeStatus, TaskLocation, TaskPlacement, TaskRuntime};
     use observation::ForgeId;
     use std::path::PathBuf;
     use task_runs::{Initiator, RunStatus, TaskRunId, TaskRunMeta, TaskStore};

@@ -10,6 +10,13 @@
 //! the GC sweep. `Database::connect()` is cheap (an `Arc` clone plus a
 //! per-connection state struct).
 //!
+//! Independent connections mean independent write-lock contenders, so every
+//! connection carries a `busy_timeout` and every write goes through
+//! [`TaskStore::exec_retry`], which retries the `Busy` class with backoff. A
+//! write that returns `Busy` is a *lost* write, not a slow one — R617-B9 was
+//! exactly that: the lifecycle's terminal `update_status` losing the race
+//! against chunk/event writers and leaving the run `Running` forever.
+//!
 //! Storage contract (W195 §3 / Shape 1): this store owns
 //! `.yah/db/task-runs.turso` under the camp daemon.
 
@@ -24,6 +31,19 @@ use std::str::FromStr;
 use thiserror::Error;
 use tokio::sync::Mutex;
 use turso::{params, params_from_iter, Builder, Connection, Database, Value};
+
+/// Total in-turso backoff before a statement gives up and reports `Busy`.
+const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// First outer-retry delay for a write that still came back `Busy`.
+const BUSY_RETRY_BASE: std::time::Duration = std::time::Duration::from_millis(10);
+/// Once the doubling delay passes this, the write gives up (≈10s total).
+const BUSY_RETRY_MAX: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// `true` when the error means "someone else holds the write lock" — the
+/// retryable class, as opposed to a schema/constraint/misuse failure.
+fn is_busy(e: &turso::Error) -> bool {
+    matches!(e, turso::Error::Busy(_) | turso::Error::BusySnapshot(_))
+}
 
 // ─── Error ────────────────────────────────────────────────────────────────────
 
@@ -186,8 +206,45 @@ impl TaskStore {
     /// an independent `Connection` that the caller may use within one logical
     /// operation and drop. Never share a `Connection` across awaiting tasks —
     /// `turso` 0.6.x rejects concurrent use on the same handle.
+    ///
+    /// Every connection carries a busy timeout: a live run drives three
+    /// concurrent writers (PTY reader chunks, shim-FIFO events, lifecycle
+    /// status), and without it the loser of a write-lock race gets an
+    /// immediate `Busy` instead of waiting its turn.
     fn conn(&self) -> Result<Connection, StoreError> {
-        Ok(self.db.connect()?)
+        let conn = self.db.connect()?;
+        let _ = conn.busy_timeout(BUSY_TIMEOUT);
+        Ok(conn)
+    }
+
+    /// Execute a write statement, retrying while turso reports the database
+    /// is locked.
+    ///
+    /// `busy_timeout` alone is not enough: turso caps its internal backoff at
+    /// the configured total and then hands `Busy` back to the caller. Losing a
+    /// write here is not a slow path but a *wrong* one — a dropped terminal
+    /// `update_status` leaves the run `Running` forever — so writes get an
+    /// outer retry with exponential backoff on top.
+    async fn exec_retry(
+        &self,
+        sql: &str,
+        params: impl turso::params::IntoParams,
+    ) -> Result<u64, StoreError> {
+        let params = params.into_params()?;
+        let mut delay = BUSY_RETRY_BASE;
+        let mut last: StoreError;
+        loop {
+            match self.conn()?.execute(sql, params.clone()).await {
+                Ok(n) => return Ok(n),
+                Err(e) if is_busy(&e) => last = StoreError::Sql(e),
+                Err(e) => return Err(StoreError::Sql(e)),
+            }
+            if delay > BUSY_RETRY_MAX {
+                return Err(last);
+            }
+            tokio::time::sleep(delay).await;
+            delay *= 2;
+        }
     }
 
     pub async fn insert_run(&self, meta: &TaskRunMeta) -> Result<(), StoreError> {
@@ -201,8 +258,7 @@ impl TaskStore {
             .transpose()?;
         let cwd = meta.cwd.to_string_lossy().to_string();
 
-        self.conn()?
-            .execute(
+        self.exec_retry(
                 "INSERT INTO runs \
                  (id, command, cwd, env_json, started_at, ended_at, exit_code, signal, \
                   status, status_detail, label, initiator, beholder_status, pinned, origin) \
@@ -239,12 +295,11 @@ impl TaskStore {
         status: &BeholderStatus,
     ) -> Result<(), StoreError> {
         let json = serde_json::to_string(status)?;
-        self.conn()?
-            .execute(
-                "UPDATE runs SET beholder_status = ?1 WHERE id = ?2",
-                params![json, id.to_string()],
-            )
-            .await?;
+        self.exec_retry(
+            "UPDATE runs SET beholder_status = ?1 WHERE id = ?2",
+            params![json, id.to_string()],
+        )
+        .await?;
         Ok(())
     }
 
@@ -254,20 +309,19 @@ impl TaskStore {
         status: &RunStatus,
     ) -> Result<(), StoreError> {
         let (status_str, ended_at, exit_code, signal, detail) = status_columns(status);
-        self.conn()?
-            .execute(
-                "UPDATE runs SET status=?1, status_detail=?2, ended_at=?3, exit_code=?4, signal=?5 \
-                 WHERE id=?6",
-                params![
-                    status_str.to_string(),
-                    detail,
-                    ended_at,
-                    exit_code.map(|c| c as i64),
-                    signal.map(|s| s as i64),
-                    id.to_string(),
-                ],
-            )
-            .await?;
+        self.exec_retry(
+            "UPDATE runs SET status=?1, status_detail=?2, ended_at=?3, exit_code=?4, signal=?5 \
+             WHERE id=?6",
+            params![
+                status_str.to_string(),
+                detail,
+                ended_at,
+                exit_code.map(|c| c as i64),
+                signal.map(|s| s as i64),
+                id.to_string(),
+            ],
+        )
+        .await?;
         Ok(())
     }
 
@@ -296,8 +350,7 @@ impl TaskStore {
             }
         };
 
-        self.conn()?
-            .execute(
+        self.exec_retry(
                 "INSERT INTO chunks (run_id, seq, offset_ms, stream, bytes) VALUES (?1,?2,?3,?4,?5)",
                 params![
                     key,
@@ -573,8 +626,7 @@ impl TaskStore {
 
         let fields_json = serde_json::to_string(fields)?;
 
-        self.conn()?
-            .execute(
+        self.exec_retry(
                 "INSERT INTO events \
                  (run_id, seq, offset_ms, level, target, msg, fields_json, anchor_seq, source_kind, source_name) \
                  VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
@@ -1353,6 +1405,61 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(n, 0);
+    }
+
+    /// R617-B9: a live run has three concurrent writers (PTY chunks, shim
+    /// events, lifecycle status). Before `exec_retry`, the terminal
+    /// `update_status` lost the write-lock race and came back
+    /// `Busy("database is locked")` — the caller's `let _ =` swallowed it and
+    /// the run stayed `Running` forever. Writes must survive contention.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_writers_do_not_lose_the_terminal_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            std::sync::Arc::new(TaskStore::open(&dir.path().join("tr.turso")).await.unwrap());
+        let id = TaskRunId::new();
+        store.insert_run(&make_meta(id.clone(), "contended")).await.unwrap();
+
+        // Two background writers hammering the same DB from other tasks.
+        let mut writers = Vec::new();
+        for w in 0..2 {
+            let store = std::sync::Arc::clone(&store);
+            let id = id.clone();
+            writers.push(tokio::spawn(async move {
+                for i in 0..50u32 {
+                    store.append_chunk(&id, i, Stream::Stdout, b"noise").await.unwrap();
+                    store
+                        .append_event(
+                            &id,
+                            i,
+                            Level::Info,
+                            "t",
+                            &format!("w{w}-{i}"),
+                            &serde_json::json!({}),
+                            None,
+                            &EventSource::Shim {
+                                lib: "test".into(),
+                                version: "0.1.0".into(),
+                            },
+                        )
+                        .await
+                        .unwrap();
+                }
+            }));
+        }
+
+        let status = RunStatus::Done { exit_code: 0, ended_at: 2_000_000 };
+        store.update_status(&id, &status).await.unwrap();
+
+        for w in writers.drain(..) {
+            w.await.unwrap();
+        }
+        let got = store.get_run(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(got.status, RunStatus::Done { exit_code: 0, .. }),
+            "terminal status was lost under contention: {:?}",
+            got.status
+        );
     }
 
     #[tokio::test]

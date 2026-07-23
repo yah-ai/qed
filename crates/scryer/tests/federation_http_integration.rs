@@ -63,6 +63,14 @@ async fn federate_events_returns_payload_with_operator_tag() {
     assert_eq!(resp.status(), 200);
     let body: FederateEventsResp = resp.json().await.unwrap();
     assert_eq!(body.events.len(), 3);
+    // R585-F2: each row carries the scope it was stored under, so a
+    // cross-scope rollup (`scopes: None`) is no longer scope-blind.
+    for row in &body.events {
+        assert_eq!(
+            row.scope,
+            EventScope::Service(MeshIdent("svc.test".to_string())),
+        );
+    }
     handle.abort();
 }
 
@@ -133,5 +141,9 @@ async fn http_federation_peer_roundtrip() {
     let events = peer.events(&EventFilter::default()).await.unwrap();
     assert_eq!(events.len(), 3);
     assert_eq!(peer.name(), "peer-test");
+    // The envelope survives the full HTTP round-trip through the production
+    // FederationPeer impl — this is what populates AnalyticsEvent.scope_* .
+    assert_eq!(events[0].scope.kind_str(), "service");
+    assert_eq!(events[0].scope.id_str(), "svc.test");
     handle.abort();
 }

@@ -21,7 +21,7 @@ use async_trait::async_trait;
 use thiserror::Error;
 use tokio::sync::mpsc::UnboundedSender;
 
-use crate::{ForgeSpec, ForgeStatus};
+use velveteen::{ForgeSpec, ForgeStatus};
 
 /// Host-side execution context for a forge run.
 ///
@@ -102,7 +102,7 @@ impl ExecOutcome {
 
 #[derive(Debug, Error)]
 pub enum ForgeExecutorError {
-    /// The driver doesn't know how to run this [`crate::ForgeCommand`]
+    /// The driver doesn't know how to run this [`velveteen::ForgeCommand`]
     /// variant (e.g. [`LocalForgeDriver`](crate::local::LocalForgeDriver)
     /// receives `BuildImage` or `Workload`).
     #[error("unsupported ForgeCommand for this executor: {0}")]

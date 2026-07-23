@@ -789,6 +789,7 @@ target = ["x86_64", "aarch64"]
             image: None,
             tag: None,
             push: false,
+            platforms: Vec::new(),
             binary_path: None,
             triple: None,
             package: None,

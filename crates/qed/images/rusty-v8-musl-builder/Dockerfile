@@ -58,7 +58,13 @@ ENV V8_FROM_SOURCE=1 \
     RUSTC_BOOTSTRAP=1
 
 COPY build-v8.sh /usr/local/bin/build-v8.sh
-RUN chmod +x /usr/local/bin/build-v8.sh
+# verify-consumer.sh is the PRE-PUBLISH gate: it links + runs a real deno_core
+# binary against a built tarball, which is the only check that catches a
+# feature-set mismatch between the archive and its consumer (R546-T4 — a whole
+# publish cycle shipped a non-linking archive because every other check stops at
+# `cargo build` of the v8 lib, where undefined externs have not bound yet).
+COPY verify-consumer.sh /usr/local/bin/verify-consumer.sh
+RUN chmod +x /usr/local/bin/build-v8.sh /usr/local/bin/verify-consumer.sh
 
 # Smoke-test the toolchain so a broken image fails at build time, not 40 min
 # into a V8 compile. (Alpine's gn is a real standalone binary, unlike the

@@ -47,16 +47,20 @@
 //! @yah:gotcha("This is an oss/qed crate — changes land in-tree under oss/task-runs and flow outward via scripts/export-oss.sh. Keep the reattach seam generic (origin-agnostic policy hook), not yah-terminal-specific, since the crate ships standalone.")
 //! @yah:gotcha("Reattach only makes sense once the PTY outlives the desktop (S5 decides the host). Landing it before that gives a reattach path with nothing to reattach to.")
 //! @arch:see(.yah/docs/working/W280-durable-terminal-sessions.md)
-//! @yah:depends_on(R617-S5)
+//! @yah:depends_on(R617-F13)
 //!
 //! @yah:ticket(R617-B9, "Pre-existing: task-runs log_pipe_events_land_in_store never completes (233 pass / 1 fail)")
-//! @yah:at(2026-07-20T21:19:08Z)
-//! @yah:status(open)
+//! @yah:status(review)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:at(2026-07-22T19:50:25Z)
 //! @yah:phase(P1)
 //! @yah:parent(R617)
-//! @yah:next("The run never reaches Done/Lost within the 20s deadline, so the FIFO assertions are never reached. Child writes one JSON line via `printf ... >> \"$YAH_LOG_PIPE\"`; suspect the child blocks or the lifecycle never observes its exit. mkfifo itself works on this machine.")
-//! @yah:verify("cd oss/qed && cargo test -p task-runs --lib log_pipe_events_land_in_store")
-//! @yah:gotcha("Confirmed pre-existing during R617-B1, not caused by the DriverChannels output tap: swapping driver.rs + lib.rs to their HEAD versions reproduces the identical failure. Anyone touching this file (R617-F6 lands here) will meet a red suite that is not theirs.")
+//! @yah:handoff("Root cause: not the FIFO, not the PTY. The whole pipeline completed correctly every time (child wrote the JSON line, receiver drained it, reader hit EOF, child.wait returned 0) — but the lifecycle's terminal `store.update_status` returned `Sql(Busy(\"database is locked\"))` and run_lifecycle swallowed it with `let _ =`, so the run stayed Running forever and the 20s poll deadline blew. A live run has three concurrent turso writers (PTY chunk appends, shim-FIFO event appends, lifecycle status) on independent connections with no busy handling at all.")
+//! @yah:handoff("Fix in oss/qed/crates/task-runs/src/store.rs: (1) `conn()` now sets `busy_timeout(5s)` on every connection; (2) new `exec_retry()` wraps writes in an outer exponential-backoff retry on the `Busy`/`BusySnapshot` class, because turso caps its internal backoff and then hands `Busy` back; (3) insert_run / update_status / update_beholder_status / append_chunk / append_event all routed through it.")
+//! @yah:handoff("driver.rs run_lifecycle no longer swallows the terminal status write — a genuine failure after retries now prints `[yah task-runs] failed to record terminal status for run <id>`, matching the crate's existing eprintln convention.")
+//! @yah:handoff("New regression test store.rs::concurrent_writers_do_not_lose_the_terminal_status — two background tasks hammer append_chunk/append_event while update_status lands. Verified it has teeth: with busy_timeout and the retry disabled it fails 3/3 with the exact `Busy(\"database is locked\")`; with them it passes 5/5.")
+//! @yah:verify("cd oss/qed && cargo test -p task-runs --lib — 237 passed / 0 failed (was 235 pass / 1 fail)")
+//! @yah:verify("log_pipe_events_land_in_store run 8x sequentially: 8/8 green in ~0.58s each. Before the fix the same loop was 11/12 red at the 20s timeout.")
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -817,7 +821,14 @@ async fn run_lifecycle(
         },
     };
 
-    let _ = store.update_status(&id, &status).await;
+    /* Losing this write is not cosmetic: the run stays `Running` in the store
+       forever and every reader — tail loops, the terminal UI, the next
+       daemon's Lost-on-disappear sweep — believes a dead process is alive.
+       `update_status` already retries through lock contention, so a failure
+       here is terminal and worth saying out loud. */
+    if let Err(e) = store.update_status(&id, &status).await {
+        eprintln!("[yah task-runs] failed to record terminal status for run {id}: {e}");
+    }
     if let Some(ref tx) = completion_tx {
         let _ = tx.send((id.clone(), status));
     }

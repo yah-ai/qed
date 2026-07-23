@@ -16,9 +16,55 @@
 
 use crate::service::{EventFilter, ScryerError};
 use async_trait::async_trait;
-use observation::Event;
+use observation::{Event, EventScope};
+use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use thiserror::Error;
+
+// ─── ScopedEvent ──────────────────────────────────────────────────────────────
+
+/// An event together with the scope it was stored under (R585-F2).
+///
+/// Scryer is scope-keyed all the way down — `push`, `events`, and the store
+/// indexes all take an [`EventScope`] — but the *federation* layer used to drop
+/// it: `FederationPeer::events` returned a bare `Vec<Event>`, so a cross-scope
+/// rollup came back as an undifferentiated pile and every consumer downstream
+/// had to render the scope as blank. `AnalyticsEvent.scope_kind` / `scope_id`
+/// were hardcoded empty strings for exactly this reason.
+///
+/// Carrying the envelope costs one enum per row and makes the cross-scope
+/// rollup — the whole point of `scopes: None` — actually usable: a mesh-wide
+/// query can now say *which* task run or service each event came from.
+///
+/// The wire form is `{"scope": …, "event": {…}}`, a named struct rather than a
+/// tuple so the JSON stays self-describing for non-Rust readers of
+/// `/federate/events`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScopedEvent {
+    pub scope: EventScope,
+    pub event: Event,
+}
+
+impl ScopedEvent {
+    pub fn new(scope: EventScope, event: Event) -> Self {
+        Self { scope, event }
+    }
+
+    /// Tag a whole batch from one scope — the shape every scope-keyed query
+    /// result takes on its way into a federated merge.
+    pub fn tag_all(scope: &EventScope, events: Vec<Event>) -> Vec<Self> {
+        events
+            .into_iter()
+            .map(|event| Self::new(scope.clone(), event))
+            .collect()
+    }
+
+    /// Drop the envelope. For callers that genuinely don't care about scope
+    /// (the scope-keyed `Scryer::events` path, whose caller already knows it).
+    pub fn into_events(rows: Vec<Self>) -> Vec<Event> {
+        rows.into_iter().map(|r| r.event).collect()
+    }
+}
 
 // ─── FederationRule ───────────────────────────────────────────────────────────
 
@@ -91,23 +137,48 @@ pub enum FederationError {
 
 /// Abstracts a remote scryer peer.
 ///
-/// Production impl: gRPC streaming over the yubaba mesh (WireGuard).
-/// Test impls: in-process mock that holds a `Vec<Event>`.
+/// Production impl: HTTP `POST /federate/events` over the yubaba mesh
+/// (see [`crate::federation_http::HttpFederationPeer`]).
+/// Test impls: in-process mock that holds a `Vec<ScopedEvent>`.
 #[async_trait]
 pub trait FederationPeer: Send + Sync {
     /// Stable display name for this peer (e.g. `"yubaba-pdx-1"`).
     fn name(&self) -> &str;
     /// Query events from this peer using `filter`.
-    async fn events(&self, filter: &EventFilter) -> Result<Vec<Event>, FederationError>;
+    ///
+    /// Scope-omitted by design — a peer query is a cross-scope rollup, so each
+    /// row carries its own [`EventScope`] in the [`ScopedEvent`] envelope
+    /// rather than the caller supplying one (R585-F2).
+    async fn events(&self, filter: &EventFilter) -> Result<Vec<ScopedEvent>, FederationError>;
 }
 
 // ─── Merge ────────────────────────────────────────────────────────────────────
 
-/// Merge two event slices ordered by `(offset_ms, seq)`.  O(n+m).
+/// Rows a federated merge can order — anything with an event's
+/// `(offset_ms, seq)` position. Implemented for both the bare [`Event`] (the
+/// scope-keyed local path, where the caller already knows the scope) and
+/// [`ScopedEvent`] (the cross-scope / federated path).
+pub trait TimeOrdered {
+    fn order_key(&self) -> (u32, u32);
+}
+
+impl TimeOrdered for Event {
+    fn order_key(&self) -> (u32, u32) {
+        (self.offset_ms, self.seq)
+    }
+}
+
+impl TimeOrdered for ScopedEvent {
+    fn order_key(&self) -> (u32, u32) {
+        (self.event.offset_ms, self.event.seq)
+    }
+}
+
+/// Merge two time-ordered slices by `(offset_ms, seq)`.  O(n+m).
 ///
 /// Both inputs must already be sorted; the output is sorted.  Near-simultaneous
 /// events from different machines can appear in either order (best-effort clock).
-pub fn merge_events(a: Vec<Event>, b: Vec<Event>) -> Vec<Event> {
+pub fn merge_ordered<T: TimeOrdered>(a: Vec<T>, b: Vec<T>) -> Vec<T> {
     let mut result = Vec::with_capacity(a.len() + b.len());
     let mut ia = a.into_iter().peekable();
     let mut ib = b.into_iter().peekable();
@@ -118,7 +189,7 @@ pub fn merge_events(a: Vec<Event>, b: Vec<Event>) -> Vec<Event> {
             (Some(_), None) => result.push(ia.next().unwrap()),
             (None, Some(_)) => result.push(ib.next().unwrap()),
             (Some(ea), Some(eb)) => {
-                if (ea.offset_ms, ea.seq) <= (eb.offset_ms, eb.seq) {
+                if ea.order_key() <= eb.order_key() {
                     result.push(ia.next().unwrap());
                 } else {
                     result.push(ib.next().unwrap());
@@ -127,6 +198,12 @@ pub fn merge_events(a: Vec<Event>, b: Vec<Event>) -> Vec<Event> {
         }
     }
     result
+}
+
+/// [`merge_ordered`] at the bare-`Event` type. Kept as a named function because
+/// it is the scope-keyed local merge and reads better at those call sites.
+pub fn merge_events(a: Vec<Event>, b: Vec<Event>) -> Vec<Event> {
+    merge_ordered(a, b)
 }
 
 fn peer_matches_rule(peer: &dyn FederationPeer, rule: &FederationRule) -> bool {
@@ -140,19 +217,24 @@ fn peer_matches_rule(peer: &dyn FederationPeer, rule: &FederationRule) -> bool {
 
 /// Fan `filter` out to all peers matching `rule`, merge with `local_events`.
 ///
+/// Every row keeps its [`EventScope`] envelope through the merge (R585-F2), so
+/// a mesh-wide rollup can still say which task run or service each event came
+/// from. Local callers that hold a bare `Vec<Event>` for a known scope wrap it
+/// with [`ScopedEvent::tag_all`] first.
+///
 /// Peer failures are swallowed — federation is best-effort.  Callers that need
 /// error visibility should call `FederationPeer::events` directly.
 pub async fn federated_events(
-    local_events: Vec<Event>,
+    local_events: Vec<ScopedEvent>,
     peers: &[Arc<dyn FederationPeer>],
     filter: &EventFilter,
     rule: &FederationRule,
-) -> Vec<Event> {
+) -> Vec<ScopedEvent> {
     let mut result = local_events;
     for peer in peers {
         if peer_matches_rule(peer.as_ref(), rule) {
             if let Ok(remote) = peer.events(filter).await {
-                result = merge_events(result, remote);
+                result = merge_ordered(result, remote);
             }
         }
     }

@@ -311,7 +311,7 @@ pub use runner::{
 /// direct `observation` dep edge.
 pub use observation::ForgeId;
 pub use velveteen::TaskRuntime;
-pub use velveteen::{
+pub use velveteen_exec::{
     RecipeError, RecipeLocation, RecipePlacement, RecipeStep, TransformRecipe,
     TransformRecipeLoader,
 };

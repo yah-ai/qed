@@ -78,7 +78,20 @@ export GN_ARGS="treat_warnings_as_errors=false v8_enable_temporal_support=false 
 clang_use_chrome_plugins=false use_custom_libcxx=false use_sysroot=false \
 clang_base_path=\"$CB\" use_system_libffi=true is_debug=false symbol_level=0 \
 fatal_linker_warnings=false rust_sysroot_absolute=\"$RUST_SYSROOT\""
-echo "build-v8: cargo build --release (the ~30-110m expensive leg)"
+echo "build-v8: cargo build --release --features simdutf (the ~30-110m expensive leg)"
+# --features simdutf is REQUIRED, not optional (R546-T4). deno_core — the only
+# consumer this asset exists for — declares `v8 = { features = ["simdutf"],
+# default-features = false }`, and cargo features are additive, so NO consumer
+# can turn it back off. With the feature on, v8's src/string.rs takes its
+# `#[cfg(feature = "simdutf")]` branches and calls extern "C" simdutf__* symbols
+# that only exist in an archive built with gn `rusty_v8_enable_simdutf=true`
+# (BUILD.gn:22 pulls in //third_party/simdutf). Building without it produced an
+# archive with ZERO simdutf__ symbols, against which every deno_core binary fails
+# to LINK — undefined simdutf__validate_utf16le / __convert_latin1_to_utf8 / … from
+# v8::String::to_rust_string_lossy and deno_core's op_decode. v8's build.rs
+# (L316-319) derives the gn arg from CARGO_FEATURE_SIMDUTF, so setting the cargo
+# feature here is the single source of truth — do NOT also push the gn arg into
+# GN_ARGS above or gn sees it twice.
 # build.rs (V8_FROM_SOURCE) runs gn+ninja -> librusty_v8.a, THEN bindgen, THEN
 # cargo compiles the v8 lib. libclang-22 mangles nested enums as WriteFlags_*
 # instead of the v8_String_WriteFlags_* that the crate's src/string.rs expects
@@ -86,13 +99,24 @@ echo "build-v8: cargo build --release (the ~30-110m expensive leg)"
 # already on disk by then. The ARCHIVE'S PRESENCE, not cargo's exit code, is the
 # success criterion here; we ship denoland's binding regardless. So don't let
 # `set -e` abort on the expected lib-compile failure.
-cargo build --release || echo "build-v8: lib compile failed (expected clang22 binding skew); checking for the archive"
+cargo build --release --features simdutf || echo "build-v8: lib compile failed (expected clang22 binding skew); checking for the archive"
 
 # ── locate the archive (build.rs writes the authoritative outputs to gn_out) ──
 LIB=$(find target -path '*/gn_out/*' -name 'librusty_v8.a' -print -quit)
 [ -n "$LIB" ] || LIB=$(find target -name 'librusty_v8.a' -print -quit)
 [ -n "$LIB" ] || { echo "build-v8: librusty_v8.a not produced — real build failure" >&2; exit 1; }
 echo "build-v8: archive = $LIB ($(du -h "$LIB" | cut -f1))"
+
+# Fail closed on the R546-T4 defect: an archive built without
+# rusty_v8_enable_simdutf links fine at `cargo build` of the v8 lib but breaks
+# every downstream deno_core BINARY at link time. That is far too late to catch
+# it — a whole publish cycle shipped an unusable artifact this way. Assert the
+# symbols are present here, where it costs nothing.
+nm --defined-only "$LIB" 2>/dev/null | grep -q 'simdutf__validate_utf16le' || {
+  echo "build-v8: archive has no simdutf__ symbols — built without --features simdutf?" >&2
+  exit 1
+}
+echo "build-v8: simdutf symbols present (deno_core link requirement satisfied)"
 
 # ── binding: ship DENOLAND'S, not our clang22-generated one ──
 # libclang 22 mangles nested enums differently (WriteFlags_* vs the
@@ -104,15 +128,22 @@ echo "build-v8: fetching denoland binding from crates.io v8=$RUSTY_V8_VER"
 BF="$(mktemp -d)"; ( cd "$BF" && cargo init --quiet --name bfetch \
   && printf 'v8 = "=%s"\n' "$RUSTY_V8_VER" >> Cargo.toml && cargo fetch --quiet )
 CRATE=$(find "${CARGO_HOME:-$HOME/.cargo}/registry/src" -maxdepth 2 -type d -name "v8-$RUSTY_V8_VER" | head -1)
-BIND="$CRATE/gen/src_binding_release_$GNU.rs"
+# The binding variant MUST match the feature set the archive was built with —
+# denoland publishes a separate src_binding_simdutf_* because the feature changes
+# the generated surface. Mixing a plain binding with a simdutf archive is silent
+# ABI skew (R546-T4).
+BIND="$CRATE/gen/src_binding_simdutf_release_$GNU.rs"
 [ -f "$BIND" ] || { echo "build-v8: denoland binding $BIND not found" >&2; exit 1; }
 grep -q v8_String_WriteFlags_kNullTerminate "$BIND" || { echo "build-v8: binding sanity check failed" >&2; exit 1; }
 
 # ── deterministic tar -> OUT (consumer sets RUSTY_V8_ARCHIVE + _SRC_BINDING_PATH) ──
-# release / no-simdutf / no-ptrcomp config => plain `*_release_*` names.
+# release / simdutf / no-ptrcomp config => `*_simdutf_release_*` names, matching
+# the names v8's build.rs would construct for this feature set (prebuilt_features_
+# suffix(), build.rs L555-567). The env-var consumer path ignores these names, but
+# keeping them honest is what lets a RUSTY_V8_MIRROR-style consumer work at all.
 STAGE="$(mktemp -d)"
-cp "$LIB"  "$STAGE/librusty_v8_release_$TARGET.a"
-cp "$BIND" "$STAGE/src_binding_release_$TARGET.rs"
+cp "$LIB"  "$STAGE/librusty_v8_simdutf_release_$TARGET.a"
+cp "$BIND" "$STAGE/src_binding_simdutf_release_$TARGET.rs"
 # OUT may name a not-yet-existing dir (e.g. the recipe's /tmp/rusty-v8-musl/…);
 # the redirect below can't create it, so materialize the parent first.
 mkdir -p "$(dirname "$OUT")"

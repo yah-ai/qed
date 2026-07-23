@@ -5,7 +5,7 @@
 //! `/services` but is **not** in the data path; consumers connect here.
 //!
 //! Routes:
-//!   - `POST /federate/events`    `{filter, scopes?}` → `{events}`
+//!   - `POST /federate/events`    `{filter, scopes?}` → `{events: [{scope, event}]}`
 //!   - `POST /federate/aggregate` `{filter, group_by, since_ms, scopes?}` → `{buckets}`
 //!   - `GET  /scopes?limit=N`     → `{scopes}`
 //!   - `GET  /health`             → `{status:"ok"}`
@@ -29,19 +29,30 @@
 //! `reqwest`-based client whose `name()` is the node tailnet hostname.
 //!
 //! @yah:ticket(R585-F2, "scope envelope on the federation wire: populate AnalyticsEvent.scope_kind / scope_id end-to-end")
-//! @yah:at(2026-06-30T06:57:44Z)
-//! @yah:status(open)
+//! @yah:status(review)
+//! @yah:at(2026-07-23T04:09:01Z)
 //! @yah:assignee(agent:bundle-anthropic-ashguard)
 //! @yah:parent(R585)
-//! @yah:next("Federated events lose their scope envelope on the wire: yah_scryer::federation::FederationPeer::events returns Vec<Event>, and POST /federate/events maps to {events: Vec<Event>} — no (scope_kind, scope_id) attached. As a result AnalyticsEvent.scope_kind / scope_id are empty strings under Mode-1 (see in_process.rs analytics_events: 'Scope kind/id are tracked on the wire row but not yet surfaced').")
-//! @yah:next("Pick a wire shape: either (a) widen FederateEventsResp to {events: Vec<(EventScope, Event)>} (clean, breaking change — trait extension), or (b) add a parallel envelope route POST /federate/events_envelope returning {rows: [{scope, event}]} and keep events unchanged (additive). Recommend (a) given the pre-release cut-and-bleed posture; it's one trait fn signature plus the JSON tuple.")
-//! @yah:next("Mirror through HttpFederationPeer (or a new trait method like events_with_scope) and through hub::in_process::federated_events_for_analytics + the AnalyticsEvent projection so scope_kind/scope_id are no longer hardcoded empty.")
-//! @yah:next("scryer-local: Scryer::events already returns Vec<Event> without scope; the cross-scope rollup helpers (events_all) iterate per-scope but throw the scope away when merging. Preserve it through the rollup so the federation path can hand it back.")
-//! @yah:next("Tests: extend tests/federation_http_integration.rs with an assertion that an event pushed under Service(MeshIdent(\"svc.test\")) comes back over /federate/events carrying scope_kind=service / scope_id=svc.test; extend hub analytics_tests to prove AnalyticsEvent fields populate.")
-//! @yah:next("Tier: Cleric — wire-shape change + plumbing through 3 layers; spec is clear, mechanical edits in 4 files + tests.")
 //! @arch:see(.yah/docs/working/W264-kamaji-managed-scryer.md)
+//! @yah:handoff("DONE — the scope envelope now rides the federation wire end-to-end and AnalyticsEvent.scope_kind / scope_id are populated from it instead of being hardcoded empty strings. Took wire shape (a) as the ticket recommended, with a named struct rather than a tuple so the JSON stays self-describing: ScopedEvent { scope: EventScope, event: Event } in scryer::federation, serialized as {\"scope\": …, \"event\": {…}}.")
+//! @yah:handoff("scryer/src/federation.rs: new ScopedEvent (+ tag_all / into_events helpers); FederationPeer::events now returns Vec<ScopedEvent>; federated_events takes and returns Vec<ScopedEvent>. merge_events was generalized rather than duplicated — new TimeOrdered trait (order_key -> (offset_ms, seq)) impl'd for both Event and ScopedEvent, new generic merge_ordered<T>, and merge_events kept as the bare-Event alias so the scope-keyed local call sites still read well.")
+//! @yah:handoff("scryer/src/service.rs: new events_all_scoped preserves the scope through the cross-scope rollup (this is the ticket's 'events_all iterates per-scope but throws the scope away' bullet); events_all is now a thin wrapper that drops the envelope. Scryer::federated_events tags its local rows with the queried scope via ScopedEvent::tag_all and returns Vec<ScopedEvent>.")
+//! @yah:handoff("scryer/src/federation_http.rs: FederateEventsResp.events is Vec<ScopedEvent>; handle_events uses events_all_scoped for the scopes:None rollup and tag_all + merge_ordered for the explicit-scopes branch; HttpFederationPeer::events returns the envelope. scryer/src/lib.rs re-exports ScopedEvent, TimeOrdered, merge_ordered.")
+//! @yah:handoff("hub/src/in_process.rs: federated_events_for_analytics returns Vec<ScopedEvent>; group_by_level and group_into_buckets read through row.event; the AnalyticsEvent projection was EXTRACTED into a free fn analytics_event_row (it was inline in analytics_events, which meant a test could only re-implement it rather than exercise it) and fills scope_kind = scope.kind_str(), scope_id = scope.id_str() — observation::EventScope already had both accessors, so no new mapping table.")
+//! @yah:handoff("SCOPE BEYOND THE TICKET (small, and the reason the envelope exists): group_into_buckets gained \"scope\" and \"scope_kind\" as group_by keys. Analytics timeseries could not previously slice a mesh-wide rollup by which task run / service produced the events, because the transport had discarded that before the hub saw it. Three lines, covered by tests. No frontend change — grep shows no TS/TSX consumer of scope_kind yet, so the FE is free to start asking for it.")
+//! @yah:handoff("DOC UPDATED: .yah/docs/working/W264 §Wire shape now records the {scope, event} row shape, why the bare-Event first cut was wrong, and that the break was taken deliberately because no scryer is deployed on the fleet to break (measured under R585-F1 the same day — all 8 nodes' /services return []).")
+//! @yah:verify("cargo test -p yah-scryer (89 passed: 76 unit + 6 federation_http_integration + 7 integration)")
+//! @yah:verify("cargo test -p yah-hub (56 passed)")
+//! @yah:verify("cargo check --workspace --all-targets in BOTH workspaces (yah root and oss/qed) — clean, no other consumer of the changed signatures")
+//! @yah:gotcha("BREAKING WIRE CHANGE, taken deliberately. POST /federate/events now returns {events: [{scope, event}]} where it returned {events: [Event]}. An old peer and a new hub cannot talk to each other — there is no version negotiation on this route. Safe today only because no scryer is deployed anywhere on the fleet (R585-F1 measured every node's /services returning [] on 2026-07-22). If a scryer ships before this does, they must ship together.")
+//! @yah:gotcha("FederationPeer::events changed signature, so any out-of-tree impl breaks. In-tree impls were all updated: HttpFederationPeer plus the MockPeer/FailingPeer fixtures in scryer tests/integration.rs, scryer tests/federation_http_integration.rs, and hub analytics_tests.")
+//! @yah:gotcha("merge_events is retained but is now an alias for merge_ordered at the Event type. New code merging federated rows must use merge_ordered (or it will not compile against Vec<ScopedEvent>) — merge_events is only for the scope-keyed local path where the caller already knows the scope.")
+//! @yah:gotcha("Scryer::events_all still exists and still returns Vec<Event>; it is now events_all_scoped with the envelope thrown away. If you find yourself calling events_all and then wishing you had the scope, call events_all_scoped instead rather than re-deriving it.")
+//! @yah:gotcha("The analytics EVENT surface is still empty in production for the reason R585-F1 recorded: no scryer is deployed, so there are no federation peers to query. scope_kind/scope_id are correct and tested but will not be observable in the running UI until W264's managed scryer is actually deployed.")
 
-use crate::federation::{FederationAcl, FederationError, FederationPeer, PeerIdentity};
+use crate::federation::{
+    FederationAcl, FederationError, FederationPeer, PeerIdentity, ScopedEvent,
+};
 use crate::service::{AggregateBucket, EventFilter, Scryer};
 use crate::store::ScopeInfo;
 use async_trait::async_trait;
@@ -51,7 +62,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     routing::{get, post},
 };
-use observation::{Event, EventScope};
+use observation::EventScope;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -65,9 +76,13 @@ pub struct FederateEventsReq {
     pub scopes: Option<Vec<EventScope>>,
 }
 
+/// `{events: [{scope, event}]}` — each row carries the scope it was stored
+/// under (R585-F2). The envelope is what lets a cross-scope rollup
+/// (`scopes: None`) say *which* task run or service each event came from;
+/// before it, every consumer downstream rendered the scope blank.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FederateEventsResp {
-    pub events: Vec<Event>,
+    pub events: Vec<ScopedEvent>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -212,16 +227,23 @@ async fn handle_events(
 ) -> Result<Json<FederateEventsResp>, (StatusCode, Json<ErrorBody>)> {
     ensure_authorized(&state, &headers)?;
     let events = match req.scopes {
-        None => state.scryer.events_all(&req.filter).await.map_err(scryer_err)?,
+        None => state
+            .scryer
+            .events_all_scoped(&req.filter)
+            .await
+            .map_err(scryer_err)?,
         Some(scopes) => {
-            let mut acc: Vec<Event> = Vec::new();
+            let mut acc: Vec<ScopedEvent> = Vec::new();
             for scope in &scopes {
-                let part = state
-                    .scryer
-                    .events(scope, &req.filter)
-                    .await
-                    .map_err(scryer_err)?;
-                acc = crate::federation::merge_events(acc, part);
+                let part = ScopedEvent::tag_all(
+                    scope,
+                    state
+                        .scryer
+                        .events(scope, &req.filter)
+                        .await
+                        .map_err(scryer_err)?,
+                );
+                acc = crate::federation::merge_ordered(acc, part);
             }
             acc
         }
@@ -358,7 +380,7 @@ impl FederationPeer for HttpFederationPeer {
         &self.name
     }
 
-    async fn events(&self, filter: &EventFilter) -> Result<Vec<Event>, FederationError> {
+    async fn events(&self, filter: &EventFilter) -> Result<Vec<ScopedEvent>, FederationError> {
         let req = FederateEventsReq { filter: filter.clone(), scopes: None };
         let url = format!("{}/federate/events", self.base_url.trim_end_matches('/'));
         let resp = self

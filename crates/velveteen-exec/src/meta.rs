@@ -18,7 +18,7 @@ use observation::ForgeId;
 use serde::{Deserialize, Serialize};
 use task_runs::{BeholderStatus, Initiator, TaskRunMeta};
 
-use crate::{ForgeSpecies, ForgeStatus, TaskLocation, TaskPlacement, TaskRuntime};
+use velveteen::{ForgeSpecies, ForgeStatus, TaskLocation, TaskPlacement, TaskRuntime};
 
 /// Metadata for a forge run, regardless of species.
 ///

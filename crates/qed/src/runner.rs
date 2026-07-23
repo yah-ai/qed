@@ -172,7 +172,7 @@
 //! @yah:depends_on(R590-B3)
 //! @yah:gotcha("yah-qed --lib has 5 PRE-EXISTING failures unrelated to F2, from the qed->yah-qed package rename: preflight tests do PackageNotFound{package:\"qed\"} (hardcode old crate name), plus config::parses_on_success_outcomes_from_toml, transform::release_yml_transforms_end_to_end, preflight::audit_workspace..., runner::musl_static_preflight.... F2's own paths (build_image*, remote_subprocess*, velveteen widening) are all green. Don't attribute these to F2.")
 //! @yah:gotcha("Shared working tree churns fast: execute_step_remote was edited concurrently by another session (image-override half) while I did the mesh_tags half -- both R590-F2 helpers now coexist. Expect transient broken builds mid-edit.")
-//! @yah:gotcha("Before rusty-v8-musl on-box green, two image-resolution details need reconciling (in the image-on-box slice, not the wiring): (1) NAMING: step.image='rusty-v8-musl-builder' resolves via catalog_image to ghcr.io/yah-ai/rusty-v8-musl-builder:latest, but the gha builds it locally as 'rusty-v8-musl-builder:ci' -- the box's containerd must hold it under the ghcr.io/yah-ai ref, OR extend step.image to accept a full registry/repo:tag ref. (2) DIGEST: catalog_image fills the all-zeros test-sentinel digest for unpinned names (no YAH_RUSTY_V8_MUSL_BUILDER_DIGEST), and B3 made kamaji resolve tag@digest -- an unpinned builder image won't match by digest unless kamaji falls back to tag.")
+//! @yah:gotcha("RESOLVED 2026-07-22 (see R590-B5 on .yah/qed/P018-rusty-v8-musl.toml) -- kept for the shape of the trap. NAMING+DIGEST were both symptoms of step.image only accepting a bare CATALOG NAME, which velveteen_exec::default_image::catalog_image hard-codes to ghcr.io/yah-ai/<name>:latest + a compile-time-or-sentinel digest. step_image_override now ALSO accepts a full registry/repo:tag@sha256 ref (any string containing / or @), parsed via ImageRef::parse_pinned, and P018 pins cr.yah.dev/rusty-v8-musl-builder:v149.4.0-amd64@sha256:a1fb9d9c... -- same bytes the transform recipe names. Bare names still route through catalog_image unchanged.")
 //! @yah:next("FIRST: examine the rusty-v8 build result on us-west-002. `ssh -i ~/.ssh/yah struc@100.64.0.4`. Was launched ~2026-07-11 17:12 local (UTC-7), ETA ~1h49m so it's long done by pickup. Check: `sudo ctr -n yah tasks ls` (STOPPED=done/died), `sudo ctr -n yah tasks delete forge-695667cc-213d-4a26-8f56-702fd373ed39` prints the exit code, `sudo journalctl -u kamaji --since '3 hours ago' | grep -iE 'build-v8|ninja|tar|librusty|error|signal'` for the tail. SUCCESS = build-v8.sh wrote /tmp/rusty-v8-musl/librusty_v8-x86_64-unknown-linux-musl.tar.gz INSIDE the (now-exited) container — note: /tmp is the container's tmpfs, gone once the task is deleted, so if it completed, the proof is the exit-0 + the 'wrote tar' log line, not a retrievable file (retrieval is the deferred ArtifactStore leg). If it FAILED, diagnose from the kamaji journal (next likely walls: tmpfs /tmp 24G too small for a full V8 build → ENOSPC; or a gn/ninja/clang toolchain gap in the builder image).")
 //! @yah:next("THEN B9 (yubaba state-poll 404, in the open column): the clean fix is READ-PATH, not a name change (I tried dotting for_forge's name -> DNS-label validation rejected it, reverted). kamaji stamps a yah.ident label = mesh identity (forge.<uuid>) on each container; make kamaji-bin's list() return that label as WorkloadEntry.id (instead of container_id forge-<uuid>), OR make yubaba get_workload_state match against the yah.ident label. Needs a kamaji (or yubaba) cross-build + redeploy — recipe below. This makes `yah qed run rusty-v8-musl` REPORT green instead of 404-timeout-Failed.")
 //! @yah:next("THEN B8 (kamaji ignores image ENTRYPOINT/ENV, open): merge image OCI config into build_oci_spec (process.args = image.Entrypoint ++ argv; env = image.Env overlaid by spec env). Then delete the throwaway .yah/qed/P018-rusty-v8-musl-verify.toml and the real P018-rusty-v8-musl.toml runs as authored.")
@@ -241,6 +241,22 @@
 //! @yah:verify("End-to-end (needs a yah rebuild + daemon restart): `yah qed run rusty-v8-musl` should stream for ~58min and exit 0 with '==> pipeline passed', matching `yah qed status <run_id>` instead of dying with os error 35.")
 //! @yah:gotcha("COSMETIC ONLY — never harmed the run. Surfaced 2026-07-20 during the first green rusty-v8-musl build: the CLI died with `qed.tail failed: daemon I/O: Resource temporarily unavailable (os error 35)` at ~51min while the daemon carried the run to success at 58m21s.")
 //! @yah:gotcha("Takes effect only after a `yah` rebuild AND a camp-daemon restart — the fix spans the CLI binary (follow loop) and the shared daemon_client timeout table baked into both.")
+//!
+//! @yah:ticket(R636-B1, "Offloaded build-image bind-mounts the qed host's camp_root onto a different worker host (cross-host context gap)")
+//! @yah:at(2026-07-23T18:48:06Z)
+//! @yah:status(open)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R636)
+//! @yah:severity(high)
+//! @yah:verify("From an arm64 host, `yah qed images build <catalog-image> --platform linux/amd64` builds on us-west-002 and writes/publishes without a camp-root mount error")
+//! @yah:verify("The worker's runc task mounts a worker-local context dir, not the qed host's /Users/... path")
+//! @yah:gotcha("Two OTHER gaps sit in front of this one on the offload path and are already cleared, so don't re-chase them: (1) build-image remote routing used the runner's HOST arch not the step's TARGET arch — an amd64 build from an arm64 Mac went to a tier:arm RPi (us-west-011) that then failed on a loopback yubaba URL; FIXED in R636 via remote_build_image_arch. (2) us-west-002's containerd `yah` namespace lacked moby/buildkit:v0.12.5-rootless; pre-pulled 2026-07-23 (node bootstrap, same class as P018's deferred image pre-pull).")
+//! @yah:next("DEPLOYABLE FIX DESIGN (qed-side only, NO fleet redeploy needed — the workload spec's command+mounts are authored by the qed dispatcher and merely executed by the existing 0.8.20 yubaba/kamaji): in build_image_workload_spec (velveteen-exec/src/remote.rs), when the target worker != qed host, stop bind-mounting camp-host paths. Instead (a) tar the resolved context dir, (b) upload it to a worker-reachable URL (yah-cloud R2 → cdn.yah.dev/yah-cloud/qed-context/<forge_id>.tar.gz; unique key per forge_id sidesteps the CDN-stale gotcha), (c) change buildctl_argv from `--local context=... --local dockerfile=...` to buildkit's remote-context `--opt context=<url> --opt filename=<Dockerfile>`, and (d) drop the two camp-host VolumeMounts. The OCI-archive OUT mount (BUILDKIT_HOST_OUT_DIR, worker-local) stays. Validate live via `yah qed images build rusty-v8-musl-builder --platform linux/amd64` from the arm64 Mac.")
+//! @yah:next("ALTERNATIVE (higher-fidelity, needs redeploy): carry the context inline in WorkloadSpec (new VolumeSource::Inline or a context payload) and have kamaji materialize it to a worker-local dir + bind-mount that. Cleaner model but touches workload-spec + kamaji and only takes effect after the fleet is redeployed off 0.8.20 — so it cannot deliver until a redeploy anyway. Prefer the deployable design above unless kamaji is being redeployed for other reasons.")
+//! @yah:next("AFTER the fix lands: re-run the amd64 build through the offload path to prove it end-to-end, then the workaround's native-on-box step is retired.")
+//! @yah:handoff("2026-07-23: the two upstream gaps on the offload path are CLEARED and the amd64 builder image was DELIVERED via the native-host workaround. (1) build-image remote routing now uses the step's TARGET arch (R636 remote_build_image_arch) — an amd64 build from the arm64 Mac now lands on us-west-002 (tier:x86, mesh 100.64.0.4), not the tier:arm RPi. (2) moby/buildkit:v0.12.5-rootless pre-pulled into us-west-002's `yah` containerd namespace (node bootstrap). With both cleared, the offload dispatch reaches BuildKit and fails ONLY on this ticket's cross-host mount: runc `open /Users/leif/ss/yah: no such file or directory` — the camp Mac's camp_root bind-mounted onto the worker.")
+//! @yah:handoff("DELIVERED anyway (native path): built the amd64 builder image ON us-west-002 with `docker buildx --platform linux/amd64 -o type=oci` (byte-equivalent to what the verb shells, native arch, no emulation), pulled the OCI layout to camp, published via `yah cloud cr push`. LIVE + VERIFIED: cr.yah.dev/rusty-v8-musl-builder:v149.4.0-amd64-r636 @ sha256:7e9f0327255c8b96e65864c6324c9412b03558dd8fcdb50e1958734722171c9d — pulled back, arch=x86_64, baked /usr/local/bin/build-v8.sh has 4x `features simdutf` (the old v149.4.0-amd64 had ZERO). The stale-builder-image root cause of the broken published rusty_v8 artifact is fixed. NOT YET re-pinned into P018 / the transform recipe (busts derivation caches; sequence with the R546 owner) and the actual librusty_v8 artifact still needs a recipe run with this image.")
+//! @yah:handoff("DEFERRED (not blocked): the durable transport fix below was NOT implemented this session — velveteen-exec is a published OSS crate inside the active 0.8.21 release window and a peer was building the workspace (R629); churning it half-validated would be reckless. Sequence post-release.")
 
 use std::sync::Arc;
 
@@ -249,9 +265,11 @@ use chrono::Utc;
 use observation::ForgeId as ObsForgeId;
 use yah_scryer::service::Scryer;
 use velveteen::{
-    ExecContext, ExecEvent, ForgeCommand, ForgeExecutor, ForgeExecutorError, ForgeSpec,
-    ForgeStatus, LocalForgeDriver, MeshAccess, RemoteForgeDriver, TaskLocation, TaskPlacement,
-    TaskRuntime, WardenClient,
+    ForgeCommand, ForgeSpec, ForgeStatus, MeshAccess, TaskLocation, TaskPlacement, TaskRuntime,
+};
+use velveteen_exec::{
+    ExecContext, ExecEvent, ForgeExecutor, ForgeExecutorError, LocalForgeDriver, RemoteForgeDriver,
+    WardenClient,
 };
 use task_runs::Initiator;
 use thiserror::Error;
@@ -456,18 +474,51 @@ fn remote_subprocess_mesh_tags(step: &crate::types::QedStep) -> Vec<String> {
 }
 
 /// Per-step container image override (R590-F2, finishing the R381 `step.image`
-/// seam). When a step names a catalog image via `image = "<name>"`, resolve it
-/// to a pinned [`workload_spec::ImageRef`] (`ghcr.io/yah-ai/<name>` +
-/// compile-time digest, or the test-fixture sentinel on unpinned dev builds) so
-/// the argv runs *inside that image* — e.g. `rusty-v8-musl-builder` executing
-/// `build-v8.sh`. `None` ⇒ fall back to the default forge image
+/// seam) so the argv runs *inside that image* — e.g. `rusty-v8-musl-builder`
+/// executing `build-v8.sh`. `None` ⇒ fall back to the default forge image
 /// (`yah-rust-bun`), preserving the pre-seam behaviour for plain steps. Used by
 /// both the local-container and remote subprocess paths so `image` behaves the
 /// same regardless of `--where`.
-fn step_image_override(step: &crate::types::QedStep) -> Option<workload_spec::ImageRef> {
-    step.image
-        .as_deref()
-        .map(velveteen::default_image::catalog_image)
+///
+/// Two spellings, distinguished by shape (R590-B5):
+///
+/// - **Full ref** — anything containing `/` or `@`, e.g.
+///   `cr.yah.dev/rusty-v8-musl-builder:v149.4.0-amd64@sha256:…`. Parsed
+///   verbatim through [`workload_spec::ImageRef::parse_pinned`]. This is the
+///   spelling to reach for: it names the registry explicitly (so a pipeline is
+///   not welded to whatever host [`catalog_image`] happens to hard-code) and it
+///   carries a real digest, so the pull is content-addressed rather than
+///   chasing a floating tag.
+/// - **Bare catalog name** — e.g. `yah-rust-bun`. Resolved through
+///   [`velveteen_exec::default_image::catalog_image`] to
+///   `ghcr.io/yah-ai/<name>:latest` plus the compile-time digest, or the
+///   all-zeros [`workload_spec::ImageRef::UNPINNED_DIGEST`] sentinel on dev
+///   builds (which `pull_ref` then degrades to a tag-only pull).
+///
+/// A full ref without a digest is a hard config error, not a silent tag pull —
+/// if you went to the trouble of naming a registry, you get pinning with it.
+///
+/// [`catalog_image`]: velveteen_exec::default_image::catalog_image
+fn step_image_override(
+    step: &crate::types::QedStep,
+) -> Result<Option<workload_spec::ImageRef>, RunnerError> {
+    let Some(image) = step.image.as_deref() else {
+        return Ok(None);
+    };
+    if image.contains('/') || image.contains('@') {
+        return workload_spec::ImageRef::parse_pinned(image)
+            .map(Some)
+            .map_err(|reason| {
+                RunnerError::InvalidConfig(format!(
+                    "step `{}` sets image = {image:?}, which looks like a full registry \
+                     reference but does not parse: {reason}. Either spell it as a bare \
+                     catalog name (`rusty-v8-musl-builder`) or as a digest-pinned ref \
+                     (`cr.yah.dev/rusty-v8-musl-builder:<tag>@sha256:<hex>`).",
+                    step.name,
+                ))
+            });
+    }
+    Ok(Some(velveteen_exec::default_image::catalog_image(image)))
 }
 
 pub struct PipelineRunner {
@@ -3413,8 +3464,8 @@ impl PipelineRunner {
         };
         // R590-F2: honor a per-step `image = "<name>"` override (R381 seam);
         // fall back to the default forge image (`yah-rust-bun`) for plain steps.
-        let image = step_image_override(step)
-            .unwrap_or_else(velveteen::default_image::default_forge_image);
+        let image = step_image_override(step)?
+            .unwrap_or_else(velveteen_exec::default_image::default_forge_image);
         let spec = build_subprocess_spec(step, TaskRuntime::Container, Some(image));
         let ctx = ExecContext::default().with_cwd(mount_cwd).with_env(
             step.env
@@ -3448,8 +3499,8 @@ impl PipelineRunner {
                     let Some(events) = &events else { continue };
                     if let ExecEvent::Output { stream, line } = ev {
                         let qed_stream = match stream {
-                            velveteen::OutputStream::Stdout => OutputStream::Stdout,
-                            velveteen::OutputStream::Stderr => OutputStream::Stderr,
+                            velveteen_exec::OutputStream::Stdout => OutputStream::Stdout,
+                            velveteen_exec::OutputStream::Stderr => OutputStream::Stderr,
                         };
                         let _ = events.send(QedEvent::StepOutput {
                             index,
@@ -3516,8 +3567,8 @@ impl PipelineRunner {
                         let Some(events) = &events else { continue };
                         if let ExecEvent::Output { stream, line } = ev {
                             let qed_stream = match stream {
-                                velveteen::OutputStream::Stdout => OutputStream::Stdout,
-                                velveteen::OutputStream::Stderr => OutputStream::Stderr,
+                                velveteen_exec::OutputStream::Stdout => OutputStream::Stdout,
+                                velveteen_exec::OutputStream::Stderr => OutputStream::Stderr,
                             };
                             let _ = events.send(QedEvent::StepOutput {
                                 index: event_index,
@@ -3999,12 +4050,24 @@ impl PipelineRunner {
 
         let prepared = self.prepare_build_image(step)?;
 
-        if matches!(self.run_where, RunWhere::Remote) {
+        // R633: route on the step's EFFECTIVE placement, not the runner's raw
+        // `--where`. Under the default `Auto` a `native = true` cross-arch
+        // build-image step resolves to Offload → Remote, exactly like a
+        // subprocess step; reading `self.run_where` here made every Auto run
+        // build on the qed host regardless, which is how a foreign-arch image
+        // silently came out host-arch (or emulated).
+        if matches!(self.effective_placement(step), RunWhere::Remote) {
             let forge_id = self
                 .execute_step_build_image_remote(step, &prepared)
                 .await?;
             return Ok(Some(forge_id));
         }
+
+        // Local docker daemon: refuse to build a foreign platform here. buildx
+        // would happily do it under QEMU, which for a from-source toolchain
+        // image is either wrong-by-construction or an OOM — the same refusal
+        // `execute_step_local_container` makes for foreign-arch container steps.
+        self.refuse_foreign_platform_locally(step)?;
 
         let context_buf = step
             .context
@@ -4015,7 +4078,7 @@ impl PipelineRunner {
             .unwrap_or_else(|| std::path::Path::new("."));
 
         let cmd = {
-            let opts = velveteen::local::BuildImageOptions {
+            let opts = velveteen_exec::local::BuildImageOptions {
                 dockerfile: &prepared.dockerfile_path,
                 context,
                 tag: &prepared.tag,
@@ -4027,13 +4090,14 @@ impl PipelineRunner {
                 } else {
                     Some(&prepared.archive_path)
                 },
-                // The local catalog build-image path is host-native + no
-                // build-args (R590-F2 widened the option surface; the step model
-                // doesn't yet expose these knobs — a follow-up wires TOML→here).
-                platforms: &[],
+                // R633: `platforms` now comes from the step (`platforms = [...]`
+                // in TOML, `--platform` on `yah qed images build`). Empty keeps
+                // the pre-R633 behaviour: buildx builds the daemon's own
+                // platform. Foreign entries were rejected above.
+                platforms: &step.platforms,
                 build_args: &[],
             };
-            velveteen::local::build_image_command(&opts)
+            velveteen_exec::local::build_image_command(&opts)
         };
 
         let mut cmd = cmd;
@@ -4137,7 +4201,7 @@ impl PipelineRunner {
             ),
         });
 
-        let mut cmd = velveteen::local::imagetools_create_command(&cfg.target, &cfg.sources);
+        let mut cmd = velveteen_exec::local::imagetools_create_command(&cfg.target, &cfg.sources);
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
 
@@ -4203,6 +4267,48 @@ impl PipelineRunner {
         Ok(())
     }
 
+    /// R633: reject a local build-image step whose declared `platforms` include
+    /// an arch this host cannot build natively.
+    ///
+    /// `docker buildx --platform linux/amd64` on an arm64 daemon does not fail —
+    /// it emulates through QEMU, silently and slowly, and for a from-source
+    /// toolchain image (rusty-v8-musl-builder) that is either an OOM or a
+    /// wrong-by-construction artifact. The honest answer is a hard error naming
+    /// the mesh tier that *can* build it, so the operator's next move is
+    /// `--where auto` (offload) rather than a six-hour emulated build.
+    ///
+    /// An unrecognized platform string is let through: buildx owns that
+    /// vocabulary and will produce a better message than a guess would.
+    fn refuse_foreign_platform_locally(
+        &self,
+        step: &crate::types::QedStep,
+    ) -> Result<(), RunnerError> {
+        let host_arch = crate::platform::arch_of(&self.host_triple);
+        for platform in &step.platforms {
+            let Some(want) = crate::platform::docker_platform_arch(platform) else {
+                continue;
+            };
+            if want == host_arch {
+                continue;
+            }
+            let tier = crate::platform::build_worker_mesh_tags(want)
+                .into_iter()
+                .find(|t| t.starts_with("tier:"))
+                .unwrap_or_else(|| "tier:?".to_string());
+            return Err(RunnerError::StepFailed {
+                step: step.name.clone(),
+                msg: format!(
+                    "build-image step '{}' targets platform `{platform}` ({want}) but this host \
+                     is `{}`: building it here means QEMU emulation, not a native image. Declare \
+                     `platform = {{ native = true, target = \"...\" }}` on the step and run with \
+                     `--where auto` so it routes to a `{tier}` build-worker, or run on a {want} host.",
+                    step.name, self.host_triple,
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// Shared catalog-lookup + Dockerfile-staging path used by both local and
     /// remote build-image dispatch.
     fn prepare_build_image(
@@ -4232,14 +4338,21 @@ impl PipelineRunner {
             }
         })?;
 
-        let per_camp_dir = camp_images_dir.join(image_name);
-        let dockerfile_text =
-            crate::images::compile_with_dockerfile_dir(&entry, &catalog, &per_camp_dir).map_err(
-                |e| RunnerError::StepFailed {
-                    step: step.name.clone(),
-                    msg: format!("Dockerfile compile failed for `{image_name}`: {e}"),
-                },
-            )?;
+        // R633: resolve the entry's context directory across the whole search
+        // path, not just the per-camp slot. A bundled entry's Dockerfile lives
+        // in the qed crate's own `images/<name>/`; looking only under
+        // `.yah/qed/images/` meant every bundled entry with a real Dockerfile
+        // silently fell back to its (near-empty) TOML layering.
+        let image_dir = crate::images::resolve_image_dir(&camp_root, image_name)
+            .map(|rel| camp_root.join(rel))
+            .unwrap_or_else(|| camp_images_dir.join(image_name));
+        let dockerfile_text = crate::images::compile_with_dockerfile_dir(
+            &entry, &catalog, &image_dir,
+        )
+        .map_err(|e| RunnerError::StepFailed {
+            step: step.name.clone(),
+            msg: format!("Dockerfile compile failed for `{image_name}`: {e}"),
+        })?;
 
         let cache_root = camp_root.join(".yah/cache");
         let buildkit_dir = cache_root.join("buildkit");
@@ -4285,6 +4398,24 @@ impl PipelineRunner {
     /// as bind-mount targets; this assumes the yubaba node has access to those
     /// paths (single-machine sim/dogfood case). Cross-host context shipping
     /// (R091 artifact transport) is its own follow-up.
+    /// The arch a remote build-image step should be routed to (R636).
+    ///
+    /// A build-image step that resolves to [`Offload`](crate::platform::Resolution::Offload)
+    /// — i.e. it declares a foreign-arch target via `platform.native = true` —
+    /// must build on a worker of that *target* arch, so the tier is derived from
+    /// the Offload target. Any other resolution means the step has no cross-arch
+    /// target (a plain host-native build-image forced remote with `--where
+    /// remote`), so it builds for the runner's own arch. Returns an owned
+    /// `String` because the Offload target is owned.
+    fn remote_build_image_arch(&self, step: &crate::types::QedStep) -> String {
+        match self.resolve_step(step) {
+            crate::platform::Resolution::Offload { target } => {
+                crate::platform::arch_of(&target).to_string()
+            }
+            _ => crate::platform::arch_of(&self.host_triple).to_string(),
+        }
+    }
+
     async fn execute_step_build_image_remote(
         &self,
         step: &crate::types::QedStep,
@@ -4316,13 +4447,18 @@ impl PipelineRunner {
             where_: TaskPlacement::new(
                 TaskLocation::RemoteAny {
                     tier: TierTag("infra".into()),
-                    // R594: route to an arch-matched build-worker. The catalog
-                    // build-image path has no explicit target platform, so it
-                    // builds for the runner's host arch on a matching worker.
-                    // (The gha build-push path threads `with.platforms` through
-                    // QedImageBuilder instead.)
+                    // R594/R636: route to a build-worker matching the step's
+                    // TARGET arch, not the runner's host arch. A `yah qed images
+                    // build --platform linux/amd64` from an arm64 Mac declares a
+                    // `native = true` x86 target and must land on a `tier:x86`
+                    // worker — deriving the tier from `self.host_triple` (arm64)
+                    // instead sent it to a `tier:arm` RPi that then failed on an
+                    // unreachable loopback URL. `remote_build_image_arch` reads
+                    // the step's Offload target and falls back to the host arch
+                    // only when the step declares no cross-arch target (a plain
+                    // host-native build-image under `--where remote`).
                     mesh_tags: crate::platform::build_worker_mesh_tags(
-                        crate::platform::arch_of(&self.host_triple),
+                        &self.remote_build_image_arch(step),
                     ),
                 },
                 TaskRuntime::Container,
@@ -4665,7 +4801,7 @@ impl PipelineRunner {
         // catalog image (e.g. `rusty-v8-musl-builder`) to run its argv inside,
         // instead of the default forge image (`yah-rust-bun`). `None` keeps the
         // default-image behaviour for plain steps.
-        let image = step_image_override(step);
+        let image = step_image_override(step)?;
 
         // R603-T5: a remote step's declared `produces` must be written under the
         // durable produced dir (`/yah/produced`), which build_workload_spec
@@ -4722,8 +4858,8 @@ impl PipelineRunner {
                     let Some(events) = &events else { continue };
                     if let ExecEvent::Output { stream, line } = ev {
                         let qed_stream = match stream {
-                            velveteen::OutputStream::Stdout => OutputStream::Stdout,
-                            velveteen::OutputStream::Stderr => OutputStream::Stderr,
+                            velveteen_exec::OutputStream::Stdout => OutputStream::Stdout,
+                            velveteen_exec::OutputStream::Stderr => OutputStream::Stderr,
                         };
                         let _ = events.send(QedEvent::StepOutput {
                             index,
@@ -4894,6 +5030,7 @@ mod tests {
                 image: None,
                 tag: None,
                 push: false,
+                platforms: Vec::new(),
                 binary_path: None,
                 triple: None,
                 package: None,
@@ -5070,14 +5207,14 @@ mod tests {
         async fn deploy(
             &self,
             _spec: &workload_spec::WorkloadSpec,
-        ) -> Result<(), velveteen::RemoteForgeError> {
+        ) -> Result<(), velveteen_exec::RemoteForgeError> {
             Ok(())
         }
 
         async fn connect_logs(
             &self,
             _ident: &MeshIdent,
-        ) -> Result<mpsc::Receiver<String>, velveteen::RemoteForgeError> {
+        ) -> Result<mpsc::Receiver<String>, velveteen_exec::RemoteForgeError> {
             let (tx, rx) = mpsc::channel(64);
             let lines = self.lines.clone();
             tokio::spawn(async move {
@@ -5088,14 +5225,14 @@ mod tests {
             Ok(rx)
         }
 
-        async fn teardown(&self, _ident: &MeshIdent) -> Result<(), velveteen::RemoteForgeError> {
+        async fn teardown(&self, _ident: &MeshIdent) -> Result<(), velveteen_exec::RemoteForgeError> {
             Ok(())
         }
 
         async fn exit_code(
             &self,
             _ident: &MeshIdent,
-        ) -> Result<Option<i32>, velveteen::RemoteForgeError> {
+        ) -> Result<Option<i32>, velveteen_exec::RemoteForgeError> {
             Ok(Some(self.exit_code))
         }
 
@@ -5103,9 +5240,9 @@ mod tests {
             &self,
             _ident: &MeshIdent,
             remote_path: &std::path::Path,
-        ) -> Result<Vec<u8>, velveteen::RemoteForgeError> {
+        ) -> Result<Vec<u8>, velveteen_exec::RemoteForgeError> {
             self.produced_files.get(remote_path).cloned().ok_or_else(|| {
-                velveteen::RemoteForgeError::Fetch(format!(
+                velveteen_exec::RemoteForgeError::Fetch(format!(
                     "no produced file scripted at {}",
                     remote_path.display()
                 ))
@@ -5347,6 +5484,7 @@ mod tests {
             image: None,
             tag: None,
             push: false,
+            platforms: Vec::new(),
             binary_path: None,
             triple: None,
             package: None,
@@ -5451,6 +5589,7 @@ mod tests {
                 image: None,
                 tag: None,
                 push: false,
+                platforms: Vec::new(),
                 binary_path: None,
                 triple: None,
                 package: None,
@@ -6130,6 +6269,177 @@ mod tests {
         }
     }
 
+    // ── R633: build-image placement + platforms ──────────────────────────────
+
+    /// `QedStep::default()` must agree with what serde produces for a step that
+    /// declares nothing. The field that bites is `enabled`: a *derived* Default
+    /// makes it `false`, so every `..Default::default()` call site would build a
+    /// step the runner skips — and a pipeline of skipped steps reports Success,
+    /// which is a green light over work that never ran.
+    #[test]
+    fn qed_step_default_matches_serde_defaults() {
+        let d = QedStep::default();
+        assert!(
+            d.enabled,
+            "a default step must be enabled, or `..Default::default()` silently builds a no-op"
+        );
+        assert_eq!(d.activation, crate::types::StepActivation::Active);
+        assert_eq!(d.kind, crate::types::StepKind::Subprocess);
+        assert!(d.platforms.is_empty());
+
+        let from_toml: QedStep =
+            toml::from_str(r#"name = "x""#).expect("a bare step parses on serde defaults");
+        assert_eq!(from_toml.enabled, d.enabled);
+        assert_eq!(from_toml.activation, d.activation);
+        assert_eq!(from_toml.kind, d.kind);
+    }
+
+    /// A `build-image` step for `img`, targeting one docker platform. `native`
+    /// mirrors what `yah qed images build` synthesizes for a foreign-arch
+    /// platform.
+    fn build_image_step(img: &str, platform: &str, target: &str, native: bool) -> QedStep {
+        use crate::platform::PlatformSpec;
+        QedStep {
+            name: format!("build-{img}"),
+            kind: crate::types::StepKind::BuildImage,
+            image: Some(img.to_string()),
+            tag: Some(format!("cr.yah.dev/{img}:dev")),
+            platforms: vec![platform.to_string()],
+            platform: Some(PlatformSpec {
+                target: Some(target.to_string()),
+                container_platform: Some(platform.to_string()),
+                native,
+            }),
+            ..Default::default()
+        }
+    }
+
+    /// The R633 routing fix: under the default `Auto`, a `native = true`
+    /// cross-arch build-image step must resolve to Remote (offload to an
+    /// arch-matched build-worker) exactly like a subprocess step does.
+    ///
+    /// Before the fix `execute_step_build_image` read `self.run_where`, which is
+    /// `Auto` here and so fell through to the LOCAL docker path — building the
+    /// foreign image on the qed host, or emulating it.
+    #[test]
+    fn build_image_step_offloads_under_auto() {
+        let step = build_image_step(
+            "rusty-v8-musl-builder",
+            "linux/amd64",
+            "x86_64-unknown-linux-musl",
+            true,
+        );
+        let pipeline = bg_pipeline("images", vec![step.clone()]);
+        let auto = PipelineRunner::new(pipeline).with_host_triple("aarch64-apple-darwin");
+        let auto = PipelineRunner {
+            run_where: RunWhere::Auto,
+            ..auto
+        };
+        assert_eq!(auto.effective_placement(&step), RunWhere::Remote);
+
+        // The same step on a matching host is a plain local build — no fleet.
+        let native_host = PipelineRunner {
+            run_where: RunWhere::Auto,
+            ..PipelineRunner::new(bg_pipeline("images", vec![step.clone()]))
+                .with_host_triple("x86_64-unknown-linux-gnu")
+        };
+        assert_eq!(native_host.effective_placement(&step), RunWhere::Local);
+    }
+
+    /// R636: a remote build-image step must route to a worker of the step's
+    /// TARGET arch, not the runner's host arch. An amd64 image build offloaded
+    /// from an arm64 Mac has to land on `tier:x86`; deriving the tier from the
+    /// host sent it to a `tier:arm` node that failed on an unreachable URL.
+    #[test]
+    fn remote_build_image_routes_by_target_arch_not_host() {
+        let amd64 = build_image_step(
+            "rusty-v8-musl-builder",
+            "linux/amd64",
+            "x86_64-unknown-linux-musl",
+            true,
+        );
+        let runner = PipelineRunner {
+            run_where: RunWhere::Auto,
+            ..PipelineRunner::new(bg_pipeline("images", vec![amd64.clone()]))
+                .with_host_triple("aarch64-apple-darwin")
+        };
+        // The forcing case: host is arm64, target is x86 → must pick x86.
+        assert_eq!(runner.remote_build_image_arch(&amd64), "x86_64");
+        assert_eq!(
+            crate::platform::build_worker_mesh_tags(&runner.remote_build_image_arch(&amd64)),
+            vec!["tag:build-worker".to_string(), "tier:x86".to_string()]
+        );
+
+        // A host-native build-image forced remote has no cross target → host arch.
+        let host_native = build_image_step(
+            "yah-rust",
+            "linux/arm64",
+            "aarch64-unknown-linux-musl",
+            false,
+        );
+        let remote = PipelineRunner {
+            run_where: RunWhere::Remote,
+            ..PipelineRunner::new(bg_pipeline("images", vec![host_native.clone()]))
+                .with_host_triple("aarch64-apple-darwin")
+        };
+        assert_eq!(remote.remote_build_image_arch(&host_native), "aarch64");
+    }
+
+    /// A foreign `platforms` entry reaching the LOCAL docker path is a hard
+    /// error, not a QEMU build. This is the case `--where local` produces:
+    /// `effective_placement` returns Local without inspecting the step, so the
+    /// refusal has to live at the build-image seam itself.
+    #[test]
+    fn build_image_refuses_foreign_platform_on_local_daemon() {
+        let step = build_image_step(
+            "rusty-v8-musl-builder",
+            "linux/amd64",
+            "x86_64-unknown-linux-musl",
+            false,
+        );
+        let forced = PipelineRunner::new(bg_pipeline("images", vec![step.clone()]))
+            .with_host_triple("aarch64-apple-darwin");
+        assert_eq!(forced.effective_placement(&step), RunWhere::Local);
+
+        let err = forced
+            .refuse_foreign_platform_locally(&step)
+            .expect_err("a foreign-platform image build must not emulate locally");
+        match err {
+            RunnerError::StepFailed { step: s, msg } => {
+                assert_eq!(s, "build-rusty-v8-musl-builder");
+                assert!(msg.contains("linux/amd64"), "message: {msg}");
+                assert!(msg.contains("tier:x86"), "message: {msg}");
+                assert!(msg.contains("aarch64-apple-darwin"), "message: {msg}");
+            }
+            other => panic!("expected StepFailed, got {other:?}"),
+        }
+    }
+
+    /// The host's own platform is always fine, and an empty `platforms` (every
+    /// pre-R633 build-image step) must stay a plain host-native build.
+    #[test]
+    fn build_image_allows_host_platform_and_empty_platforms() {
+        let host_step = build_image_step(
+            "yah-rust",
+            "linux/arm64",
+            "aarch64-unknown-linux-musl",
+            false,
+        );
+        let runner = PipelineRunner::new(bg_pipeline("images", vec![host_step.clone()]))
+            .with_host_triple("aarch64-apple-darwin");
+        assert!(runner.refuse_foreign_platform_locally(&host_step).is_ok());
+
+        let mut legacy = host_step.clone();
+        legacy.platforms.clear();
+        assert!(runner.refuse_foreign_platform_locally(&legacy).is_ok());
+
+        // An arch buildx knows but we don't is buildx's to reject, not ours —
+        // guessing here would turn a working build into a false blocker.
+        let mut exotic = host_step;
+        exotic.platforms = vec!["linux/riscv64".to_string()];
+        assert!(runner.refuse_foreign_platform_locally(&exotic).is_ok());
+    }
+
     /// A multi-step local pipeline (Live workspace, no outcomes) from the
     /// given steps.
     fn bg_pipeline(name: &str, steps: Vec<crate::types::QedStep>) -> Pipeline {
@@ -6747,13 +7057,13 @@ mod tests {
             spec: ForgeSpec,
             ctx: ExecContext,
             _sink: Option<tokio::sync::mpsc::UnboundedSender<ExecEvent>>,
-        ) -> Result<velveteen::ExecOutcome, ForgeExecutorError> {
+        ) -> Result<velveteen_exec::ExecOutcome, ForgeExecutorError> {
             let argv = match spec.command {
                 ForgeCommand::Subprocess { argv, .. } => argv,
                 _ => Vec::new(),
             };
             *self.seen.lock().unwrap() = Some((argv, ctx.env));
-            Ok(velveteen::ExecOutcome {
+            Ok(velveteen_exec::ExecOutcome {
                 status: ForgeStatus::Done {
                     exit_code: 0,
                     ended_at: 0,
@@ -6906,12 +7216,56 @@ mod tests {
     #[test]
     fn step_image_override_resolves_catalog_image() {
         let mut step = mk_step("v8", &["build-v8.sh"]);
-        assert!(step_image_override(&step).is_none(), "no image ⇒ None");
+        assert!(
+            step_image_override(&step).expect("no image is not an error").is_none(),
+            "no image ⇒ None",
+        );
 
         step.image = Some("rusty-v8-musl-builder".into());
-        let img = step_image_override(&step).expect("image override resolves");
+        let img = step_image_override(&step)
+            .expect("bare catalog name resolves")
+            .expect("image override resolves");
         assert_eq!(img.registry, "ghcr.io");
         assert_eq!(img.repository, "yah-ai/rusty-v8-musl-builder");
+    }
+
+    /// R590-B5: a full `registry/repo:tag@sha256:…` ref bypasses the catalog's
+    /// hard-coded `ghcr.io/yah-ai` prefix entirely and pulls from the named
+    /// registry — the cr.yah.dev path for rusty-v8-musl.
+    #[test]
+    fn step_image_override_accepts_full_pinned_ref() {
+        let mut step = mk_step("v8", &["build-v8.sh"]);
+        let digest = "sha256:a1fb9d9cc631dcb844fbbb949dc65a80be1d532fa80868c4df5ed4b21939f9a4";
+        step.image = Some(format!(
+            "cr.yah.dev/rusty-v8-musl-builder:v149.4.0-amd64@{digest}"
+        ));
+
+        let img = step_image_override(&step)
+            .expect("full ref parses")
+            .expect("image override resolves");
+        assert_eq!(img.registry, "cr.yah.dev");
+        assert_eq!(img.repository, "rusty-v8-musl-builder");
+        assert_eq!(img.tag, "v149.4.0-amd64");
+        assert_eq!(img.digest, digest);
+        assert!(img.is_pinned(), "a full ref carries a real digest");
+        assert_eq!(
+            img.pull_ref(),
+            format!("cr.yah.dev/rusty-v8-musl-builder:v149.4.0-amd64@{digest}"),
+            "the runtime pulls the exact published ref, not a floating :latest",
+        );
+    }
+
+    /// A full ref without a digest is a config error, not a silent tag pull.
+    #[test]
+    fn step_image_override_rejects_unpinned_full_ref() {
+        let mut step = mk_step("v8", &["build-v8.sh"]);
+        step.image = Some("cr.yah.dev/rusty-v8-musl-builder:v149.4.0-amd64".into());
+
+        let err = step_image_override(&step).expect_err("bare-tag full ref rejects");
+        assert!(
+            matches!(err, RunnerError::InvalidConfig(ref m) if m.contains("digest-pinned")),
+            "error must name the missing pin, got {err:?}",
+        );
     }
 
     /// Local + container routes through `task::local::local_container_command`
@@ -6960,6 +7314,7 @@ mod tests {
                 image: Some(image.to_string()),
                 tag: None,
                 push: false,
+                platforms: Vec::new(),
                 binary_path: None,
                 triple: None,
                 package: None,
@@ -7173,6 +7528,7 @@ description = "smoke test image"
                 image: Some(image.to_string()),
                 tag: None,
                 push: false,
+                platforms: Vec::new(),
                 binary_path: Some(binary_rel.to_string()),
                 triple: Some(triple.to_string()),
                 package: None,
@@ -7434,6 +7790,7 @@ produces    = ["native-tarball"]
                 image: None,
                 tag: None,
                 push: false,
+                platforms: Vec::new(),
                 binary_path: None,
                 triple: None,
                 package: Some(package.to_string()),
@@ -7559,6 +7916,7 @@ produces    = ["native-tarball"]
                     image: Some(image.to_string()),
                     tag: None,
                     push: false,
+                    platforms: Vec::new(),
                     binary_path: Some(binary_rel.to_string()),
                     triple: Some(triple.to_string()),
                     package: None,
@@ -7592,6 +7950,7 @@ produces    = ["native-tarball"]
                     image: Some(image.to_string()),
                     tag: None,
                     push: false,
+                    platforms: Vec::new(),
                     binary_path: None,
                     triple: Some(triple.to_string()),
                     package: None,
@@ -7648,6 +8007,7 @@ produces    = ["native-tarball"]
                 image: Some(image.to_string()),
                 tag: None,
                 push: false,
+                platforms: Vec::new(),
                 binary_path: None,
                 triple: Some(triple.to_string()),
                 package: None,
@@ -7857,6 +8217,7 @@ produces    = ["native-tarball"]
             image: None,
             tag: None,
             push: false,
+            platforms: Vec::new(),
             binary_path: None,
             triple: None,
             package: None,
@@ -7931,6 +8292,7 @@ produces    = ["native-tarball"]
             image: None,
             tag: None,
             push: false,
+            platforms: Vec::new(),
             binary_path: None,
             triple: None,
             package: None,
@@ -8608,6 +8970,7 @@ jobs:
             image: None,
             tag: None,
             push: false,
+            platforms: Vec::new(),
             binary_path: None,
             triple: None,
             package: None,
@@ -8792,6 +9155,7 @@ jobs:
             image: None,
             tag: None,
             push: false,
+            platforms: Vec::new(),
             binary_path: None,
             triple: None,
             package: None,
@@ -9886,6 +10250,7 @@ jobs:
             image: None,
             tag: None,
             push: false,
+            platforms: Vec::new(),
             binary_path: None,
             triple: None,
             package: None,

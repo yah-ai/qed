@@ -34,7 +34,7 @@
 //! points the operator at `yah qed run <name>`).
 
 use crate::types::{
-    Outcome, OnFail, Pipeline, Placement, QedStep, RunStatus, StepKind, Trigger,
+    Outcome, OnFail, Pipeline, Placement, QedStep, StepKind, Trigger,
 };
 
 /// One feature that did not survive the QED → GHA export. The `feature` tag is
@@ -450,7 +450,7 @@ fn is_plain_safe(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::ProducedArtifact;
+    use crate::types::{ProducedArtifact, RunStatus};
     use std::collections::HashMap;
 
     fn step(name: &str, argv: &[&str]) -> QedStep {

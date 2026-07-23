@@ -77,7 +77,7 @@ pub use beholders::{
 };
 pub use federation::{
     DenyAllAcl, FederationAcl, FederationError, FederationPeer, FederationRule, OperatorTagAcl,
-    PeerIdentity, federated_events, merge_events,
+    PeerIdentity, ScopedEvent, TimeOrdered, federated_events, merge_events, merge_ordered,
 };
 pub use federation_http::{
     BucketDto, FederateAggregateReq, FederateAggregateResp, FederateEventsReq, FederateEventsResp,
