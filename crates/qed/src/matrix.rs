@@ -750,6 +750,8 @@ target = ["x86_64", "aarch64"]
 
     fn test_pipeline(matrix: Option<MatrixSpec>, steps: Vec<QedStep>) -> Pipeline {
         Pipeline {
+            description: None,
+            tags: Vec::new(),
             name: "test".into(),
             label: "Test".into(),
             steps,
@@ -771,9 +773,12 @@ target = ["x86_64", "aarch64"]
 
     fn test_step(name: &str, argv: &[&str], env_pairs: Option<&[(&str, &str)]>) -> QedStep {
         QedStep {
+            inputs: Vec::new(),
+            secret: false,
             background: false,
             background_until: None,
             wait_for: None,
+            manual: None,
             manifest_stitch: None,
             name: name.into(),
             argv: argv.iter().map(|s| (*s).into()).collect(),

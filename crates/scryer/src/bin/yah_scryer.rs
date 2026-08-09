@@ -36,6 +36,14 @@
 //!                                 (default 7). Events older are promoted.
 //!   --promote-interval-secs <n>   Promotion cadence (default 3600).
 //!
+//! Mode-2 analytics snapshots (R556-F6) — off unless `--snapshot-interval-secs`
+//! is given (and the long tier is enabled). When on, a background producer
+//! aggregates this node's Parquet corpus into an at-rest JSON snapshot published
+//! to R2 (`analytics/current.json` → content-addressed blob), which the managed
+//! mesofact analytics server renders behind cheers auth (W234 §Mode-2).
+//!
+//!   --snapshot-interval-secs <n>  Snapshot cadence. Enables the producer.
+//!
 //! Exit codes:
 //!   0  clean shutdown (SIGINT/SIGTERM)
 //!   1  unrecoverable startup error (bind failure, db open failure, bad
@@ -49,7 +57,8 @@ use std::sync::Arc;
 use yah_object_store::R2ObjectStore;
 use yah_scryer::{
     FederationState, LongTierConfig, LongTierStore, MS_PER_DAY, ObjectStore, OperatorTagAcl,
-    PromotionConfig, PromotionConsumer, Scryer, ScryerConfig, serve_federation,
+    PromotionConfig, PromotionConsumer, Scryer, ScryerConfig, SnapshotConfig, SnapshotProducer,
+    serve_federation,
 };
 
 fn main() -> ExitCode {
@@ -93,8 +102,15 @@ fn main() -> ExitCode {
             .and_then(|s| s.parse().ok())
             .unwrap_or(3600),
     );
+    // R556-F6: opt-in Mode-2 analytics snapshot producer. Presence of the flag
+    // (with the long tier enabled) spawns a loop that aggregates this node's
+    // Parquet corpus into an at-rest snapshot published to R2 for the managed
+    // mesofact analytics server to render (W234 §Mode-2).
+    let snapshot_interval: Option<std::time::Duration> = parse_arg(&args, "--snapshot-interval-secs")
+        .and_then(|s| s.parse::<u64>().ok())
+        .map(std::time::Duration::from_secs);
 
-    let long_tier: Option<Arc<LongTierStore>> = match (
+    let (long_tier, snapshot): (Option<Arc<LongTierStore>>, Option<SnapshotProducer>) = match (
         parse_arg(&args, "--long-tier-bucket"),
         parse_arg(&args, "--r2-account"),
     ) {
@@ -117,21 +133,30 @@ fn main() -> ExitCode {
                     return ExitCode::from(1);
                 }
             };
+            // The snapshot producer aggregates this node's own shards; a
+            // coordinator-side producer that spans the whole inventory is a
+            // follow-up (see snapshot.rs module doc).
+            let snapshot = snapshot_interval.map(|iv| {
+                SnapshotProducer::new(
+                    Arc::clone(&obj_store),
+                    SnapshotConfig::new(vec![machine_id.clone()], retention_ms).with_interval(iv),
+                )
+            });
             let lt = Arc::new(LongTierStore::new(
                 LongTierConfig { machine_id, retention_ms },
                 obj_store,
             ));
             scryer = scryer.with_long_tier(Arc::clone(&lt), retention_ms);
-            Some(lt)
+            (Some(lt), snapshot)
         }
         (Some(_), None) | (None, Some(_)) => {
             eprintln!(
                 "yah-scryer: long tier needs both --long-tier-bucket and --r2-account; \
                  ignoring partial config"
             );
-            None
+            (None, None)
         }
-        (None, None) => None,
+        (None, None) => (None, None),
     };
 
     let scryer = Arc::new(scryer);
@@ -163,6 +188,14 @@ fn main() -> ExitCode {
             );
             let cfg = PromotionConfig::new(retention_ms).with_interval(promote_interval);
             PromotionConsumer::new(promo_scryer, lt, cfg).spawn();
+        }
+
+        if let Some(producer) = snapshot {
+            eprintln!(
+                "yah-scryer: Mode-2 analytics snapshot producer enabled (interval {}s)",
+                snapshot_interval.map(|d| d.as_secs()).unwrap_or(0)
+            );
+            producer.spawn();
         }
 
         // Wait for either the server to exit on its own or a shutdown signal.

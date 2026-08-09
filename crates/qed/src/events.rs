@@ -197,6 +197,25 @@ pub enum QedEvent {
         forge_id: String,
         at: DateTime<Utc>,
     },
+    /// A `kind = "manual"` step parked on a human (R622, W282). Emitted every
+    /// time the step parks — including a re-park after a failed `advance` — so
+    /// the card always names the form currently awaiting an answer.
+    ///
+    /// `form_id` is the AnswerQueue form the human answers (`None` on the
+    /// headless path, where no [`crate::runner::ManualGate`] is installed and
+    /// `advance` is the only door). `advance` is echoed so a consumer can show
+    /// the condition the step is waiting to satisfy without re-reading the
+    /// pipeline TOML.
+    ///
+    /// The run's `concurrency_key` is **released** for the duration of the park
+    /// — see [`crate::types::StepKind::Manual`].
+    StepAwaitingHuman {
+        index: usize,
+        name: String,
+        form_id: Option<String>,
+        advance: Option<String>,
+        at: DateTime<Utc>,
+    },
     /// One line of stdout/stderr captured from the executing step (local runs).
     StepOutput {
         index: usize,

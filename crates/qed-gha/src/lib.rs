@@ -55,7 +55,7 @@ pub use image_builder::{is_image_push_action, ImageBuildCall, ImageBuilder};
 pub use graph::{
     build_context_for_instance, build_needs_value, eval_exprstring, evaluate_outputs,
     expand_matrix, plan, should_run_job, topo_sort, CompletedInstance, GraphError, JobInstance,
-    JobResult, Plan,
+    JobResult, Plan, PlanContext, RunnerInfo,
 };
 pub use parse::{parse_workflow, ParseError};
 pub use runtime::{execute_workflow, Executor, InstanceRun, RuntimeError, StepResult, WorkflowRun};
@@ -86,11 +86,21 @@ mod roundtrip_tests {
     /// this crate is consumed as the standalone github.com/yah-ai/qed export
     /// mirror there are no yah workflows, so the marker is absent and the
     /// fixture-dependent tests skip instead of failing.
+    ///
+    /// `oss/qed` (this crate's own exportable subtree) carries a decoy
+    /// `.github/workflows/release.yml` of its own — a crates.io-publish
+    /// workflow for the standalone mirror, single `publish` job — which sits
+    /// *closer* to `CARGO_MANIFEST_DIR` than the monorepo's real CI workflow.
+    /// Stopping at the first match silently parses the wrong file.
+    /// `.yah/camp.toml` only exists at the true monorepo root (oss/* subtrees
+    /// are deliberately un-anchored so they stay transparent to the camp's
+    /// ticket index) — require it alongside the workflow dir so the walk
+    /// skips the decoy and keeps ascending to the real root.
     fn workflows_dir() -> Option<PathBuf> {
         let mut dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         loop {
             let candidate = dir.join(".github").join("workflows");
-            if candidate.join("release.yml").is_file() {
+            if candidate.join("release.yml").is_file() && dir.join(".yah/camp.toml").is_file() {
                 return Some(candidate);
             }
             if !dir.pop() {
@@ -203,7 +213,7 @@ mod roundtrip_tests {
         // *relative* invariants that the topology guarantees rather than
         // absolute wave numbers, so adding an image job doesn't churn this test.
         let Some(wf) = parse_file("release.yml") else { eprintln!("skip: yah workflow fixtures not present"); return; };
-        let plan = crate::plan(&wf).expect("plan succeeds");
+        let plan = crate::plan(&wf, &crate::PlanContext::default()).expect("plan succeeds");
 
         let job_to_wave: std::collections::HashMap<String, usize> = plan
             .waves
@@ -235,7 +245,9 @@ mod roundtrip_tests {
             .iter_instances()
             .filter(|i| i.job_id == "cli-build")
             .collect();
-        assert_eq!(cli_instances.len(), 3, "cli-build has 3 matrix rows");
+        // R638-F1 added two macOS/darwin legs alongside the original three
+        // Linux rows (gnu + musl x86_64 + musl aarch64) — 5 total.
+        assert_eq!(cli_instances.len(), 5, "cli-build has 5 matrix rows");
         assert!(cli_instances.iter().all(|i| i.matrix.is_some()));
     }
 

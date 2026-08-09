@@ -7,12 +7,12 @@
 //!
 //! F2 will add Service scope via the containerd_logs and warden_rpc adapters.
 //!
-//! @yah:ticket(R556-F7-T2, "scryer: /federate/{events,aggregate} + /scopes HTTP listener + cross-scope rollup helper + HttpFederationPeer impl")
+//! @yah:ticket(R556-T9, "scryer: /federate/{events,aggregate} + /scopes HTTP listener + cross-scope rollup helper + HttpFederationPeer impl")
 //! @yah:status(review)
 //! @yah:at(2026-06-30T06:20:17Z)
 //! @yah:assignee(agent:bundle-anthropic-ashguard)
 //! @yah:phase(P1)
-//! @yah:parent(R556-F7)
+//! @yah:parent(R556)
 //! @yah:next("Add an HTTP listener with: POST /federate/events {filter, scopes?} -> {events}, POST /federate/aggregate {filter, group_by, scopes?} -> {buckets}, GET /scopes?limit=N -> {scopes}, GET /health -> {status:'ok'}. Scope-omitted = cross-scope rollup (the missing mesh-wide-by-level case at crates/yah/hub/src/in_process.rs:46).")
 //! @yah:next("Land the cross-scope rollup helper in scryer::service (cleanest spot per W264); HTTP layer just exposes it.")
 //! @yah:next("Gate the listener with OperatorTagAcl from scryer::federation (W264 §Trust boundary — gate sits at scryer's HTTP listener, not yubaba).")
@@ -560,6 +560,7 @@ mod tests {
             beholder_status: None,
             pinned: false,
             origin: None,
+            host_pid: None,
         };
         task_store.insert_run(&meta).await.unwrap();
         for i in 0u32..5 {

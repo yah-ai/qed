@@ -295,6 +295,7 @@ mod diagnostics {
                 beholder_status: None,
                 pinned: false,
                 origin: None,
+                host_pid: None,
             })
             .await
             .unwrap();
@@ -431,6 +432,7 @@ mod triage {
                 beholder_status: None,
                 pinned: false,
                 origin: None,
+                host_pid: None,
             })
             .await
             .unwrap();

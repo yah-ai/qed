@@ -27,14 +27,20 @@
 //! @arch:see(.yah/docs/working/W235-remote-qed.md)
 //!
 //! @yah:relay(R631, "Placement mesh-tags carry no OS dimension — a darwin target routes to Linux build-workers")
-//! @yah:at(2026-07-23T03:13:00Z)
-//! @yah:status(open)
-//! @yah:next("Surfaced 2026-07-22 by enrolling us-west-015, the fleet's first macOS node. Until then every build-worker was Linux, so arch alone was an adequate proxy for capability and the gap could not manifest.")
-//! @yah:next("Start at build_worker_mesh_tags (this file, ~line 464): it maps arch to a tier only — aarch64 yields [tag:build-worker, tier:arm] with no OS term. Extend it to emit os:<os> from the target triple's OS segment, then teach the machine inventory and any placement spec that consumes it.")
+//! @yah:status(review)
+//! @yah:assignee(agent:bundle-anthropic-miravel)
+//! @yah:at(2026-07-24T05:11:43Z)
 //! @yah:gotcha("The failure is silent and picks the WRONG node rather than none. An aarch64-apple-darwin offload requests exactly the tag set the Raspberry Pi 5s (us-west-011/013/014) already carry; candidates are filtered by tag superset and ties break on declaration order, so a Linux Pi wins and then cannot emit Mach-O.")
 //! @yah:gotcha("qed already knows darwin cannot be cross-built from Linux — platform.rs resolve() sends such a target to Offload (see resolve_darwin_target_from_linux_host_offloads). So the placement decision is correct in isolation; it is only the TAG DERIVATION that loses the OS, which is why this survived.")
 //! @yah:gotcha("us-west-015 already declares os:darwin and tag:mac-builder, but nothing selects on them — they are descriptive until this lands. Its inventory file says so explicitly; update that note when the gap closes.")
 //! @arch:see(.yah/infra/machines/us-west-015.toml)
+//! @yah:next("Verify on live infra once R626-F5 (kamaji deploy route) lands: a real rusty-v8-musl-shaped arm64/darwin offload should route to us-west-015 and no other node.")
+//! @yah:handoff("Fixed the tag-derivation gap: build_worker_mesh_tags(arch, os) now takes an os token and emits an os:<os> requirement tag alongside tier:<arch> (oss/qed/crates/qed/src/platform.rs, new os_tag_of() helper reusing the existing target_os() triple classifier).")
+//! @yah:handoff("Updated all 6 call sites (oss/qed/crates/qed/src/runner.rs:471,3444,4303,4472,6390 and app/yah/cli/src/qed_images.rs:457) to pass the OS — derived from the full target triple where one is available, hardcoded \"linux\" where the call site only ever builds docker container images (which are always Linux).")
+//! @yah:handoff("Added os:linux to the mesh_tags of the four existing Linux build-workers (us-west-002/011/013/014) so they stay selectable now that build-worker placement requests an OS dimension; us-west-015 already declared os:darwin.")
+//! @yah:handoff("Updated us-west-015.toml's header commentary: the declaration-order/capacity-floor contingency it described is gone now that os:darwin no longer tag-matches the Pi5s at all — R626-F5 (deploy route stub) is the only remaining blocker for real work landing there.")
+//! @yah:handoff("All qed platform/runner unit tests updated and green (cargo test -p yah-qed --lib platform:: / runner::mesh_tags — new arm64_darwin_does_not_collide_with_arm64_linux regression test added); cargo check -p yah --bin yah is clean.")
+//! @yah:gotcha("SIBLING GAP, closed separately under R577-F2 (2026-08-04) -- flagged here because R631 alone did NOT make darwin routing work, and a reviewer signing this off could reasonably assume it did. The same arch-only blindness existed one layer UP, in platform::resolve_placement, which decides local-vs-offload before any mesh tag is derived. It compared arch_of(target) vs arch_of(host) only (with a test asserting 'different OS is irrelevant'), so on an arm64 Linux coordinator an aarch64-apple-darwin native=true step resolved NativeCross and never offloaded at all -- meaning R631's os:darwin tags were unreachable on that path. resolve_placement now compares (arch, OS), exempting steps that declare a container_platform. Same file; R577-F2's diff sits just above build_worker_mesh_tags. Nothing in R631's own change needed altering.")
 
 use serde::{Deserialize, Serialize};
 
@@ -67,13 +73,16 @@ pub struct PlatformSpec {
     /// `linux/amd64`. `None` = no container, or the host-platform default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container_platform: Option<String>,
-    /// R590-F4: when `true`, this step's cross-arch target MUST be built on a
-    /// real machine of that arch. QED disables the cross-compile / emulate
-    /// tiers for the step and routes it to an arch-matched build-worker
-    /// (`Offload`) instead. Defaults `false`, so ordinary steps keep the
-    /// cross-first ladder. Set it only for builds that genuinely can't cross or
-    /// emulate here — e.g. `rusty-v8-musl`, a gn/ninja C++ build that OOMs under
-    /// QEMU on an arm64 host. On the TOML side:
+    /// R590-F4: when `true`, this step's target MUST be built on a real machine
+    /// of that target's **platform** — its arch *and* its OS (R577-F2; a
+    /// declared `container_platform` exempts the OS half, since the container
+    /// brings its own userland). QED disables the cross-compile / emulate tiers
+    /// for the step and routes it to a matching build-worker (`Offload`)
+    /// instead. Defaults `false`, so ordinary steps keep the cross-first ladder.
+    /// Set it only for builds that genuinely can't cross or emulate here — e.g.
+    /// `rusty-v8-musl`, a gn/ninja C++ build that OOMs under QEMU on an arm64
+    /// host, or a Tauri `.dmg`, which needs a live macOS userland. On the TOML
+    /// side:
     /// `platform = { target = "x86_64-unknown-linux-musl", native = true }`.
     #[serde(default, skip_serializing_if = "is_false")]
     pub native: bool,
@@ -314,11 +323,35 @@ pub fn resolve(host: &str, target: Option<&str>, container_platform: Option<&str
 /// When `native` is `false` this defers entirely to the cross-first decision
 /// table [`resolve`] (the ~99% path: cross-compile beats emulation).
 ///
-/// When `native` is `true` the step demands a real machine of its target arch,
-/// so the cross-compile and emulate tiers are *disabled* and the decision
-/// collapses to a binary:
-/// - host-arch (or absent) target → build locally ([`NativeCross`]);
-/// - foreign-arch target → [`Offload`] to an arch-matched build-worker.
+/// When `native` is `true` the step demands a real machine of its target
+/// *platform*, so the cross-compile and emulate tiers are *disabled* and the
+/// decision collapses to a binary:
+/// - host-platform (or absent) target → build locally ([`NativeCross`]);
+/// - foreign-platform target → [`Offload`] to a matched build-worker.
+///
+/// "Platform" here is **arch and OS**, not arch alone (R577-F2). Arch alone was
+/// the same blindness R631 fixed one layer up in [`build_worker_mesh_tags`]:
+/// there it picked the wrong *node*, here it picks the wrong *machine class
+/// entirely*. `native = true` means "no cross-compiling, run it on real
+/// silicon", and a Mach-O `.app`/`.dmg` cannot be produced by a Linux userland
+/// any more than an AppImage can be produced by macOS — even when both are
+/// `aarch64`. Concretely, `desktop-release`'s pipeline-level matrix declares
+/// `aarch64-apple-darwin` *and* `aarch64-unknown-linux-gnu` with
+/// `native = true`: on this camp's arm64 Mac the Linux row used to match on
+/// arch and resolve [`NativeCross`], i.e. run `cargo tauri build` for a Linux
+/// bundle against macOS, instead of offloading to a Pi5. The mirror case is the
+/// darwin row from an arm64 Linux coordinator.
+///
+/// The OS dimension applies only when the step has **no** `container_platform`.
+/// A container supplies its own userland — docker on macOS runs a Linux VM — so
+/// a `linux/arm64` image build on an arm64 Mac genuinely is native and must
+/// keep resolving [`NativeCross`]. Only a bare host-userland build is
+/// OS-constrained.
+///
+/// Unknown OS tokens (bare-metal triples like `mos-unknown-none`, for which
+/// [`os_tag_of`] yields `"unknown"`) never force an offload: there is no node
+/// to name for them, so they keep the pre-R577 arch-only verdict rather than
+/// routing to a build-worker that cannot exist.
 ///
 /// `native = true` deliberately overrides even a declared foreign
 /// `container_platform` (which [`resolve`] would send to [`Emulate`] at its
@@ -336,13 +369,28 @@ pub fn resolve_placement(
         return resolve(host, target, container_platform);
     }
     let host_arch = arch_of(host);
+    // A container carries its own OS, so only a bare host-userland build is
+    // constrained by the host's OS.
+    let os_constrained = container_platform.is_none();
     match target.map(str::trim).filter(|t| !t.is_empty()) {
-        Some(t) if arch_of(t) != host_arch => Resolution::Offload {
-            target: t.to_string(),
-        },
-        // Host-arch target or no target: a plain native build on this host.
+        Some(t) if arch_of(t) != host_arch || (os_constrained && foreign_os(host, t)) => {
+            Resolution::Offload {
+                target: t.to_string(),
+            }
+        }
+        // Host-platform target or no target: a plain native build on this host.
         _ => Resolution::NativeCross,
     }
+}
+
+/// True when `target`'s OS differs from `host`'s *and both are recognized*.
+///
+/// The both-known guard is what keeps a bare-metal / unrecognized triple from
+/// being routed to a build-worker that could never be tagged for it — see
+/// [`resolve_placement`], the only caller.
+fn foreign_os(host: &str, target: &str) -> bool {
+    let (host_os, target_os) = (os_tag_of(host), os_tag_of(target));
+    host_os != "unknown" && target_os != "unknown" && host_os != target_os
 }
 
 /// Can `target` be built on `host` with a host-native linker
@@ -386,6 +434,18 @@ fn target_os(triple: &str) -> TargetOs {
         TargetOs::Darwin
     } else {
         TargetOs::Unknown
+    }
+}
+
+/// The OS segment of a target triple, normalized to the `os:<os>` mesh-tag
+/// vocabulary (R631). Reuses [`target_os`]'s triple classification so this
+/// stays in lockstep with [`host_native_crossable`]'s notion of OS.
+pub fn os_tag_of(triple: &str) -> &'static str {
+    match target_os(triple) {
+        TargetOs::Linux => "linux",
+        TargetOs::Windows { .. } => "windows",
+        TargetOs::Darwin => "darwin",
+        TargetOs::Unknown => "unknown",
     }
 }
 
@@ -462,24 +522,34 @@ pub fn arch_of(triple: &str) -> &str {
     triple.split('-').next().unwrap_or(triple)
 }
 
-/// R594: mesh tags that select an arch-matched build-worker for a remote image
-/// build. `arch` is an arch token (as from [`arch_of`]); the returned tags are a
-/// *superset requirement* — a candidate node must carry all of them.
+/// R594/R631: mesh tags that select an arch-and-OS-matched build-worker for a
+/// remote image build. `arch` is an arch token (as from [`arch_of`]); `os` is
+/// an OS token (as from [`os_tag_of`]). The returned tags are a *superset
+/// requirement* — a candidate node must carry all of them.
 ///
 /// The fleet nodes are tagged in `.yah/infra/machines/*.toml` with
-/// `mesh_tags = ["tag:build-worker", "tag:qed", "tier:x86" | "tier:arm"]`, so an
-/// amd64 image build routes to `us-west-002` (x86) and an arm64 build to the
-/// Pi5s (arm). yubaba admission consumes this set (see
+/// `mesh_tags = ["tag:build-worker", "tag:qed", "tier:x86" | "tier:arm",
+/// "os:linux" | "os:darwin"]`, so an amd64 image build routes to
+/// `us-west-002` (x86) and an arm64 *Linux* build to the Pi5s — not to
+/// `us-west-015`, the fleet's only arm64 *Darwin* node, even though it also
+/// carries `tier:arm`. Before R631 this function derived the tag set from
+/// arch alone, so an `aarch64-apple-darwin` offload requested exactly the tag
+/// set the Pi5s already carry and a Linux node silently won a job it could
+/// never satisfy — the OS dimension is what tells the Pi5s and the Mac apart.
+/// yubaba admission consumes this set (see
 /// `velveteen_exec::remote::NODE_SELECTOR_MESH_TAGS_ANNOTATION`).
-pub fn build_worker_mesh_tags(arch: &str) -> Vec<String> {
+pub fn build_worker_mesh_tags(arch: &str, os: &str) -> Vec<String> {
+    let os_tag = format!("os:{os}");
     let arch_tag = match arch {
         "x86_64" | "x86" | "i686" | "amd64" => "tier:x86",
         "aarch64" | "arm64" | "arm" => "tier:arm",
-        // Unknown arch: fall back to the build-worker pool without an arch pin;
-        // yubaba admission picks any build-worker (may emulate).
-        _ => return vec!["tag:build-worker".into()],
+        // Unknown arch: fall back to the build-worker pool without an arch pin
+        // (still OS-pinned — a foreign OS can't be emulated the way an
+        // unrecognized arch tier can); yubaba admission picks any build-worker
+        // of the right OS (may emulate the arch).
+        _ => return vec!["tag:build-worker".into(), os_tag],
     };
-    vec!["tag:build-worker".into(), arch_tag.into()]
+    vec!["tag:build-worker".into(), arch_tag.into(), os_tag]
 }
 
 #[cfg(test)]
@@ -489,24 +559,43 @@ mod build_worker_tag_tests {
     #[test]
     fn amd64_selects_x86_build_worker() {
         assert_eq!(
-            build_worker_mesh_tags("x86_64"),
-            vec!["tag:build-worker".to_string(), "tier:x86".to_string()]
+            build_worker_mesh_tags("x86_64", "linux"),
+            vec![
+                "tag:build-worker".to_string(),
+                "tier:x86".to_string(),
+                "os:linux".to_string()
+            ]
         );
     }
 
     #[test]
     fn arm64_selects_arm_build_worker() {
         assert_eq!(
-            build_worker_mesh_tags("aarch64"),
-            vec!["tag:build-worker".to_string(), "tier:arm".to_string()]
+            build_worker_mesh_tags("aarch64", "linux"),
+            vec![
+                "tag:build-worker".to_string(),
+                "tier:arm".to_string(),
+                "os:linux".to_string()
+            ]
         );
     }
 
     #[test]
-    fn unknown_arch_falls_back_to_pool() {
+    fn arm64_darwin_does_not_collide_with_arm64_linux() {
+        // R631: same tier, different OS — the Pi5s (arm/linux) must not be a
+        // candidate for an arm64/darwin request, and vice versa.
+        let darwin = build_worker_mesh_tags("aarch64", "darwin");
+        let linux = build_worker_mesh_tags("aarch64", "linux");
+        assert_ne!(darwin, linux);
+        assert!(darwin.contains(&"os:darwin".to_string()));
+        assert!(linux.contains(&"os:linux".to_string()));
+    }
+
+    #[test]
+    fn unknown_arch_falls_back_to_os_pinned_pool() {
         assert_eq!(
-            build_worker_mesh_tags("riscv64"),
-            vec!["tag:build-worker".to_string()]
+            build_worker_mesh_tags("riscv64", "linux"),
+            vec!["tag:build-worker".to_string(), "os:linux".to_string()]
         );
     }
 }
@@ -876,16 +965,78 @@ mod tests {
     }
 
     #[test]
-    fn native_host_arch_target_builds_locally() {
-        // Same arch (different OS is irrelevant) → the native build runs right
-        // here; no offload even under native=true.
+    fn native_host_platform_target_builds_locally() {
+        // Same arch AND same OS → the native build runs right here; no offload
+        // even under native=true. (`-musl` vs `-gnu` is a libc tail, not an OS.)
         assert_eq!(
-            resolve_placement(ARM_MAC, Some("aarch64-unknown-linux-musl"), None, true),
+            resolve_placement(ARM_MAC, Some("aarch64-apple-darwin"), None, true),
             Resolution::NativeCross
         );
         // The x86 build-worker running its own x86 musl build: local native.
         assert_eq!(
             resolve_placement(X64_LINUX, Some("x86_64-unknown-linux-musl"), None, true),
+            Resolution::NativeCross
+        );
+    }
+
+    /// R577-F2: `native = true` means "real machine of the target platform",
+    /// and a platform is (arch, OS). Same-arch/different-OS used to resolve
+    /// NativeCross, which put `desktop-release`'s `aarch64-unknown-linux-gnu`
+    /// row on this camp's arm64 Mac — a `cargo tauri build` for a Linux bundle
+    /// against macOS instead of an offload to a Pi5.
+    #[test]
+    fn native_same_arch_foreign_os_offloads() {
+        // The live case: the Linux rows of desktop-release, from an arm64 Mac.
+        assert_eq!(
+            resolve_placement(ARM_MAC, Some("aarch64-unknown-linux-gnu"), None, true),
+            Resolution::Offload {
+                target: "aarch64-unknown-linux-gnu".into()
+            }
+        );
+        assert_eq!(
+            resolve_placement(ARM_MAC, Some("aarch64-unknown-linux-musl"), None, true),
+            Resolution::Offload {
+                target: "aarch64-unknown-linux-musl".into()
+            }
+        );
+        // The mirror: the darwin row from an arm64 Linux coordinator, which is
+        // exactly what must reach us-west-015 (R631 tags it `os:darwin`).
+        assert_eq!(
+            resolve_placement(
+                "aarch64-unknown-linux-gnu",
+                Some("aarch64-apple-darwin"),
+                None,
+                true
+            ),
+            Resolution::Offload {
+                target: "aarch64-apple-darwin".into()
+            }
+        );
+    }
+
+    /// A container brings its own userland, so the OS dimension must NOT apply
+    /// to an image build: `yah qed images build --platform linux/arm64` on an
+    /// arm64 Mac builds locally through Colima's Linux VM. Only the arch has to
+    /// match there.
+    #[test]
+    fn native_container_step_is_not_os_constrained() {
+        assert_eq!(
+            resolve_placement(
+                ARM_MAC,
+                Some("aarch64-unknown-linux-musl"),
+                Some("linux/arm64"),
+                true
+            ),
+            Resolution::NativeCross
+        );
+    }
+
+    /// An unrecognized-OS triple has no build-worker tag to route to, so it
+    /// keeps the arch-only verdict rather than offloading into the void.
+    #[test]
+    fn native_unknown_os_target_does_not_offload_on_os_alone() {
+        assert_eq!(
+            resolve_placement(X64_LINUX, Some("x86_64-unknown-none"), None, true),
             Resolution::NativeCross
         );
     }

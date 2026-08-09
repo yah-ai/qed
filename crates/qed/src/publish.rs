@@ -127,10 +127,29 @@ pub struct ChannelBundle {
     pub url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size: Option<u64>,
+    /// Canonical asset hash, ALWAYS algorithm-tagged (`blake3:<hex>`) — R330-F40.
+    ///
+    /// Until this existed the channel manifest carried a URL and a size and
+    /// nothing else, so every download this publisher produced rendered with no
+    /// way to verify it. A bare hex digest is deliberately not an option here:
+    /// the index this feeds is permanent, so an untagged digest written into it
+    /// would be untagged forever.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash: Option<String>,
 }
 
 /// Bucket key for the per-binary mutable pointer almanac re-fetches on push.
 const MANIFEST_FILENAME: &str = "release-manifest.json";
+
+/// Filename of the IMMUTABLE per-version copy of a binary's manifest, written
+/// alongside the mutable pointer at `<binary>/<version>/manifest.json`.
+///
+/// The mutable pointer answers "what is current" and is rewritten by every
+/// release; this copy answers "what was 0.8.21" and never changes, so it is
+/// safe to cache forever and safe for the version index to link to. Same split
+/// (and same key) as `cli-release-manifest` in `.github/workflows/release.yml`,
+/// which writes `s3://yah-dev/yah/<version>/manifest.json` for the same reason.
+const VERSIONED_MANIFEST_FILENAME: &str = "manifest.json";
 
 /// Per-triple stable manifest filename (R330-B8). One per (binary, triple),
 /// containing only that triple's bundle. Cross-stage merge fan-in feeds on these.
@@ -161,6 +180,248 @@ pub fn resolve_triple(triple: Option<&str>) -> String {
         other => other,
     };
     format!("{os}-{}", std::env::consts::ARCH)
+}
+
+// ── The accumulating version index (R330-T32) ────────────────────────────────
+//
+// `release-manifest.json` is ONE version by construction — it answers "what is
+// current". The /releases page is a HISTORY, so it reads a separate object that
+// accumulates: `<prefix>/<binary>/index.json`, parsed by almanac's `R2Index`
+// source. Publishing only the pointer is why that page was blank — there was a
+// producer and a consumer and no object between them.
+//
+// Shape is almanac's `IndexManifest`/`IndexVersion`/`TripleEntry`. Only `url` is
+// required over there; everything else is optional, so this stays additive.
+
+/// The whole index object as published at `<binary>/index.json`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReleaseIndex {
+    pub name: String,
+    /// Read but never matched on by the consumer — a producer may add fields
+    /// without stranding a deployed reader. A breaking change gets a new key.
+    pub schema: u32,
+    pub updated_at: String,
+    pub versions: Vec<IndexVersion>,
+}
+
+/// One published version inside [`ReleaseIndex`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexVersion {
+    pub version: String,
+    pub pub_date: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manifest_url: Option<String>,
+    pub triples: BTreeMap<String, IndexTriple>,
+}
+
+/// One (version, triple) download inside [`IndexVersion`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexTriple {
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filename: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_bytes: Option<u64>,
+    /// Tagged `blake3:<hex>`. See [`ChannelBundle::hash`] for why never bare.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hash: Option<String>,
+}
+
+/// Fold one release into the index, returning the bytes to publish.
+///
+/// `existing` is the current object's bytes, or `None` for the create case (a
+/// missing key is a first release, not an error).
+///
+/// Two invariants this exists to hold, both learned the hard way:
+///
+/// 1. **Replace-or-append, never a bare push.** Re-publishing a version updates
+///    its entry instead of duplicating it, which is what makes retrying a
+///    failed publish safe.
+/// 2. **A version keeps the `pub_date` it was FIRST published with.** Consumers
+///    order this list by date (almanac re-sorts on read, and the page sorts
+///    again), so restamping on a re-publish would not merely edit a field — it
+///    would move an old release to the top of /releases and present it as the
+///    newest. Publication dates are historical facts.
+pub fn merge_index(
+    existing: Option<&str>,
+    binary: &str,
+    version: &str,
+    pub_date: &str,
+    manifest_url: Option<String>,
+    triples: BTreeMap<String, IndexTriple>,
+) -> Result<String, serde_json::Error> {
+    let version = version.trim_start_matches('v').to_string();
+    let mut prior: Vec<IndexVersion> = match existing.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(raw) => serde_json::from_str::<ReleaseIndex>(raw)?.versions,
+        None => Vec::new(),
+    };
+
+    let first_published = prior
+        .iter()
+        .find(|v| v.version == version)
+        .map(|v| v.pub_date.clone());
+    prior.retain(|v| v.version != version);
+    prior.push(IndexVersion {
+        version,
+        pub_date: first_published.unwrap_or_else(|| pub_date.to_string()),
+        manifest_url,
+        triples,
+    });
+
+    // Newest first, and deterministic: two entries sharing a `pub_date` must
+    // not be free to swap places between publishes, or the feed diffs as
+    // changed and rebuilds a history that did not move.
+    prior.sort_by(|a, b| {
+        b.pub_date
+            .cmp(&a.pub_date)
+            .then_with(|| b.version.cmp(&a.version))
+    });
+
+    serde_json::to_string_pretty(&ReleaseIndex {
+        name: binary.to_string(),
+        schema: 1,
+        updated_at: Utc::now().to_rfc3339(),
+        versions: prior,
+    })
+}
+
+/// Bucket key for a binary's accumulating index.
+pub fn index_key(prefix: Option<&str>, binary: &str) -> String {
+    join_key(prefix, &[binary, "index.json"])
+}
+
+/// One binary's contribution to the index, handed across the publisher seam.
+///
+/// Carries the inputs [`merge_index`] needs plus the key to read-modify-write,
+/// so the publisher impl supplies only the I/O — the merge semantics (and the
+/// two invariants they hold) stay here, in the tested crate, rather than being
+/// re-derived by every backend.
+#[derive(Debug, Clone)]
+pub struct IndexUpdate {
+    /// Bucket key of the index object, prefix already applied.
+    pub key: String,
+    pub binary: String,
+    pub version: String,
+    /// Publish timestamp for a version appearing here for the FIRST time. A
+    /// version already in the index keeps the date it was first published with
+    /// — see [`merge_index`].
+    pub pub_date: String,
+    pub manifest_url: Option<String>,
+    pub triples: BTreeMap<String, IndexTriple>,
+}
+
+impl IndexUpdate {
+    /// Fold this release into the index's current bytes (`None` = first
+    /// publish), returning the bytes to write back.
+    pub fn merge(&self, existing: Option<&str>) -> Result<String, serde_json::Error> {
+        merge_index(
+            existing,
+            &self.binary,
+            &self.version,
+            &self.pub_date,
+            self.manifest_url.clone(),
+            self.triples.clone(),
+        )
+    }
+}
+
+/// Map a target triple onto the platform token `/releases` keys its labels by.
+///
+/// The consumer chain is: this token → almanac's `ReleaseAsset::platform` →
+/// `PLATFORM_LABELS` in `app/yah/web/marketing/src/releases.ts`. A token with no
+/// entry there falls through and the page renders the raw string, so "publish
+/// the triple and let something downstream figure it out" shows a visitor
+/// `aarch64-apple-darwin` where the label should read "macOS (Apple Silicon)".
+///
+/// Two spellings arrive here and both must map: the full Rust triple a
+/// cross-build declares (`aarch64-apple-darwin`) and the `<os>-<arch>`
+/// shorthand [`resolve_triple`] synthesises for a host-native build
+/// (`darwin-aarch64`) — the channel manifest is keyed by whichever the
+/// producing step used.
+///
+/// **musl is checked before gnu, deliberately.** almanac's own fallback mapper
+/// matches on the `x86_64-unknown-linux` prefix and so collapses the two onto
+/// one token, listing a musl and a gnu binary as the same download. They are
+/// not interchangeable. Supplying the token from here — rather than leaving
+/// `platform` unset and letting that fallback run — is what keeps them apart.
+pub fn platform_token(triple: &str) -> String {
+    let t = triple.to_ascii_lowercase();
+    let musl = t.contains("musl");
+    let arm = t.contains("aarch64") || t.contains("arm64");
+    let x86 = t.contains("x86_64") || t.contains("amd64");
+
+    if t.contains("apple") || t.contains("darwin") || t.contains("macos") {
+        if arm {
+            return "macos-arm64".to_string();
+        }
+        if x86 {
+            return "macos-x86_64".to_string();
+        }
+    } else if t.contains("windows") {
+        if x86 {
+            return "windows-x86_64".to_string();
+        }
+    } else if t.contains("linux") {
+        return match (arm, x86, musl) {
+            (true, _, true) => "linux-aarch64-musl".to_string(),
+            (true, _, false) => "linux-arm64".to_string(),
+            (_, true, true) => "linux-x86_64-musl".to_string(),
+            (_, true, false) => "linux-x86_64".to_string(),
+            _ => triple.to_string(),
+        };
+    }
+    // Unrecognised: pass the triple through rather than guess. The page shows
+    // it verbatim, which is a visible prompt to add a mapping — better than a
+    // wrong label that reads as correct.
+    triple.to_string()
+}
+
+/// Project a staged [`ChannelManifest`] onto the index's per-triple shape.
+pub fn index_triples_from_manifest(manifest: &ChannelManifest) -> BTreeMap<String, IndexTriple> {
+    manifest
+        .host
+        .bundle
+        .iter()
+        .map(|(triple, bundle)| {
+            (
+                triple.clone(),
+                IndexTriple {
+                    url: bundle.url.clone(),
+                    platform: Some(platform_token(triple)),
+                    filename: bundle
+                        .url
+                        .rsplit('/')
+                        .next()
+                        .filter(|f| !f.is_empty())
+                        .map(str::to_string),
+                    size_bytes: bundle.size,
+                    hash: bundle.hash.clone(),
+                },
+            )
+        })
+        .collect()
+}
+
+/// Streaming BLAKE3 of a staged artifact, returned already tagged.
+///
+/// Streamed rather than slurped because these are release binaries and
+/// tarballs — reading a few hundred MB into memory to hash it is a needless
+/// way to fail on a small runner.
+fn blake3_file(path: &Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("blake3:{}", hasher.finalize().to_hex()))
 }
 
 fn join_key(prefix: Option<&str>, parts: &[&str]) -> String {
@@ -202,7 +463,28 @@ pub fn stage_release(
         if let Some(parent) = dest.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let bytes = std::fs::copy(src, &dest)?;
+        // Name the file. This is the ONE place staging opens a caller-supplied
+        // path, and a bare `No such file or directory (os error 2)` at the end
+        // of a multi-minute release build is close to undebuggable — it does
+        // not say which artifact, which step declared it, or which tree it was
+        // resolved against. Every `produces` bug lands here.
+        let bytes = std::fs::copy(src, &dest).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!(
+                    "staging artifact {} (binary={}, triple={}): {e} — the step that \
+                     declares this `produces` must leave the file at exactly this path, \
+                     resolved against the run's workspace",
+                    src.display(),
+                    artifact.binary,
+                    triple
+                ),
+            )
+        })?;
+        // Hash the STAGED copy, not the source: what a consumer downloads is
+        // what was uploaded, so the digest has to describe the bytes that
+        // actually landed in the channel.
+        let hash = blake3_file(&dest)?;
 
         let url = match base_url.map(str::trim).filter(|b| !b.is_empty()) {
             Some(base) => format!("{}/{}", base.trim_end_matches('/'), key),
@@ -213,6 +495,7 @@ pub fn stage_release(
             ChannelBundle {
                 url,
                 size: Some(bytes),
+                hash: Some(hash),
             },
         );
         report.object_keys.push(key);
@@ -257,15 +540,31 @@ pub fn stage_release(
             notes: None,
             host: ChannelHost { bundle },
         };
-        let manifest_key = join_key(prefix, &[&binary, MANIFEST_FILENAME]);
-        let dest = staging_dir.join(&manifest_key);
-        if let Some(parent) = dest.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let json = serde_json::to_vec_pretty(&manifest)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        std::fs::write(&dest, json)?;
-        report.manifest_keys.push(manifest_key);
+
+        // Two keys, same bytes. The immutable per-version copy is what the
+        // version index links to: pointing a HISTORY entry at the mutable
+        // pointer means clicking "0.8.21's manifest" hands you whatever is
+        // current, which is wrong the moment a second version exists.
+        for filename in [
+            VERSIONED_MANIFEST_FILENAME,
+            // Written LAST so a failed per-version write never leaves the
+            // pointer aimed at a version whose manifest is not published.
+            MANIFEST_FILENAME,
+        ] {
+            let manifest_key = if filename == VERSIONED_MANIFEST_FILENAME {
+                join_key(prefix, &[&binary, &version, filename])
+            } else {
+                join_key(prefix, &[&binary, filename])
+            };
+            let dest = staging_dir.join(&manifest_key);
+            if let Some(parent) = dest.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&dest, &json)?;
+            report.manifest_keys.push(manifest_key);
+        }
         report.manifests.insert(binary, manifest);
     }
 
@@ -294,14 +593,53 @@ pub trait ReleasePublisher: Send + Sync {
         prefix: Option<&str>,
     ) -> Result<(), RunnerError>;
 
-    /// Fire the almanac revalidate hook so the feed re-fetches from this
-    /// channel. A no-configured-receiver impl returns `Ok(())`.
-    async fn revalidate(&self) -> Result<(), RunnerError>;
+    /// Read-modify-write the accumulating version index at `update.key`
+    /// (R330-T32) — the object the /releases history renders from, as opposed
+    /// to the single-version pointer `sync` uploads.
+    ///
+    /// The impl performs three steps and owns only the middle one's I/O: read
+    /// the current bytes (absent = first release, not an error), call
+    /// [`IndexUpdate::merge`], write the result back.
+    ///
+    /// **The write MUST be a compare-and-swap** — conditional on the ETag the
+    /// bytes were read at, retrying the whole read-merge-write on a failed
+    /// precondition. This object is a permanent record that every publisher
+    /// appends to, so an unconditional PUT loses whichever concurrent release
+    /// wrote first, silently and irreversibly. A backend that cannot do a
+    /// conditional write should say so rather than emulate one.
+    async fn publish_index(
+        &self,
+        provider: &str,
+        bucket: &str,
+        update: &IndexUpdate,
+    ) -> Result<(), RunnerError>;
+
+    /// Fire the almanac revalidate hook so the feed re-renders from this
+    /// release. A no-configured-receiver impl returns `Ok(())`.
+    ///
+    /// `report` is the release that was just staged and uploaded, manifests
+    /// included. It is passed rather than withheld because the poke is
+    /// expected to **carry its payload** (R330-F33): the run that just cut the
+    /// release holds the fact, so it hands the manifest over instead of
+    /// publishing it and waiting for the consumer's poller to notice. An impl
+    /// with no manifest to offer can ignore it and poke payload-less — that
+    /// stays a supported mode, it just leaves one stale render before the
+    /// fetch tier converges.
+    ///
+    /// An `Err` here is REPORTED, NOT FATAL: implementors should return the
+    /// real failure (so it is visible in logs and to direct callers), but
+    /// [`PublishingOutcomeDispatcher::publish`] deliberately downgrades it to
+    /// a warning. The poke only collapses the staleness window — the
+    /// consumer's own feed-fetch tier is what makes the feed correct — so an
+    /// unreachable receiver must not fail a release whose artifacts uploaded
+    /// fine. Do NOT swallow the error in the impl to get that behaviour.
+    async fn revalidate(&self, report: &StageReport) -> Result<(), RunnerError>;
 }
 
 /// The real outcome dispatcher (R330-F3): stages produced artifacts into the
 /// release channel layout, uploads them via a [`ReleasePublisher`], then fires
-/// the revalidate hook. `warden_deploy` / `almanac_run` stay logging stubs
+/// the revalidate hook (best-effort — see [`ReleasePublisher::revalidate`]).
+/// `yubaba_deploy` / `almanac_run` stay logging stubs
 /// (those backends are still pending — R040-F4 / the almanac scheduler).
 pub struct PublishingOutcomeDispatcher<P: ReleasePublisher> {
     publisher: P,
@@ -315,7 +653,7 @@ impl<P: ReleasePublisher> PublishingOutcomeDispatcher<P> {
 
 #[async_trait]
 impl<P: ReleasePublisher> OutcomeDispatcher for PublishingOutcomeDispatcher<P> {
-    async fn warden_deploy(&self, service: &str, env: &str) -> Result<(), RunnerError> {
+    async fn yubaba_deploy(&self, service: &str, env: &str) -> Result<(), RunnerError> {
         tracing::info!(
             service,
             env,
@@ -367,7 +705,71 @@ impl<P: ReleasePublisher> OutcomeDispatcher for PublishingOutcomeDispatcher<P> {
                 req.prefix.as_deref(),
             )
             .await?;
-        self.publisher.revalidate().await?;
+
+        // The index is part of the release record, not a nicety layered on
+        // top: `sync` uploads a pointer to THIS version, and the history page
+        // reads the index. A release whose artifacts uploaded but whose index
+        // write failed is invisible on /releases, so this error propagates
+        // (unlike the revalidate poke below, which only affects latency).
+        for (binary, manifest) in &report.manifests {
+            let update = IndexUpdate {
+                key: index_key(req.prefix.as_deref(), binary),
+                binary: binary.clone(),
+                version: manifest.version.clone(),
+                pub_date: manifest.pub_date.clone(),
+                // The IMMUTABLE per-version manifest, not the mutable pointer:
+                // this is a history entry, so it must keep resolving to the
+                // manifest of THIS version after the next release lands.
+                //
+                // Derived from the same (base_url, prefix, binary, version) the
+                // staging pass used, NOT by string surgery on an asset URL —
+                // the two must agree, and reconstructing one from the other is
+                // the kind of coupling that works until a layout changes.
+                manifest_url: req
+                    .base_url
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|b| !b.is_empty())
+                    .map(|base| {
+                        format!(
+                            "{}/{}",
+                            base.trim_end_matches('/'),
+                            join_key(
+                                req.prefix.as_deref(),
+                                &[binary, &manifest.version, VERSIONED_MANIFEST_FILENAME]
+                            )
+                        )
+                    }),
+                triples: index_triples_from_manifest(manifest),
+            };
+            self.publisher
+                .publish_index(&req.provider, &req.bucket, &update)
+                .await?;
+            tracing::info!(
+                bucket = %req.bucket,
+                key = %update.key,
+                version = %update.version,
+                triples = update.triples.len(),
+                "qed outcome: merged release into version index"
+            );
+        }
+
+        // The poke is a LATENCY OPTIMISATION, not the correctness path
+        // (R330-T14, re-scoped by R330-F31): the node's feed-fetch tier
+        // re-renders from upstream on its own timer, so a release that never
+        // gets poked is still correct within `feed_interval_secs`. Aborting
+        // the whole publish on an unreachable receiver would therefore throw
+        // away a successful artifact upload to save nothing — warn and let
+        // the release stand.
+        if let Err(e) = self.publisher.revalidate(&report).await {
+            tracing::warn!(
+                bucket = %req.bucket,
+                version = %req.version,
+                error = %e,
+                "qed outcome: revalidate poke failed — release stands; the feed-fetch \
+                 tier will pick the new version up on its next tick"
+            );
+        }
         Ok(())
     }
 }
@@ -395,8 +797,27 @@ impl ReleasePublisher for LoggingReleasePublisher {
         Ok(())
     }
 
-    async fn revalidate(&self) -> Result<(), RunnerError> {
-        tracing::info!("qed publish: revalidate hook skipped (no receiver configured)");
+    async fn publish_index(
+        &self,
+        provider: &str,
+        bucket: &str,
+        update: &IndexUpdate,
+    ) -> Result<(), RunnerError> {
+        tracing::info!(
+            provider,
+            bucket,
+            key = %update.key,
+            version = %update.version,
+            "qed publish: index merge skipped (no real publisher wired)"
+        );
+        Ok(())
+    }
+
+    async fn revalidate(&self, report: &StageReport) -> Result<(), RunnerError> {
+        tracing::info!(
+            manifests = report.manifests.len(),
+            "qed publish: revalidate hook skipped (no receiver configured)"
+        );
         Ok(())
     }
 }
@@ -407,11 +828,144 @@ mod tests {
     use std::sync::Mutex;
     use tempfile::TempDir;
 
+    /// First file named `name` anywhere under `root`.
+    fn find_file(root: &Path, name: &str) -> Option<std::path::PathBuf> {
+        let mut stack = vec![root.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).ok()? {
+                let path = entry.ok()?.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.file_name().is_some_and(|f| f == name) {
+                    return Some(path);
+                }
+            }
+        }
+        None
+    }
+
     fn write_dummy(dir: &Path, rel: &str, contents: &[u8]) -> String {
         let p = dir.join(rel);
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(&p, contents).unwrap();
         p.to_string_lossy().into_owned()
+    }
+
+    fn triple_entry(url: &str) -> BTreeMap<String, IndexTriple> {
+        let mut m = BTreeMap::new();
+        m.insert(
+            "darwin-aarch64".to_string(),
+            IndexTriple {
+                url: url.to_string(),
+                platform: Some("darwin-aarch64".into()),
+                filename: Some("yah.tar.gz".into()),
+                size_bytes: Some(42),
+                hash: Some("blake3:aa".into()),
+            },
+        );
+        m
+    }
+
+    fn versions_of(json: &str) -> Vec<(String, String)> {
+        serde_json::from_str::<ReleaseIndex>(json)
+            .unwrap()
+            .versions
+            .into_iter()
+            .map(|v| (v.version, v.pub_date))
+            .collect()
+    }
+
+    #[test]
+    fn a_missing_index_is_the_create_case_not_an_error() {
+        let out = merge_index(
+            None,
+            "yah",
+            "v0.8.21",
+            "2026-07-31T00:00:00Z",
+            None,
+            triple_entry("https://cdn.yah.dev/yah/0.8.21/darwin-aarch64/yah.tar.gz"),
+        )
+        .unwrap();
+        // The leading `v` is stripped: the page and the install pointer both
+        // key on the bare version.
+        assert_eq!(
+            versions_of(&out),
+            vec![("0.8.21".to_string(), "2026-07-31T00:00:00Z".to_string())]
+        );
+    }
+
+    #[test]
+    fn republishing_a_version_replaces_its_entry_rather_than_duplicating_it() {
+        let first = merge_index(
+            None,
+            "yah",
+            "0.8.21",
+            "2026-07-31T00:00:00Z",
+            None,
+            triple_entry("https://cdn.yah.dev/a"),
+        )
+        .unwrap();
+        let second = merge_index(
+            Some(&first),
+            "yah",
+            "0.8.21",
+            "2026-08-02T00:00:00Z",
+            None,
+            triple_entry("https://cdn.yah.dev/b"),
+        )
+        .unwrap();
+
+        let v = versions_of(&second);
+        assert_eq!(v.len(), 1, "a re-publish must not duplicate the version");
+        // The RE-PUBLISHED payload wins...
+        let idx: ReleaseIndex = serde_json::from_str(&second).unwrap();
+        assert_eq!(idx.versions[0].triples["darwin-aarch64"].url, "https://cdn.yah.dev/b");
+        // ...but the ORIGINAL publication date survives. Restamping it would
+        // reorder published history on every consumer, which all sort by date.
+        assert_eq!(
+            v[0].1, "2026-07-31T00:00:00Z",
+            "a re-publish must not restamp pub_date"
+        );
+    }
+
+    #[test]
+    fn the_index_accumulates_and_stays_newest_first() {
+        let a = merge_index(None, "yah", "0.8.21", "2026-07-01T00:00:00Z", None, triple_entry("u")).unwrap();
+        let b = merge_index(Some(&a), "yah", "0.8.22", "2026-07-20T00:00:00Z", None, triple_entry("u")).unwrap();
+        // Appended out of order — the sort, not the caller, decides position.
+        let c = merge_index(Some(&b), "yah", "0.8.20", "2026-06-01T00:00:00Z", None, triple_entry("u")).unwrap();
+
+        let got: Vec<String> = versions_of(&c).into_iter().map(|(v, _)| v).collect();
+        assert_eq!(got, vec!["0.8.22", "0.8.21", "0.8.20"]);
+    }
+
+    #[test]
+    fn every_download_in_the_index_carries_a_tagged_hash() {
+        let tmp = TempDir::new().unwrap();
+        let src = write_dummy(tmp.path(), "src/yah", b"binary bytes");
+        let staging = tmp.path().join("stage");
+        let report = stage_release(
+            &staging,
+            &[ProducedArtifact {
+                binary: "yah".into(),
+                path: src,
+                triple: Some("darwin-aarch64".into()),
+            }],
+            "0.8.21",
+            None,
+            Some("https://cdn.yah.dev"),
+        )
+        .unwrap();
+
+        let triples = index_triples_from_manifest(&report.manifests["yah"]);
+        let entry = &triples["darwin-aarch64"];
+        let hash = entry.hash.as_deref().expect("staged artifact has no hash");
+        assert!(
+            hash.starts_with("blake3:") && hash.len() == "blake3:".len() + 64,
+            "hash must be a tagged blake3 digest, got {hash:?}"
+        );
+        assert_eq!(entry.filename.as_deref(), Some("yah"));
+        assert_eq!(entry.size_bytes, Some(b"binary bytes".len() as u64));
     }
 
     #[test]
@@ -421,6 +975,98 @@ mod tests {
         assert_eq!(resolve_triple(Some("linux-x86_64")), "linux-x86_64");
         // Empty string falls back to host too.
         assert_eq!(resolve_triple(Some("")), resolve_triple(None));
+    }
+
+    #[test]
+    fn platform_token_maps_both_triple_spellings() {
+        // Full Rust triples (what a cross-build declares).
+        assert_eq!(platform_token("aarch64-apple-darwin"), "macos-arm64");
+        assert_eq!(platform_token("x86_64-apple-darwin"), "macos-x86_64");
+        assert_eq!(platform_token("x86_64-unknown-linux-gnu"), "linux-x86_64");
+        assert_eq!(platform_token("aarch64-unknown-linux-gnu"), "linux-arm64");
+        assert_eq!(platform_token("x86_64-pc-windows-msvc"), "windows-x86_64");
+        // The `<os>-<arch>` shorthand `resolve_triple` synthesises for a
+        // host-native build — the CLI-only release recipe's spelling.
+        assert_eq!(platform_token("darwin-aarch64"), "macos-arm64");
+        assert_eq!(platform_token("darwin-x86_64"), "macos-x86_64");
+        assert_eq!(platform_token("linux-x86_64"), "linux-x86_64");
+        assert_eq!(platform_token("linux-aarch64"), "linux-arm64");
+        // Whatever the host actually is, it must map to something the page has
+        // a label for — this is the token a local `cli-release` publishes.
+        assert!(
+            [
+                "macos-arm64",
+                "macos-x86_64",
+                "linux-x86_64",
+                "linux-arm64",
+                "windows-x86_64",
+            ]
+            .contains(&platform_token(&resolve_triple(None)).as_str()),
+            "host {} has no /releases label",
+            resolve_triple(None)
+        );
+    }
+
+    #[test]
+    fn platform_token_keeps_musl_and_gnu_apart() {
+        // The whole reason the producer supplies `platform` rather than letting
+        // almanac's fallback derive it: that mapper matches on the
+        // `x86_64-unknown-linux` prefix and collapses these two, listing a musl
+        // and a gnu binary as the same download.
+        assert_eq!(
+            platform_token("x86_64-unknown-linux-musl"),
+            "linux-x86_64-musl"
+        );
+        assert_eq!(
+            platform_token("aarch64-unknown-linux-musl"),
+            "linux-aarch64-musl"
+        );
+        assert_ne!(
+            platform_token("x86_64-unknown-linux-musl"),
+            platform_token("x86_64-unknown-linux-gnu")
+        );
+    }
+
+    #[test]
+    fn platform_token_passes_unknown_triples_through() {
+        // Better a visibly-raw token on the page (a prompt to add a mapping)
+        // than a confident wrong label.
+        assert_eq!(
+            platform_token("riscv64gc-unknown-none"),
+            "riscv64gc-unknown-none"
+        );
+    }
+
+    #[test]
+    fn index_triples_carry_a_page_label_not_a_raw_triple() {
+        let manifest = ChannelManifest {
+            version: "0.8.21".into(),
+            pub_date: "2026-08-01T00:00:00Z".into(),
+            notes: None,
+            host: ChannelHost {
+                bundle: BTreeMap::from([(
+                    "aarch64-apple-darwin".to_string(),
+                    ChannelBundle {
+                        url: "https://cdn.yah.dev/yah/0.8.21/aarch64-apple-darwin/yah.tar.gz"
+                            .into(),
+                        size: Some(4),
+                        hash: Some("blake3:ff".into()),
+                    },
+                )]),
+            },
+        };
+        let triples = index_triples_from_manifest(&manifest);
+        // Keyed by triple, but `platform` is the token PLATFORM_LABELS keys on.
+        // Emitting the triple here rendered "aarch64-apple-darwin" as the
+        // download's visible label on /releases.
+        assert_eq!(
+            triples["aarch64-apple-darwin"].platform.as_deref(),
+            Some("macos-arm64")
+        );
+        assert_eq!(
+            triples["aarch64-apple-darwin"].filename.as_deref(),
+            Some("yah.tar.gz")
+        );
     }
 
     #[test]
@@ -449,11 +1095,13 @@ mod tests {
         let copied = staging.path().join("yah/0.8.6/darwin-aarch64/yah");
         assert_eq!(std::fs::read(&copied).unwrap(), b"YAH-BINARY");
 
-        // Manifests: both the shared key and a per-triple stable key (R330-B8).
-        // Order: per-triple entries land first (inner loop), shared last.
+        // Three manifest keys (report sorts them): the IMMUTABLE per-version
+        // copy the index links to, the per-triple stable key (R330-B8), and the
+        // mutable pointer almanac re-fetches on push.
         assert_eq!(
             report.manifest_keys,
             vec![
+                "yah/0.8.6/manifest.json",
                 "yah/release-manifest-darwin-aarch64.json",
                 "yah/release-manifest.json",
             ]
@@ -467,10 +1115,14 @@ mod tests {
         );
         assert_eq!(bundle.size, Some("YAH-BINARY".len() as u64));
 
-        // The on-disk manifest round-trips through the same wire type.
+        // The on-disk manifest round-trips through the same wire type, and the
+        // per-version copy is byte-identical to the pointer at publish time —
+        // it just stops changing afterwards.
         let bytes = std::fs::read(staging.path().join("yah/release-manifest.json")).unwrap();
         let parsed: ChannelManifest = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(&parsed, manifest);
+        let versioned = std::fs::read(staging.path().join("yah/0.8.6/manifest.json")).unwrap();
+        assert_eq!(versioned, bytes);
     }
 
     #[test]
@@ -498,6 +1150,7 @@ mod tests {
         assert_eq!(
             report.manifest_keys,
             vec![
+                "channels/desktop/0.9.0/manifest.json",
                 "channels/desktop/release-manifest-linux-x86_64.json",
                 "channels/desktop/release-manifest.json",
             ]
@@ -665,6 +1318,16 @@ mod tests {
         revalidated: Mutex<u32>,
         /// Manifest contents captured from the staging dir at sync time.
         captured_manifests: Mutex<Vec<String>>,
+        /// Binary names the revalidate hook was handed manifests for — the
+        /// payload a real hook maps into the poke's `data_inputs`.
+        revalidate_saw: Mutex<Vec<String>>,
+        /// Make `revalidate` report a failure (still counting the attempt) —
+        /// stands in for an unreachable / 5xx receiver.
+        fail_revalidate: bool,
+        /// Stand-in bucket for index objects: key → current bytes. Persisting
+        /// them across calls is the point — accumulation is what the index is
+        /// for, and a fake that forgets can't catch a clobbering merge.
+        index_objects: Mutex<BTreeMap<String, String>>,
     }
 
     #[async_trait]
@@ -677,17 +1340,70 @@ mod tests {
             _prefix: Option<&str>,
         ) -> Result<(), RunnerError> {
             // Confirm the staged tree actually exists at sync time (the
-            // tempdir must outlive this call).
-            let manifest = staging_dir.join("yah/release-manifest.json");
+            // tempdir must outlive this call). Located by walk rather than a
+            // fixed path so a prefixed request (`dl/yah/...`) works too.
+            let manifest = find_file(staging_dir, MANIFEST_FILENAME)
+                .expect("staged tree carries a shared manifest at sync time");
             let body = std::fs::read_to_string(&manifest).unwrap();
             self.captured_manifests.lock().unwrap().push(body);
             self.synced.lock().unwrap().push(bucket.to_string());
             Ok(())
         }
 
-        async fn revalidate(&self) -> Result<(), RunnerError> {
-            *self.revalidated.lock().unwrap() += 1;
+        async fn publish_index(
+            &self,
+            _provider: &str,
+            _bucket: &str,
+            update: &IndexUpdate,
+        ) -> Result<(), RunnerError> {
+            let mut objects = self.index_objects.lock().unwrap();
+            let merged = update
+                .merge(objects.get(&update.key).map(String::as_str))
+                .map_err(|e| RunnerError::Remote(format!("merge index: {e}")))?;
+            objects.insert(update.key.clone(), merged);
             Ok(())
+        }
+
+        async fn revalidate(&self, report: &StageReport) -> Result<(), RunnerError> {
+            *self.revalidated.lock().unwrap() += 1;
+            self.revalidate_saw
+                .lock()
+                .unwrap()
+                .extend(report.manifests.keys().cloned());
+            if self.fail_revalidate {
+                return Err(RunnerError::Remote(
+                    "POST https://yah.dev/revalidate: connection refused".into(),
+                ));
+            }
+            Ok(())
+        }
+    }
+
+    /// The dispatcher takes its publisher by value; this forwarder lets a test
+    /// keep a handle for assertions.
+    struct ArcPublisher(std::sync::Arc<RecordingPublisher>);
+
+    #[async_trait]
+    impl ReleasePublisher for ArcPublisher {
+        async fn sync(
+            &self,
+            d: &Path,
+            p: &str,
+            b: &str,
+            pre: Option<&str>,
+        ) -> Result<(), RunnerError> {
+            self.0.sync(d, p, b, pre).await
+        }
+        async fn publish_index(
+            &self,
+            p: &str,
+            b: &str,
+            u: &IndexUpdate,
+        ) -> Result<(), RunnerError> {
+            self.0.publish_index(p, b, u).await
+        }
+        async fn revalidate(&self, r: &StageReport) -> Result<(), RunnerError> {
+            self.0.revalidate(r).await
         }
     }
 
@@ -697,26 +1413,6 @@ mod tests {
         let src = TempDir::new().unwrap();
         let bin = write_dummy(src.path(), "target/release/yah", b"BIN");
         let publisher = Arc::new(RecordingPublisher::default());
-
-        // Build a dispatcher around a publisher we can inspect. The dispatcher
-        // owns the publisher, so use an Arc clone for assertions.
-        struct ArcPublisher(Arc<RecordingPublisher>);
-        #[async_trait]
-        impl ReleasePublisher for ArcPublisher {
-            async fn sync(
-                &self,
-                d: &Path,
-                p: &str,
-                b: &str,
-                pre: Option<&str>,
-            ) -> Result<(), RunnerError> {
-                self.0.sync(d, p, b, pre).await
-            }
-            async fn revalidate(&self) -> Result<(), RunnerError> {
-                self.0.revalidate().await
-            }
-        }
-
         let dispatcher = PublishingOutcomeDispatcher::new(ArcPublisher(publisher.clone()));
         let req = PublishRequest {
             provider: "r2".into(),
@@ -746,6 +1442,120 @@ mod tests {
             manifest.contains("darwin-aarch64"),
             "manifest carries triple"
         );
+        // R330-T14: the hook is handed the release it is poking about, so it
+        // can carry the manifest as the poke's `data_inputs` instead of
+        // leaving the receiver to render whatever its own node last fetched.
+        assert_eq!(
+            publisher.revalidate_saw.lock().unwrap().as_slice(),
+            ["yah"],
+            "revalidate must see the staged manifests, not just the fact of a publish"
+        );
+    }
+
+    /// R330-T32: two releases through the dispatcher leave BOTH versions in
+    /// the index. This is the whole point of the object — `release-manifest`
+    /// is overwritten by each publish, so if the index behaved the same way
+    /// the /releases page would render a one-row history forever.
+    #[tokio::test]
+    async fn dispatcher_accumulates_versions_in_the_index() {
+        use std::sync::Arc;
+        let src = TempDir::new().unwrap();
+        let publisher = Arc::new(RecordingPublisher::default());
+        let dispatcher = PublishingOutcomeDispatcher::new(ArcPublisher(publisher.clone()));
+
+        for version in ["0.8.6", "0.8.7"] {
+            let bin = write_dummy(src.path(), &format!("{version}/yah"), b"BIN");
+            dispatcher
+                .publish(&PublishRequest {
+                    provider: "r2".into(),
+                    bucket: "yah-releases".into(),
+                    prefix: Some("dl".into()),
+                    base_url: Some("https://releases.yah.dev".into()),
+                    version: version.into(),
+                    artifacts: vec![ProducedArtifact {
+                        binary: "yah".into(),
+                        path: bin,
+                        triple: Some("darwin-aarch64".into()),
+                    }],
+                })
+                .await
+                .unwrap();
+        }
+
+        let objects = publisher.index_objects.lock().unwrap();
+        let raw = objects
+            .get("dl/yah/index.json")
+            .expect("index published under the request's prefix");
+        let index: ReleaseIndex = serde_json::from_str(raw).unwrap();
+        assert_eq!(
+            index.versions.iter().map(|v| &v.version).collect::<Vec<_>>(),
+            ["0.8.7", "0.8.6"],
+            "both releases present, newest first"
+        );
+
+        let entry = &index.versions[0];
+        assert_eq!(
+            entry.manifest_url.as_deref(),
+            Some("https://releases.yah.dev/dl/yah/0.8.7/manifest.json"),
+            "derived from (base_url, prefix, binary, version), prefix included"
+        );
+        // A HISTORY entry must not link the mutable pointer: 0.8.6's manifest
+        // has to keep resolving to 0.8.6 after 0.8.7 lands.
+        assert_eq!(
+            index.versions[1].manifest_url.as_deref(),
+            Some("https://releases.yah.dev/dl/yah/0.8.6/manifest.json"),
+        );
+        let triple = entry.triples.get("darwin-aarch64").expect("triple entry");
+        assert_eq!(
+            triple.url,
+            "https://releases.yah.dev/dl/yah/0.8.7/darwin-aarch64/yah"
+        );
+        assert!(
+            triple.hash.as_deref().is_some_and(|h| h.starts_with("blake3:")),
+            "downloads carry a tagged hash: {:?}",
+            triple.hash
+        );
+    }
+
+    /// R330-T14: an unreachable revalidate receiver must NOT fail a release
+    /// whose artifacts uploaded fine. The poke only collapses the staleness
+    /// window; the consumer's feed-fetch tier is the correctness path, so
+    /// aborting here would discard a good upload to save nothing.
+    #[tokio::test]
+    async fn dispatcher_publish_survives_a_failing_revalidate() {
+        use std::sync::Arc;
+        let src = TempDir::new().unwrap();
+        let bin = write_dummy(src.path(), "target/release/yah", b"BIN");
+        let publisher = Arc::new(RecordingPublisher {
+            fail_revalidate: true,
+            ..Default::default()
+        });
+        let dispatcher = PublishingOutcomeDispatcher::new(ArcPublisher(publisher.clone()));
+        let req = PublishRequest {
+            provider: "r2".into(),
+            bucket: "yah-releases".into(),
+            prefix: None,
+            base_url: Some("https://releases.yah.dev".into()),
+            version: "0.8.6".into(),
+            artifacts: vec![ProducedArtifact {
+                binary: "yah".into(),
+                path: bin,
+                triple: Some("darwin-aarch64".into()),
+            }],
+        };
+
+        dispatcher
+            .publish(&req)
+            .await
+            .expect("a failed revalidate poke must not abort the publish");
+
+        // The upload still happened and the poke was still attempted — this is
+        // "warn and stand", not "skip the hook".
+        assert_eq!(
+            publisher.synced.lock().unwrap().as_slice(),
+            ["yah-releases"]
+        );
+        assert_eq!(*publisher.revalidated.lock().unwrap(), 1);
     }
 
     #[tokio::test]
@@ -755,22 +1565,6 @@ mod tests {
         // after via a shared Arc instead.
         use std::sync::Arc;
         let probe = Arc::new(publisher);
-        struct ArcPublisher(Arc<RecordingPublisher>);
-        #[async_trait]
-        impl ReleasePublisher for ArcPublisher {
-            async fn sync(
-                &self,
-                d: &Path,
-                p: &str,
-                b: &str,
-                pre: Option<&str>,
-            ) -> Result<(), RunnerError> {
-                self.0.sync(d, p, b, pre).await
-            }
-            async fn revalidate(&self) -> Result<(), RunnerError> {
-                self.0.revalidate().await
-            }
-        }
         let dispatcher = PublishingOutcomeDispatcher::new(ArcPublisher(probe.clone()));
         let req = PublishRequest {
             provider: "r2".into(),

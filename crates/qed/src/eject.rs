@@ -97,6 +97,15 @@ pub fn eject(source: &Path, source_bytes: &[u8], workflow: &Workflow) -> String 
     render_document(&header, &report)
 }
 
+/// Read an ejected pipeline's provenance header, if it has one.
+///
+/// `None` means the file is hand-authored, not generated — the caller should
+/// leave it alone. This is how a validator tells "a pipeline I must re-expand
+/// and check" from "a pipeline someone wrote", without loading either.
+pub fn generated_header(generated_toml: &str) -> Option<GeneratedHeader> {
+    parse_header(generated_toml)
+}
+
 /// Recompute the source hash and compare against an ejected pipeline's pin.
 /// `current_source_bytes` are the bytes on disk now; returns [`EjectFreshness`].
 /// `None` when `generated_toml` carries no `# @qed:generated` header.
@@ -142,7 +151,7 @@ pub fn validate_ejected(
 /// Render the full ejected document: provenance + flag comment header, then the
 /// native pipeline body.
 fn render_document(header: &GeneratedHeader, report: &TransformReport) -> String {
-    let pipeline = report_to_pipeline(report);
+    let pipeline = report_to_pipeline(header, report);
     let body = toml::to_string_pretty(&pipeline)
         .unwrap_or_else(|e| panic!("serialize ejected pipeline: {e}"));
     format!("{}\n{body}", render_header(header, report))
@@ -183,15 +192,18 @@ fn flag_summary(flag: &FlagKind) -> String {
         FlagKind::ToolkitAction { slug, .. } => format!("toolkit action {slug}"),
         FlagKind::Unknown { slug } => format!("unknown action {slug}"),
         FlagKind::UnresolvedExpression => "unresolved expression".to_string(),
+        FlagKind::UnbridgedSecret { names } => format!("unbridged secret {}", names.join(", ")),
     };
     format!("{what}: {}", flag.stanza_hint())
 }
 
 /// Build a native [`Pipeline`] from a transform report — the ejected body.
-fn report_to_pipeline(report: &TransformReport) -> Pipeline {
+fn report_to_pipeline(header: &GeneratedHeader, report: &TransformReport) -> Pipeline {
     Pipeline {
+        description: None,
         name: report.name.clone(),
         label: report.label.clone(),
+        tags: Vec::new(),
         steps: report.collect_native(),
         params: HashMap::new(),
         on_success: Vec::new(),
@@ -202,8 +214,17 @@ fn report_to_pipeline(report: &TransformReport) -> Pipeline {
         workspace: crate::types::WorkspaceMode::default(),
         // Record that this pipeline exists *because* it composes a workflow, so
         // the daemon suppresses the source's auto-ingest (no double catalog
-        // entry). Advisory only.
-        wraps: Some(format!("gha:{}", report.name)),
+        // entry).
+        //
+        // The token MUST carry the source's camp-relative PATH, not the
+        // pipeline name: `qed_pipelines_handler` builds its suppression set by
+        // stripping the `gha:` prefix and matching the remainder against each
+        // workflow's `rel_path`. A name slug never matches a path, so ejecting
+        // used to leave the source workflow still listed in the run tab
+        // alongside its own ejected output — the exact double-entry this field
+        // exists to prevent. It is what makes the raw `.github/workflows/*.yml`
+        // rows disappear as, and only as, each one is ported.
+        wraps: Some(format!("gha:{}", header.source.display())),
         matrix: None,
         toolchain: None,
         binds: Vec::new(),
@@ -278,6 +299,24 @@ jobs:
         assert_eq!(pipeline.name, "release-flow");
         assert_eq!(pipeline.steps.len(), 1, "only the run step is native; checkout is flagged");
         assert_eq!(pipeline.steps[0].name, "build: Build");
+    }
+
+    #[test]
+    fn wraps_records_the_source_path_so_the_run_tab_suppression_matches() {
+        // `qed_pipelines_handler` strips the `gha:` prefix and matches the
+        // remainder against each workflow's camp-relative rel_path. Recording
+        // the pipeline NAME here (as this did before) never matches, so the
+        // ejected pipeline and the workflow it replaces both stayed listed.
+        let src = Path::new(".github/workflows/release.yml");
+        let doc = eject(src, WF.as_bytes(), &wf(WF));
+        let pipeline: Pipeline = toml::from_str(strip_header(&doc)).expect("valid Pipeline TOML");
+        assert_eq!(
+            pipeline.wraps.as_deref(),
+            Some("gha:.github/workflows/release.yml")
+        );
+        // And specifically NOT the slug, which is what the name-based token
+        // would have produced.
+        assert_ne!(pipeline.wraps.as_deref(), Some("gha:release-flow"));
     }
 
     #[test]

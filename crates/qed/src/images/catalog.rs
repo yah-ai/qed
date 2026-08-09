@@ -2,7 +2,8 @@
 //!
 //! The bundled manifest at `crates/yah/qed/images/catalog.toml` ships
 //! `yah-base`, `yah-rust`, `yah-bun`, `yah-rust-bun`, `yah-python`,
-//! `yah-cuda`, `yah-node`, `yah-yubaba`, `yah-miniflare`. Per-camp entries
+//! `yah-rust-sccache`, `yah-cuda`, `yah-node`, `yah-yubaba`, `yah-miniflare`.
+//! Per-camp entries
 //! at `.yah/qed/images/<name>.toml`
 //! (or `.yah/qed/images/<name>/image.toml` when a Dockerfile lives next to
 //! the TOML) override or extend the bundled set.
@@ -240,6 +241,7 @@ mod tests {
     const EXPECTED_BUNDLED: &[&str] = &[
         "yah-base",
         "yah-rust",
+        "yah-rust-sccache",
         "yah-bun",
         "yah-rust-bun",
         "yah-python",
@@ -247,7 +249,6 @@ mod tests {
         "yah-node",
         "yah-yubaba",
         "yah-miniflare",
-        "yah-cloud-runner",
         "rusty-v8-musl-builder",
     ];
 

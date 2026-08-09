@@ -100,6 +100,7 @@ mod meta {
             beholder_status: None,
             pinned: false,
             origin: None,
+            host_pid: None,
         }
     }
 

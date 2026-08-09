@@ -83,6 +83,15 @@ pub struct Executor {
     /// so a workflow gating on `runner.arch` sees the real host it's running
     /// on, not just `runner.os`.
     pub runner_arch: String,
+    /// `runner.environment` — `github-hosted` or `self-hosted` in GHA's
+    /// vocabulary. Defaults to the running host (see
+    /// [`detect_runner_environment`]), which is `self-hosted` everywhere
+    /// except inside a GitHub-hosted runner. Workflows gate their
+    /// runner-shape steps on this (relocating Docker's storage onto the
+    /// hosted scratch volume, `sudo apt-get install`ing what the hosted
+    /// image lacks) so those steps no-op when QED runs the same workflow on
+    /// a dev box or a fleet slot.
+    pub runner_environment: String,
     /// Forward the parent process env into step subprocesses. Tests usually
     /// want this off so the workflow env is hermetic; production wants it on
     /// so steps see PATH, HOME, etc.
@@ -97,6 +106,24 @@ pub struct Executor {
     /// `if:` skip). Empty set is a caller bug; validate at the qed-runner
     /// boundary, not here.
     pub included_instance_keys: Option<std::collections::HashSet<String>>,
+    /// Restrict execution to matrix rows whose dimension VALUES match — the
+    /// declarative sibling of [`Self::included_instance_keys`].
+    ///
+    /// Each entry is `dimension => required value`, and an instance is skipped
+    /// only when it *has* that dimension and its value differs. An instance with
+    /// no matrix at all, or whose matrix lacks the dimension, is unaffected: this
+    /// narrows a fan-out, it does not disable jobs. So filtering
+    /// `{"board": "rpi_zero2w"}` over a workflow whose `build` job fans out on
+    /// `board` and whose `lint` job does not runs one `build` row and the whole
+    /// `lint` job.
+    ///
+    /// This exists because `included_instance_keys` is POSITIONAL (`build#0`),
+    /// and a position is not a thing a pipeline author knows or should have to
+    /// track: inserting a value into the matrix silently repoints every key after
+    /// it. The dashboard's operator-driven picker seeds keys from an observed run,
+    /// where positions are real; a checked-in pipeline TOML has to say what it
+    /// means. Both compose (AND) when set.
+    pub matrix_filter: std::collections::HashMap<String, String>,
     /// Optional live-event sink (W200 R487 follow-up). When set,
     /// [`execute_workflow`] emits a [`crate::GhaEvent`] at each job/step
     /// boundary so the qed-runner can mirror the nested tree into its own
@@ -148,8 +175,10 @@ impl Executor {
             inputs: Value::object(),
             runner_os: detect_runner_os().into(),
             runner_arch: detect_runner_arch().into(),
+            runner_environment: detect_runner_environment(),
             env_passthrough: true,
             included_instance_keys: None,
+            matrix_filter: std::collections::HashMap::new(),
             events: None,
             secrets: Value::object(),
             image_builder: None,
@@ -215,6 +244,22 @@ fn detect_runner_arch() -> &'static str {
     }
 }
 
+/// `runner.environment` for this host. GitHub's own runner exports
+/// `RUNNER_ENVIRONMENT` into every step, so when QED is itself running inside
+/// a GHA job (a QED pipeline invoked from a workflow) we inherit and report
+/// the truth. Everywhere else — a dev box, a fleet slot — a QED run is not on
+/// a GitHub-hosted runner, and `self-hosted` is GHA's word for that.
+///
+/// Deliberately NOT keyed off `GITHUB_ACTIONS`: that variable says "some GHA
+/// runner is in the picture", not which kind, and a self-hosted GHA runner
+/// sets it too.
+fn detect_runner_environment() -> String {
+    match std::env::var("RUNNER_ENVIRONMENT") {
+        Ok(v) if !v.trim().is_empty() => v,
+        _ => "self-hosted".into(),
+    }
+}
+
 // ─── results ───────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -241,6 +286,12 @@ pub struct InstanceRun {
     pub result: JobResult,
     pub steps: Vec<StepResult>,
     pub outputs: IndexMap<String, Value>,
+    /// Human-readable cause when [`Self::result`] is [`JobResult::Skipped`] —
+    /// which `needs:` dependency didn't succeed, the `if:` text that
+    /// evaluated falsy, or the instance-selector/matrix filter that excluded
+    /// this row (R330-B41). `None` for every other result, and for a
+    /// `Skipped` result reached by a path this runtime doesn't yet label.
+    pub skip_reason: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -255,11 +306,56 @@ pub struct StepResult {
 
 // ─── workflow walker ───────────────────────────────────────────────────────
 
+/// Should this instance be skipped rather than run? Both selectors compose with
+/// AND: an instance has to survive the positional key set (when one is given)
+/// *and* every matrix-value constraint. Returns the skip reason to surface on
+/// the [`InstanceRun`] (R330-B41), or `None` when the instance should run.
+///
+/// See [`Executor::matrix_filter`] for why a value constraint over a dimension
+/// the instance does not have is a no-op rather than an exclusion.
+fn instance_excluded(executor: &Executor, instance: &JobInstance) -> Option<String> {
+    if let Some(set) = executor.included_instance_keys.as_ref() {
+        if !set.contains(&instance.key()) {
+            return Some(format!(
+                "instance selector excluded `{}` (not in the requested run set)",
+                instance.key()
+            ));
+        }
+    }
+    if executor.matrix_filter.is_empty() {
+        return None;
+    }
+    let Some(Value::Object(row)) = instance.matrix.as_ref() else {
+        // No matrix (or a matrix that isn't an object): nothing to constrain.
+        return None;
+    };
+    for (dim, required) in &executor.matrix_filter {
+        if let Some(actual) = row.get(dim) {
+            let actual = actual.as_str_lossy();
+            if &actual != required {
+                return Some(format!(
+                    "matrix filter {dim}={required} excluded this row ({dim}={actual})"
+                ));
+            }
+        }
+    }
+    None
+}
+
 pub fn execute_workflow(
     workflow: &Workflow,
     executor: &Executor,
 ) -> Result<WorkflowRun, RuntimeError> {
-    let plan: Plan = build_plan(workflow)?;
+    // R654-F2: the matrix is expanded against the workflow-level context, so a
+    // `strategy.matrix.<dim>: ${{ fromJSON(inputs.x && … || '[…]') }}` narrows
+    // the fan-out from the caller's inputs. `vars` has no executor field yet;
+    // it stays empty rather than being faked from `env`.
+    let plan_ctx = crate::graph::PlanContext {
+        github: executor.github.clone(),
+        inputs: executor.inputs.clone(),
+        vars: Value::object(),
+    };
+    let plan: Plan = build_plan(workflow, &plan_ctx)?;
     let mut completed: Vec<CompletedInstance> = Vec::new();
     let mut runs: Vec<InstanceRun> = Vec::new();
 
@@ -267,22 +363,18 @@ pub fn execute_workflow(
         // Sequential within wave — F4 simplification. Real parallelism is a
         // scheduling concern, not a correctness one, so we punt to F4+.
         for instance in wave {
-            // R499-F3 phase 2: instance-key filter. Non-selected rows
-            // short-circuit to Skipped — same path as a GHA `if: false`
-            // — so needs aggregation (failure > cancelled > skipped >
-            // success) and downstream `if:` checks still see them.
-            let run = if executor
-                .included_instance_keys
-                .as_ref()
-                .map(|set| !set.contains(&instance.key()))
-                .unwrap_or(false)
-            {
+            // R499-F3 phase 2: instance filter. Non-selected rows short-circuit
+            // to Skipped — same path as a GHA `if: false` — so needs aggregation
+            // (failure > cancelled > skipped > success) and downstream `if:`
+            // checks still see them.
+            let run = if let Some(reason) = instance_excluded(executor, instance) {
                 InstanceRun {
                     job_id: instance.job_id.clone(),
                     matrix_index: instance.matrix_index,
                     result: JobResult::Skipped,
                     steps: vec![],
                     outputs: IndexMap::new(),
+                    skip_reason: Some(reason),
                 }
             } else {
                 emit_job_started(executor, instance, workflow);
@@ -325,13 +417,14 @@ fn run_instance(
     // is structural: the consumer never runs, so the failure surfaces at the
     // producing job — not as a bogus download error three waves later
     // (R516-B1).
-    if !needs_gate_passes(job, completed) {
+    if let Some(reason) = needs_gate_passes(job, completed) {
         return Ok(InstanceRun {
             job_id: instance.job_id.clone(),
             matrix_index: instance.matrix_index,
             result: JobResult::Skipped,
             steps: vec![],
             outputs: IndexMap::new(),
+            skip_reason: Some(reason),
         });
     }
 
@@ -342,18 +435,27 @@ fn run_instance(
         completed,
         executor.github.clone(),
         executor.inputs.clone(),
-        &executor.runner_os,
-        &executor.runner_arch,
+        crate::graph::RunnerInfo {
+            os: &executor.runner_os,
+            arch: &executor.runner_arch,
+            environment: &executor.runner_environment,
+        },
         executor.secrets.clone(),
     )?;
 
     if !should_run_job(job, &ctx)? {
+        let reason = job
+            .if_cond
+            .as_ref()
+            .map(|c| format!("if: `{}` evaluated false", c.raw_source()))
+            .unwrap_or_else(|| "if: evaluated false".to_string());
         return Ok(InstanceRun {
             job_id: instance.job_id.clone(),
             matrix_index: instance.matrix_index,
             result: JobResult::Skipped,
             steps: vec![],
             outputs: IndexMap::new(),
+            skip_reason: Some(reason),
         });
     }
 
@@ -439,6 +541,7 @@ fn run_instance(
         result,
         steps: step_results,
         outputs,
+        skip_reason: None,
     })
 }
 
@@ -527,10 +630,14 @@ fn body_calls(body: &str, name: &str) -> bool {
 /// `if_cond.is_some()` short-circuit was too coarse: it let `smoke` (an
 /// event/ref `if:` with no status function) run after its `cli-build` producer
 /// was skipped, then fail on an empty artifact store three waves later (R516-B1).
-fn needs_gate_passes(job: &Job, completed: &[CompletedInstance]) -> bool {
+/// `None` when the job's needs-gate passes (or is bypassed by a status-check
+/// `if:`); `Some(reason)` naming the first `needs:` dependency that didn't
+/// succeed otherwise (R330-B41) — the loop order matches GHA's own gate, so
+/// the first offender is the one an operator would look for first.
+fn needs_gate_passes(job: &Job, completed: &[CompletedInstance]) -> Option<String> {
     if let Some(cond) = &job.if_cond {
         if references_status_function(cond) {
-            return true;
+            return None;
         }
     }
     for need in &job.needs {
@@ -541,10 +648,18 @@ fn needs_gate_passes(job: &Job, completed: &[CompletedInstance]) -> bool {
                 .map(|c| c.result),
         );
         if agg != JobResult::Success {
-            return false;
+            return Some(format!(
+                "needs `{need}` which {} instead of succeeding",
+                match agg {
+                    JobResult::Failure => "failed",
+                    JobResult::Cancelled => "was cancelled",
+                    JobResult::Skipped => "was skipped",
+                    JobResult::Success => unreachable!("filtered above"),
+                }
+            ));
         }
     }
-    true
+    None
 }
 
 fn should_run_job(job: &Job, ctx: &Context) -> Result<bool, RuntimeError> {
@@ -605,6 +720,67 @@ fn run_step(
     Ok(res)
 }
 
+/// The W224 tier-2 environment floor: the synthetic repo context every GHA
+/// step is entitled to read, projected out of [`Executor::github`] into the
+/// `GITHUB_*` env names the runner exports, plus the generic `CI` flag.
+///
+/// tier.rs classifies this surface as **fabricate** — QED knows the repo and
+/// commit it is building, so withholding it buys nothing and costs fidelity.
+/// Before this existed the only env a step saw was `GITHUB_OUTPUT`/`_ENV`/
+/// `_STEP_SUMMARY` + `RUNNER_*`, which is the tier-1 toolkit contract alone;
+/// anything reading `$GITHUB_SHA` or `$CI` silently saw a dev shell.
+///
+/// **`GITHUB_ACTIONS` is deliberately absent**, and that omission is the whole
+/// design. It is the tier-3 flag: tools read it to mean "GitHub-the-service is
+/// reachable" and go on to assume `GITHUB_TOKEN`, the REST API, OIDC, and the
+/// artifact/cache services. W224 declines to mimic tier 3, so claiming it here
+/// would make the runtime lie about facilities it does not provide — a step
+/// that branched on it would fail deeper in, with a worse message, than one
+/// that never took the branch. `CI=true` carries the honest half of the claim:
+/// this is an automated non-interactive pipeline run. Consumers that want "am
+/// I in CI" (cargo, test harnesses, `qed`'s own placement gate) key on `CI`;
+/// consumers that want "can I call the GitHub API" correctly see nothing.
+///
+/// Lowest precedence by construction — the caller lays workflow / job / step
+/// `env:` on top, matching GHA, where the runner's env is the base a workflow
+/// may shadow. Values absent from the github context are skipped rather than
+/// exported empty, so `${GITHUB_SHA:-}` fallbacks in a step behave the same as
+/// on a runner that never set them.
+fn gha_env_floor(executor: &Executor) -> IndexMap<String, String> {
+    let mut out: IndexMap<String, String> = IndexMap::new();
+    // Generic automation flag. Set by every CI provider; the one signal here
+    // that is unambiguously true of a QED workflow run on any host.
+    out.insert("CI".into(), "true".into());
+    out.insert(
+        "GITHUB_WORKSPACE".into(),
+        executor.workspace.display().to_string(),
+    );
+    let Value::Object(github) = &executor.github else {
+        return out;
+    };
+    // (github context key, exported env name). Only the tier-2 members: repo
+    // identity and the commit/ref under build. No `GITHUB_TOKEN`, no
+    // `GITHUB_API_URL`, no run-identity (`GITHUB_RUN_ID`) — those are tier-3
+    // service handles, and a fabricated run id is worse than none.
+    const PROJECTION: &[(&str, &str)] = &[
+        ("repository", "GITHUB_REPOSITORY"),
+        ("sha", "GITHUB_SHA"),
+        ("ref", "GITHUB_REF"),
+        ("ref_name", "GITHUB_REF_NAME"),
+        ("event_name", "GITHUB_EVENT_NAME"),
+        ("actor", "GITHUB_ACTOR"),
+    ];
+    for (key, env_name) in PROJECTION {
+        if let Some(v) = github.get(*key) {
+            let s = v.as_str_lossy();
+            if !s.is_empty() {
+                out.insert((*env_name).into(), s);
+            }
+        }
+    }
+    out
+}
+
 /// Compose the env passed to a step: workflow.env + job.env are already in
 /// ctx.env; merge per-step env (typed values lowered to strings) on top. The
 /// `env_overlay` argument is the prior-step `$GITHUB_ENV` accumulator — it's
@@ -616,7 +792,7 @@ fn compose_step_env(
     _env_overlay: &IndexMap<String, String>,
     executor: &Executor,
 ) -> Result<IndexMap<String, String>, RuntimeError> {
-    let mut out: IndexMap<String, String> = IndexMap::new();
+    let mut out: IndexMap<String, String> = gha_env_floor(executor);
     // Lowest-precedence host default (inserted first so workflow / job / step
     // `env:` below override it): when the runner host isn't x86_64, point docker
     // at linux/amd64. Steps that pull the amd64-only cross base images
@@ -700,6 +876,7 @@ fn run_bash_step(
     cmd.env("GITHUB_STEP_SUMMARY", &step_summary_path);
     cmd.env("RUNNER_OS", &executor.runner_os);
     cmd.env("RUNNER_ARCH", &executor.runner_arch);
+    cmd.env("RUNNER_ENVIRONMENT", &executor.runner_environment);
 
     // Pipe stdout + stderr so we can stream lines through the event sink
     // (when configured) and still capture full buffers for the returned
@@ -1223,22 +1400,6 @@ mod tests {
 
     fn workflow(yaml: &str) -> Workflow {
         parse_workflow(yaml).unwrap_or_else(|e| panic!("parse: {e}"))
-    }
-
-    fn executor() -> Executor {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut e = Executor::new(tmp.path());
-        // Tests run hermetic — env_passthrough off so PATH-leak doesn't
-        // change behavior. Re-inject PATH explicitly so bash + coreutils
-        // still resolve.
-        e.env_passthrough = false;
-        let path = std::env::var("PATH").unwrap_or_default();
-        e.runner_os = "Linux".into();
-        // Stash PATH on a struct field-less side — we add it to the env via
-        // a workflow-level env entry instead.
-        std::mem::forget(tmp); // keep workspace alive for the test
-        let _ = path;
-        e
     }
 
     fn workspace_path() -> PathBuf {
@@ -1882,6 +2043,146 @@ jobs:
         assert_eq!(run.instance_at("build", 1).unwrap().steps.len(), 1);
     }
 
+    #[test]
+    fn matrix_filter_selects_by_value_not_position() {
+        // The point of the value selector: a checked-in pipeline says WHICH board
+        // it builds, and stays correct when the matrix gains a row ahead of it.
+        // Same workflow, same filter, a value inserted at the front — and the
+        // selected row moves with its value instead of staying at an index.
+        let before = workflow(
+            r#"
+on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        board: [orangepi_zero2w, rpi_zero2w]
+    steps:
+      - run: echo "building ${{ matrix.board }}"
+"#,
+        );
+        let after = workflow(
+            r#"
+on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        board: [stm32mp157c_dk2, orangepi_zero2w, rpi_zero2w]
+    steps:
+      - run: echo "building ${{ matrix.board }}"
+"#,
+        );
+        let filtered = || {
+            let mut e = Executor::new(workspace_path());
+            e.env_passthrough = true;
+            e.runner_os = "Linux".into();
+            e.matrix_filter = [("board".to_string(), "rpi_zero2w".to_string())]
+                .into_iter()
+                .collect();
+            e
+        };
+
+        let run = execute_workflow(&before, &filtered()).expect("execute before");
+        assert_eq!(run.instances.len(), 2);
+        assert_eq!(run.instance_at("build", 0).unwrap().result, JobResult::Skipped);
+        assert_eq!(run.instance_at("build", 1).unwrap().result, JobResult::Success);
+        // R330-B41: a matrix-filtered skip names the filter, not just "skipped".
+        let reason = run.instance_at("build", 0).unwrap().skip_reason.as_deref().unwrap();
+        assert!(reason.contains("rpi_zero2w"), "reason should name the filter: {reason}");
+
+        // rpi_zero2w is now at index 2. A positional selector pinned to `build#1`
+        // would have silently started building orangepi here.
+        let run = execute_workflow(&after, &filtered()).expect("execute after");
+        assert_eq!(run.instances.len(), 3);
+        assert_eq!(run.instance_at("build", 0).unwrap().result, JobResult::Skipped);
+        assert_eq!(run.instance_at("build", 1).unwrap().result, JobResult::Skipped);
+        assert_eq!(run.instance_at("build", 2).unwrap().result, JobResult::Success);
+        assert_eq!(run.instance_at("build", 2).unwrap().steps.len(), 1);
+    }
+
+    #[test]
+    fn matrix_filter_leaves_jobs_without_that_dimension_alone() {
+        // A filter NARROWS a fan-out; it does not disable jobs. `lint` has no
+        // board dimension, so pinning a board must not make it disappear — and a
+        // matrix job on an unrelated dimension is likewise untouched.
+        let wf = workflow(
+            r#"
+on: [push]
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo linting
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        board: [orangepi_zero2w, rpi_zero2w]
+    steps:
+      - run: echo "building ${{ matrix.board }}"
+  docs:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        lang: [en, fr]
+    steps:
+      - run: echo "docs ${{ matrix.lang }}"
+"#,
+        );
+        let mut e = Executor::new(workspace_path());
+        e.env_passthrough = true;
+        e.runner_os = "Linux".into();
+        e.matrix_filter = [("board".to_string(), "orangepi_zero2w".to_string())]
+            .into_iter()
+            .collect();
+        let run = execute_workflow(&wf, &e).expect("execute");
+
+        // `lint` has no matrix, so it has no matrix_index — reached via
+        // `instance`, not `instance_at`.
+        assert_eq!(run.instance("lint").unwrap().result, JobResult::Success);
+        assert_eq!(run.instance_at("build", 0).unwrap().result, JobResult::Success);
+        assert_eq!(run.instance_at("build", 1).unwrap().result, JobResult::Skipped);
+        assert_eq!(run.instance_at("docs", 0).unwrap().result, JobResult::Success);
+        assert_eq!(run.instance_at("docs", 1).unwrap().result, JobResult::Success);
+    }
+
+    #[test]
+    fn matrix_filter_and_instance_keys_compose_as_and() {
+        // Both selectors set: an instance has to survive both. The positional set
+        // admits rows 0 and 1; the value filter admits only rpi_zero2w (row 1), so
+        // exactly row 1 runs. An operator narrowing a run in the dashboard must not
+        // be able to widen what a pinned pipeline builds.
+        let wf = workflow(
+            r#"
+on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        board: [orangepi_zero2w, rpi_zero2w, stm32mp157c_dk2]
+    steps:
+      - run: echo "building ${{ matrix.board }}"
+"#,
+        );
+        let mut e = Executor::new(workspace_path());
+        e.env_passthrough = true;
+        e.runner_os = "Linux".into();
+        e.included_instance_keys =
+            Some(["build#0".to_string(), "build#1".to_string()].into_iter().collect());
+        e.matrix_filter = [("board".to_string(), "rpi_zero2w".to_string())]
+            .into_iter()
+            .collect();
+        let run = execute_workflow(&wf, &e).expect("execute");
+
+        assert_eq!(run.instance_at("build", 0).unwrap().result, JobResult::Skipped);
+        assert_eq!(run.instance_at("build", 1).unwrap().result, JobResult::Success);
+        assert_eq!(run.instance_at("build", 2).unwrap().result, JobResult::Skipped);
+    }
+
     fn run_in_fresh_workspace(wf: &Workflow) -> WorkflowRun {
         let tmp = tempfile::tempdir().unwrap();
         let mut e = Executor::new(tmp.path());
@@ -1949,6 +2250,10 @@ jobs:
         let consumer = run.instance("consumer").unwrap();
         assert_eq!(consumer.result, JobResult::Skipped);
         assert!(consumer.steps.is_empty(), "consumer must not run any step");
+        // R330-B41: the skip names the dependency that failed, not just "skipped".
+        let reason = consumer.skip_reason.as_deref().unwrap();
+        assert!(reason.contains("producer"), "reason should name the dep: {reason}");
+        assert!(reason.contains("failed"), "reason should say why: {reason}");
     }
 
     #[test]
@@ -1997,7 +2302,247 @@ jobs:
 "#;
         let wf = workflow(yaml);
         let run = run_with_path(&wf);
-        assert_eq!(run.instance("a").unwrap().result, JobResult::Skipped);
+        let a = run.instance("a").unwrap();
+        assert_eq!(a.result, JobResult::Skipped);
+        // R330-B41: an if:-false skip names the condition, not just "skipped".
+        let reason = a.skip_reason.as_deref().unwrap();
+        assert!(reason.contains("false"), "reason should name the if: {reason}");
         assert_eq!(run.instance("b").unwrap().result, JobResult::Success);
+    }
+
+    /// The workflow shape R654-T1 exists for: a hosted-runner-shape step
+    /// (relocating Docker's storage onto the hosted scratch volume,
+    /// `sudo apt-get install`ing what the hosted image lacks) gated so it
+    /// no-ops off GitHub, with a local-only sibling gated the other way.
+    const RUNNER_ENVIRONMENT_GATE: &str = r#"
+on: [push]
+jobs:
+  one:
+    runs-on: ubuntu-latest
+    steps:
+      - id: hosted
+        if: runner.environment == 'github-hosted'
+        run: echo "ran=hosted" >> "$GITHUB_OUTPUT"
+      - id: local
+        if: runner.environment != 'github-hosted'
+        run: echo "ran=local" >> "$GITHUB_OUTPUT"
+      - id: report
+        run: |
+          echo "ctx=${{ runner.environment }}" >> "$GITHUB_OUTPUT"
+          echo "envvar=$RUNNER_ENVIRONMENT" >> "$GITHUB_OUTPUT"
+"#;
+
+    #[test]
+    fn self_hosted_runner_environment_skips_the_hosted_only_step() {
+        // A QED run is not on a GitHub-hosted runner, so the hosted-only step
+        // must skip and its local sibling must run. Before R654-T1 `runner`
+        // carried only {os, arch}, so `runner.environment` resolved to null.
+        let wf = workflow(RUNNER_ENVIRONMENT_GATE);
+        let mut e = Executor::new(workspace_path());
+        e.env_passthrough = true;
+        e.runner_environment = "self-hosted".into();
+        let run = execute_workflow(&wf, &e).unwrap_or_else(|err| panic!("execute: {err}"));
+        let inst = run.instance("one").unwrap();
+        assert_eq!(inst.result, JobResult::Success);
+        assert_eq!(inst.steps[0].conclusion, StepConclusion::Skipped);
+        assert_eq!(inst.steps[1].conclusion, StepConclusion::Success);
+        assert_eq!(
+            inst.steps[1].outputs.get("ran"),
+            Some(&Value::String("local".into()))
+        );
+        // The value is readable as an expression AND as the env var GitHub's
+        // own runner exports, so a `run:` body can branch on either.
+        assert_eq!(
+            inst.steps[2].outputs.get("ctx"),
+            Some(&Value::String("self-hosted".into()))
+        );
+        assert_eq!(
+            inst.steps[2].outputs.get("envvar"),
+            Some(&Value::String("self-hosted".into()))
+        );
+    }
+
+    #[test]
+    fn github_hosted_runner_environment_runs_the_hosted_only_step() {
+        // The other direction: QED invoked from inside a GitHub-hosted job
+        // inherits RUNNER_ENVIRONMENT=github-hosted, and the same workflow
+        // then runs its hosted-shape step and skips the local one.
+        let wf = workflow(RUNNER_ENVIRONMENT_GATE);
+        let mut e = Executor::new(workspace_path());
+        e.env_passthrough = true;
+        e.runner_environment = "github-hosted".into();
+        let run = execute_workflow(&wf, &e).unwrap_or_else(|err| panic!("execute: {err}"));
+        let inst = run.instance("one").unwrap();
+        assert_eq!(inst.result, JobResult::Success);
+        assert_eq!(inst.steps[0].conclusion, StepConclusion::Success);
+        assert_eq!(
+            inst.steps[0].outputs.get("ran"),
+            Some(&Value::String("hosted".into()))
+        );
+        assert_eq!(inst.steps[1].conclusion, StepConclusion::Skipped);
+        assert_eq!(
+            inst.steps[2].outputs.get("ctx"),
+            Some(&Value::String("github-hosted".into()))
+        );
+    }
+
+    #[test]
+    fn dynamic_matrix_narrows_the_executed_fan_out_from_inputs() {
+        // R654-F2 end to end: `executor.inputs` reaches the matrix expansion,
+        // so a caller-narrowed matrix actually runs one row — not the two the
+        // literal fallback would produce, and not one row whose `matrix.board`
+        // is the un-evaluated `${{ … }}` source text.
+        let yaml = r#"
+on: [workflow_dispatch]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        board: ${{ fromJSON(inputs.board && format('["{0}"]', inputs.board) || '["rpi_zero2w","rpi4"]') }}
+    steps:
+      - id: a
+        run: echo "board=${{ matrix.board }}" >> "$GITHUB_OUTPUT"
+"#;
+        let wf = workflow(yaml);
+
+        let mut wide = Executor::new(workspace_path());
+        wide.env_passthrough = true;
+        let run = execute_workflow(&wf, &wide).unwrap_or_else(|err| panic!("execute: {err}"));
+        assert_eq!(run.instances.len(), 2);
+
+        let mut narrow = Executor::new(workspace_path());
+        narrow.env_passthrough = true;
+        narrow.inputs = crate::expr::obj([("board", "rpi4")]);
+        let run = execute_workflow(&wf, &narrow).unwrap_or_else(|err| panic!("execute: {err}"));
+        assert_eq!(run.instances.len(), 1);
+        assert_eq!(run.instances[0].result, JobResult::Success);
+        assert_eq!(
+            run.instances[0].steps[0].outputs.get("board"),
+            Some(&Value::String("rpi4".into()))
+        );
+    }
+
+    #[test]
+    fn runner_environment_defaults_to_self_hosted_off_a_github_runner() {
+        // The default the noisetable wrap depends on. Guarded so the assertion
+        // stays honest if this suite ever runs inside a GitHub-hosted job,
+        // where inheriting `github-hosted` is the correct answer.
+        let e = Executor::bare(workspace_path());
+        match std::env::var("RUNNER_ENVIRONMENT") {
+            Ok(v) if !v.trim().is_empty() => assert_eq!(e.runner_environment, v),
+            _ => assert_eq!(e.runner_environment, "self-hosted"),
+        }
+    }
+
+    // ─── tier-2 env floor ───────────────────────────────────────────────────
+
+    fn github_ctx(pairs: &[(&str, &str)]) -> Value {
+        let mut m: IndexMap<String, Value> = IndexMap::new();
+        for (k, v) in pairs {
+            m.insert((*k).into(), Value::String((*v).into()));
+        }
+        Value::Object(m)
+    }
+
+    #[test]
+    fn env_floor_projects_the_tier2_repo_context() {
+        let mut e = Executor::bare(workspace_path());
+        e.github = github_ctx(&[
+            ("repository", "yah-ai/yah"),
+            ("sha", "deadbeef"),
+            ("ref", "refs/tags/v0.8.20"),
+            ("ref_name", "v0.8.20"),
+            ("event_name", "push"),
+            ("actor", "Yah Dev"),
+        ]);
+        let floor = gha_env_floor(&e);
+        assert_eq!(floor.get("CI").map(String::as_str), Some("true"));
+        assert_eq!(
+            floor.get("GITHUB_REPOSITORY").map(String::as_str),
+            Some("yah-ai/yah")
+        );
+        assert_eq!(floor.get("GITHUB_SHA").map(String::as_str), Some("deadbeef"));
+        assert_eq!(
+            floor.get("GITHUB_REF").map(String::as_str),
+            Some("refs/tags/v0.8.20")
+        );
+        assert_eq!(
+            floor.get("GITHUB_REF_NAME").map(String::as_str),
+            Some("v0.8.20")
+        );
+        assert_eq!(
+            floor.get("GITHUB_EVENT_NAME").map(String::as_str),
+            Some("push")
+        );
+        assert_eq!(floor.get("GITHUB_ACTOR").map(String::as_str), Some("Yah Dev"));
+        assert_eq!(
+            floor.get("GITHUB_WORKSPACE").map(String::as_str),
+            Some(workspace_path().display().to_string().as_str())
+        );
+    }
+
+    #[test]
+    fn env_floor_withholds_github_actions_and_service_handles() {
+        // The load-bearing omission (W224 tier 3): QED provides no GITHUB_TOKEN,
+        // no REST API, no OIDC. Claiming `GITHUB_ACTIONS=true` would invite a
+        // step to take a branch that needs all three. `CI` carries the honest
+        // half. If this assertion is ever relaxed, tier-3 has to land first.
+        let mut e = Executor::bare(workspace_path());
+        e.github = github_ctx(&[("repository", "yah-ai/yah"), ("sha", "deadbeef")]);
+        let floor = gha_env_floor(&e);
+        assert!(!floor.contains_key("GITHUB_ACTIONS"));
+        assert!(!floor.contains_key("GITHUB_TOKEN"));
+        assert!(!floor.contains_key("GITHUB_RUN_ID"));
+        assert!(!floor.contains_key("GITHUB_API_URL"));
+    }
+
+    #[test]
+    fn env_floor_skips_unknown_context_members_rather_than_exporting_empty() {
+        // A workspace with no git origin has no `repository`; a step doing
+        // `${GITHUB_REPOSITORY:-fallback}` must see the fallback, which an
+        // exported empty string would defeat.
+        let mut e = Executor::bare(workspace_path());
+        e.github = github_ctx(&[("repository", ""), ("sha", "deadbeef")]);
+        let floor = gha_env_floor(&e);
+        assert!(!floor.contains_key("GITHUB_REPOSITORY"));
+        assert!(floor.contains_key("GITHUB_SHA"));
+    }
+
+    #[test]
+    fn workflow_env_overrides_the_floor_and_steps_observe_ci() {
+        // Two contracts in one run: `$CI` reaches a real bash step (the thing
+        // the placement gate keys on), and the floor sits at the BOTTOM of the
+        // precedence stack the way a real runner's env does.
+        let yaml = r#"
+on: [push]
+env:
+  GITHUB_REF_NAME: shadowed-by-workflow-env
+jobs:
+  one:
+    runs-on: ubuntu-latest
+    steps:
+      - id: report
+        run: |
+          echo "ci=$CI" >> "$GITHUB_OUTPUT"
+          echo "sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+          echo "refname=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+"#;
+        let wf = workflow(yaml);
+        let mut e = Executor::new(workspace_path());
+        e.env_passthrough = true;
+        e.github = github_ctx(&[("sha", "deadbeef"), ("ref_name", "v0.8.20")]);
+        let run = execute_workflow(&wf, &e).unwrap_or_else(|err| panic!("execute: {err}"));
+        let s = &run.instance("one").unwrap().steps[0];
+        assert_eq!(s.conclusion, StepConclusion::Success);
+        assert_eq!(s.outputs.get("ci"), Some(&Value::String("true".into())));
+        assert_eq!(s.outputs.get("sha"), Some(&Value::String("deadbeef".into())));
+        assert_eq!(
+            s.outputs.get("refname"),
+            Some(&Value::String("shadowed-by-workflow-env".into()))
+        );
+        // `GITHUB_ACTIONS` is asserted absent at the floor, not here: this run
+        // uses `env_passthrough`, so on a real GitHub runner the ambient value
+        // legitimately leaks through — and there it is true.
     }
 }

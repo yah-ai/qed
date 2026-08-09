@@ -38,16 +38,30 @@
 //! Shim libraries must treat absent `YAH_TASK_RUN` as "not inside a TaskRun".
 //!
 //! @yah:ticket(R617-F6, "Reattach-by-run_id replaces Lost-on-disappear for origin=terminal shells")
-//! @yah:at(2026-07-20T18:38:27Z)
-//! @yah:status(open)
+//! @yah:status(review)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:at(2026-07-24T01:26:41Z)
 //! @yah:phase(P3)
 //! @yah:parent(R617)
-//! @yah:next("TaskDriver::new (driver.rs:199) marks every leftover Running run Lost on construction — correct for ordinary jobs, fatal for a shell meant to survive a restart. Split the behaviour on origin: a terminal shell whose host process is still alive is re-adopted (control channel rebuilt, reader thread restarted against the surviving PTY) rather than tombstoned.")
-//! @yah:verify("Manual: open a shell, run `sleep 300`, quit and relaunch the desktop — the run is still Running, not Lost")
-//! @yah:gotcha("This is an oss/qed crate — changes land in-tree under oss/task-runs and flow outward via scripts/export-oss.sh. Keep the reattach seam generic (origin-agnostic policy hook), not yah-terminal-specific, since the crate ships standalone.")
-//! @yah:gotcha("Reattach only makes sense once the PTY outlives the desktop (S5 decides the host). Landing it before that gives a reattach path with nothing to reattach to.")
 //! @arch:see(.yah/docs/working/W280-durable-terminal-sessions.md)
 //! @yah:depends_on(R617-F13)
+//! @yah:handoff("DELIVERED. Verified: `cd oss/qed && cargo test -p task-runs --lib` 243/243 (was 237 — 6 new); `cargo test -p kg-daemon --lib shell_vt` 9/9; `cargo test -p yah --lib r617` 9/9; `cargo test -p desktop --lib` 357 pass / 2 fail, both pre-existing and in files this ticket does not touch (agent.rs rules-view expects 12 rows and a peer's approval-rule change makes 19; agent_process reader-finished is a known timing flake).")
+//! @yah:handoff("THE TICKET'S OWN FRAMING WAS WRONG ABOUT THE MECHANISM, and the correction is the design. @yah:next said to 're-adopt' a live shell by 'control channel rebuilt, reader thread restarted against the surviving PTY'. That is not possible and never was: you cannot re-open another process's PTY master fd. The real defect is narrower and worse — a driver was tombstoning runs IT DID NOT OWN. `.yah/db/task-runs.turso` has several writers (desktop, the R617-F13 shell host, one CampService per MCP sidecar), and `TaskDriver::new` assumed any leftover `Running` row must be its own predecessor's corpse. So every attach marked some other LIVE process's shell `Lost`, and that shell kept producing output under a status saying it was dead. The fix is therefore 'do not tombstone what you do not own', not 'reattach'. Actual PTY reattach is unnecessary once F13 puts the PTY in a process that outlives the desktop.")
+//! @yah:handoff("HOW OWNERSHIP IS KNOWN: new `TaskRunMeta::host_pid` — the pid of the process whose driver spawned the run, NOT the child's. Stamped by `spawn_run` at INSERT, before the child exists, so a crash between insert and spawn still leaves the row attributable. Store column added by the same idempotent `ALTER TABLE ... ADD COLUMN` pattern `origin` used, and `row_to_meta` reads index 15 with `.ok().flatten()` so a DB with no such column reads `None` rather than erroring.")
+//! @yah:handoff("THE SEAM IS ORIGIN-AGNOSTIC, per this ticket's gotcha. New `task_runs::StaleRunPolicy` in oss/qed/crates/task-runs/src/driver.rs: `LostOnDisappear` (the default — `TaskDriver::new` and `with_channels` behave exactly as before, so no existing embedder changed) and `AdoptLiveHosts { origins: Vec<String> }`, which spares a leftover run only when its `host_pid` names a process that still exists. The crate decides on OWNERSHIP and takes the origin list as data — it never learns what 'terminal' means. New `TaskDriver::with_config` is the constructor that takes it.")
+//! @yah:handoff("yah side: `crates/yah/kg-daemon/src/service.rs::open_task_store` now passes `AdoptLiveHosts { origins: [ORIGIN_TERMINAL] }`. Also replaced the magic string — new `kg_daemon::shell_vt::ORIGIN_TERMINAL` now backs the two live `origin == \"terminal\"` gates in shell_vt.rs plus the policy, so the VT-parsing gate and the tombstone-exemption gate cannot drift apart by a typo. The constant lives on the yah side, NOT in task-runs, precisely to keep the crate generic.")
+//! @yah:handoff("Also stamped at app/yah/desktop/src/terminal.rs:519 — the desktop-local PTY path (terminal_open_local's scrollback mint) owns its own PTYs, so those rows carry the desktop's pid. Without it the shell host's driver would tombstone a live desktop-local session on attach, which is the same bug pointing the other way.")
+//! @yah:handoff("PID REUSE is the honest weakness and is why the policy is opt-in and origin-narrowed. `kill(pid, 0)` (EPERM counts as alive — the process exists, it is just not ours to signal) can read a recycled pid as the original owner. The failure mode of a false 'alive' is one run left `Running` until something closes it; the false 'dead' this replaces kills a live session's status. Strictly the better direction for an interactive shell, and the exposure is bounded to origins the embedder opted in. Non-unix has no kill(2), so `host_process_alive` reports false there and the platform keeps the old behaviour rather than stranding runs forever.")
+//! @yah:handoff("SIX NEW TESTS, each pinned to a failure rather than a code path: a live-owner terminal run survives a new driver (the ticket's whole point); a run whose owner pid was spawned and reaped in-test IS tombstoned (a crashed host must not leave zombie tiles); origin-less and non-matching origins are tombstoned even with a live owner (an in-flight `cargo build` whose driver is gone has nobody left to record its exit); an unattributed row (pre-migration) is tombstoned; `TaskDriver::new` still tombstones unconditionally (no silent behaviour change for existing embedders); and `spawn_run` stamps this process — the policy is worthless if rows arrive unattributed.")
+//! @yah:verify("cd oss/qed && cargo test -p task-runs --lib  # 243/243, 6 new under driver::tests")
+//! @yah:verify("cargo test -p kg-daemon --lib shell_vt  # 9/9")
+//! @yah:verify("cargo test -p yah --lib r617  # 9/9")
+//! @yah:verify("Manual (needs a desktop rebuild): open a shell, run `sleep 300`, quit and relaunch the desktop — the run is still Running, not Lost")
+//! @yah:verify("sqlite3 .yah/db/task-runs.turso \"select id, origin, host_pid, status from runs where status='running';\"  # every live row names a pid that ps shows")
+//! @yah:gotcha("This is an oss/qed crate — changes land in-tree under oss/qed/crates/task-runs and flow outward via scripts/export-oss.sh. The seam was kept origin-agnostic (StaleRunPolicy decides on host_pid, takes origins as data); the one yah-ism, ORIGIN_TERMINAL, lives in crates/yah/kg-daemon/src/shell_vt.rs instead.")
+//! @yah:gotcha("`host_pid` is NOT on the wire. rpc::WireRunMeta does not carry it, so a client cannot ask 'is this run's owner alive'. Nothing needs it today — the policy runs entirely daemon-side — but R617-F7 should check whether reattaching tiles want it before adding a second liveness notion of their own.")
+//! @yah:gotcha("pid reuse can make a dead owner read alive, leaving a run `Running` with nobody driving it. Bounded on purpose (opt-in + origin-narrowed) and strictly safer than the false-dead it replaces, but it is a real edge: if zombie terminal rows ever accumulate, this is why.")
+//! @yah:gotcha("TaskRunMeta gained a required field, so every struct-literal construction site had to be updated (velveteen-exec x4, scryer, task-runs fixtures, kg-daemon fixtures, desktop/terminal.rs x2). A new construction site added by anyone else will fail to compile until they pick a value — which is the intended forcing function: a run with no recorded owner is a run the policy has to tombstone.")
 //!
 //! @yah:ticket(R617-B9, "Pre-existing: task-runs log_pipe_events_land_in_store never completes (233 pass / 1 fail)")
 //! @yah:status(review)
@@ -61,6 +75,21 @@
 //! @yah:handoff("New regression test store.rs::concurrent_writers_do_not_lose_the_terminal_status — two background tasks hammer append_chunk/append_event while update_status lands. Verified it has teeth: with busy_timeout and the retry disabled it fails 3/3 with the exact `Busy(\"database is locked\")`; with them it passes 5/5.")
 //! @yah:verify("cd oss/qed && cargo test -p task-runs --lib — 237 passed / 0 failed (was 235 pass / 1 fail)")
 //! @yah:verify("log_pipe_events_land_in_store run 8x sequentially: 8/8 green in ~0.58s each. Before the fix the same loop was 11/12 red at the 20s timeout.")
+//!
+//! @yah:ticket(R652-T6, "Login shell: when cmd is the resolved shell, exec it directly (not sh -c) with -l")
+//! @yah:at(2026-08-02T00:03:08Z)
+//! @yah:status(review)
+//! @yah:assignee(agent:bundle-ollama-cloud-boulder)
+//! @yah:phase(P1)
+//! @yah:parent(R652)
+//! @yah:handoff("Login shells now exec directly with -l instead of going through sh -c. SpawnOpts (oss/qed/crates/task-runs/src/driver.rs) gained `argv: Option<Vec<String>>`: when set, spawn_run builds the CommandBuilder from that argv verbatim instead of wrapping `cmd` in `sh -c`. camp-service task_run sets it to [resolved_shell, \"-l\"] whenever the request is a shell request.")
+//! @yah:handoff("Why an argv escape hatch rather than a `login_shell: bool` flag in the driver: task-runs is an oss/qed crate and has no business knowing what a login shell is. The caller names the exact process; the driver just execs it. This also made R652-T4 a two-line addition rather than a second flag.")
+//! @yah:handoff("Three things this fixes beyond .zprofile finally running. (1) `sh -c \"zsh -l\"` left an inert `sh` as the PTY's foreground process group leader, so job control misbehaved and signals went to the wrong process. (2) That same inert sh is what the foreground-pid cwd probe (R652-T2) would have reported for, so T2 could not have worked without this. (3) -l is now a real argv element instead of text inside a shell string, so no quoting layer can eat it.")
+//! @yah:handoff("`cmd` is still what lands on TaskRunMeta.command, so a shell run reads back as \"$SHELL\" -- the rail label and the history re-run path both keep working. Beholder argv rewriting is bypassed when argv is set (the attach runs with BeholderSelect::None): the rewritten argv would be discarded on that path, so recording a `rewrite=...` that never happened would be a lie in the run metadata.")
+//! @yah:handoff("An empty argv falls back to the sh -c path rather than spawning nothing -- a caller bug should not become an exec of the empty string.")
+//! @yah:verify("cd oss/qed && cargo test -p task-runs --lib  # 246/246 green (3 new: explicit_argv_execs_the_program_directly, explicit_argv_still_records_the_requested_command, empty_argv_falls_back_to_the_shell_path)")
+//! @yah:verify("Manual (needs desktop rebuild): add `echo W289-login-test >> /tmp/w289.log` to ~/.zprofile, open a shell tile, confirm the file gets a line")
+//! @yah:gotcha("driver.rs is an oss/qed crate -- this lands in-tree under oss/qed/crates/task-runs and flows outward via scripts/export-oss.sh on the next release. SpawnOpts gained a field, but every in-tree construction site uses ..Default::default(), so nothing else needed touching.")
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -126,6 +155,24 @@ pub struct SpawnOpts {
     /// Provenance tag stored on the run's `TaskRunMeta.origin` (e.g.
     /// `Some("terminal")` for an interactive shell). `None` is an ordinary job.
     pub origin: Option<String>,
+    /// Exec this argv directly instead of wrapping `cmd` in `sh -c`.
+    ///
+    /// The default `sh -c <cmd>` is right for a job — the caller wrote a
+    /// command line and expects a shell to parse it. It is wrong for an
+    /// *interactive shell*: `sh -c "zsh -l"` leaves an inert `sh` as the PTY's
+    /// foreground process group leader, so job control misbehaves, signals go
+    /// to the wrong process, and anything that reads the foreground pid (a
+    /// live-cwd probe, say) sees `sh` instead of the shell the operator is
+    /// typing into. Handing the exact argv here makes the shell itself the
+    /// child, which is also the only way to pass `-l` as a real argv element
+    /// so `.zprofile` / `.profile` actually run.
+    ///
+    /// `cmd` is still what gets recorded on `TaskRunMeta.command`, so the run
+    /// reads the way the caller asked for it. Beholder argv rewriting is
+    /// bypassed when this is set: the caller has already decided the exact
+    /// process to exec, and a recorded `rewrite=…` that didn't happen would be
+    /// a lie in the run metadata.
+    pub argv: Option<Vec<String>>,
 }
 
 impl Default for SpawnOpts {
@@ -143,6 +190,7 @@ impl Default for SpawnOpts {
             tty_attached: false,
             log_fd_enabled: true,
             origin: None,
+            argv: None,
         }
     }
 }
@@ -163,6 +211,98 @@ pub struct DriverChannels {
     /// The driver deliberately stays ignorant of what the tap is for — the
     /// chunk carries `run_id`, so the host decides which runs it cares about.
     pub output: Option<mpsc::UnboundedSender<OutputChunk>>,
+}
+
+// ─── Stale-run policy ────────────────────────────────────────────────────────
+
+/// What a freshly-constructed [`TaskDriver`] does with `Running` rows it finds
+/// already in the store.
+///
+/// The historical rule — tombstone every one of them — bakes in an assumption
+/// that stops being true the moment a second process attaches to the same
+/// store: that any `Running` row must be a corpse from *this* process's
+/// predecessor. When two processes share a store, a driver starting up in one
+/// will happily mark the other's live runs `Lost`, and the run keeps producing
+/// output under a status that says it is dead.
+///
+/// The policy is deliberately origin-agnostic in its mechanism — it decides on
+/// **who owns the run** ([`TaskRunMeta::host_pid`]) — and takes the origin list
+/// as data, so an embedder names the runs it wants exempted without this crate
+/// knowing what any of them mean.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub enum StaleRunPolicy {
+    /// Tombstone every leftover `Running` run as `Lost`.
+    ///
+    /// Correct, and the default, whenever this process is the only writer:
+    /// a run whose driver is gone has no one left to notice it exit.
+    #[default]
+    LostOnDisappear,
+    /// Spare runs whose recorded owner process is still alive.
+    ///
+    /// A leftover run is tombstoned only when its `host_pid` is absent (owner
+    /// unknown — a row from before the column existed) or names a process that
+    /// no longer exists. Anything else belongs to a live peer and is left
+    /// `Running` for that peer to finish.
+    ///
+    /// `origins` narrows the exemption to runs whose
+    /// [`TaskRunMeta::origin`] is in the list; empty means every origin
+    /// qualifies. A run with no origin never matches a non-empty list.
+    AdoptLiveHosts { origins: Vec<String> },
+}
+
+impl StaleRunPolicy {
+    /// Whether `meta` should be tombstoned `Lost` at driver construction.
+    fn tombstones(&self, meta: &TaskRunMeta) -> bool {
+        match self {
+            StaleRunPolicy::LostOnDisappear => true,
+            StaleRunPolicy::AdoptLiveHosts { origins } => {
+                let exempt_origin = origins.is_empty()
+                    || meta
+                        .origin
+                        .as_deref()
+                        .is_some_and(|o| origins.iter().any(|want| want == o));
+                if !exempt_origin {
+                    return true;
+                }
+                match meta.host_pid {
+                    Some(pid) => !host_process_alive(pid),
+                    None => true,
+                }
+            }
+        }
+    }
+}
+
+/// Is a process with this pid still around?
+///
+/// `kill(pid, 0)` is the portable liveness probe: it performs the permission
+/// check and existence lookup without delivering anything. `EPERM` counts as
+/// alive — the process exists, it just is not ours to signal.
+///
+/// Pid reuse can make a dead owner read as alive. That is why
+/// [`StaleRunPolicy::AdoptLiveHosts`] is opt-in and origin-narrowed: the cost
+/// of a false "alive" is one run left `Running` until something closes it,
+/// which is strictly better for an interactive session than the false "dead"
+/// this replaces — which kills a *live* session's status.
+#[cfg(unix)]
+fn host_process_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    if pid == std::process::id() {
+        return true;
+    }
+    // SAFETY: `kill` with signal 0 delivers nothing; it only reports whether
+    // the pid exists and is signallable.
+    let rc = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    rc == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+/// No `kill(2)` off Unix. Reporting every owner dead keeps the historical
+/// Lost-on-disappear behaviour rather than stranding runs `Running` forever.
+#[cfg(not(unix))]
+fn host_process_alive(_pid: u32) -> bool {
+    false
 }
 
 // ─── Internal run-control handle ─────────────────────────────────────────────
@@ -252,17 +392,39 @@ impl TaskDriver {
         store: Arc<TaskStore>,
         channels: DriverChannels,
     ) -> Result<Self, DriverError> {
-        let stale = store.list_runs(&RunFilter {
-            status: Some("running".to_string()),
-            ..Default::default()
-        }).await?;
+        Self::with_config(store, channels, StaleRunPolicy::default()).await
+    }
+
+    /// Full constructor: side-channels plus the [`StaleRunPolicy`] applied to
+    /// `Running` rows already in the store.
+    ///
+    /// R617-F6 — annotation in this file's header. Splitting the sweep out of
+    /// the constructor's fixed behaviour is what lets a store be shared: a
+    /// process that is not the run's owner can now attach without declaring
+    /// the owner's live work dead.
+    pub async fn with_config(
+        store: Arc<TaskStore>,
+        channels: DriverChannels,
+        stale_policy: StaleRunPolicy,
+    ) -> Result<Self, DriverError> {
+        let stale = store
+            .list_runs(&RunFilter {
+                status: Some("running".to_string()),
+                ..Default::default()
+            })
+            .await?;
         for meta in stale {
-            store.update_status(
-                &meta.id,
-                &RunStatus::Lost {
-                    reason: "daemon restarted while run was in-flight".to_string(),
-                },
-            ).await?;
+            if !stale_policy.tombstones(&meta) {
+                continue;
+            }
+            store
+                .update_status(
+                    &meta.id,
+                    &RunStatus::Lost {
+                        reason: "daemon restarted while run was in-flight".to_string(),
+                    },
+                )
+                .await?;
         }
         Ok(Self {
             store,
@@ -297,7 +459,17 @@ impl TaskDriver {
                     .map(|h| std::path::PathBuf::from(h).join(".yah/beholders"))
             });
         let registry = registry_with_user_beholders(user_dir.as_deref());
-        let attach = registry.attach(cmd, &opts.beholder_select, opts.tty_attached);
+        /* An explicit argv means the caller already chose the exact process
+           (an interactive login shell, say). Selecting a beholder there would
+           either do nothing — the rewritten argv is discarded on that path —
+           or record a rewrite that never happened, so we opt out honestly
+           instead. */
+        let select = if opts.argv.is_some() {
+            &BeholderSelect::None
+        } else {
+            &opts.beholder_select
+        };
+        let attach = registry.attach(cmd, select, opts.tty_attached);
         // Use the (possibly rewritten) argv to reconstruct the effective command.
         let effective_cmd = if attach.argv.is_empty() {
             cmd.to_string()
@@ -317,6 +489,12 @@ impl TaskDriver {
             beholder_status: Some(attach.status),
             pinned: opts.pin,
             origin: opts.origin.clone(),
+            /* R617-F6: stamp the OWNER, before the child exists. Written at
+               insert rather than after spawn so a crash between the two still
+               leaves the row attributable — an unattributed `Running` row is
+               exactly what the conservative arm of `StaleRunPolicy` has to
+               tombstone. */
+            host_pid: Some(std::process::id()),
         }).await?;
 
         // Open PTY pair.
@@ -411,9 +589,23 @@ impl TaskDriver {
             None
         };
 
-        // Build and spawn the child inside the slave.
-        let mut cb = CommandBuilder::new("sh");
-        cb.args(["-c", &effective_cmd]);
+        // Build and spawn the child inside the slave. An explicit argv execs
+        // that program directly; otherwise the command line goes through `sh`
+        // so the caller's quoting, pipes and redirections mean what they say.
+        let mut cb = match opts.argv.as_deref() {
+            Some([program, args @ ..]) => {
+                let mut cb = CommandBuilder::new(program);
+                cb.args(args);
+                cb
+            }
+            // An empty argv is a caller bug, not a request for an empty exec —
+            // fall back to the shell path rather than spawning nothing.
+            _ => {
+                let mut cb = CommandBuilder::new("sh");
+                cb.args(["-c", &effective_cmd]);
+                cb
+            }
+        };
         cb.cwd(&opts.cwd);
         for (k, v) in &opts.env {
             cb.env(k, v);
@@ -628,6 +820,36 @@ impl TaskDriver {
                     .map_err(|e| DriverError::Pty(e.to_string()))
             }
             None => Err(DriverError::NotFound(id.to_string())),
+        }
+    }
+
+    /// The pid of the run's *foreground* process — the leader of the process
+    /// group the PTY currently gives the keyboard to.
+    ///
+    /// For a shell tile that is the shell itself while it sits at a prompt,
+    /// and the command the operator is running while one is in flight. That
+    /// distinction is the whole point: asking the spawned child would report
+    /// the shell forever, so anything derived from this pid (a live cwd probe,
+    /// a "what is this pane doing" label) would answer for the wrong process.
+    ///
+    /// `None` when the run is not active on this driver instance, or when the
+    /// platform has no notion of a foreground process group.
+    pub fn foreground_pid(&self, id: &TaskRunId) -> Option<u32> {
+        let master = self
+            .active
+            .lock()
+            .unwrap()
+            .get(&id.to_string())
+            .map(|c| Arc::clone(&c.master))?;
+        #[cfg(unix)]
+        {
+            let pid = master.lock().unwrap().process_group_leader()?;
+            u32::try_from(pid).ok()
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = master;
+            None
         }
     }
 
@@ -893,6 +1115,7 @@ mod tests {
                 beholder_status: None,
                 pinned: false,
                 origin: None,
+                host_pid: None,
             })
             .await
             .unwrap();
@@ -906,6 +1129,192 @@ mod tests {
             "stale run should be Lost, got {:?}",
             meta.status
         );
+    }
+
+    // ── Stale-run policy (R617-F6) ───────────────────────────────────────────
+
+    /// Plant a `Running` row as if some other process had spawned it.
+    async fn plant_running(
+        store: &Arc<TaskStore>,
+        origin: Option<&str>,
+        host_pid: Option<u32>,
+    ) -> TaskRunId {
+        let id = TaskRunId::new();
+        store
+            .insert_run(&TaskRunMeta {
+                id: id.clone(),
+                command: "sleep 9999".to_string(),
+                cwd: "/tmp".into(),
+                env: vec![],
+                started_at: unix_now_secs() - 60,
+                status: RunStatus::Running,
+                label: None,
+                initiator: Initiator::Human {
+                    camp: "test".to_string(),
+                },
+                beholder_status: None,
+                pinned: false,
+                origin: origin.map(str::to_string),
+                host_pid,
+            })
+            .await
+            .unwrap();
+        id
+    }
+
+    async fn is_lost(store: &Arc<TaskStore>, id: &TaskRunId) -> bool {
+        matches!(
+            store.get_run(id).await.unwrap().unwrap().status,
+            RunStatus::Lost { .. }
+        )
+    }
+
+    fn adopt_terminal() -> StaleRunPolicy {
+        StaleRunPolicy::AdoptLiveHosts {
+            origins: vec!["terminal".to_string()],
+        }
+    }
+
+    /// The property the whole ticket exists for: attaching to a store must not
+    /// declare another live process's shell dead.
+    #[tokio::test]
+    async fn a_run_owned_by_a_live_host_survives_a_new_driver() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(&dir).await;
+        // Our own pid is by definition a live process, and is the cheapest
+        // honest stand-in for "a peer that is still running".
+        let id = plant_running(&store, Some("terminal"), Some(std::process::id())).await;
+
+        let _driver = TaskDriver::with_config(
+            Arc::clone(&store),
+            DriverChannels::default(),
+            adopt_terminal(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            !is_lost(&store, &id).await,
+            "a terminal run whose owner is alive must stay Running — \
+             tombstoning it is what made a surviving shell read as dead"
+        );
+    }
+
+    /// The other half: a genuinely abandoned shell must still be tombstoned,
+    /// or a crashed host leaves permanent zombie tiles.
+    #[tokio::test]
+    async fn a_run_whose_host_is_gone_is_still_tombstoned() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(&dir).await;
+        // Reaped in-test, so the pid is real-but-dead rather than guessed.
+        let dead_pid = {
+            let child = std::process::Command::new("true").spawn().unwrap();
+            let pid = child.id();
+            let mut child = child;
+            let _ = child.wait();
+            pid
+        };
+        let id = plant_running(&store, Some("terminal"), Some(dead_pid)).await;
+
+        let _driver = TaskDriver::with_config(
+            Arc::clone(&store),
+            DriverChannels::default(),
+            adopt_terminal(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            is_lost(&store, &id).await,
+            "pid {dead_pid} was reaped; its run has no owner left and must be Lost"
+        );
+    }
+
+    /// The exemption is narrowed by origin, so ordinary jobs keep the old rule
+    /// even when their owner happens to still be alive — an in-flight `cargo
+    /// build` whose driver is gone has nobody left to record its exit.
+    #[tokio::test]
+    async fn a_non_matching_origin_is_tombstoned_even_with_a_live_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(&dir).await;
+        let job = plant_running(&store, None, Some(std::process::id())).await;
+        let other = plant_running(&store, Some("gnome"), Some(std::process::id())).await;
+
+        let _driver = TaskDriver::with_config(
+            Arc::clone(&store),
+            DriverChannels::default(),
+            adopt_terminal(),
+        )
+        .await
+        .unwrap();
+
+        assert!(is_lost(&store, &job).await, "an origin-less job is not exempt");
+        assert!(
+            is_lost(&store, &other).await,
+            "an origin outside the list is not exempt"
+        );
+    }
+
+    /// A row written before `host_pid` existed reads back `None`. Unknown
+    /// ownership must fall back to the old behaviour rather than stranding the
+    /// run `Running` forever.
+    #[tokio::test]
+    async fn an_unattributed_run_is_tombstoned() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(&dir).await;
+        let id = plant_running(&store, Some("terminal"), None).await;
+
+        let _driver = TaskDriver::with_config(
+            Arc::clone(&store),
+            DriverChannels::default(),
+            adopt_terminal(),
+        )
+        .await
+        .unwrap();
+
+        assert!(is_lost(&store, &id).await);
+    }
+
+    /// `TaskDriver::new` must not have quietly changed behaviour — every
+    /// existing embedder still gets Lost-on-disappear.
+    #[tokio::test]
+    async fn the_default_policy_is_still_lost_on_disappear() {
+        assert_eq!(StaleRunPolicy::default(), StaleRunPolicy::LostOnDisappear);
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(&dir).await;
+        let id = plant_running(&store, Some("terminal"), Some(std::process::id())).await;
+
+        let _driver = TaskDriver::new(Arc::clone(&store)).await.unwrap();
+
+        assert!(
+            is_lost(&store, &id).await,
+            "the default must tombstone regardless of origin or owner liveness"
+        );
+    }
+
+    /// The owner is recorded by `spawn_run` itself, not by the caller — the
+    /// policy is worthless if rows arrive unattributed.
+    #[tokio::test]
+    async fn spawn_run_stamps_this_process_as_the_owner() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(&dir).await;
+        let driver = TaskDriver::new(Arc::clone(&store)).await.unwrap();
+
+        let id = driver
+            .spawn_run(
+                "true",
+                SpawnOpts {
+                    cwd: "/tmp".into(),
+                    origin: Some("terminal".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let meta = store.get_run(&id).await.unwrap().unwrap();
+        assert_eq!(meta.host_pid, Some(std::process::id()));
     }
 
     #[tokio::test]
@@ -927,6 +1336,7 @@ mod tests {
                 beholder_status: None,
                 pinned: false,
                 origin: None,
+                host_pid: None,
             })
             .await
             .unwrap();
@@ -990,6 +1400,116 @@ mod tests {
             matches!(meta.status, RunStatus::Done { exit_code: 0, .. }),
             "expected Done(0), got {:?}",
             meta.status
+        );
+    }
+
+    /// Wait for a run to reach a terminal status, or panic.
+    async fn await_done(store: &TaskStore, id: &TaskRunId) -> TaskRunMeta {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let meta = store.get_run(id).await.unwrap().unwrap();
+            if matches!(meta.status, RunStatus::Done { .. } | RunStatus::Lost { .. }) {
+                return meta;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("run did not complete in time, status={:?}", meta.status);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    async fn output_of(store: &TaskStore, id: &TaskRunId) -> String {
+        let chunks = store.get_chunks(id, &ChunkFilter::default()).await.unwrap();
+        let bytes: Vec<u8> = chunks.into_iter().flat_map(|c| c.bytes).collect();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    // ── Direct argv (R652-T6) ────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn explicit_argv_execs_the_program_directly() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(&dir).await;
+        let driver = TaskDriver::new(Arc::clone(&store)).await.unwrap();
+
+        /* The distinguishing observation: under `sh -c` the child is `sh` and
+           `$0` is `sh`; exec'd directly it is the program itself. Printing
+           `$0` is the cheapest way to see which of the two happened. */
+        let id = driver
+            .spawn_run(
+                "unused-because-argv-wins",
+                SpawnOpts {
+                    cwd: "/tmp".into(),
+                    argv: Some(vec![
+                        "/bin/sh".into(),
+                        "-c".into(),
+                        "printf 'argv0=%s\\n' \"$0\"".into(),
+                        "direct-exec-marker".into(),
+                    ]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        await_done(&store, &id).await;
+        let text = output_of(&store, &id).await;
+        assert!(
+            text.contains("argv0=direct-exec-marker"),
+            "argv should have been exec'd verbatim, got: {text:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_argv_still_records_the_requested_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(&dir).await;
+        let driver = TaskDriver::new(Arc::clone(&store)).await.unwrap();
+
+        /* A shell tile asks for "$SHELL" and the daemon resolves it to a real
+           argv. The run must still read back as what was asked for, or the
+           rail row and the history re-run both show an implementation
+           detail. */
+        let id = driver
+            .spawn_run(
+                "$SHELL",
+                SpawnOpts {
+                    cwd: "/tmp".into(),
+                    argv: Some(vec!["/bin/sh".into(), "-c".into(), "true".into()]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let meta = await_done(&store, &id).await;
+        assert_eq!(meta.command, "$SHELL");
+        assert!(
+            matches!(meta.status, RunStatus::Done { exit_code: 0, .. }),
+            "expected Done(0), got {:?}",
+            meta.status
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_argv_falls_back_to_the_shell_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(&dir).await;
+        let driver = TaskDriver::new(Arc::clone(&store)).await.unwrap();
+
+        let id = driver
+            .spawn_run(
+                "echo empty_argv_fallback",
+                SpawnOpts { cwd: "/tmp".into(), argv: Some(vec![]), ..Default::default() },
+            )
+            .await
+            .unwrap();
+
+        await_done(&store, &id).await;
+        let text = output_of(&store, &id).await;
+        assert!(
+            text.contains("empty_argv_fallback"),
+            "empty argv must not spawn nothing, got: {text:?}"
         );
     }
 

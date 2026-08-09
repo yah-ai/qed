@@ -23,12 +23,23 @@ use serde::Deserialize;
 use thiserror::Error;
 use workload_spec::ImageRef;
 
-use velveteen::TaskRuntime;
+use velveteen::{TaskLocation, TaskRuntime};
 
 /// Substitution key bound to the resolved fetched input (always present).
+///
+/// **Bind an ABSOLUTE path.** See [`ENV_TRANSFORM_OUT`].
 pub const ENV_TRANSFORM_IN_0: &str = "YAH_TRANSFORM_IN_0";
 
 /// Substitution key bound to the recipe's output path (always present).
+///
+/// **Bind an ABSOLUTE path.** A recipe is free to `cd` — rusty-v8's build-v8.sh
+/// chdirs into a scratch dir to build V8 — so a relative binding resolves
+/// against whatever cwd the recipe happens to be in when it writes. The step
+/// then exits 0 having written the artifact somewhere the caller never looks;
+/// inside a container those bytes die with it. This cost a ~2h arm64 V8 build
+/// that had actually succeeded (R546-B8). Callers must canonicalize before
+/// binding: `cache_dir` and `workspace_root` are commonly relative (`yah cloud
+/// apply` defaults `--path` to `"."`).
 pub const ENV_TRANSFORM_OUT: &str = "YAH_TRANSFORM_OUT";
 
 /// On-disk recipe shape. Top-level TOML keys map 1:1 to fields.
@@ -53,29 +64,104 @@ pub struct TransformRecipe {
 
 /// Where + how a recipe step runs.
 ///
-/// W164 transforms are local-only by design (the materialize step runs in the
-/// reconciler that owns the cache). Remote placement is explicitly out of
-/// scope for W164 — the location enum reflects that today and stays open for
-/// additive growth if a later doc opens that surface.
+/// W164 scoped transforms to local-only; W235 (Remote QED) opened the surface
+/// the W164 doc-comment left open. A recipe may now declare a remote node or a
+/// remote tier, and the materialize path lowers `location` straight through to
+/// [`velveteen::TaskPlacement`] — see [`RecipeLocation`] for the TOML forms.
 ///
 /// `platform`, when set, forces `docker run --platform <value>` so a recipe
 /// pinned to a single-arch upstream image (e.g. ggerganov/whisper.cpp ships
 /// `linux/amd64` only) still runs on cross-arch hosts via emulation (Rosetta
 /// on Apple Silicon, qemu on Linux/arm64). Omit it for multi-arch images and
 /// docker picks the host-matching manifest automatically.
+///
+/// **`platform` is a LOCAL-only knob.** It asks the host's container runtime to
+/// emulate a foreign architecture; a remote run has no such host and selects
+/// architecture by scheduling instead — `location = { kind = "remote_any", …,
+/// mesh_tags = ["tier:x86"] }`. `RemoteForgeDriver` refuses a spec that carries
+/// a platform request rather than dropping it, because a silently-ignored
+/// `--platform` yields a wrong-arch artifact that only fails at link time.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct RecipePlacement {
+    #[serde(deserialize_with = "deserialize_recipe_location")]
     pub location: RecipeLocation,
     pub runtime: TaskRuntime,
     #[serde(default)]
     pub platform: Option<String>,
 }
 
-/// Recipe-side location vocabulary (Local-only for W164).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RecipeLocation {
-    Local,
+/// Recipe-side location vocabulary — **this is [`velveteen::TaskLocation`]**.
+///
+/// The recipe layer reuses the task layer's placement vocabulary rather than
+/// mirroring it, exactly as [`RecipePlacement::runtime`] already reuses
+/// [`TaskRuntime`]. A mirrored enum has to re-grow every time the task layer
+/// does (R594 added `mesh_tags` to `TaskLocation`; a mirror would have missed
+/// it), and "map `RecipePlacement` → `TaskPlacement` straight through" is only
+/// honest if the mapping is the identity.
+///
+/// TOML forms accepted by [`RecipePlacement`]:
+///
+/// ```toml
+/// location = "local"
+/// location = { kind = "remote", node = "us-west-002" }
+/// location = { kind = "remote_any", tier = "infra", mesh_tags = ["tier:x86"] }
+/// ```
+///
+/// The bare-string form is the pre-W235 spelling and stays valid for `local`
+/// only — the remote variants carry a payload, so they need the table form.
+pub type RecipeLocation = TaskLocation;
+
+/// Accept both the legacy bare-string `location = "local"` and the tagged
+/// table form that [`TaskLocation`]'s own `Deserialize` understands.
+///
+/// `TaskLocation` is internally tagged (`#[serde(tag = "kind")]`), so it can
+/// only be deserialized from a map. Every recipe in the tree predates W235 and
+/// says `location = "local"`; rejecting that would be a gratuitous break for
+/// zero type-safety gain. Dispatching on the input shape keeps both readable.
+fn deserialize_recipe_location<'de, D>(de: D) -> Result<RecipeLocation, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct LocationVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for LocationVisitor {
+        type Value = RecipeLocation;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str(
+                r#""local", or a table like { kind = "remote", node = "…" } / \
+                { kind = "remote_any", tier = "…", mesh_tags = [ … ] }"#,
+            )
+        }
+
+        fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            match v {
+                "local" => Ok(TaskLocation::Local),
+                other => Err(E::custom(format!(
+                    "unknown recipe placement location {other:?}. Valid forms: \
+                     `location = \"local\"`, \
+                     `location = {{ kind = \"remote\", node = \"<mesh-ident>\" }}`, \
+                     `location = {{ kind = \"remote_any\", tier = \"<tier>\", \
+                     mesh_tags = [\"tier:x86\"] }}`. The remote variants carry a \
+                     payload, so the bare-string spelling can't express them."
+                ))),
+            }
+        }
+
+        fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::MapAccess<'de>,
+        {
+            // Delegate to TaskLocation so its own field-level errors (missing
+            // `tier`, unknown `kind`) survive verbatim.
+            TaskLocation::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+        }
+    }
+
+    de.deserialize_any(LocationVisitor)
 }
 
 /// One executable step in a recipe. `argv[0]` is the executable; the
@@ -305,6 +391,121 @@ timeout = 600
                 "{{YAH_TRANSFORM_OUT}}",
                 "{{quant}}",
             ]
+        );
+    }
+
+    /// A recipe TOML with `[placement]` spelled however the caller wants.
+    fn recipe_with_placement(placement: &str) -> String {
+        format!(
+            r#"
+name  = "placed"
+label = "Placement fixture"
+image = "ghcr.io/yah-ai/tool:v1@sha256:{HASH_64}"
+
+[placement]
+{placement}
+
+[[steps]]
+name = "noop"
+argv = ["true"]
+"#
+        )
+    }
+
+    fn load_placement(placement: &str) -> Result<RecipePlacement, RecipeError> {
+        let dir = tempdir().unwrap();
+        let transforms = dir.path().join("transforms");
+        fs::create_dir_all(&transforms).unwrap();
+        fs::write(
+            transforms.join("placed.toml"),
+            recipe_with_placement(placement),
+        )
+        .unwrap();
+        TransformRecipeLoader::new(&transforms)
+            .load("placed")
+            .map(|r| r.placement)
+    }
+
+    /// Every recipe in the tree predates W235 and says `location = "local"`.
+    /// Growing the enum must not break a single one of them.
+    #[test]
+    fn bare_string_local_still_parses_after_w235() {
+        let placement = load_placement("location = \"local\"\nruntime = \"container\"").unwrap();
+        assert_eq!(placement.location, RecipeLocation::Local);
+        assert_eq!(placement.runtime, TaskRuntime::Container);
+    }
+
+    #[test]
+    fn tagged_table_remote_pins_a_named_node() {
+        let placement = load_placement(
+            "location = { kind = \"remote\", node = \"us-west-002\" }\nruntime = \"container\"",
+        )
+        .unwrap();
+        assert_eq!(
+            placement.location,
+            RecipeLocation::Remote {
+                node: workload_spec::MeshIdent("us-west-002".into()),
+            }
+        );
+    }
+
+    /// The R555-T7 / R546 shape: schedule on an arch-matched node instead of
+    /// forking the recipe per architecture and emulating locally.
+    #[test]
+    fn tagged_table_remote_any_carries_tier_and_mesh_tags() {
+        let placement = load_placement(
+            "location = { kind = \"remote_any\", tier = \"infra\", mesh_tags = [\"tier:x86\"] }\n\
+             runtime = \"container\"",
+        )
+        .unwrap();
+        assert_eq!(
+            placement.location,
+            RecipeLocation::RemoteAny {
+                tier: workload_spec::TierTag("infra".into()),
+                mesh_tags: vec!["tier:x86".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn remote_any_mesh_tags_default_to_empty() {
+        let placement = load_placement(
+            "location = { kind = \"remote_any\", tier = \"infra\" }\nruntime = \"container\"",
+        )
+        .unwrap();
+        assert_eq!(
+            placement.location,
+            RecipeLocation::RemoteAny {
+                tier: workload_spec::TierTag("infra".into()),
+                mesh_tags: vec![],
+            }
+        );
+    }
+
+    /// The remote variants carry a payload, so the bare-string spelling can't
+    /// express them — say so instead of a bare "unknown variant".
+    #[test]
+    fn bare_string_remote_names_the_table_form() {
+        let err = load_placement("location = \"remote\"\nruntime = \"container\"")
+            .expect_err("bare `remote` must reject");
+        let msg = err.to_string();
+        assert!(matches!(err, RecipeError::Parse { .. }), "got {err:?}");
+        assert!(
+            msg.contains("kind = \\\"remote\\\"") || msg.contains("kind = \"remote\""),
+            "error must show the table spelling, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn remote_any_without_tier_is_rejected() {
+        let err = load_placement(
+            "location = { kind = \"remote_any\" }\nruntime = \"container\"",
+        )
+        .expect_err("remote_any without a tier must reject");
+        assert!(matches!(err, RecipeError::Parse { .. }), "got {err:?}");
+        assert!(
+            err.to_string().contains("tier"),
+            "error must name the missing field, got: {err}"
         );
     }
 

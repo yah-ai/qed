@@ -156,7 +156,7 @@ impl QedImageBuilder {
         if tags.is_empty() && push {
             return Err("docker/build-push-action: push=true but no `tags` provided".into());
         }
-        let build_args = collect_build_args(with);
+        let build_args = collect_build_args(with, config);
 
         let metadata_dir =
             tempfile::tempdir().map_err(|e| format!("docker/build-push-action: tempdir: {e}"))?;
@@ -386,7 +386,21 @@ fn parse_buildx_metadata(json: &str) -> Option<(Option<String>, Option<String>)>
     Some((digest, imageid))
 }
 
-fn collect_build_args(with: &IndexMap<String, Value>) -> IndexMap<String, String> {
+/// Parse `with.build-args` (one `KEY=VALUE` per line), routing each VALUE
+/// through [`apply_registry_route`].
+///
+/// Routing the values is not cosmetic — it is what makes a *chained* image
+/// build work off ghcr. `release.yml` builds `yah-rust-bun` `FROM ${RUST_BASE}`
+/// with `RUST_BASE=ghcr.io/yah-ai/yah-rust:smoke-<sha>`, the tag the previous
+/// job just pushed. Under a redirect those bytes went to the routed registry,
+/// so an unrouted build-arg sends the `FROM` back to ghcr and the build dies on
+/// a tag that was never pushed there. Rewriting only the `tags` gets you a
+/// registry that receives images but can never be built *from*.
+///
+/// Non-image build args are untouched by construction: [`apply_registry_route`]
+/// only substitutes on a registry-host key match at a `/` boundary, so
+/// `FEATURES=deploy` and friends fall through unchanged.
+fn collect_build_args(with: &IndexMap<String, Value>, config: &Value) -> IndexMap<String, String> {
     let mut out = IndexMap::new();
     let raw = with_string(with, "build-args").unwrap_or_default();
     for line in raw.lines() {
@@ -395,7 +409,7 @@ fn collect_build_args(with: &IndexMap<String, Value>) -> IndexMap<String, String
             continue;
         }
         if let Some((k, v)) = line.split_once('=') {
-            out.insert(k.trim().to_string(), v.to_string());
+            out.insert(k.trim().to_string(), apply_registry_route(v, config));
         }
     }
     out
@@ -483,6 +497,47 @@ mod tests {
         let (u, p) = resolve_login_auth(&with, &config, &secrets, "docker.io");
         assert_eq!(u, "yahdev");
         assert_eq!(p, "pat-xyz");
+    }
+
+    #[test]
+    fn build_arg_base_image_follows_the_route() {
+        // The v0.8.20 `yah-rust-bun` failure: tags were routed to docker.io but
+        // `RUST_BASE` still named ghcr, so `FROM ${RUST_BASE}` 404'd on a tag
+        // that had only ever been pushed to the routed registry.
+        let config = obj(&[(
+            "registry_route",
+            obj(&[("ghcr.io/yah-ai", Value::String("docker.io/yahdev".into()))]),
+        )]);
+        let with = obj(&[(
+            "build-args",
+            Value::String("RUST_BASE=ghcr.io/yah-ai/yah-rust:smoke-abc\nFEATURES=deploy\n".into()),
+        )]);
+        let Value::Object(with) = with else {
+            unreachable!()
+        };
+        let args = collect_build_args(&with, &config);
+        assert_eq!(
+            args.get("RUST_BASE").map(String::as_str),
+            Some("docker.io/yahdev/yah-rust:smoke-abc")
+        );
+        // A build arg that is not an image ref cannot match a registry key.
+        assert_eq!(args.get("FEATURES").map(String::as_str), Some("deploy"));
+    }
+
+    #[test]
+    fn build_args_are_untouched_without_a_route() {
+        let with = obj(&[(
+            "build-args",
+            Value::String("RUST_BASE=ghcr.io/yah-ai/yah-rust:smoke-abc".into()),
+        )]);
+        let Value::Object(with) = with else {
+            unreachable!()
+        };
+        let args = collect_build_args(&with, &Value::object());
+        assert_eq!(
+            args.get("RUST_BASE").map(String::as_str),
+            Some("ghcr.io/yah-ai/yah-rust:smoke-abc")
+        );
     }
 
     #[test]

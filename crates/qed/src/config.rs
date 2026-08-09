@@ -7,7 +7,7 @@
 use crate::peers::PeerConfig;
 use crate::registries::{extract_registry_host, RegistryConfig, RegistryConfigError};
 use crate::types::{
-    GhaWorkflowConfig, OnFail, ParamDef, Pipeline, Placement, QedStep, StepKind,
+    GhaWorkflowConfig, ParamDef, Pipeline, Placement, QedStep, StepKind,
     StepValidationError, SubPipelineRef, SubPipelineResolver,
 };
 use serde::Deserialize;
@@ -16,47 +16,82 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
-/// Parse a `P{n}-{name}` filename stem into `(n, name)`.
-/// e.g. `"P006-build-yah-yubaba"` → `(6, "build-yah-yubaba")`.
-fn parse_p_prefix(stem: &str) -> Option<(u32, &str)> {
-    let rest = stem.strip_prefix('P')?;
-    let dash = rest.find('-')?;
-    if dash == 0 {
-        return None;
-    }
-    let num: u32 = rest[..dash].parse().ok()?;
-    Some((num, &rest[dash + 1..]))
+/// Locate `{dir}/{name}.toml`. The filename IS the pipeline name — a direct
+/// join, no directory scan, no alternate spelling.
+///
+/// This used to prefer a `P{n}-{name}.toml` form and fall back to the bare
+/// name. The numbering was never enforceable: nothing assigned the next free
+/// number, `yah cloud init` generated unprefixed cards, retiring a pipeline
+/// orphaned its number (P003/P006/P007 all became dangling references in
+/// prose and `@arch:see` annotations), and on a shared tree two agents adding
+/// a pipeline would race for the same integer. Removed R707 — the name is the
+/// only handle anything ever dispatched by.
+fn find_pipeline_file(dir: &Path, name: &str) -> Option<PathBuf> {
+    let path = dir.join(format!("{name}.toml"));
+    path.is_file().then_some(path)
 }
 
-/// Locate `{dir}/P*-{name}.toml` (canonical) or `{dir}/{name}.toml` (legacy /
-/// auto-generated fallback). Returns `None` when the directory doesn't exist
-/// or no matching file is found.
-fn find_pipeline_file(dir: &Path, name: &str) -> Option<PathBuf> {
-    if !dir.exists() {
+/// Lift a pipeline file's leading `#` comment block into readme prose
+/// (R703-F3).
+///
+/// Every pipeline in a mature camp already carries a readme — authors write
+/// the rationale at the top of the TOML, where an editor shows it. Before this
+/// only the one-line `label` reached the wire and that block was dropped on the
+/// floor, so the catalog UI could show a row title and nothing else.
+///
+/// What counts as the block:
+/// - Only the contiguous comment run at the *top* of the file. The first
+///   non-blank line that isn't a comment ends it, so a comment above a step is
+///   never mistaken for a readme.
+/// - `@yah:` / `@arch:` annotation lines end it too. Board annotations live in
+///   these headers (see `.yah/qed/check.toml`) and are metadata, not prose —
+///   they'd otherwise show up mid-readme in the UI. A prose line that merely
+///   *mentions* one mid-sentence is unaffected; the match is line-initial.
+/// - A `#:schema …` taplo directive is skipped, not treated as a terminator:
+///   `.yah/qed/dashboard-e2e.toml` opens with one and puts its readme under it.
+/// - One leading space after `#` is stripped, and no more: indented sub-lists
+///   and box-drawing rules (`# ── Why this exists ───`) survive verbatim,
+///   because these blocks are already written as markdown-ish prose.
+/// - A bare `#` becomes an empty line, which is how the paragraph breaks in
+///   these headers are spelled.
+///
+/// Returns `None` for a file with no leading block (or one holding only
+/// annotations), so a consumer can omit the readme section rather than render
+/// an empty one.
+pub fn leading_comment_block(content: &str) -> Option<String> {
+    let mut lines: Vec<&str> = Vec::new();
+    for raw in content.lines() {
+        let trimmed = raw.trim_start();
+        let Some(rest) = trimmed.strip_prefix('#') else {
+            // Blank lines before the block, or between two comment paragraphs
+            // of it, don't end it — only real content does.
+            if trimmed.is_empty() {
+                if !lines.is_empty() {
+                    lines.push("");
+                }
+                continue;
+            }
+            break;
+        };
+        // `#:schema …` is a taplo editor directive, not prose. Skipped rather
+        // than treated as a terminator: `.yah/qed/dashboard-e2e.toml` opens
+        // with one and puts its readme underneath.
+        if rest.starts_with(':') {
+            continue;
+        }
+        let body = rest.strip_prefix(' ').unwrap_or(rest);
+        if body.starts_with("@yah:") || body.starts_with("@arch:") {
+            break;
+        }
+        lines.push(body.trim_end());
+    }
+    while lines.last().is_some_and(|l| l.trim().is_empty()) {
+        lines.pop();
+    }
+    if lines.is_empty() {
         return None;
     }
-    // Prefer the prefixed form.
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().map_or(false, |e| e == "toml") {
-                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    if let Some((_, stem_name)) = parse_p_prefix(stem) {
-                        if stem_name == name {
-                            return Some(path);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    // Fallback: unprefixed (cloud-init generated cards, legacy, tests).
-    let legacy = dir.join(format!("{name}.toml"));
-    if legacy.exists() {
-        Some(legacy)
-    } else {
-        None
-    }
+    Some(lines.join("\n"))
 }
 
 #[derive(Error, Debug)]
@@ -75,6 +110,8 @@ pub enum ConfigError {
     SubPipelineGraph(#[from] crate::types::SubPipelineError),
     #[error("Invalid bind: {0}")]
     InvalidBind(String),
+    #[error("Invalid param: {0}")]
+    InvalidParam(String),
 }
 
 /// On-disk shape of a `.yah/qed/*.toml` pipeline file. This is the JSON-Schema
@@ -104,6 +141,15 @@ pub struct PipelineToml {
 pub struct PipelineConfig {
     name: String,
     label: String,
+    /// Explicit long-form readme. Almost always omitted — see
+    /// [`crate::types::Pipeline::description`]; the loader falls back to the
+    /// file's leading `#` comment block, which is where camps already write
+    /// this. Present so an ejected pipeline round-trips.
+    #[serde(default)]
+    description: Option<String>,
+    /// Catalog classification tags — see [`crate::types::Pipeline::tags`].
+    #[serde(default)]
+    tags: Vec<String>,
     #[serde(default)]
     steps: Vec<QedStep>,
     #[serde(default)]
@@ -270,31 +316,28 @@ impl PipelineLoader {
             .find(|w| w.name == name)
     }
 
-    /// List all pipeline names from `<qed_dir>/*.toml`, sorted by P-number
-    /// prefix (unprefixed files last).
+    /// List all pipeline names from `<qed_dir>/*.toml`, sorted by name.
+    ///
+    /// Name order, not creation order: the `P{n}-` prefix that used to impose
+    /// the latter was removed in R707 (see [`find_pipeline_file`]). Callers
+    /// that want recency have the run history, which is a truer answer than a
+    /// number nobody was assigning.
     pub fn list_all(&self) -> Result<Vec<String>, ConfigError> {
         let mut names: Vec<String> = Vec::new();
 
         if self.qed_dir.exists() {
-            let mut file_entries: Vec<(u32, String)> = Vec::new();
             for entry in fs::read_dir(&self.qed_dir)? {
                 let entry = entry?;
                 let path = entry.path();
                 if path.extension().map_or(false, |e| e == "toml") {
                     if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                        let (num, name) = if let Some((n, base)) = parse_p_prefix(stem) {
-                            (n, base.to_string())
-                        } else {
-                            (u32::MAX, stem.to_string())
-                        };
-                        if !names.iter().any(|n| n == &name) {
-                            file_entries.push((num, name));
+                        if !names.iter().any(|n| n == stem) {
+                            names.push(stem.to_string());
                         }
                     }
                 }
             }
-            file_entries.sort_by_key(|(n, _)| *n);
-            names.extend(file_entries.into_iter().map(|(_, n)| n));
+            names.sort();
         }
 
         Ok(names)
@@ -313,34 +356,8 @@ impl PipelineLoader {
         Ok(pipeline)
     }
 
-    /// Return P-numbers for the requested pipeline names. Numbers come from
-    /// the numeric prefix of `P{n}-{name}.toml` files in `<qed_dir>`. Names
-    /// with no prefixed file return no entry; callers already treat
-    /// `p_numbers.get(name)` as `Option<u32>`.
-    pub fn load_p_numbers(&self, names: &[String]) -> HashMap<String, u32> {
-        let mut map: HashMap<String, u32> = HashMap::new();
-        if self.qed_dir.exists() {
-            if let Ok(entries) = fs::read_dir(&self.qed_dir) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.extension().map_or(false, |e| e == "toml") {
-                        if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                            if let Some((num, name)) = parse_p_prefix(stem) {
-                                map.insert(name.to_string(), num);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        names
-            .iter()
-            .filter_map(|n| map.get(n).map(|&v| (n.clone(), v)))
-            .collect()
-    }
-
     /// List only custom pipeline files from `.yah/qed/` (excludes built-ins),
-    /// returning the pipeline name (prefix stripped).
+    /// returning the pipeline name — which is the filename stem.
     pub fn list_files(&self) -> Result<Vec<String>, ConfigError> {
         let mut pipelines = Vec::new();
         if self.qed_dir.exists() {
@@ -349,12 +366,7 @@ impl PipelineLoader {
                 let path = entry.path();
                 if path.extension().map_or(false, |ext| ext == "toml") {
                     if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                        let name = if let Some((_, base)) = parse_p_prefix(stem) {
-                            base.to_string()
-                        } else {
-                            stem.to_string()
-                        };
-                        pipelines.push(name);
+                        pipelines.push(stem.to_string());
                     }
                 }
             }
@@ -362,12 +374,23 @@ impl PipelineLoader {
         Ok(pipelines)
     }
 
-    #[cfg(test)]
-    fn load_from_str(&self, content: &str) -> Result<Pipeline, ConfigError> {
+    /// Parse + validate one pipeline TOML document. The single place a
+    /// [`PipelineToml`] becomes a [`Pipeline`] — `load_from_file` and the
+    /// test-only `load_from_str` both route through here so a new field can't
+    /// be wired into one path and forgotten in the other (R703-F3: which is
+    /// exactly what two copies of this hoist invited).
+    fn pipeline_from_str(&self, content: &str) -> Result<Pipeline, ConfigError> {
         let parsed: PipelineToml = toml::from_str(content)?;
         let pipeline = Pipeline {
             name: parsed.pipeline.name,
             label: parsed.pipeline.label,
+            // Explicit key wins; otherwise the file's own header block is the
+            // readme (R703-F3).
+            description: parsed
+                .pipeline
+                .description
+                .or_else(|| leading_comment_block(content)),
+            tags: parsed.pipeline.tags,
             steps: parsed.pipeline.steps,
             params: parsed.pipeline.params.unwrap_or_default(),
             on_success: parsed.pipeline.on_success,
@@ -385,7 +408,13 @@ impl PipelineLoader {
         };
         self.validate_steps(&pipeline)?;
         self.validate_binds(&pipeline)?;
+        self.validate_params(&pipeline)?;
         Ok(pipeline)
+    }
+
+    #[cfg(test)]
+    fn load_from_str(&self, content: &str) -> Result<Pipeline, ConfigError> {
+        self.pipeline_from_str(content)
     }
 
     /// Public helper: parse a pipeline directly from a file path, bypassing
@@ -398,28 +427,7 @@ impl PipelineLoader {
 
     pub(crate) fn load_from_file(&self, path: &Path) -> Result<Pipeline, ConfigError> {
         let content = fs::read_to_string(path)?;
-        let parsed: PipelineToml = toml::from_str(&content)?;
-        let pipeline = Pipeline {
-            name: parsed.pipeline.name,
-            label: parsed.pipeline.label,
-            steps: parsed.pipeline.steps,
-            params: parsed.pipeline.params.unwrap_or_default(),
-            on_success: parsed.pipeline.on_success,
-            on_fail: parsed.pipeline.on_fail,
-            triggers: parsed.pipeline.triggers,
-            concurrency_key: parsed.pipeline.concurrency_key,
-            placement: parsed.pipeline.placement,
-            workspace: parsed.pipeline.workspace,
-            wraps: parsed.pipeline.wraps,
-            matrix: parsed.pipeline.matrix,
-            toolchain: parsed.pipeline.toolchain,
-            binds: parsed.binds,
-            on_change: parsed.on_change,
-            finally: parsed.pipeline.finally,
-        };
-        self.validate_steps(&pipeline)?;
-        self.validate_binds(&pipeline)?;
-        Ok(pipeline)
+        self.pipeline_from_str(&content)
     }
 
     /// Run [`QedStep::validate`] across every step, then enforce the
@@ -495,6 +503,33 @@ impl PipelineLoader {
         }
         Ok(())
     }
+
+    /// A param declaring `options` declares a closed set, so its `default` has
+    /// to be a member of it. Catching this at load time matters more than it
+    /// looks: [`Pipeline::resolve_params`](crate::types::Pipeline::resolve_params)
+    /// would otherwise only reject it on the runs where the operator *omitted*
+    /// the param, so a mistyped default hides until someone takes the default
+    /// path. Same first-offender surface as the step/bind checks.
+    fn validate_params(&self, pipeline: &Pipeline) -> Result<(), ConfigError> {
+        let mut names: Vec<&String> = pipeline.params.keys().collect();
+        names.sort();
+        for name in names {
+            let def = &pipeline.params[name];
+            if def.options.is_empty() {
+                continue;
+            }
+            if let Some(default) = &def.default {
+                if !def.options.iter().any(|o| o == default) {
+                    return Err(ConfigError::InvalidParam(format!(
+                        "[pipeline.params.{name}]: default = {default:?} is not one of its \
+                         options ({}) — a default has to be a value the param accepts",
+                        def.options.join(", ")
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Bridge a [`PipelineLoader`] into the [`SubPipelineResolver`] trait so
@@ -541,51 +576,35 @@ pub struct GhaWorkflowEntry {
 /// so `yah qed run <workflow>` and `target = { gha-workflow = ... }` end up
 /// at the same runner arm.
 fn synthesise_gha_pipeline(entry: &GhaWorkflowEntry) -> Pipeline {
+    // Spelled as an overlay on `QedStep::default()` (which round-trips serde's
+    // own defaults, so it cannot drift from what a minimal TOML deserializes to)
+    // rather than as a 30-field literal. Only the two fields that make this a
+    // gha-workflow step differ from the default.
     let step = QedStep {
-        background: false,
-        background_until: None,
-        wait_for: None,
-        manifest_stitch: None,
         name: "gha-workflow".to_string(),
-        argv: Vec::new(),
-        cwd: None,
-        env: HashMap::new(),
-        timeout: None,
-        on_fail: OnFail::Abort,
-        produces: Vec::new(),
-        runtime: None,
         kind: StepKind::GhaWorkflow,
-        image: None,
-        tag: None,
-        push: false,
-        platforms: Vec::new(),
-        binary_path: None,
-        triple: None,
-        package: None,
-        context: None,
-        load: false,
-        sub_pipeline: None,
-        outputs: Vec::new(),
-        import: None,
         gha_workflow: Some(GhaWorkflowConfig {
             path: entry.rel_path.clone(),
             event: None,
             inputs: HashMap::new(),
+            // Auto-ingest represents a workflow AS GITHUB WOULD RUN IT, so it
+            // narrows nothing: the whole matrix.
+            matrix: HashMap::new(),
         }),
-        matrix: None,
-        enabled: true,
-        activation: crate::types::StepActivation::Active,
-        if_cond: None,
-        platform: None,
-        toolchain: None,
+        ..Default::default()
     };
     Pipeline {
+        description: None,
         name: entry.name.clone(),
         label: entry
             .workflow
             .name
             .clone()
             .unwrap_or_else(|| entry.name.clone()),
+        // Auto-ingested workflows already carry `scope: "gha"` on the wire;
+        // tags are the *author's* classification and a synthesised pipeline
+        // has no author.
+        tags: Vec::new(),
         steps: vec![step],
         params: HashMap::new(),
         on_success: Vec::new(),
@@ -669,47 +688,28 @@ impl SubPipelineResolver for LoaderSubPipelineResolver {
                 event,
                 inputs,
             } => {
+                // Overlay on `QedStep::default()` — see `synthesise_gha_pipeline`.
                 let step = crate::types::QedStep {
-                    background: false,
-                    background_until: None,
-                    wait_for: None,
-                    manifest_stitch: None,
                     name: "gha-workflow".into(),
-                    argv: Vec::new(),
-                    cwd: None,
-                    env: std::collections::HashMap::new(),
-                    timeout: None,
-                    on_fail: crate::types::OnFail::Abort,
-                    produces: Vec::new(),
-                    runtime: None,
                     kind: crate::types::StepKind::GhaWorkflow,
-                    image: None,
-                    tag: None,
-                    push: false,
-                    platforms: Vec::new(),
-                    binary_path: None,
-                    triple: None,
-                    package: None,
-                    context: None,
-                    load: false,
-                    sub_pipeline: None,
-                    outputs: Vec::new(),
-                    import: None,
                     gha_workflow: Some(crate::types::GhaWorkflowConfig {
                         path: path.clone(),
                         event: event.clone(),
                         inputs: inputs.clone(),
+                        // `SubPipelineRef::GhaWorkflow` carries no row selector,
+                        // so there is nothing to forward. Pin a row with a direct
+                        // `kind = "gha-workflow"` step instead; widening the
+                        // SubPipelineRef variant is a change worth making when a
+                        // composite pipeline actually needs it, not before.
+                        matrix: HashMap::new(),
                     }),
-                    matrix: None,
-                    enabled: true,
-                    activation: crate::types::StepActivation::Active,
-                    if_cond: None,
-                    platform: None,
-                    toolchain: None,
+                    ..Default::default()
                 };
                 Some(crate::types::Pipeline {
+                    description: None,
                     name: format!("gha-workflow:{}", path.display()),
                     label: String::new(),
+                    tags: Vec::new(),
                     concurrency_key: None,
                     steps: vec![step],
                     triggers: Vec::new(),
@@ -800,27 +800,195 @@ impl SubPipelineResolver for LoaderSubPipelineResolver {
 mod tests {
     use super::*;
 
+    /// R707: the filename stem IS the pipeline name. Guards against anyone
+    /// reintroducing a decorated filename form — a `P013-release.toml` no
+    /// longer resolves under the name `release`, it resolves (only) under the
+    /// name `P013-release`, which is what makes the coupling self-enforcing
+    /// rather than something a convention has to police.
     #[test]
-    fn parse_p_prefix_parses_canonical_form() {
+    fn pipeline_resolves_by_filename_stem_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = |name: &str| {
+            format!("[pipeline]\nname = \"{name}\"\nlabel = \"l\"\nworkspace = \"live\"\n")
+        };
+        std::fs::write(dir.path().join("release.toml"), body("release")).unwrap();
+        std::fs::write(dir.path().join("P013-legacy.toml"), body("legacy")).unwrap();
+        let loader = PipelineLoader::new(dir.path());
+
+        assert_eq!(loader.load("release").unwrap().name, "release");
+        // The decorated file is reachable only by its literal stem...
+        assert!(loader.load("P013-legacy").is_ok());
+        // ...never by the name inside it.
+        assert!(matches!(
+            loader.load("legacy"),
+            Err(ConfigError::NotFound(_))
+        ));
         assert_eq!(
-            parse_p_prefix("P006-build-yah-yubaba"),
-            Some((6, "build-yah-yubaba"))
+            loader.list_all().unwrap(),
+            vec!["P013-legacy".to_string(), "release".to_string()],
+            "list_all is name-sorted, no numeric axis",
         );
-        assert_eq!(parse_p_prefix("P001-check"), Some((1, "check")));
+    }
+    /// R703-F3: the header block is the readme. Paragraph breaks (`#` alone)
+    /// and the box-drawing section rules these files use must survive intact —
+    /// the block is rendered as markdown-ish prose, not reflowed.
+    #[test]
+    fn leading_comment_block_becomes_the_description() {
+        let toml = "\
+# release — cut a tag and ship it.
+#
+# ── Why this exists ─────────────
+# Because the label is one line and this is not.
+#   - indented detail keeps its indent
+
+[pipeline]
+name = \"release\"
+label = \"Release\"
+workspace = \"live\"
+";
+        let dir = tempfile::tempdir().unwrap();
+        let loader = PipelineLoader::new(dir.path());
+        let p = loader.load_from_str(toml).unwrap();
         assert_eq!(
-            parse_p_prefix("P013-full-release"),
-            Some((13, "full-release"))
+            p.description.as_deref(),
+            Some(
+                "release — cut a tag and ship it.\n\
+                 \n\
+                 ── Why this exists ─────────────\n\
+                 Because the label is one line and this is not.\n\
+                 \x20 - indented detail keeps its indent"
+            ),
         );
     }
 
+    /// The board annotations that live in these headers are metadata, not
+    /// prose — they end the readme rather than appearing inside it. See
+    /// `.yah/qed/check.toml`, where twenty lines of `@yah:` follow the prose.
     #[test]
-    fn parse_p_prefix_rejects_non_prefixed() {
-        assert_eq!(parse_p_prefix("check"), None);
-        assert_eq!(parse_p_prefix("publish-assets"), None);
-        assert_eq!(parse_p_prefix("peers"), None);
-        assert_eq!(parse_p_prefix("P-bad"), None);
-        assert_eq!(parse_p_prefix("P"), None);
+    fn description_stops_at_board_annotations() {
+        let toml = "\
+# check — the correctness bar.
+#
+# @yah:ticket(R475-T7, \"something\")
+# @yah:status(review)
+
+[pipeline]
+name = \"check\"
+label = \"Check\"
+workspace = \"live\"
+";
+        let dir = tempfile::tempdir().unwrap();
+        let loader = PipelineLoader::new(dir.path());
+        let p = loader.load_from_str(toml).unwrap();
+        assert_eq!(p.description.as_deref(), Some("check — the correctness bar."));
     }
+
+    /// A `#:schema` line is a taplo editor directive, not prose. Several of
+    /// this camp's pipelines open with one and put the readme underneath, so it
+    /// has to be skipped rather than end the block — and it must not become the
+    /// readme's first line, which is what the collapsed section summarises.
+    #[test]
+    fn schema_directive_is_not_part_of_the_readme() {
+        let toml = "\
+#:schema ../schema/qed-pipeline.toml.schema.json
+
+# dashboard-e2e — the real readme.
+# Second line.
+
+[pipeline]
+name = \"dashboard-e2e\"
+label = \"l\"
+workspace = \"live\"
+";
+        let dir = tempfile::tempdir().unwrap();
+        let loader = PipelineLoader::new(dir.path());
+        assert_eq!(
+            loader.load_from_str(toml).unwrap().description.as_deref(),
+            Some("dashboard-e2e — the real readme.\nSecond line."),
+        );
+    }
+
+    /// Prose that *mentions* `@yah:` mid-sentence is prose. Four of this camp's
+    /// headers do exactly that ("the canonical `@yah:ticket` block lives in
+    /// …"), and truncating there would drop the rest of the readme.
+    #[test]
+    fn annotation_mentioned_mid_sentence_does_not_end_the_readme() {
+        let toml = "\
+# release-build — cross-compile one target.
+# The load-bearing check is the one the ticket's @yah:verify asks for.
+# Still readme.
+
+[pipeline]
+name = \"release-build\"
+label = \"l\"
+workspace = \"live\"
+";
+        let dir = tempfile::tempdir().unwrap();
+        let loader = PipelineLoader::new(dir.path());
+        let d = loader.load_from_str(toml).unwrap().description.unwrap();
+        assert!(d.ends_with("Still readme."), "got: {d:?}");
+    }
+
+    /// No header ⇒ `None`, not `Some("")`. The UI omits the readme section
+    /// entirely on `None`; an empty string would render an empty one.
+    #[test]
+    fn no_header_block_yields_no_description() {
+        let dir = tempfile::tempdir().unwrap();
+        let loader = PipelineLoader::new(dir.path());
+        let p = loader
+            .load_from_str("[pipeline]\nname = \"n\"\nlabel = \"l\"\nworkspace = \"live\"\n")
+            .unwrap();
+        assert_eq!(p.description, None);
+        // Annotations-only header is also nothing to show.
+        let only_annotations = loader
+            .load_from_str(
+                "# @yah:ticket(R1, \"x\")\n\n[pipeline]\nname = \"n\"\nlabel = \"l\"\nworkspace = \"live\"\n",
+            )
+            .unwrap();
+        assert_eq!(only_annotations.description, None);
+    }
+
+    /// A comment attached to a step is not a readme — only the contiguous run
+    /// at the very top of the file counts.
+    #[test]
+    fn comments_below_the_header_are_not_the_description() {
+        let toml = "\
+[pipeline]
+name = \"n\"
+label = \"l\"
+workspace = \"live\"
+
+# this explains the step, not the pipeline
+[[pipeline.steps]]
+name = \"s\"
+argv = [\"true\"]
+";
+        let dir = tempfile::tempdir().unwrap();
+        let loader = PipelineLoader::new(dir.path());
+        assert_eq!(loader.load_from_str(toml).unwrap().description, None);
+    }
+
+    /// An explicit `description =` key beats the header block, so a pipeline
+    /// that came back through `qed eject` keeps the prose it was ejected with.
+    #[test]
+    fn explicit_description_key_wins_over_header() {
+        let toml = "\
+# header prose
+
+[pipeline]
+name = \"n\"
+label = \"l\"
+description = \"explicit\"
+workspace = \"live\"
+";
+        let dir = tempfile::tempdir().unwrap();
+        let loader = PipelineLoader::new(dir.path());
+        assert_eq!(
+            loader.load_from_str(toml).unwrap().description.as_deref(),
+            Some("explicit"),
+        );
+    }
+
     use crate::registries::RegistryEntry;
     use crate::types::Outcome;
 
@@ -902,6 +1070,66 @@ intent = "latest"
         let loader = PipelineLoader::new(dir.path());
         let err = loader.load_from_str(toml).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidBind(_)), "got {err:?}");
+    }
+
+    /// R653-F2: an enumerated param round-trips from TOML — `options` is what
+    /// the operator surface renders a dropdown from, so it has to survive the
+    /// loader, and `description` has to come with it (the QED tab had no way to
+    /// show a description it already had in the file).
+    #[test]
+    fn parses_enumerated_params() {
+        let toml = r#"
+[pipeline]
+name = "appliance-image"
+label = "Build an appliance image"
+
+[pipeline.params.board]
+description = "Which board to build for"
+default = "orangepi_zero2w"
+options = ["orangepi_zero2w", "rpi_zero2w"]
+
+[[pipeline.steps]]
+name = "build"
+kind = "subprocess"
+argv = ["make", "image", "BOARD={{board}}"]
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let loader = PipelineLoader::new(dir.path());
+        let pipeline = loader.load_from_str(toml).expect("loads cleanly");
+        let board = &pipeline.params["board"];
+        assert_eq!(board.options, vec!["orangepi_zero2w", "rpi_zero2w"]);
+        assert_eq!(board.default.as_deref(), Some("orangepi_zero2w"));
+        assert_eq!(board.description.as_deref(), Some("Which board to build for"));
+        assert!(!board.required, "a param with a default needn't claim required");
+    }
+
+    /// A default outside the option set is an authoring error, and it has to
+    /// fail at load rather than only on the runs that take the default.
+    #[test]
+    fn rejects_param_default_outside_its_options() {
+        let toml = r#"
+[pipeline]
+name = "appliance-image"
+label = "Build an appliance image"
+
+[pipeline.params.board]
+default = "rpi_zero2"
+options = ["orangepi_zero2w", "rpi_zero2w"]
+
+[[pipeline.steps]]
+name = "build"
+kind = "subprocess"
+argv = ["make", "image"]
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let loader = PipelineLoader::new(dir.path());
+        let err = loader.load_from_str(toml).unwrap_err();
+        match &err {
+            ConfigError::InvalidParam(msg) => {
+                assert!(msg.contains("board") && msg.contains("rpi_zero2w"), "got: {msg}");
+            }
+            other => panic!("expected InvalidParam, got {other:?}"),
+        }
     }
 
     /// R513-F4: a `[[pipeline.finally]]` subprocess teardown step parses and is
@@ -1131,7 +1359,7 @@ pipeline = "notify-failure"
 
         assert!(matches!(
             &pipeline.on_success[0],
-            Outcome::WardenDeploy { service, env }
+            Outcome::YubabaDeploy { service, env }
             if service == "yah" && env == "production"
         ));
         assert!(matches!(
@@ -1904,7 +2132,7 @@ push    = false
     /// `platform = { target = "…", native = true }` inline table — and that
     /// declaration resolves to Offload on an arm64 host (so `pipeline_needs_offload`
     /// tells the CLI to stand up the fleet path). Mirrors
-    /// `.yah/qed/P018-rusty-v8-musl.toml`.
+    /// `.yah/qed/rusty-v8-musl.toml`.
     #[test]
     fn native_container_run_step_parses_and_offloads() {
         let loader = PipelineLoader::new(".yah/qed");
@@ -2090,7 +2318,7 @@ argv = ["cargo", "build", "--release"]
     #[test]
     fn peer_resolver_reports_peer_camp_root_for_subprocess_cwd() {
         // Regression: peer children must execute in the *peer* camp's
-        // workspace, not the parent's. Without this, `peer-release` runs
+        // workspace, not the parent's. Without this, `peer-binaries` runs
         // yubaba's `cargo publish -p workload-spec` from yah's root and the
         // package isn't found. resolved_camp_root feeds the child runner's
         // camp_root, which is the cwd for subprocess steps.

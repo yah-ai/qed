@@ -571,4 +571,3 @@ fn split_uses(raw: &str) -> (String, Option<String>) {
         None => (raw.to_string(), None),
     }
 }
-

@@ -59,6 +59,7 @@ pub mod promotion;
 pub mod quota;
 pub mod ring;
 pub mod service;
+pub mod snapshot;
 pub mod store;
 
 #[cfg(unix)]
@@ -86,6 +87,11 @@ pub use federation_http::{
 };
 pub use promotion::{
     DEFAULT_PROMOTE_INTERVAL, PromotionConfig, PromotionConsumer,
+};
+pub use snapshot::{
+    AnalyticsSnapshot, DEFAULT_EVENT_LIMIT, DEFAULT_SNAPSHOT_INTERVAL, POINTER_KEY,
+    SNAPSHOT_PREFIX, SnapshotBucket, SnapshotConfig, SnapshotError, SnapshotEvent,
+    SnapshotLevelCount, SnapshotPointer, SnapshotProducer,
 };
 pub use quota::{QuotaDecision, ServiceQuotaManager, DEFAULT_QUOTA_PER_SECOND};
 pub use ring::{EventRing, RingConfig};

@@ -21,6 +21,12 @@ description = "Cargo workspaces — yah-base + cargo, rustc, build-essential"
 tools       = ["bash", "git", "curl", "cargo", "rustc", "build-essential", "pkg-config"]
 
 [[image]]
+name        = "yah-rust-sccache"
+extends     = "yah-rust"
+description = "yah-rust + sccache (pinned upstream release) — W219's warm-base lower layer; RUSTC_WRAPPER/SCCACHE_DIR preset"
+tools       = ["bash", "git", "curl", "cargo", "rustc", "build-essential", "pkg-config", "sccache"]
+
+[[image]]
 name        = "yah-bun"
 base        = "oven/bun:debian"
 description = "Frontend builds, TS scripts"
@@ -61,12 +67,6 @@ name        = "yah-miniflare"
 base        = "oven/bun:1-debian"
 description = "Pond-tier miniflare (workerd) container — bun + tini + baked miniflare; Worker bundle bind-mounted at runtime (R455-F1; W180)"
 tools       = ["tini", "bun", "miniflare"]
-
-[[image]]
-name        = "yah-cloud-runner"
-base        = "debian:bookworm-slim"
-description = "Cloud-tier almanac runner (almanac-serve under tini) behind runner.yah.dev — R330-F11, W059"
-tools       = ["tini", "almanac-serve"]
 
 [[image]]
 name        = "rusty-v8-musl-builder"

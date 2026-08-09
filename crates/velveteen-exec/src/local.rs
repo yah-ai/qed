@@ -63,7 +63,7 @@ use workload_spec::ImageRef;
 use crate::executor::{
     ExecContext, ExecEvent, ExecOutcome, ForgeExecutor, ForgeExecutorError, OutputStream,
 };
-use velveteen::{ForgeCommand, ForgeSpec, ForgeStatus, TaskRuntime};
+use velveteen::{ForgeCommand, ForgeSpec, ForgeStatus, TaskLocation, TaskRuntime};
 
 /// Format an [`ImageRef`] as the single positional argument passed to
 /// `docker run`. Pinned images resolve content-addressed (`repo:tag@digest`);
@@ -273,6 +273,16 @@ pub fn imagetools_create_command(target: &str, sources: &[String]) -> Command {
 /// Refuses [`ForgeCommand::BuildImage`] and [`ForgeCommand::Workload`] with
 /// [`ForgeExecutorError::Unsupported`] — those have dedicated paths
 /// (qed's build-image dispatch; yubaba RPC).
+///
+/// Also refuses any spec whose `where_.location` is not
+/// [`TaskLocation::Local`]. That check is load-bearing, not defensive: W235
+/// opened recipe placement to `remote` / `remote_any`, and this driver has
+/// always dispatched on `runtime` alone. Without the guard a recipe that says
+/// `location = { kind = "remote_any", … }` would run happily *on the dev box*
+/// and report success — the failure mode being an arch-mismatched artifact
+/// produced under emulation, discovered hours later at link time. Fail at
+/// dispatch instead; the caller's job is to route remote specs to
+/// [`RemoteForgeDriver`](crate::remote::RemoteForgeDriver).
 #[derive(Debug, Default, Clone, Copy)]
 pub struct LocalForgeDriver;
 
@@ -290,6 +300,21 @@ impl ForgeExecutor for LocalForgeDriver {
         ctx: ExecContext,
         sink: Option<UnboundedSender<ExecEvent>>,
     ) -> Result<ExecOutcome, ForgeExecutorError> {
+        if !matches!(spec.where_.location, TaskLocation::Local) {
+            return Err(ForgeExecutorError::Unsupported(
+                "LocalForgeDriver received a spec with a remote placement.location — \
+                 route it to RemoteForgeDriver, or set placement.location = \"local\". \
+                 Running it here would silently produce a host-arch artifact (W235)",
+            ));
+        }
+        if ctx.produced.is_some() {
+            return Err(ForgeExecutorError::Unsupported(
+                "LocalForgeDriver received ExecContext::produced, which is a remote-only \
+                 retrieval contract — a local run writes its artifact straight onto this \
+                 filesystem, so there is nothing to fetch. Bind the output path directly \
+                 instead of asking for retrieval",
+            ));
+        }
         let runtime = spec.where_.runtime;
         match spec.command {
             ForgeCommand::Subprocess { argv, image } => match runtime {
@@ -950,6 +975,7 @@ mod tests {
             command: ForgeCommand::BuildImage {
                 dockerfile: PathBuf::from("/tmp/Dockerfile"),
                 context: PathBuf::from("."),
+                context_url: None,
                 tags: vec!["x:y".into()],
                 platforms: vec![],
                 build_args: vec![],
@@ -967,6 +993,70 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, ForgeExecutorError::Unsupported("BuildImage")), "got {err:?}");
+    }
+
+    /// R555-T2: W235 opened `RecipeLocation` to `remote` / `remote_any`, and
+    /// this driver dispatches on `runtime` alone. Without an explicit refusal a
+    /// remote-placed spec runs right here on the dev box and reports success —
+    /// the artifact is built for the host architecture and nothing notices
+    /// until it fails to link. Fail at dispatch instead.
+    #[tokio::test]
+    async fn remote_placement_is_refused_not_silently_run_locally() {
+        let driver = LocalForgeDriver::new();
+        for location in [
+            TaskLocation::Remote {
+                node: workload_spec::MeshIdent("us-west-002".into()),
+            },
+            TaskLocation::RemoteAny {
+                tier: workload_spec::TierTag("infra".into()),
+                mesh_tags: vec!["tier:x86".into()],
+            },
+        ] {
+            let mut spec = subprocess_spec(
+                vec!["/bin/sh".into(), "-c".into(), "exit 0".into()],
+                velveteen::TaskRuntime::Native,
+            );
+            spec.where_ = TaskPlacement::new(location.clone(), velveteen::TaskRuntime::Native);
+
+            let err = driver
+                .execute(spec, ExecContext::default(), None)
+                .await
+                .expect_err("remote placement must not run locally");
+            assert!(
+                matches!(err, ForgeExecutorError::Unsupported(_)),
+                "location {location:?} → {err:?}"
+            );
+            assert!(
+                err.to_string().contains("RemoteForgeDriver"),
+                "the refusal must name where the spec should go, got: {err}"
+            );
+        }
+    }
+
+    /// R555-F3: `ExecContext::produced` asks the driver to pull an artifact off
+    /// a worker. There is no worker here, and the local run wrote its output
+    /// straight to the caller's disk — so honoring it is impossible and
+    /// ignoring it would hand back a run that looks retrieved and isn't.
+    #[tokio::test]
+    async fn a_produced_retrieval_request_is_refused_rather_than_ignored() {
+        let driver = LocalForgeDriver::new();
+        let spec = subprocess_spec(
+            vec!["/bin/sh".into(), "-c".into(), "exit 0".into()],
+            velveteen::TaskRuntime::Native,
+        );
+        let err = driver
+            .execute(
+                spec,
+                ExecContext::default()
+                    .with_produced(PathBuf::from("/yah/produced/out.bin"), PathBuf::from("/tmp/out.bin")),
+                None,
+            )
+            .await
+            .expect_err("produced retrieval is remote-only");
+        assert!(
+            err.to_string().contains("remote-only"),
+            "the refusal must say why, got: {err}"
+        );
     }
 
     #[tokio::test]

@@ -148,6 +148,7 @@ fn kind_tag(kind: &StepKind) -> &'static str {
         StepKind::Import => "import",
         StepKind::WaitFor => "wait-for",
         StepKind::ManifestStitch => "manifest-stitch",
+        StepKind::Manual => "manual",
     }
 }
 
@@ -214,7 +215,7 @@ fn record_outcome_degradations(site: &str, outcomes: &[Outcome], degradations: &
                 "content-addressed release publish is a native QED facility (atomic-release \
                  model); GHA does not publish — run `yah qed run` to publish",
             ),
-            Outcome::WardenDeploy { .. } => (
+            Outcome::YubabaDeploy { .. } => (
                 "outcome:yubaba-deploy",
                 "yubaba deploy is native; GHA cannot perform it — delegate to `yah qed run`",
             ),
@@ -471,6 +472,8 @@ mod tests {
 
     fn pipeline(name: &str, steps: Vec<QedStep>) -> Pipeline {
         Pipeline {
+            description: None,
+            tags: Vec::new(),
             name: name.into(),
             label: name.into(),
             steps,

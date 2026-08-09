@@ -46,6 +46,26 @@ impl ExprString {
         Some(out)
     }
 
+    /// Reconstruct approximate source text (`${{ … }}` re-wrapped around each
+    /// `Expr` token) for human-facing messages — a skip reason naming the
+    /// `if:` condition that gated a job, say. Not guaranteed to round-trip
+    /// byte-for-byte (whitespace inside the original braces is trimmed at
+    /// parse time), but reads the same to a human.
+    pub fn raw_source(&self) -> String {
+        let mut out = String::new();
+        for t in &self.tokens {
+            match t {
+                ExprToken::Literal(s) => out.push_str(s),
+                ExprToken::Expr(s) => {
+                    out.push_str("${{ ");
+                    out.push_str(s);
+                    out.push_str(" }}");
+                }
+            }
+        }
+        out
+    }
+
     /// Parse a raw YAML scalar into a tokenized `ExprString`. Splits on every
     /// occurrence of `${{ … }}`; the inner text (trimmed) becomes an `Expr`
     /// token. Anything outside braces is a `Literal` token.

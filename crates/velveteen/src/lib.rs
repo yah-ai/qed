@@ -346,6 +346,22 @@ pub enum ForgeCommand {
     BuildImage {
         dockerfile: PathBuf,
         context: PathBuf,
+        /// When set, the build context is loaded by BuildKit from this URL — a
+        /// (optionally gzipped) tar whose root holds the context *and* the
+        /// Dockerfile named by `dockerfile`'s basename — instead of from the
+        /// local `context` / `dockerfile` paths (R636-B1).
+        ///
+        /// The local paths are host paths on whoever *composed* the spec. That
+        /// is fine when the builder shares a filesystem with the composer, and
+        /// wrong the moment it doesn't: a remote build bind-mounted the qed
+        /// host's camp root onto a worker that has no such directory, and runc
+        /// failed with `open /Users/…: no such file or directory`. A URL is the
+        /// one context reference that means the same thing on both machines.
+        ///
+        /// `None` keeps the bind-mount shape, which remains correct for the
+        /// same-host case (local docker, or a yubaba on the qed host).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context_url: Option<String>,
         /// One or more image tags to apply. All tags reference the same built
         /// image; a single build emits every tag. Non-empty by convention —
         /// the qed runner always supplies at least one.
@@ -546,6 +562,7 @@ mod types {
         let cmd = ForgeCommand::BuildImage {
             dockerfile: PathBuf::from("crates/yah/qed/images/yah-rust/Dockerfile"),
             context: PathBuf::from("."),
+            context_url: None,
             tags: vec![
                 "ghcr.io/yah-ai/yah-rust:dev".into(),
                 "ghcr.io/yah-ai/yah-rust:latest".into(),
@@ -560,6 +577,40 @@ mod types {
         assert_eq!(cmd, back);
         // Confirm the snake_case tag is what yubaba reads on the wire.
         assert!(json.contains(r#""kind":"build_image""#));
+        // `None` must not appear on the wire at all: a kamaji that predates
+        // this field has to keep deserializing specs from a newer qed.
+        assert!(!json.contains("context_url"));
+    }
+
+    /// A remote-context spec round-trips and carries the URL on the wire.
+    #[test]
+    fn forge_command_build_image_carries_context_url() {
+        let cmd = ForgeCommand::BuildImage {
+            dockerfile: PathBuf::from("/camp/.yah/cache/buildkit/yah-rust.Dockerfile"),
+            context: PathBuf::from("/camp/oss/qed/crates/qed/images/yah-rust"),
+            context_url: Some("https://cdn.yah.dev/yah-cloud/qed-context/abc.tar.gz".into()),
+            tags: vec!["cr.yah.dev/yah-rust:dev".into()],
+            platforms: vec![],
+            build_args: vec![],
+            push: false,
+            load: false,
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert!(json.contains("qed-context/abc.tar.gz"));
+        let back: ForgeCommand = serde_json::from_str(&json).unwrap();
+        assert_eq!(cmd, back);
+    }
+
+    /// A spec written before `context_url` existed still deserializes — the
+    /// field defaults to `None` (bind-mount shape), not a parse error.
+    #[test]
+    fn forge_command_build_image_accepts_legacy_json_without_context_url() {
+        let legacy = r#"{"kind":"build_image","dockerfile":"D","context":".","tags":["t"]}"#;
+        let back: ForgeCommand = serde_json::from_str(legacy).unwrap();
+        match back {
+            ForgeCommand::BuildImage { context_url, .. } => assert!(context_url.is_none()),
+            other => panic!("expected BuildImage, got {other:?}"),
+        }
     }
 
     #[test]

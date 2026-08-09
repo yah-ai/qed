@@ -519,6 +519,16 @@ pub struct Context<'a> {
     /// Host hook for `hashFiles(...)`. Defaults to returning `""` — that's
     /// good enough for parse + dry-run; F4+ wires this to a real walker.
     pub hash_files: Option<&'a dyn Fn(&[String]) -> String>,
+    /// Host-defined namespaces beyond GHA's own (R653-F1). The fields above
+    /// are the namespaces GitHub Actions itself defines, and this crate keeps
+    /// that list faithful; a host embedding the evaluator over its own model
+    /// registers extra roots here instead of growing the struct. qed uses it
+    /// for `params.<name>` — a pipeline run's resolved run params, which have
+    /// no GHA equivalent (`inputs` is workflow_dispatch's, not qed's).
+    ///
+    /// A name here that collides with a built-in root above never wins:
+    /// [`Self::root`] checks the built-ins first.
+    pub extra: IndexMap<String, Value>,
 }
 
 impl<'a> Context<'a> {
@@ -550,8 +560,16 @@ impl<'a> Context<'a> {
             "runner" => Some(&self.runner),
             "secrets" => Some(&self.secrets),
             "job" => Some(&self.job),
-            _ => None,
+            other => self.extra.get(other),
         }
+    }
+
+    /// Register a host-defined namespace root (R653-F1). Chainable:
+    /// `Context::new().with_namespace("params", Value::Object(m))`. Built-in
+    /// GHA roots always win, so this cannot shadow `env`/`matrix`/`steps`/….
+    pub fn with_namespace(mut self, name: impl Into<String>, value: Value) -> Self {
+        self.extra.insert(name.into(), value);
+        self
     }
 }
 
@@ -1454,5 +1472,38 @@ mod tests {
         let mut c = ctx();
         c.matrix = Some(obj([("os", s("ubuntu-latest"))]));
         assert_eq!(ev("matrix.os", &c), s("ubuntu-latest"));
+    }
+
+    // ── host-defined namespaces (R653-F1)
+
+    #[test]
+    fn host_namespace_resolves_like_a_builtin_root() {
+        let c = ctx().with_namespace("params", obj([("variant", s("full"))]));
+        assert_eq!(ev("params.variant", &c), s("full"));
+        assert_eq!(ev("params.variant == 'full'", &c), b(true));
+    }
+
+    #[test]
+    fn unknown_key_in_a_host_namespace_is_null_not_an_error() {
+        let c = ctx().with_namespace("params", obj([("variant", s("full"))]));
+        assert_eq!(ev("params.missing", &c), Value::Null);
+        assert_eq!(ev("params.missing == 'full'", &c), b(false));
+    }
+
+    #[test]
+    fn unregistered_namespace_is_null() {
+        // Registering nothing must not turn `params.x` into an eval error —
+        // a qed run with no params should skip a gated step, not fail.
+        assert_eq!(ev("params.variant", &ctx()), Value::Null);
+    }
+
+    #[test]
+    fn host_namespace_cannot_shadow_a_builtin_root() {
+        // `root()` checks GHA's own namespaces first, so a host that
+        // (mistakenly) registers `env` cannot hijack `env.<k>` lookups.
+        let mut c = ctx();
+        c.env = obj([("PATH", s("/real"))]);
+        let c = c.with_namespace("env", obj([("PATH", s("/hijacked"))]));
+        assert_eq!(ev("env.PATH", &c), s("/real"));
     }
 }

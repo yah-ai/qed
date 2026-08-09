@@ -45,6 +45,40 @@
 //! @yah:verify("cargo test -p task --lib remote_native_refused_at_start_emits_no_events  # the new test in isolation")
 //! @yah:verify("cargo check --workspace  # clean (pre-existing desktop warnings unrelated)")
 //!
+//!
+//! @yah:ticket(R636-B2, "Rootless BuildKit cannot start under kamaji's OCI sandbox — every offloaded build-image step dies before the first layer")
+//! @yah:status(review)
+//! @yah:at(2026-08-05T04:30:58Z)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R636)
+//! @yah:severity(high)
+//! @yah:next("MEASURED LADDER (us-west-002, 2026-08-04): reproduced kamaji's OCI knobs one at a time with `sudo docker run` against moby/buildkit:v0.12.5-rootless and the real rusty-v8-musl-builder context. kamaji's spec (kamaji-containerd-core build_oci_spec_with): caps dropped to CAP_NET_BIND_SERVICE only (GRANTED_CAPABILITY), noNewPrivileges=true, NO seccomp profile, no /dev/fuse.")
+//! @yah:next("(A) default docker seccomp: 'rootlesskit:parent error: failed to start the child: fork/exec /proc/self/exe: operation not permitted'.")
+//! @yah:next("(B) seccomp=unconfined + no-new-privileges: 'failed to setup UID/GID map: newuidmap ... fork/exec /usr/bin/newuidmap: operation not permitted'. newuidmap is setuid-root, so no-new-privileges blocks it, and the reduced bounding set blocks CAP_SETUID anyway.")
+//! @yah:next("(C) + --cap-add=SETUID --cap-add=SETGID and NO no-new-privileges: rootlesskit STARTS and the R636-B1 remote context loads ('#1 load remote build context', '#2 copy /context /'), then fails 'lsetxattr /verify-consumer.sh: operation not supported'.")
+//! @yah:next("(D) C + --device /dev/fuse: identical lsetxattr failure. So the privilege chain up to the snapshotter is fully characterized and the snapshotter is the one remaining unknown — try BUILDKITD_FLAGS=--oci-worker-snapshotter=native, or run the NON-rootless moby/buildkit under a wider grant.")
+//! @yah:next("THE DECISION THIS NEEDS IS THE OPERATOR'S, WHICH IS WHY IT IS A SEPARATE TICKET: making this work means kamaji granting CAP_SETUID+CAP_SETGID and dropping noNewPrivileges for a class of workloads. That is a real widening of the container sandbox on every build-worker. Scope it as a guarded opt-in (annotation, tier=infra only) mirroring how workload_spec::HOST_NETWORK_ANNOTATION is already gated — not as a blanket relaxation of GRANTED_CAPABILITY.")
+//! @yah:verify("`yah qed images build rusty-v8-musl-builder --platform linux/amd64` from the arm64 camp Mac runs BuildKit to completion on us-west-002 and writes the OCI archive to /var/lib/yah/qed/build-out.")
+//! @yah:verify("The widened privileges are opt-in and scoped: a non-forge, non-infra workload still gets kamaji's CAP_NET_BIND_SERVICE-only + noNewPrivileges baseline. Assert it with a build_oci_spec test, not by inspection.")
+//! @yah:gotcha("This is NOT the R636-B1 cross-host context gap and is not caused by it. B1 is fixed and independently proven: the same context tarball, fetched over `--opt context=<url>`, builds the real rusty-v8-musl-builder Dockerfile (syntax frontend, alpine:edge, apk layer running) under a privileged buildkit. What B1's fix did was clear the two mount failures that were masking this one — the camp-root bind and the missing /var/lib/yah/qed/build-out — so this is the next wall, not a regression.")
+//! @yah:gotcha("The kamaji-side symptom is nearly silent: the run reports 'buildkit exited with code 1' with ZERO streamed log lines, and the container's stdout/stderr are FIFOs under /var/log/yah/yah/forge-<id>/ that nothing persists. The only visible trace is `journalctl -u kamaji`: 'could not connect to unix:///run/user/1000/buildkit/buildkitd.sock after 10 trials'. Budget for that: any diagnosis here starts by reproducing under `sudo docker run` on the box, not by reading qed output.")
+//! @yah:gotcha("CROSS-RELAY COUPLING with R555-F4 (noted by R555-S1/spade, 2026-08-04). The widening this ticket needs - CAP_SETUID + CAP_SETGID, noNewPrivileges off, on every build-worker - is the same kamaji policy surface R555-F4 ('kamaji admission: only signed recipes may run remotely') exists to TIGHTEN. F4's gotcha states the stake: 'remote execution without signed-recipe verification is a remote-code-execution surface on shared infra.' Widening raises the cost of an admission gap from 'arbitrary code in a tight sandbox' to 'arbitrary code with SETUID and no-new-privs off'.")
+//! @yah:gotcha("GOOD NEWS: this ticket's proposed shape already IS the resolution. The 'guarded opt-in (annotation, tier=infra only) mirroring HOST_NETWORK_ANNOTATION' in the next-steps is exactly the admission mechanism R555-F4 has to build. So the two should land as ONE piece of work rather than a widening that F4 retrofits a gate around later. Whoever takes this first should read R555-F4 and W235 section (c) before designing the annotation - and note F4's own HARD prereqs (W217 signed asset catalog + the W233 signing conclusion) apply to the gate, not just to F4's paperwork.")
+//! @yah:handoff("ROOT-CAUSED AND BUILT (2026-08-04). (1) The lsetxattr wall was NEVER the snapshotter. 'lsetxattr /verify-consumer.sh: operation not supported' came from SCHILY.xattr.com.apple.provenance pax headers in a context tarball packed by macOS tar -- every source file in this repo carries that xattr on the camp Mac, and Linux rejects the com.apple.* namespace outright, so BuildKit dies at 'copy /context /' before it reads the Dockerfile. A/B proof under IDENTICAL caps on us-west-002: mac-tar context -> the exact lsetxattr error; GNU-tar context -> build green through 'exporting to oci image format'. The production path never had this bug (qed::build_context::pack_context uses the Rust tar crate, which builds headers from fs::Metadata and has no xattr support), so ladder step (D) was diagnosing a hand-made tarball. Locked by build_context::tests::packs_without_extended_attributes.")
+//! @yah:handoff("(2) MINIMAL GRANT MEASURED EXACTLY. CAP_SETUID + CAP_SETGID + noNewPrivileges=false, each INDIVIDUALLY necessary: baseline -> 'fork/exec /usr/bin/newuidmap: operation not permitted'; +SETUID only -> 'fork/exec /usr/bin/newgidmap: operation not permitted'; +SETUID+SETGID with nnp ON -> 'newuidmap: Could not set caps'; all three -> starts, build runs to completion. Not CAP_SYS_ADMIN (that is what a NON-rootless buildkitd would need instead -- far wider). Emptying /etc/subuid to force rootlesskit's single-mapping path does not avoid the setuid helpers either: it fails earlier with 'No subuid ranges found', and a self-only range (user:1000:1) still execs newuidmap. So there is no zero-widening path through rootless BuildKit.")
+//! @yah:handoff("(3) SHIPPED: a guarded opt-in exactly as the ticket specified. workload_spec::NESTED_SANDBOX_ANNOTATION ('yah.sandbox') / NESTED_SANDBOX_VALUE ('nested') + WorkloadSpec::wants_nested_sandbox() (oss/yah-base/crates/workload-spec/src/lib.rs, mirroring wants_host_network); the grant in kamaji-containerd-core::build_oci_spec_with keyed on it (NESTED_SANDBOX_CAPABILITIES const), which also raises RLIMIT_NOFILE 1024->65536 as HEADROOM (explicitly NOT a measured requirement -- a small build passes at 1024); tier=infra refusal in BOTH backends (kamaji-bin/src/containerd.rs validate_spec_for_constable, kamaji/src/containerd.rs deploy_workload); and exactly ONE setter in the whole tree, velveteen-exec's build_image_workload_spec.")
+//! @yah:handoff("TESTS (all green): kamaji-containerd-core oci_spec_baseline_sandbox_is_unchanged_without_the_annotation (the ticket's second verify criterion, asserted not inspected -- also proves host-networking does not drag the caps along), oci_spec_nested_sandbox_grants_setuid_setgid_and_drops_no_new_privs, oci_spec_nested_sandbox_leaves_namespaces_and_mounts_alone; kamaji-bin validate_{rejects,allows}_nested_sandbox_for_{non_infra,infra}_tier; workload-spec nested_sandbox_marker_is_opt_in_and_reads_back + _is_independent_of_the_other_markers; velveteen-exec build_image_workload_asks_for_the_nested_sandbox_grant + subprocess_workload_does_not_ask_for_the_nested_sandbox_grant. Suites: kamaji workspace --all-features all green (incl. 32/32 containerd-core), yah-workload-spec 67/67, velveteen-exec 95/95, yah-qed 714/715, root cargo check --workspace clean.")
+//! @yah:gotcha("CORRECTION to this ticket's own ladder (2026-08-04, R636-B2 session): step (D)'s 'the snapshotter is the one remaining unknown' is FALSE and should not be carried forward. The lsetxattr failure was macOS-tar xattrs in the context tarball, not the snapshotter -- BUILDKITD_FLAGS=--oci-worker-snapshotter=native changes nothing, and the default overlay snapshotter builds fine once the tarball is clean. Left as an append rather than a rewrite because (A)-(C) were true as measured; only (D)'s conclusion was wrong.")
+//! @yah:verify("cargo test -p kamaji-containerd-core --lib --features containerd-integration  # 32/32, incl. the baseline-unchanged + grant + namespaces-untouched trio")
+//! @yah:verify("cargo test -p yah-qed --lib build_context  # 6/6, incl. packs_without_extended_attributes (the macOS-xattr regression lock)")
+//! @yah:verify("yah-qed lib has ONE unrelated flake: waitfor::tests::tcp_probe_fails_against_a_dead_port fails under full-suite parallelism and passes in isolation (port race, not this change).")
+//! @yah:next("THE ONLY REMAINING STEP IS THE OPERATOR-CONSENT DEPLOY, and it is deliberately not done. The code is complete and green but INERT on the fleet: us-west-002 runs the kamaji built 2026-07-19, which knows nothing of yah.sandbox, so an offloaded build-image step still fails exactly as it does today. Nothing widens until someone rolls kamaji. I asked via ask_user and the form timed out unanswered after 30m; I did not deploy on a timeout.")
+//! @yah:next("DEPLOY RECIPE (grounded, follows the box's own .bak convention -- /usr/local/bin already holds kamaji.0.8.17/18/19.bak): (1) cross-build from oss/kamaji with CC_x86_64_unknown_linux_musl=x86_64-linux-musl-gcc CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=x86_64-linux-musl-gcc cargo build -p kamaji-bin --bin kamaji --target x86_64-unknown-linux-musl --features containerd-integration --release; (2) ssh -i ~/.ssh/yah struc@100.64.0.4, sudo cp /usr/local/bin/kamaji /usr/local/bin/kamaji.0.8.20.bak; (3) scp the new binary to /usr/local/bin/kamaji; (4) sudo systemctl restart kamaji (unit is /etc/systemd/system/kamaji.service, enabled, currently up since 2026-08-04 02:30 PDT); (5) run the first @yah:verify from the camp Mac. Rollback is a cp from the .bak plus a restart.")
+//! @yah:next("BLAST RADIUS OF THE DEPLOY, stated plainly so the sign-off is informed: us-west-002 only. It is the qed dogfood box, carries taints no-server/no-appliance/no-voter, and hosts no serving workloads. The grant itself reaches only a workload that BOTH sets yah.sandbox=nested AND is tier=infra; the sole setter in the tree is velveteen-exec::build_image_workload_spec. A subprocess forge on the same node is unaffected.")
+//! @yah:next("WIRE PATH IS ALREADY PROVEN, so the deploy should not surprise: annotations are a plain HashMap field on WorkloadSpec and survive the postcard UDS (kamaji-proto codec::deploy_container_round_trip, 25/25 green, and its fixture spec carries an annotation), and yubaba admission READS annotations off the spec rather than rebuilding it (cloud/src/config.rs:1045 does exactly this for NODE_SELECTOR_MESH_TAGS_ANNOTATION, which is live-proven by the R594/R631 offload routing). So there is no untested hop between the camp and build_oci_spec_with.")
+//! @yah:gotcha("DO NOT DEPLOY A KAMAJI BUILT FROM THIS WORKING TREE AS-IS. R577-T1 (@Ashguard:eclipse, live at time of writing) has substantial UNCOMMITTED in-flight work in the same crate: a new `native-exec` cargo feature (kamaji-bin/Cargo.toml), --native-exec-dir / KAMAJI_NATIVE_EXEC_DIR plumbing in kamaji-bin/src/main.rs, and ~443 changed lines in kamaji-bin/src/server.rs. I cross-built x86_64-unknown-linux-musl green (19.6s, only the pre-existing benign `-z stacksize ignored` linker warning), which derisks the compile step -- but that binary carries eclipse's R577 work too. The `native-exec` FEATURE is off by default, which bounds the risk, but the server.rs changes are in the default build path. Before rolling to us-west-002, either wait for R577-T1 to land and re-verify, or build from a commit that has my four files and not theirs. This is exactly the shared-tree trap: `git status` on the kamaji crates looks like one change and is two.")
+//! @yah:gotcha("MY FILES, so a deploy build can be scoped precisely: oss/yah-base/crates/workload-spec/src/lib.rs (annotation const + wants_nested_sandbox + 2 tests), oss/kamaji/crates/kamaji-containerd-core/src/lib.rs (NESTED_SANDBOX_CAPABILITIES + the build_oci_spec_with branch + 3 tests), oss/kamaji/crates/kamaji/src/containerd.rs (tier guard), oss/kamaji/crates/kamaji-bin/src/containerd.rs (tier guard + 2 tests), oss/qed/crates/velveteen-exec/src/remote.rs (the single annotation setter + 2 tests), oss/qed/crates/qed/src/build_context.rs (the no-xattr regression test). Nothing else in the diff of those crates is mine.")
+//! @yah:handoff("CODE COMPLETE, DEPLOY DELIBERATELY NOT DONE -- in review for the operator consent the ticket itself said this needed. The sandbox widening is built as the guarded opt-in the ticket specified, every unit test is green, and the x86_64-musl cross-build succeeds; nothing on the fleet has changed and nothing will until someone rolls kamaji to us-west-002. See @yah:next for the grounded deploy recipe and @yah:gotcha for the shared-tree trap that makes a naive build of this tree unsafe to ship.")
 
 // @yah:ticket(R094-F3, "Remote-forge driver: synthesize WorkloadSpec from ForgeSpec, deploy via yubaba RPC, attach containerd-logs scryer adapter scoped to Forge(id)")
 // @yah:assignee(agent:claude)
@@ -79,9 +113,13 @@ use yah_scryer::service::Scryer;
 use serde_json::json;
 use thiserror::Error;
 use tokio::sync::{mpsc, watch};
-use workload_spec::{ImageRef, MeshIdent, TierTag, VolumeMount, VolumeSource, WorkloadSpec};
+use workload_spec::{
+    EnvValue, EnvVar, ImageRef, MeshIdent, TierTag, VolumeMount, VolumeSource, WorkloadSpec,
+};
 
-use crate::executor::{ExecEvent, OutputStream};
+use crate::executor::{
+    ExecContext, ExecEvent, ExecOutcome, ForgeExecutor, ForgeExecutorError, OutputStream,
+};
 use velveteen::{ForgeCommand, ForgeSpec, ForgeStatus, TaskLocation, TaskRuntime};
 
 // ─── Error ────────────────────────────────────────────────────────────────────
@@ -111,31 +149,38 @@ pub enum RemoteForgeError {
 /// Production: yubaba's containerd gRPC client (R091).  Tests:
 /// [`test_support::ScriptedWardenClient`] / [`test_support::HangingWardenClient`].
 ///
-/// # Remote + native: not in v1
+/// # Remote + native: shipped as a marked container workload, not a sibling method
 ///
-/// All v1 paths through this trait are containerd-backed — `deploy` takes a
-/// [`WorkloadSpec`] which is an image-pinned workload.  Remote + native (a
-/// host subprocess running directly on the yubaba node, no containerd) is
-/// intentionally absent from the surface.  When a real use case lands
-/// (BuildKit shelling to host docker on a yubaba node is the leading
-/// candidate per W149 §Open policy), v2 adds a sibling method here:
+/// R380-T7 left a documented v2 hook here — `async fn exec_native(&self, spec:
+/// &NativeExecSpec)`, parallel to `deploy` — to be added when a real use case
+/// arrived. One did (the W254 Darwin build leg), and the hook was **not** the
+/// shape taken. **This trait is unchanged**; there is no `exec_native`.
 ///
-/// ```ignore
-/// async fn exec_native(&self, spec: &NativeExecSpec) -> Result<…, RemoteForgeError>;
-/// ```
+/// The reason is that the difference between a Darwin build and a Linux build
+/// is not the *transport*, it is only which runtime the node ends up forking.
+/// Everything this trait exists to do — deploy, stream logs, read the exit
+/// code, fetch produced files, tear down — is identical for both. A sibling
+/// method would have duplicated all five for a one-bit difference. So a native
+/// forge goes out through `deploy` like any other, as a `WorkloadSpec` carrying
+/// [`workload_spec::NATIVE_EXEC_ANNOTATION`], and kamaji routes on that marker
+/// to its `Backend::Native`. See [`build_workload_spec`] for the synthesis and
+/// [`WorkloadSpec::wants_native_exec`] for the marker contract.
 ///
-/// Until then, any `ForgeSpec` whose `placement.runtime == Native` and
-/// `placement.location` is `Remote` or `RemoteAny` is refused by
-/// [`RemoteForgeDriver::start`] before it touches this trait —
-/// see [`build_workload_spec`].
+/// `image` on a native workload is identity metadata only — nothing is pulled.
+/// The one quadrant still refused before touching this trait is remote+native
+/// for a non-subprocess forge command (a `Workload` or `BuildImage` forge is
+/// image-backed by construction).
 #[async_trait]
 pub trait WardenClient: Send + Sync {
     /// Submit a container workload for deployment.  Returns once the RPC
     /// completes; does NOT wait for the container to reach Ready.
     ///
-    /// Only image-backed workloads (`placement.runtime = Container`) flow
-    /// through here in v1.  See trait-level docs for the v2 `exec_native`
-    /// plan.
+    /// **Every** remote forge flows through here, including native ones — a
+    /// native workload is an ordinary [`WorkloadSpec`] carrying
+    /// [`workload_spec::NATIVE_EXEC_ANNOTATION`], and kamaji routes on that
+    /// marker (R577-T1). There is no `exec_native` sibling; the trait-level
+    /// docs above explain why the v2 hook R380-T7 planned was not the shape
+    /// taken.
     async fn deploy(&self, spec: &WorkloadSpec) -> Result<(), RemoteForgeError>;
 
     /// Open a line-oriented log stream for the named container.  The returned
@@ -227,11 +272,36 @@ impl RemoteForgeDriver {
         spec: ForgeSpec,
         sink: Option<mpsc::UnboundedSender<ExecEvent>>,
     ) -> Result<ForgeRunHandle, RemoteForgeError> {
+        self.start_with_context(spec, sink, &ExecContext::default())
+            .await
+    }
+
+    /// Like [`start_with_sink`](Self::start_with_sink) but also applies the
+    /// host-side [`ExecContext`] the [`ForgeExecutor`] surface carries.
+    ///
+    /// `ForgeSpec` is deliberately portable across the camp↔cloud boundary, so
+    /// cwd/env live out-of-band in `ExecContext`. Remotely they map onto the
+    /// workload spec: `cwd` → [`WorkloadSpec::workdir`], `env` → literal
+    /// [`EnvVar`]s. `platform` has no remote referent and is refused — see
+    /// [`ExecContext`] handling in the [`ForgeExecutor`] impl below.
+    ///
+    /// Note the `cwd` mapping is a *container-side* path: the caller is
+    /// declaring the workdir inside the image, not bind-mounting a host
+    /// directory the way [`crate::local::LocalForgeDriver`] does. A caller
+    /// passing a host-absolute path (the cloud reconciler's `workspace_root`)
+    /// gets a workdir that doesn't exist on the node.
+    pub async fn start_with_context(
+        &self,
+        spec: ForgeSpec,
+        sink: Option<mpsc::UnboundedSender<ExecEvent>>,
+        ctx: &ExecContext,
+    ) -> Result<ForgeRunHandle, RemoteForgeError> {
         let forge_id = ForgeId::new();
         let ident = forge_mesh_ident(&forge_id);
         let timeout = spec.timeout.map(|ms| Duration::from_millis(ms.as_ms()));
 
-        let workload = build_workload_spec(&forge_id, &spec)?;
+        let mut workload = build_workload_spec(&forge_id, &spec)?;
+        apply_exec_context(&mut workload, ctx)?;
         self.yubaba.deploy(&workload).await?;
 
         let (status_tx, status_rx) = watch::channel(ForgeStatus::Running);
@@ -271,6 +341,229 @@ impl RemoteForgeDriver {
             .fetch_produced_file(&forge_mesh_ident(forge_id), remote_path)
             .await
     }
+
+    /// Pull an [`ExecContext::produced`] file off the worker and land it at
+    /// `dest` (R555-F3).
+    ///
+    /// The container-dir check is the same invariant the qed runner enforces at
+    /// *dispatch* for `produces` paths, applied here at *retrieval* instead:
+    /// only [`forge_produced::CONTAINER_DIR`](workload_spec::forge_produced::CONTAINER_DIR)
+    /// is bind-mounted onto host-persistent storage, so a path outside it is
+    /// unreadable the moment kamaji reaps the container — and a caller that
+    /// asked for one has a recipe bug, not a transport fault. Saying so before
+    /// the RPC turns "fetch failed" into "your output path is wrong".
+    async fn retrieve_produced(
+        &self,
+        forge_id: &ForgeId,
+        produced: &crate::executor::ProducedFile,
+    ) -> Result<(), ForgeExecutorError> {
+        let container_dir = Path::new(workload_spec::forge_produced::CONTAINER_DIR);
+        if !produced.remote_path.starts_with(container_dir) {
+            return Err(ForgeExecutorError::Remote(format!(
+                "produced path {} is not under {} — only that dir is bind-mounted onto \
+                 host-persistent storage, so nothing written elsewhere survives the \
+                 container being reaped",
+                produced.remote_path.display(),
+                container_dir.display(),
+            )));
+        }
+        let bytes = self
+            .fetch_produced_file(forge_id, &produced.remote_path)
+            .await
+            .map_err(|e| {
+                ForgeExecutorError::Remote(format!(
+                    "retrieving {} off the worker: {e}",
+                    produced.remote_path.display()
+                ))
+            })?;
+        if let Some(parent) = produced.dest.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        tokio::fs::write(&produced.dest, &bytes).await?;
+        Ok(())
+    }
+}
+
+/// How many trailing log lines to keep for [`ExecOutcome::stderr_tail`].
+///
+/// Container logs arrive line-merged with no stdout/stderr split, so the "tail"
+/// is the tail of *everything*. Unlike the local driver — which buffers all of
+/// stderr because a host subprocess's is bounded in practice — a remote forge
+/// is exactly the long job (a multi-hour V8 build emits hundreds of thousands
+/// of lines), so this is capped. Full logs are in scryer under `Forge(id)`.
+const REMOTE_TAIL_LINES: usize = 40;
+
+/// R555-T2 — dispatch a remote forge run through the uniform executor surface.
+///
+/// This is the impl `executor.rs` described as "a follow-up when a consumer
+/// needs to dispatch uniformly through `dyn ForgeExecutor`". Remote QED (W235)
+/// is that consumer: the cloud reconciler holds an `Arc<dyn ForgeExecutor>`,
+/// and a recipe declaring `placement.location = { kind = "remote_any", … }`
+/// has to reach yubaba through it.
+///
+/// Semantics against the trait contract:
+///
+/// - **Blocking.** `execute` returns when the run is terminal; the
+///   [`start`](RemoteForgeDriver::start) / [`ForgeRunHandle::wait`] split is
+///   still there for callers that want the handle (the qed runner's
+///   `execute_step_remote` records the `ForgeId` mid-run and keeps using it).
+/// - **`sink`.** Forwarded to the log-ingest task, so lines stream during the
+///   run exactly as `start_with_sink` does — plus an [`ExecEvent::Finished`]
+///   the raw `start_with_sink` path leaves to its caller.
+/// - **Errors.** A yubaba-side failure is [`ForgeExecutorError::Remote`]. A
+///   spec that can't be placed at all (local location, remote+native) is
+///   [`ForgeExecutorError::Unsupported`] — a config bug, not a transport one,
+///   and the qed runner already renders those as `InvalidConfig`.
+#[async_trait]
+impl ForgeExecutor for RemoteForgeDriver {
+    async fn execute(
+        &self,
+        spec: ForgeSpec,
+        ctx: ExecContext,
+        sink: Option<mpsc::UnboundedSender<ExecEvent>>,
+    ) -> Result<ExecOutcome, ForgeExecutorError> {
+        if matches!(spec.where_.location, TaskLocation::Local) {
+            return Err(ForgeExecutorError::Unsupported(
+                "RemoteForgeDriver received a spec with placement.location = local — \
+                 route it to LocalForgeDriver",
+            ));
+        }
+
+        // Tee the log stream: forward every event to the caller's sink (if any)
+        // while keeping a bounded tail for ExecOutcome.stderr_tail. The caller
+        // can't do this for us — it owns the far end of its own sink.
+        let (tee_tx, mut tee_rx) = mpsc::unbounded_channel::<ExecEvent>();
+        let collector = tokio::spawn(async move {
+            let mut tail: std::collections::VecDeque<String> = std::collections::VecDeque::new();
+            while let Some(ev) = tee_rx.recv().await {
+                if let ExecEvent::Output { line, .. } = &ev {
+                    if tail.len() == REMOTE_TAIL_LINES {
+                        tail.pop_front();
+                    }
+                    tail.push_back(line.clone());
+                }
+                if let Some(tx) = &sink {
+                    let _ = tx.send(ev);
+                }
+            }
+            (tail, sink)
+        });
+
+        let handle = self
+            .start_with_context(spec, Some(tee_tx), &ctx)
+            .await
+            .map_err(exec_error)?;
+        let forge_id = handle.id.clone();
+        let status = handle.wait().await;
+
+        // `start_with_context` moved the tee sender into the log task, which
+        // drops it once the stream closes — so the collector terminates on its
+        // own and this join can't hang past the run.
+        let (tail, sink) = collector.await.unwrap_or_default();
+        if let Some(tx) = &sink {
+            let _ = tx.send(ExecEvent::Finished {
+                status: status.clone(),
+            });
+        }
+
+        let outcome = ExecOutcome {
+            status,
+            stderr_tail: tail.into_iter().collect::<Vec<_>>().join("\n").trim().to_string(),
+        };
+
+        // Retrieval is the second half of a remote run, and it only makes sense
+        // for a run that succeeded: on a failure the caller wants the log tail,
+        // not a fetch error for a file the build never got as far as writing.
+        if let (Some(produced), true) = (ctx.produced.as_ref(), outcome.succeeded()) {
+            self.retrieve_produced(&forge_id, produced).await?;
+        }
+
+        Ok(outcome)
+    }
+}
+
+/// Map a [`RemoteForgeError`] onto the executor-surface error.
+///
+/// `InvalidSpec` is the only variant that means "this spec can never run" as
+/// opposed to "this attempt failed", so it's the only one that becomes
+/// `Unsupported`; the rest are transport/lifecycle faults that a retry could
+/// plausibly clear.
+fn exec_error(e: RemoteForgeError) -> ForgeExecutorError {
+    match e {
+        RemoteForgeError::InvalidSpec(msg) => ForgeExecutorError::Remote(format!(
+            "spec cannot be placed remotely: {msg}"
+        )),
+        other => ForgeExecutorError::Remote(other.to_string()),
+    }
+}
+
+/// Fold the host-side [`ExecContext`] into the synthesized [`WorkloadSpec`].
+///
+/// Every field is either honored or refused — nothing is silently dropped,
+/// because each one silently dropped is a *wrong artifact*, not a crash:
+///
+/// - `cwd` → [`WorkloadSpec::workdir`] (container-side path). On a **native**
+///   forge a *relative* cwd is refused instead — see below.
+/// - `env` → literal [`EnvVar`]s, appended after whatever the spec already
+///   carries. Later entries win at deploy, and the caller's immediate intent
+///   should beat a `ForgeCommand::Workload`'s baked-in env. This mapping is
+///   the one that needs no native special-casing: for a fork+exec'd process
+///   these become real process env, which is stronger than the container
+///   reading, not weaker. It is also why [`mark_native_exec`] leans on
+///   `YAH_PRODUCED_DIR` rather than on `workdir` — appending cannot clobber it.
+/// - `platform` → **refused**. It exists to ask a *host* container runtime for
+///   foreign-arch emulation (Rosetta / qemu). A yubaba node has no such knob;
+///   remote runs pick architecture by *scheduling* — `location.mesh_tags =
+///   ["tier:x86"]`. Honoring it silently would hand back an artifact built for
+///   the wrong architecture, which is precisely the R546 failure this seam
+///   exists to retire.
+fn apply_exec_context(ws: &mut WorkloadSpec, ctx: &ExecContext) -> Result<(), RemoteForgeError> {
+    if let Some(platform) = &ctx.platform {
+        return Err(RemoteForgeError::InvalidSpec(format!(
+            "placement.platform = {platform:?} is a local-only emulation knob and has no \
+             remote equivalent. A remote run selects architecture by scheduling: set \
+             location = {{ kind = \"remote_any\", tier = \"…\", mesh_tags = [\"tier:x86\"] }} \
+             and drop `platform` (W235 / R546)."
+        )));
+    }
+    if let Some(cwd) = &ctx.cwd {
+        // R577-T1: a native forge is fork+exec'd on the worker's own userland,
+        // so `workdir` reaches `Command::current_dir` directly. A RELATIVE path
+        // there resolves against *kamaji's* working directory — whatever
+        // launchd/systemd happened to give the daemon — not against a source
+        // checkout. The step would then run somewhere arbitrary or die ENOENT,
+        // and `desktop-release` is exactly this shape (`cwd = "packages/yah/ui"`,
+        // `cwd = "app/yah/desktop"`).
+        //
+        // A container resolves a relative workdir against its image root, which
+        // is at least well-defined, so this refusal is native-only.
+        //
+        // This is a guard, not a resolution: what a relative cwd *should*
+        // resolve against is a worker-side checkout of the recipe's workspace,
+        // and no coordinator→worker input channel exists yet (see the
+        // `desktop-release` header comment). Until one does, failing loudly at
+        // dispatch beats building the wrong tree on real hardware.
+        if ws.wants_native_exec() && cwd.is_relative() {
+            return Err(RemoteForgeError::InvalidSpec(format!(
+                "cwd {} is relative, but this step runs natively on the build-worker's own \
+                 userland, where a relative path resolves against the kamaji daemon's working \
+                 directory rather than a source checkout. Give an absolute path on the worker \
+                 (R577-T1)."
+                ,
+                cwd.display()
+            )));
+        }
+        ws.workdir = Some(cwd.clone());
+    }
+    for (name, value) in &ctx.env {
+        ws.env.push(EnvVar {
+            name: name.clone(),
+            value: EnvValue::Literal {
+                value: value.clone(),
+            },
+        });
+    }
+    Ok(())
 }
 
 // ─── ForgeRunHandle ───────────────────────────────────────────────────────────
@@ -318,24 +611,51 @@ fn now_ms() -> u64 {
 
 /// Synthesise a [`WorkloadSpec`] from a [`ForgeSpec`].
 ///
-/// Refuses the remote + native quadrant with [`RemoteForgeError::InvalidSpec`]
-/// before any state is allocated or any yubaba RPC is issued — see W149
-/// §Open policy and the [`WardenClient`] trait docs for the v2 `exec_native`
-/// path.  No forge id is published, no events flow into scryer, and yubaba's
-/// `deploy` is not called.
+/// # Remote + native (R577-T1 / W254)
+///
+/// R380-T7 refused this quadrant outright in v1, deferring an `exec_native`
+/// surface "until a real use case arrives". It has: the Darwin build leg.
+/// `cargo tauri build` for `aarch64-apple-darwin`, `codesign` and `xcrun
+/// notarytool` need a live macOS userland, and no container can supply one —
+/// you cannot containerize the Darwin kernel. A `native = true` step whose
+/// target OS differs from the coordinator's therefore has nowhere to run
+/// unless remote+native works.
+///
+/// The route taken is **not** a parallel `exec_native` RPC. A native forge is
+/// still a `Workload::Container(WorkloadSpec)` on the wire, marked with
+/// [`workload_spec::NATIVE_EXEC_ANNOTATION`]; kamaji reads that marker and
+/// dispatches to its existing `Backend::Native` (fork+exec) instead of a
+/// container backend. Everything between here and there — yubaba admission,
+/// mesh-tag node selection, mesh assignment, the state-poll → exit-code
+/// mapping, produced-file retrieval, teardown — is shared with the container
+/// path rather than reimplemented, and `kamaji-proto`'s codec needs no new
+/// variant. See [`WorkloadSpec::wants_native_exec`] for the full rationale.
+///
+/// Only [`ForgeCommand::Subprocess`] can go native: the other two command
+/// shapes are image-backed by construction (a `Workload` forge carries a
+/// caller-supplied container spec, and `BuildImage` runs BuildKit *in* a
+/// container). Those still refuse, before any state is allocated or any
+/// yubaba RPC is issued — no forge id published, no scryer events, no
+/// `deploy` call.
 fn build_workload_spec(
     forge_id: &ForgeId,
     spec: &ForgeSpec,
 ) -> Result<WorkloadSpec, RemoteForgeError> {
-    if !matches!(spec.where_.runtime, TaskRuntime::Container) {
-        return Err(RemoteForgeError::InvalidSpec(
-            "remote + native is not supported in v1 — \
-             set placement.runtime = container, or run locally with placement.location = local. \
-             A future yubaba `exec_native` surface lands when a real use case arrives \
-             (R380-T7 / W149)."
-                .into(),
-        ));
-    }
+    let native_exec = match spec.where_.runtime {
+        TaskRuntime::Container => false,
+        TaskRuntime::Native => {
+            if !matches!(spec.command, ForgeCommand::Subprocess { .. }) {
+                return Err(RemoteForgeError::InvalidSpec(
+                    "remote + native is supported only for a subprocess forge command — \
+                     a workload forge carries its own container spec and a build-image \
+                     forge runs BuildKit inside a container, so neither has a native \
+                     shape. Set placement.runtime = container (R577-T1 / W254)."
+                        .into(),
+                ));
+            }
+            true
+        }
+    };
 
     let (tier, mesh_tags) = match &spec.where_.location {
         TaskLocation::RemoteAny { tier, mesh_tags } => (tier.clone(), mesh_tags.clone()),
@@ -369,13 +689,23 @@ fn build_workload_spec(
         ForgeCommand::BuildImage {
             dockerfile,
             context,
+            context_url,
             tags,
             platforms,
             build_args,
             push,
             load,
         } => build_image_workload_spec(
-            forge_id, dockerfile, context, tags, platforms, build_args, *push, *load, tier,
+            forge_id,
+            dockerfile,
+            context,
+            context_url.as_deref(),
+            tags,
+            platforms,
+            build_args,
+            *push,
+            *load,
+            tier,
         )?,
     };
 
@@ -401,7 +731,64 @@ fn build_workload_spec(
         workload_spec::HOST_NETWORK_VALUE.into(),
     );
 
+    if native_exec {
+        mark_native_exec(&mut ws, forge_id);
+    }
+
     Ok(ws)
+}
+
+/// Env var naming the directory a **natively executed** forge step must write
+/// its declared `produces` into (R577-T1).
+///
+/// A container step writes to the fixed container-side
+/// [`forge_produced::CONTAINER_DIR`](workload_spec::forge_produced::CONTAINER_DIR)
+/// (`/yah/produced`), which the bind mount maps onto the per-run host dir. A
+/// native step has no mount namespace, so the host dir *is* the only path —
+/// and it is per-run, so it cannot be a constant. The step learns it from this
+/// variable rather than from a hardcoded path.
+pub const PRODUCED_DIR_ENV: &str = "YAH_PRODUCED_DIR";
+
+/// Turn a container-shaped forge spec into a natively-executed one
+/// (R577-T1 / W254).
+///
+/// Three edits, all of which exist because a fork+exec'd process has no mount
+/// namespace of its own:
+///
+/// 1. The [`NATIVE_EXEC_ANNOTATION`](workload_spec::NATIVE_EXEC_ANNOTATION)
+///    marker kamaji routes on.
+/// 2. `workdir` + [`PRODUCED_DIR_ENV`] point at the per-run *host* produced
+///    dir. The bind mount that would have surfaced it at `/yah/produced` is
+///    inert for a native workload, so the step is told the real path.
+///
+///    [`PRODUCED_DIR_ENV`] is the load-bearing half of that pair, not
+///    `workdir`: `apply_exec_context` runs *after* this and replaces `workdir`
+///    outright when the caller supplied an [`ExecContext::cwd`] — legitimately
+///    so, since a build usually wants to run in its source tree rather than in
+///    its output dir. Env vars are appended, so the produced-dir path survives
+///    that override. A step should resolve its outputs through the variable and
+///    treat the workdir as a convenience default.
+/// 3. The durable-mount volume is **kept**, even though nothing mounts it.
+///    yubaba's deploy-time `ensure_forge_state_dirs` walks `spec.volumes` and
+///    creates any bind source under the forge state root — that mkdir is what
+///    makes `workdir` exist before the child is spawned, and it is also what
+///    the retrieval side (`fetch_produced_file` → `forge_produced::host_path`)
+///    reads back from. Dropping the volume as "unused" would silently break
+///    both, so it stays and this comment says why.
+fn mark_native_exec(ws: &mut WorkloadSpec, forge_id: &ForgeId) {
+    ws.annotations.insert(
+        workload_spec::NATIVE_EXEC_ANNOTATION.into(),
+        workload_spec::NATIVE_EXEC_VALUE.into(),
+    );
+
+    let produced = workload_spec::forge_produced::host_dir(&forge_id.to_string());
+    ws.env.push(workload_spec::EnvVar {
+        name: PRODUCED_DIR_ENV.into(),
+        value: workload_spec::EnvValue::Literal {
+            value: produced.to_string_lossy().into_owned(),
+        },
+    });
+    ws.workdir = Some(produced);
 }
 
 /// Annotation key carrying the R594 mesh-tag node-selector (comma-joined) from
@@ -411,12 +798,14 @@ pub const NODE_SELECTOR_MESH_TAGS_ANNOTATION: &str = "yah.node-selector.mesh-tag
 // ─── BuildKit workload synthesis (R381-T5) ────────────────────────────────────
 
 /// Conventional output dir bind-mounted into the BuildKit container when an
-/// OCI archive is requested.  The yubaba node must have this directory
-/// writable and on a filesystem the operator can reach for cross-node
-/// consumption; the single-machine sim/dogfood case (yubaba + qed sharing a
-/// host) is the v1 happy path.  Cross-node consumers should set `push=true`
-/// and let the registry handle distribution.
-const BUILDKIT_HOST_OUT_DIR: &str = "/var/lib/yah/qed/build-out";
+/// OCI archive is requested. Worker-local: unlike the context, this one is a
+/// correct bind on any host, because yubaba creates it at deploy
+/// ([`workload_spec::forge_state`]) rather than expecting it to already exist
+/// on the machine that composed the spec.
+///
+/// Cross-node consumers of the *archive* should still set `push=true` and let
+/// the registry handle distribution — nothing pulls this file back to camp yet.
+const BUILDKIT_HOST_OUT_DIR: &str = workload_spec::forge_state::BUILD_OUT_DIR;
 
 /// Default BuildKit image used by remote build-image dispatch.
 ///
@@ -437,14 +826,36 @@ fn default_buildkit_image() -> ImageRef {
     }
 }
 
+/// Program the BuildKit workload runs. The rootless image bakes
+/// `ENTRYPOINT ["rootlesskit","buildkitd"]`, and kamaji's argv rule is
+/// `(spec.entrypoint OR image.Entrypoint) ++ (spec.command OR image.Cmd)`
+/// ([`build_oci_spec_with`] in kamaji-containerd-core) — so leaving
+/// `entrypoint` unset makes the container run
+/// `rootlesskit buildkitd buildctl-daemonless.sh build …`, i.e. buildkitd with
+/// the whole buildctl invocation as junk flags. It does not error; it *hangs*,
+/// serving a socket nobody connects to, until the step's timeout. Setting the
+/// entrypoint explicitly is what makes `command` the buildctl argv it reads as.
+const BUILDCTL: &str = "buildctl-daemonless.sh";
+
 /// Synthesise the BuildKit workload that performs a remote build-image step.
 ///
-/// The container runs `buildctl-daemonless.sh` (provided by the rootless image)
-/// which boots an in-process `buildkitd` and pipes the build through it.  The
-/// build context and dockerfile parent are bind-mounted at conventional paths;
-/// when `push=true` the result is pushed straight to the tag's registry,
-/// otherwise an OCI archive is written to a bind-mounted host directory
-/// ([`BUILDKIT_HOST_OUT_DIR`]).
+/// The container runs [`BUILDCTL`] (provided by the rootless image) which boots
+/// an in-process `buildkitd` and pipes the build through it.  When `push=true`
+/// the result is pushed straight to the tag's registry, otherwise an OCI
+/// archive is written to a bind-mounted host directory
+/// ([`BUILDKIT_HOST_OUT_DIR`]) — that one is worker-*local*, so it is a correct
+/// bind on any host.
+///
+/// # Where the context comes from
+///
+/// `context_url` set (R636-B1) ⇒ BuildKit loads a tar over HTTP and the
+/// Dockerfile is read from inside it. Nothing of the composing host's
+/// filesystem is referenced, which is the only shape that works when the
+/// worker is a different machine.
+///
+/// `context_url` unset ⇒ the build context and dockerfile parent are
+/// bind-mounted at conventional paths, which requires the worker to see those
+/// exact host paths (yubaba on the qed host).
 ///
 /// Bind volume mounts require `tier == "infra"`, which yubaba's shape
 /// validation enforces; the forge convention picks infra by default so this is
@@ -454,6 +865,7 @@ fn build_image_workload_spec(
     forge_id: &ForgeId,
     dockerfile: &Path,
     context: &Path,
+    context_url: Option<&str>,
     tags: &[String],
     platforms: &[String],
     build_args: &[(String, String)],
@@ -475,13 +887,6 @@ fn build_image_workload_spec(
                 dockerfile.display()
             ))
         })?;
-    let dockerfile_parent = dockerfile.parent().ok_or_else(|| {
-        RemoteForgeError::InvalidSpec(format!(
-            "build-image dockerfile path has no parent directory: {}",
-            dockerfile.display()
-        ))
-    })?;
-
     let image = default_buildkit_image();
     let mut ws = WorkloadSpec::for_forge(&forge_id.to_string(), image, tier, vec![]);
 
@@ -491,16 +896,40 @@ fn build_image_workload_spec(
     ws.resources.cpu_millis = 2000;
     ws.resources.ephemeral_storage_mb = 4096;
 
-    ws.volumes.push(VolumeMount {
-        source: VolumeSource::Bind { host_path: context.to_path_buf() },
-        target: PathBuf::from("/yah/build/context"),
-        read_only: true,
-    });
-    ws.volumes.push(VolumeMount {
-        source: VolumeSource::Bind { host_path: dockerfile_parent.to_path_buf() },
-        target: PathBuf::from("/yah/build/dockerfile"),
-        read_only: true,
-    });
+    // R636-B2: this is the one workload in the fleet that runs a container
+    // runtime *inside* its own container. `rootlesskit` (the rootless BuildKit
+    // image's entrypoint) sets up a user namespace by exec'ing the setuid-root
+    // `newuidmap`/`newgidmap` helpers, which kamaji's baseline sandbox —
+    // CAP_NET_BIND_SERVICE only, `no_new_privs` on — forbids; buildkitd then
+    // never binds its socket and the step dies before the first layer with
+    // nothing but "could not connect to …/buildkitd.sock after 10 trials".
+    // Ask for the narrow, tier=infra-guarded nested-sandbox grant. Note this
+    // is the *only* setter of the annotation: no other forge workload gets it.
+    ws.annotations.insert(
+        workload_spec::NESTED_SANDBOX_ANNOTATION.into(),
+        workload_spec::NESTED_SANDBOX_VALUE.into(),
+    );
+
+    // Composer-host paths are only meaningful to a builder that shares this
+    // filesystem. With a URL context we mount nothing from it at all.
+    if context_url.is_none() {
+        let dockerfile_parent = dockerfile.parent().ok_or_else(|| {
+            RemoteForgeError::InvalidSpec(format!(
+                "build-image dockerfile path has no parent directory: {}",
+                dockerfile.display()
+            ))
+        })?;
+        ws.volumes.push(VolumeMount {
+            source: VolumeSource::Bind { host_path: context.to_path_buf() },
+            target: PathBuf::from("/yah/build/context"),
+            read_only: true,
+        });
+        ws.volumes.push(VolumeMount {
+            source: VolumeSource::Bind { host_path: dockerfile_parent.to_path_buf() },
+            target: PathBuf::from("/yah/build/dockerfile"),
+            read_only: true,
+        });
+    }
 
     // An OCI archive is only emitted when we neither push nor load into the
     // worker's local image store — the archive is the sole way an out-of-band
@@ -516,14 +945,20 @@ fn build_image_workload_spec(
         format!("/yah/build/out/{}", oci_archive_basename(first_tag))
     });
 
-    ws.command = Some(buildctl_argv(
+    // Split program from arguments so the image's baked `rootlesskit buildkitd`
+    // entrypoint is REPLACED rather than prefixed — see [`BUILDCTL`].
+    let mut argv = buildctl_argv(
         dockerfile_basename,
+        context_url,
         tags,
         platforms,
         build_args,
         push,
         oci_archive_remote.as_deref(),
-    ));
+    );
+    let program = argv.remove(0);
+    ws.entrypoint = Some(vec![program]);
+    ws.command = Some(argv);
     Ok(ws)
 }
 
@@ -544,7 +979,8 @@ fn oci_archive_basename(tag: &str) -> String {
     format!("{safe}.tar")
 }
 
-/// `buildctl-daemonless.sh` argv for a one-shot Dockerfile build.
+/// `buildctl-daemonless.sh` argv for a one-shot Dockerfile build. Element 0 is
+/// the program; the caller splits it off into the workload's `entrypoint`.
 ///
 /// Multi-tag, multi-platform, and build-args are all threaded here (R590-F2):
 /// - `tags` collapse into the output's `name=` attribute. Because the output
@@ -553,8 +989,15 @@ fn oci_archive_basename(tag: &str) -> String {
 ///   of the value, not attribute delimiters (`type=image,"name=a,b",push=true`).
 /// - `platforms` map to `--opt platform=<csv>` (buildkit's multi-platform key).
 /// - `build_args` map to one `--opt build-arg:<KEY>=<VALUE>` per pair.
+///
+/// `context_url` selects between the two context shapes. Remote is a single
+/// `--opt context=<url>`: the dockerfile frontend fetches the tar, unpacks it,
+/// and resolves `filename=` *inside* it, so neither `--local` flag applies (and
+/// passing them alongside is what would reintroduce the host-path dependency).
+#[allow(clippy::too_many_arguments)]
 fn buildctl_argv(
     dockerfile_basename: &str,
+    context_url: Option<&str>,
     tags: &[String],
     platforms: &[String],
     build_args: &[(String, String)],
@@ -562,17 +1005,25 @@ fn buildctl_argv(
     oci_archive_path: Option<&str>,
 ) -> Vec<String> {
     let mut argv = vec![
-        "buildctl-daemonless.sh".to_string(),
+        BUILDCTL.to_string(),
         "build".to_string(),
         "--frontend".to_string(),
         "dockerfile.v0".to_string(),
-        "--local".to_string(),
-        "context=/yah/build/context".to_string(),
-        "--local".to_string(),
-        "dockerfile=/yah/build/dockerfile".to_string(),
-        "--opt".to_string(),
-        format!("filename={dockerfile_basename}"),
     ];
+    match context_url {
+        Some(url) => {
+            argv.push("--opt".to_string());
+            argv.push(format!("context={url}"));
+        }
+        None => {
+            argv.push("--local".to_string());
+            argv.push("context=/yah/build/context".to_string());
+            argv.push("--local".to_string());
+            argv.push("dockerfile=/yah/build/dockerfile".to_string());
+        }
+    }
+    argv.push("--opt".to_string());
+    argv.push(format!("filename={dockerfile_basename}"));
 
     if !platforms.is_empty() {
         argv.push("--opt".to_string());
@@ -980,15 +1431,180 @@ mod remote {
         assert_eq!(events.len(), 2, "scryer must still record both lines");
     }
 
-    /// R380-T7 accept: a remote + native ForgeSpec is refused at `start()`
-    /// before any yubaba RPC fires and before any event is pushed to scryer.
+    /// R577-T1: a remote + native *subprocess* forge is now synthesized, not
+    /// refused — it goes out as an ordinary container-shaped workload carrying
+    /// the native-exec marker kamaji routes on.
     ///
-    /// Verifies the v1 refusal contract on the WardenClient seam:
-    /// - `start()` returns `Err(InvalidSpec)` with an actionable message.
-    /// - `yubaba.deploy` is never called (state-of-the-cluster untouched).
-    /// - No `Forge(*)` events appear in scryer (no ingest thread spawned).
+    /// This supersedes R380-T7's `remote_native_refused_at_start_emits_no_events`.
+    /// That test pinned the v1 refusal; the refusal was always explicitly
+    /// conditional on "a real use case arrives", and the W254 Darwin leg is it.
+    /// The half of R380-T7's contract that still holds — refusal *before* any
+    /// yubaba RPC or scryer event, for the shapes that genuinely have no native
+    /// form — is pinned by
+    /// [`remote_native_non_subprocess_refused_at_start_emits_no_events`].
+    #[test]
+    fn remote_native_subprocess_is_marked_for_kamajis_native_backend() {
+        let forge_id = ForgeId::new();
+        let placement = TaskPlacement::new(
+            TaskLocation::RemoteAny {
+                tier: TierTag("infra".into()),
+                mesh_tags: vec!["tag:build-worker".into(), "os:darwin".into()],
+            },
+            TaskRuntime::Native,
+        );
+        let ws = build_workload_spec(&forge_id, &subprocess_spec(placement, None))
+            .expect("remote + native subprocess must synthesize");
+
+        assert!(
+            ws.wants_native_exec(),
+            "kamaji routes on this marker; without it the Darwin build lands in a Linux container"
+        );
+
+        // The per-run host produced dir reaches the step as an env var, since a
+        // fork+exec'd process never sees the `/yah/produced` bind.
+        let produced = workload_spec::forge_produced::host_dir(&forge_id.to_string());
+        let env = ws
+            .env
+            .iter()
+            .find(|e| e.name == PRODUCED_DIR_ENV)
+            .unwrap_or_else(|| panic!("native workload must carry {PRODUCED_DIR_ENV}"));
+        assert_eq!(
+            env.value,
+            workload_spec::EnvValue::Literal {
+                value: produced.to_string_lossy().into_owned()
+            }
+        );
+        assert_eq!(ws.workdir.as_deref(), Some(produced.as_path()));
+
+        // The volume stays even though nothing mounts it: yubaba's
+        // `ensure_forge_state_dirs` walks `volumes` to mkdir the host dir, and
+        // that dir is both the workdir above and what `fetch_produced_file`
+        // later reads. Dropping it as "unused" breaks retrieval silently.
+        assert!(
+            ws.volumes.iter().any(|v| matches!(
+                &v.source,
+                workload_spec::VolumeSource::Bind { host_path } if host_path == &produced
+            )),
+            "durable produced mount must survive onto the native spec: {:?}",
+            ws.volumes
+        );
+
+        // Same spec, container runtime: no marker. The Linux offload leg proven
+        // live on us-west-002 must be byte-for-byte unaffected by this change.
+        let container = build_workload_spec(
+            &forge_id,
+            &subprocess_spec(
+                TaskPlacement::new(
+                    TaskLocation::RemoteAny {
+                        tier: TierTag("infra".into()),
+                        mesh_tags: vec![],
+                    },
+                    TaskRuntime::Container,
+                ),
+                None,
+            ),
+        )
+        .expect("container synthesis");
+        assert!(!container.wants_native_exec());
+        assert!(container.workdir.is_none());
+        assert!(!container.env.iter().any(|e| e.name == PRODUCED_DIR_ENV));
+    }
+
+    /// R577-T1 × R555-T2: `ExecContext` folding is correct for a native forge
+    /// on two of its three fields and refuses the third.
+    ///
+    /// `env` needs no special-casing — for a fork+exec'd process those become
+    /// real process env, a stronger reading than the container one. A relative
+    /// `cwd` is refused, because `workdir` reaches `Command::current_dir`
+    /// directly and would resolve against the kamaji daemon's cwd rather than a
+    /// source checkout. An absolute one is honored and remains the caller's
+    /// responsibility, exactly as for a container.
+    #[test]
+    fn native_forge_refuses_a_relative_cwd_but_honors_an_absolute_one() {
+        let forge_id = ForgeId::new();
+        let native = || {
+            let placement = TaskPlacement::new(
+                TaskLocation::RemoteAny {
+                    tier: TierTag("infra".into()),
+                    mesh_tags: vec![],
+                },
+                TaskRuntime::Native,
+            );
+            build_workload_spec(&forge_id, &subprocess_spec(placement, None)).expect("synthesis")
+        };
+
+        // The `desktop-release` shape: a repo-relative cwd.
+        let mut ws = native();
+        let err = apply_exec_context(
+            &mut ws,
+            &ExecContext {
+                cwd: Some(PathBuf::from("app/yah/desktop")),
+                ..Default::default()
+            },
+        )
+        .expect_err("a relative cwd must not reach a fork+exec'd step");
+        match err {
+            RemoteForgeError::InvalidSpec(msg) => {
+                assert!(msg.contains("app/yah/desktop"), "got {msg:?}");
+                assert!(msg.contains("relative"), "got {msg:?}");
+            }
+            other => panic!("expected InvalidSpec, got {other:?}"),
+        }
+
+        // Absolute is honored, and overrides the produced-dir default.
+        let mut ws = native();
+        apply_exec_context(
+            &mut ws,
+            &ExecContext {
+                cwd: Some(PathBuf::from("/var/lib/yah/qed/checkout")),
+                env: vec![("CARGO_TERM_COLOR".into(), "never".into())]
+                    .into_iter()
+                    .collect(),
+                ..Default::default()
+            },
+        )
+        .expect("absolute cwd is the caller's responsibility, not a refusal");
+        assert_eq!(
+            ws.workdir.as_deref(),
+            Some(std::path::Path::new("/var/lib/yah/qed/checkout"))
+        );
+        // …and the produced-dir contract survives the workdir override, because
+        // env is appended rather than replaced. This is the invariant
+        // `mark_native_exec` documents and depends on.
+        assert!(ws.env.iter().any(|e| e.name == PRODUCED_DIR_ENV));
+        assert!(ws.env.iter().any(|e| e.name == "CARGO_TERM_COLOR"));
+
+        // A CONTAINER forge keeps the old behaviour: relative is fine there,
+        // since the runtime resolves it against the image root.
+        let placement = TaskPlacement::new(
+            TaskLocation::RemoteAny {
+                tier: TierTag("infra".into()),
+                mesh_tags: vec![],
+            },
+            TaskRuntime::Container,
+        );
+        let mut container =
+            build_workload_spec(&forge_id, &subprocess_spec(placement, None)).expect("synthesis");
+        apply_exec_context(
+            &mut container,
+            &ExecContext {
+                cwd: Some(PathBuf::from("app/yah/desktop")),
+                ..Default::default()
+            },
+        )
+        .expect("relative cwd is well-defined against an image root");
+        assert_eq!(
+            container.workdir.as_deref(),
+            Some(std::path::Path::new("app/yah/desktop"))
+        );
+    }
+
+    /// R577-T1 (retaining R380-T7's live half): remote + native is still
+    /// refused for the two image-backed forge command shapes, and still refused
+    /// *early* — before any yubaba RPC fires and before any event reaches
+    /// scryer.
     #[tokio::test]
-    async fn remote_native_refused_at_start_emits_no_events() {
+    async fn remote_native_non_subprocess_refused_at_start_emits_no_events() {
         let dir = TempDir::new().unwrap();
         let scryer = make_scryer(&dir);
 
@@ -996,15 +1612,19 @@ mod remote {
         let deploy_called = yubaba.deploy_called.clone();
 
         let driver = RemoteForgeDriver::new(scryer.clone(), yubaba);
-        // remote + native — the quadrant this ticket refuses.
-        let placement = TaskPlacement::new(
-            TaskLocation::RemoteAny { tier: TierTag("infra".into()), mesh_tags: vec![] },
+        // A build-image forge runs BuildKit *inside* a container — there is no
+        // native shape for it, so the quadrant stays refused here.
+        let mut spec = build_image_spec(false);
+        spec.where_ = TaskPlacement::new(
+            TaskLocation::RemoteAny {
+                tier: TierTag("infra".into()),
+                mesh_tags: vec![],
+            },
             TaskRuntime::Native,
         );
-        let spec = subprocess_spec(placement, None);
 
         let err = match driver.start(spec).await {
-            Ok(_) => panic!("remote+native must be refused"),
+            Ok(_) => panic!("remote+native build-image must be refused"),
             Err(e) => e,
         };
         match err {
@@ -1014,8 +1634,8 @@ mod remote {
                     "error must name the refused quadrant; got {msg:?}",
                 );
                 assert!(
-                    msg.contains("R380-T7") || msg.contains("W149"),
-                    "error should reference the ticket / arch doc for context; got {msg:?}",
+                    msg.contains("R577-T1") || msg.contains("W254"),
+                    "error should reference the ticket / doc for context; got {msg:?}",
                 );
             }
             other => panic!("expected InvalidSpec, got {other:?}"),
@@ -1044,12 +1664,17 @@ mod remote {
     // ── R381-T5 BuildKit synthesis ──────────────────────────────────────────
 
     fn build_image_spec(push: bool) -> ForgeSpec {
+        build_image_spec_with_url(push, None)
+    }
+
+    fn build_image_spec_with_url(push: bool, context_url: Option<&str>) -> ForgeSpec {
         ForgeSpec {
             command: ForgeCommand::BuildImage {
                 dockerfile: PathBuf::from(
                     "/tmp/camp/.yah/cache/buildkit/yah-rust.Dockerfile",
                 ),
                 context: PathBuf::from("/tmp/camp"),
+                context_url: context_url.map(str::to_string),
                 tags: vec!["ghcr.io/yah-ai/yah-rust:dev".into()],
                 platforms: vec![],
                 build_args: vec![],
@@ -1064,23 +1689,97 @@ mod remote {
         }
     }
 
-    /// Helper: destructure a `BuildImage` spec into the positional args
+    /// Helper: destructure a `BuildImage` spec into the args
     /// `build_image_workload_spec` now takes.
-    fn build_image_parts(
-        spec: ForgeSpec,
-    ) -> (PathBuf, PathBuf, Vec<String>, Vec<String>, Vec<(String, String)>, bool, bool) {
+    struct BuildImageParts {
+        dockerfile: PathBuf,
+        context: PathBuf,
+        context_url: Option<String>,
+        tags: Vec<String>,
+        platforms: Vec<String>,
+        build_args: Vec<(String, String)>,
+        push: bool,
+        load: bool,
+    }
+
+    fn build_image_parts(spec: ForgeSpec) -> BuildImageParts {
         match spec.command {
             ForgeCommand::BuildImage {
                 dockerfile,
                 context,
+                context_url,
                 tags,
                 platforms,
                 build_args,
                 push,
                 load,
-            } => (dockerfile, context, tags, platforms, build_args, push, load),
+            } => BuildImageParts {
+                dockerfile,
+                context,
+                context_url,
+                tags,
+                platforms,
+                build_args,
+                push,
+                load,
+            },
             _ => unreachable!(),
         }
+    }
+
+    fn synth(parts: &BuildImageParts) -> WorkloadSpec {
+        build_image_workload_spec(
+            &ForgeId::new(),
+            &parts.dockerfile,
+            &parts.context,
+            parts.context_url.as_deref(),
+            &parts.tags,
+            &parts.platforms,
+            &parts.build_args,
+            parts.push,
+            parts.load,
+            TierTag("infra".into()),
+        )
+        .expect("synthesis ok")
+    }
+
+    /// R636-B2: the buildkit workload — and *only* it — asks for the
+    /// nested-sandbox grant. Without the annotation kamaji's baseline sandbox
+    /// (CAP_NET_BIND_SERVICE only, `no_new_privs` on) stops `rootlesskit`
+    /// before buildkitd ever binds its socket, and the step dies with no
+    /// streamed output at all.
+    #[test]
+    fn build_image_workload_asks_for_the_nested_sandbox_grant() {
+        let ws = synth(&build_image_parts(build_image_spec(false)));
+        assert_eq!(
+            ws.annotations
+                .get(workload_spec::NESTED_SANDBOX_ANNOTATION)
+                .map(String::as_str),
+            Some(workload_spec::NESTED_SANDBOX_VALUE),
+        );
+        assert!(ws.wants_nested_sandbox());
+
+        // The grant is guarded to tier=infra by kamaji; a build-image forge is
+        // always infra, so the request is always honourable.
+        assert_eq!(ws.tier.0, "infra");
+    }
+
+    /// The other half of the same claim: an ordinary remote subprocess step
+    /// must NOT carry the grant. Every remote forge is tier=infra, so the tier
+    /// gate alone would let one through — the annotation being absent is what
+    /// actually keeps the sandbox tight for everything but buildkit.
+    #[test]
+    fn subprocess_workload_does_not_ask_for_the_nested_sandbox_grant() {
+        let forge_id = ForgeId::new();
+        let ws = build_workload_spec(&forge_id, &subprocess_spec(remote_any_infra(), None))
+            .expect("synthesis ok");
+        assert!(
+            !ws.wants_nested_sandbox(),
+            "only the buildkit build-image workload may request CAP_SETUID/CAP_SETGID"
+        );
+        assert!(!ws
+            .annotations
+            .contains_key(workload_spec::NESTED_SANDBOX_ANNOTATION));
     }
 
     /// build_image_workload_spec assembles a buildkit-shaped WorkloadSpec:
@@ -1088,21 +1787,7 @@ mod remote {
     /// dockerfile bind-mounts, OCI archive output dir when push=false.
     #[test]
     fn build_image_workload_spec_shape_push_false() {
-        let forge_id = ForgeId::new();
-        let (df, ctx, tags, platforms, build_args, push, load) =
-            build_image_parts(build_image_spec(false));
-        let ws = build_image_workload_spec(
-            &forge_id,
-            &df,
-            &ctx,
-            &tags,
-            &platforms,
-            &build_args,
-            push,
-            load,
-            TierTag("infra".into()),
-        )
-        .expect("synthesis ok");
+        let ws = synth(&build_image_parts(build_image_spec(false)));
 
         assert_eq!(ws.image.registry, "docker.io");
         assert_eq!(ws.image.repository, "moby/buildkit");
@@ -1144,10 +1829,18 @@ mod remote {
             "build-out dir bind-mount must be writable when push=false: {mounts:?}"
         );
 
-        // Command invokes buildctl-daemonless.sh and points at the OCI archive
+        // The image's baked `rootlesskit buildkitd` entrypoint must be
+        // REPLACED, not prefixed — kamaji concatenates the two.
+        assert_eq!(
+            ws.entrypoint.as_deref(),
+            Some(["buildctl-daemonless.sh".to_string()].as_slice()),
+            "entrypoint must override the image's buildkitd entrypoint",
+        );
+
+        // Command carries buildctl's arguments and points at the OCI archive
         // when push=false.
         let argv = ws.command.expect("command must be set");
-        assert_eq!(argv.first().map(String::as_str), Some("buildctl-daemonless.sh"));
+        assert_eq!(argv.first().map(String::as_str), Some("build"));
         assert!(
             argv.iter().any(|a| a.starts_with("type=oci,")),
             "push=false must emit --output type=oci: {argv:?}",
@@ -1162,21 +1855,7 @@ mod remote {
     /// build-out bind-mount.
     #[test]
     fn build_image_workload_spec_push_true_uses_registry_output() {
-        let forge_id = ForgeId::new();
-        let (df, ctx, tags, platforms, build_args, push, load) =
-            build_image_parts(build_image_spec(true));
-        let ws = build_image_workload_spec(
-            &forge_id,
-            &df,
-            &ctx,
-            &tags,
-            &platforms,
-            &build_args,
-            push,
-            load,
-            TierTag("infra".into()),
-        )
-        .expect("synthesis ok");
+        let ws = synth(&build_image_parts(build_image_spec(true)));
 
         let argv = ws.command.expect("command must be set");
         assert!(
@@ -1202,6 +1881,7 @@ mod remote {
     fn buildctl_argv_threads_tags_platforms_and_build_args() {
         let argv = buildctl_argv(
             "yah-rust.Dockerfile",
+            None,
             &["reg/img:a".into(), "reg/img:b".into()],
             &["linux/amd64".into(), "linux/arm64".into()],
             &[("RUST_VERSION".into(), "1.85".into())],
@@ -1230,10 +1910,76 @@ mod remote {
     /// pre-F2 tests asserted.
     #[test]
     fn buildctl_argv_single_tag_is_unquoted() {
-        let argv = buildctl_argv("D.Dockerfile", &["reg/img:x".into()], &[], &[], false, None);
+        let argv = buildctl_argv("D.Dockerfile", None, &["reg/img:x".into()], &[], &[], false, None);
         assert!(
             argv.iter().any(|a| a == "type=image,name=reg/img:x"),
             "single-tag non-push output must be bare name=<tag>: {argv:?}",
+        );
+    }
+
+    // ── R636-B1 cross-host build context ────────────────────────────────────
+
+    /// With a `context_url`, the synthesized workload must reference NOTHING
+    /// from the composing host's filesystem — that is the whole bug. The one
+    /// surviving bind is `/yah/build/out`, which is a worker-local path.
+    #[test]
+    fn remote_context_url_drops_every_camp_host_bind_mount() {
+        let ws = synth(&build_image_parts(build_image_spec_with_url(
+            false,
+            Some("https://cdn.yah.dev/yah-cloud/qed-context/deadbeef.tar.gz"),
+        )));
+
+        let binds: Vec<String> = ws
+            .volumes
+            .iter()
+            .filter_map(|v| match &v.source {
+                VolumeSource::Bind { host_path } => {
+                    Some(host_path.to_string_lossy().into_owned())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            binds,
+            vec![BUILDKIT_HOST_OUT_DIR.to_string()],
+            "the only bind left may be the worker-local OCI out dir: {binds:?}",
+        );
+        assert!(
+            !binds.iter().any(|b| b.starts_with("/tmp/camp")),
+            "no path from the qed host may reach the worker: {binds:?}",
+        );
+
+        let argv = ws.command.expect("command must be set");
+        assert!(
+            argv.iter()
+                .any(|a| a == "context=https://cdn.yah.dev/yah-cloud/qed-context/deadbeef.tar.gz"),
+            "remote context must be passed as --opt context=<url>: {argv:?}",
+        );
+        assert!(
+            !argv.iter().any(|a| a.starts_with("context=/yah/build")
+                || a.starts_with("dockerfile=/yah/build")),
+            "the --local flags must be gone, or buildkit reads the empty mounts: {argv:?}",
+        );
+        // The Dockerfile is resolved from inside the fetched tar by basename.
+        assert!(
+            argv.iter().any(|a| a == "filename=yah-rust.Dockerfile"),
+            "filename= must still name the Dockerfile inside the tar: {argv:?}",
+        );
+    }
+
+    /// Without a URL the pre-R636-B1 shape is unchanged — same-host yubaba
+    /// deployments keep working off bind mounts.
+    #[test]
+    fn no_context_url_keeps_the_bind_mount_shape() {
+        let ws = synth(&build_image_parts(build_image_spec(false)));
+        let argv = ws.command.expect("command must be set");
+        assert!(
+            argv.iter().any(|a| a == "context=/yah/build/context"),
+            "bind-mount shape must still emit --local context=…: {argv:?}",
+        );
+        assert!(
+            !argv.iter().any(|a| a.starts_with("context=http")),
+            "no URL context without one being asked for: {argv:?}",
         );
     }
 
@@ -1333,6 +2079,417 @@ mod remote {
         assert!(
             *teardown_called.lock().unwrap(),
             "yubaba.teardown must be called on timeout"
+        );
+    }
+}
+
+// ─── ForgeExecutor-surface tests (R555-T2) ────────────────────────────────────
+
+#[cfg(test)]
+mod executor_surface {
+    use super::test_support::*;
+    use super::*;
+    use std::sync::Mutex;
+    use task_runs::Initiator;
+    use tempfile::TempDir;
+    use velveteen::TaskPlacement;
+    use yah_scryer::service::{Scryer, ScryerConfig};
+
+    fn make_scryer(dir: &TempDir) -> Arc<Scryer> {
+        let cfg = ScryerConfig::new(dir.path().join("events.db"));
+        Arc::new(Scryer::new(cfg, None).unwrap())
+    }
+
+    fn subprocess_spec(where_: TaskPlacement) -> ForgeSpec {
+        ForgeSpec {
+            command: ForgeCommand::Subprocess {
+                argv: vec!["true".into()],
+                image: None,
+            },
+            where_,
+            timeout: None,
+            label: None,
+            initiator: Initiator::Human {
+                camp: "test-camp".into(),
+            },
+            mesh_access: velveteen::MeshAccess::None,
+        }
+    }
+
+    fn remote_any_infra() -> TaskPlacement {
+        TaskPlacement::new(
+            TaskLocation::RemoteAny {
+                tier: TierTag("infra".into()),
+                mesh_tags: vec![],
+            },
+            TaskRuntime::Container,
+        )
+    }
+
+    /// `ScriptedWardenClient` records only *that* deploy happened; the
+    /// ExecContext tests need the spec it was handed.
+    struct CapturingWardenClient {
+        inner: Arc<ScriptedWardenClient>,
+        deployed: Arc<Mutex<Vec<WorkloadSpec>>>,
+    }
+
+    impl CapturingWardenClient {
+        fn new(lines: Vec<String>, exit_code: i32) -> (Arc<Self>, Arc<Mutex<Vec<WorkloadSpec>>>) {
+            let deployed: Arc<Mutex<Vec<WorkloadSpec>>> = Default::default();
+            let client = Arc::new(Self {
+                inner: ScriptedWardenClient::new(lines, exit_code),
+                deployed: deployed.clone(),
+            });
+            (client, deployed)
+        }
+    }
+
+    #[async_trait]
+    impl WardenClient for CapturingWardenClient {
+        async fn deploy(&self, spec: &WorkloadSpec) -> Result<(), RemoteForgeError> {
+            self.deployed.lock().unwrap().push(spec.clone());
+            self.inner.deploy(spec).await
+        }
+        async fn connect_logs(
+            &self,
+            ident: &MeshIdent,
+        ) -> Result<mpsc::Receiver<String>, RemoteForgeError> {
+            self.inner.connect_logs(ident).await
+        }
+        async fn teardown(&self, ident: &MeshIdent) -> Result<(), RemoteForgeError> {
+            self.inner.teardown(ident).await
+        }
+        async fn exit_code(&self, ident: &MeshIdent) -> Result<Option<i32>, RemoteForgeError> {
+            self.inner.exit_code(ident).await
+        }
+    }
+
+    /// The whole point of the impl: a caller holding `Arc<dyn ForgeExecutor>`
+    /// (the cloud reconciler) can dispatch a remote recipe step without knowing
+    /// it's remote.
+    #[tokio::test]
+    async fn executes_through_dyn_forge_executor_and_reports_the_exit_code() {
+        let dir = TempDir::new().unwrap();
+        let scryer = make_scryer(&dir);
+        let yubaba = ScriptedWardenClient::new(vec!["building".into(), "done".into()], 0);
+
+        let driver: Arc<dyn ForgeExecutor> =
+            Arc::new(RemoteForgeDriver::new(scryer, yubaba.clone()));
+
+        let outcome = driver
+            .execute(
+                subprocess_spec(remote_any_infra()),
+                ExecContext::default(),
+                None,
+            )
+            .await
+            .expect("remote dispatch ok");
+
+        assert!(outcome.succeeded(), "got {:?}", outcome.status);
+        assert!(
+            *yubaba.deploy_called.lock().unwrap(),
+            "the run must have reached yubaba.deploy"
+        );
+    }
+
+    /// A non-zero remote exit must surface as a *failed outcome*, not an Err —
+    /// same contract the local driver honors, so `materialize_transform`'s
+    /// `outcome.succeeded()` branch works identically for both.
+    #[tokio::test]
+    async fn nonzero_remote_exit_is_a_failed_outcome_with_a_log_tail() {
+        let dir = TempDir::new().unwrap();
+        let scryer = make_scryer(&dir);
+        let yubaba = ScriptedWardenClient::new(vec!["ld: cannot find -lstdc++".into()], 1);
+
+        let driver = RemoteForgeDriver::new(scryer, yubaba);
+        let outcome = driver
+            .execute(
+                subprocess_spec(remote_any_infra()),
+                ExecContext::default(),
+                None,
+            )
+            .await
+            .expect("a failing run is still a successful dispatch");
+
+        assert!(!outcome.succeeded(), "got {:?}", outcome.status);
+        assert!(
+            outcome.stderr_tail.contains("cannot find -lstdc++"),
+            "the tail must carry the failure text, got {:?}",
+            outcome.stderr_tail
+        );
+    }
+
+    /// R555-F3: a caller holding only `Arc<dyn ForgeExecutor>` gets the built
+    /// artifact back on its own filesystem. Without this leg the reconciler
+    /// sees exit 0 and an absent output file — the exact "produced no output"
+    /// bail R546-B8 already paid for once.
+    #[tokio::test]
+    async fn produced_file_is_pulled_back_onto_the_caller_filesystem() {
+        let dir = TempDir::new().unwrap();
+        let scryer = make_scryer(&dir);
+        let remote_path =
+            PathBuf::from(workload_spec::forge_produced::CONTAINER_DIR).join("out.tar.gz");
+        let yubaba = ScriptedWardenClient::with_produced_file(
+            vec!["building".into()],
+            0,
+            remote_path.clone(),
+            b"artifact bytes".to_vec(),
+        );
+
+        // Deliberately a path whose parent does not exist yet — a driver that
+        // only wrote the file would fail here, and the caller's next step is a
+        // read of exactly this path.
+        let dest = dir.path().join("landing").join("out.tar.gz");
+        let driver: Arc<dyn ForgeExecutor> = Arc::new(RemoteForgeDriver::new(scryer, yubaba));
+        let outcome = driver
+            .execute(
+                subprocess_spec(remote_any_infra()),
+                ExecContext::default().with_produced(remote_path, dest.clone()),
+                None,
+            )
+            .await
+            .expect("remote dispatch ok");
+
+        assert!(outcome.succeeded(), "got {:?}", outcome.status);
+        assert_eq!(std::fs::read(&dest).unwrap(), b"artifact bytes");
+    }
+
+    /// A failed build has nothing to retrieve, and a fetch error on top of the
+    /// real failure buries the log tail the operator actually needs.
+    #[tokio::test]
+    async fn a_failed_run_reports_its_log_tail_instead_of_a_fetch_error() {
+        let dir = TempDir::new().unwrap();
+        let scryer = make_scryer(&dir);
+        let remote_path =
+            PathBuf::from(workload_spec::forge_produced::CONTAINER_DIR).join("out.tar.gz");
+        // No produced file scripted: fetch would error if it were attempted.
+        let yubaba = ScriptedWardenClient::new(vec!["gn: fatal error".into()], 1);
+
+        let dest = dir.path().join("out.tar.gz");
+        let driver = RemoteForgeDriver::new(scryer, yubaba);
+        let outcome = driver
+            .execute(
+                subprocess_spec(remote_any_infra()),
+                ExecContext::default().with_produced(remote_path, dest.clone()),
+                None,
+            )
+            .await
+            .expect("a failing build is still a successful dispatch");
+
+        assert!(!outcome.succeeded());
+        assert!(outcome.stderr_tail.contains("gn: fatal error"));
+        assert!(!dest.exists(), "nothing to land from a failed build");
+    }
+
+    /// Only `/yah/produced` is bind-mounted onto host-persistent storage, so a
+    /// path outside it is gone once kamaji reaps the container. Refusing names
+    /// the recipe bug; letting the RPC 404 would read as a transport fault.
+    #[tokio::test]
+    async fn a_produced_path_outside_the_durable_dir_is_refused() {
+        let dir = TempDir::new().unwrap();
+        let scryer = make_scryer(&dir);
+        let yubaba = ScriptedWardenClient::with_produced_file(
+            vec![],
+            0,
+            PathBuf::from("/tmp/out.tar.gz"),
+            b"bytes".to_vec(),
+        );
+
+        let driver = RemoteForgeDriver::new(scryer, yubaba);
+        let err = driver
+            .execute(
+                subprocess_spec(remote_any_infra()),
+                ExecContext::default().with_produced(
+                    PathBuf::from("/tmp/out.tar.gz"),
+                    dir.path().join("out.tar.gz"),
+                ),
+                None,
+            )
+            .await
+            .expect_err("a non-durable produced path must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("/yah/produced"), "{msg}");
+    }
+
+    /// The caller's sink still sees every line during the run, plus the
+    /// terminal `Finished` the trait contract promises.
+    #[tokio::test]
+    async fn forwards_lines_to_the_caller_sink_then_finished() {
+        let dir = TempDir::new().unwrap();
+        let scryer = make_scryer(&dir);
+        let yubaba = ScriptedWardenClient::new(vec!["one".into(), "two".into()], 0);
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<ExecEvent>();
+        let driver = RemoteForgeDriver::new(scryer, yubaba);
+        driver
+            .execute(
+                subprocess_spec(remote_any_infra()),
+                ExecContext::default(),
+                Some(tx),
+            )
+            .await
+            .unwrap();
+
+        let mut lines = Vec::new();
+        let mut finished = false;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                ExecEvent::Output { line, .. } => lines.push(line),
+                ExecEvent::Finished { .. } => finished = true,
+                ExecEvent::Started => {}
+            }
+        }
+        assert_eq!(lines, vec!["one".to_string(), "two".to_string()]);
+        assert!(finished, "trait contract promises exactly one Finished");
+    }
+
+    /// The tail is capped — a multi-hour build must not buffer its whole log
+    /// just to report a failure message.
+    #[tokio::test]
+    async fn log_tail_is_bounded() {
+        let dir = TempDir::new().unwrap();
+        let scryer = make_scryer(&dir);
+        let lines: Vec<String> = (0..REMOTE_TAIL_LINES * 3)
+            .map(|i| format!("line {i}"))
+            .collect();
+        let yubaba = ScriptedWardenClient::new(lines, 1);
+
+        let driver = RemoteForgeDriver::new(scryer, yubaba);
+        let outcome = driver
+            .execute(
+                subprocess_spec(remote_any_infra()),
+                ExecContext::default(),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let kept: Vec<&str> = outcome.stderr_tail.lines().collect();
+        assert_eq!(kept.len(), REMOTE_TAIL_LINES);
+        assert_eq!(
+            *kept.last().unwrap(),
+            format!("line {}", REMOTE_TAIL_LINES * 3 - 1),
+            "the tail must keep the LAST lines, not the first"
+        );
+    }
+
+    /// Symmetric with `LocalForgeDriver`'s refusal: neither driver silently
+    /// runs work that belongs to the other.
+    #[tokio::test]
+    async fn refuses_a_local_spec() {
+        let dir = TempDir::new().unwrap();
+        let scryer = make_scryer(&dir);
+        let yubaba = ScriptedWardenClient::new(vec![], 0);
+
+        let driver = RemoteForgeDriver::new(scryer, yubaba.clone());
+        let err = driver
+            .execute(
+                subprocess_spec(TaskPlacement::new(
+                    TaskLocation::Local,
+                    TaskRuntime::Container,
+                )),
+                ExecContext::default(),
+                None,
+            )
+            .await
+            .expect_err("a local spec must not dispatch remotely");
+
+        assert!(
+            matches!(err, ForgeExecutorError::Unsupported(_)),
+            "got {err:?}"
+        );
+        assert!(
+            !*yubaba.deploy_called.lock().unwrap(),
+            "refusal must happen before any yubaba RPC"
+        );
+    }
+
+    /// `[placement] platform` asks the *host* runtime for foreign-arch
+    /// emulation. A yubaba node has no such knob, and honoring it silently
+    /// would hand back a wrong-arch artifact — the exact R546 failure this seam
+    /// exists to retire. Refuse, and name the replacement.
+    #[tokio::test]
+    async fn refuses_a_platform_request_and_names_mesh_tags() {
+        let dir = TempDir::new().unwrap();
+        let scryer = make_scryer(&dir);
+        let yubaba = ScriptedWardenClient::new(vec![], 0);
+
+        let driver = RemoteForgeDriver::new(scryer, yubaba.clone());
+        let err = driver
+            .execute(
+                subprocess_spec(remote_any_infra()),
+                ExecContext::default().with_platform("linux/amd64".into()),
+                None,
+            )
+            .await
+            .expect_err("platform + remote must not silently drop the platform");
+
+        let msg = err.to_string();
+        assert!(msg.contains("mesh_tags"), "must name the fix, got: {msg}");
+        assert!(
+            !*yubaba.deploy_called.lock().unwrap(),
+            "refusal must happen before any yubaba RPC"
+        );
+    }
+
+    /// cwd and env are the two ExecContext fields with a real remote referent.
+    /// Dropping them would be silent misbehaviour, so they're wired through.
+    #[tokio::test]
+    async fn cwd_and_env_land_on_the_workload_spec() {
+        let dir = TempDir::new().unwrap();
+        let scryer = make_scryer(&dir);
+        let (yubaba, deployed) = CapturingWardenClient::new(vec![], 0);
+
+        let driver = RemoteForgeDriver::new(scryer, yubaba);
+        driver
+            .execute(
+                subprocess_spec(remote_any_infra()),
+                ExecContext::default()
+                    .with_cwd(PathBuf::from("/build"))
+                    .with_env(vec![("RUSTY_V8_MIRROR".into(), "https://example".into())]),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let specs = deployed.lock().unwrap();
+        let ws = specs.first().expect("one deploy");
+        assert_eq!(ws.workdir.as_deref(), Some(Path::new("/build")));
+        let env = ws
+            .env
+            .iter()
+            .find(|e| e.name == "RUSTY_V8_MIRROR")
+            .expect("ctx env must reach the workload spec");
+        assert_eq!(
+            env.value,
+            EnvValue::Literal {
+                value: "https://example".into()
+            }
+        );
+    }
+
+    /// `start_with_sink` is unchanged for its existing callers — it delegates
+    /// to `start_with_context` with an empty context and must not start
+    /// injecting a workdir or env.
+    #[tokio::test]
+    async fn start_with_sink_still_deploys_an_unmodified_spec() {
+        let dir = TempDir::new().unwrap();
+        let scryer = make_scryer(&dir);
+        let (yubaba, deployed) = CapturingWardenClient::new(vec![], 0);
+
+        let driver = RemoteForgeDriver::new(scryer, yubaba);
+        let handle = driver
+            .start_with_sink(subprocess_spec(remote_any_infra()), None)
+            .await
+            .unwrap();
+        let _ = handle.wait().await;
+
+        let specs = deployed.lock().unwrap();
+        let ws = specs.first().expect("one deploy");
+        assert!(ws.workdir.is_none(), "no ctx ⇒ no workdir override");
+        assert!(
+            !ws.env.iter().any(|e| e.name == "RUSTY_V8_MIRROR"),
+            "no ctx ⇒ no injected env"
         );
     }
 }

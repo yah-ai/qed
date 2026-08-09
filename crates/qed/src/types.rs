@@ -8,19 +8,24 @@
 //! @yah:next("NOT a blocker for R622 (manual steps). R622's parked-run durability is satisfied by a non-terminal JSON persist reusing the R603 pattern, which a turso migration would carry over anyway. Deliberately decoupled — see W282 'The turso question is real, but separate'.")
 //!
 //! @yah:relay(R622, "QED manual steps: pipelines with a human in the middle (release wizard)")
-//! @yah:status(open)
-//! @yah:at(2026-07-21T18:30:00Z)
+//! @yah:status(review)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:at(2026-08-05T02:39:18Z)
 //! @arch:see(.yah/docs/working/W282-qed-manual-steps.md)
-//! @yah:gotcha("runner.rs:20 says 'all qed runs are still in-memory (run-history persistence is R325-F3)'. That is STALE — R325-F3 landed and sits at status(review) on this file. Real state: terminal runs persist as .yah/jit/qed/<run_id>.json + .events.jsonl (342 files today, NOT turso); in-flight runs are not durable in general (camp.rs:851), except R603's non-terminal persist on StepRemoteDispatched. Fix that comment as part of this work.")
 //! @yah:gotcha("A manual step is a COORDINATION point, not an authorization gate. It does not know who clicked Continue. Do not let it grow into a permissions system — that is an explicit non-goal in W282.")
-//! @yah:next("T1: StepKind::Manual + [manual] config block (prompt/terminal/advance/checklist) + validate() rejecting argv, mirroring StepKind::WaitFor which is the existing pure-gate precedent.")
-//! @yah:next("T2: RunStatus::AwaitingHuman + extend RunStatus::aggregate. Add cases to the existing run_status_aggregate_* decision-table tests rather than reasoning about precedence in prose. AwaitingHuman is non-terminal, so like Queued/Running it contributes nothing to an aggregate.")
-//! @yah:next("T3: runner park/resume with LOCK RELEASE. Decided: a parked step releases its concurrency_key and reacquires on resume (Running -> AwaitingHuman -> Queued -> Running). Holding cargo-target through an overnight park would stall every cargo pipeline in the camp, including other agents on the shared tree. Consequence to handle: the tree can move while parked, so resume MUST re-evaluate `advance` rather than blindly continue.")
-//! @yah:next("T4: the human surface is the ANSWER QUEUE — do not build a second one. A manual step mints a Form (crates/yah/forms, W111) and parks on it. Durability then falls out free: .yah/forms/ already holds 7,383 durable camp-scoped forms, so the run only records form_id. Form's by/job/session_id/character are ALL Option and documented as None for scope-unaware callers, so a QED run (not a session, not a subclass) can legally mint one.")
-//! @yah:next("T5: wire — QedEvent::StepAwaitingHuman{index,name,form_id,advance} + QedEventWire kebab 'step-awaiting-human'. THE ONLY GENUINELY NEW MECHANISM: a new OnSubmit variant. Today OnSubmit::Continue routes the answer back to the form's `by` SUBCLASS, which a QED run does not have — needs OnSubmit::ResumeQedRun{run_id,step_index}. Keep qed.resume RPC as the headless path.")
-//! @yah:next("T6: UI is nearly free, and the highest-leverage item is ONE small fix. Markdown.tsx:439 already renders a RunInTerminalButton on any shell code-fence, which mounts an InlineTerminalPanel (ghostty-web) inline. But AnswerModal.tsx:2234 renders form.framing as PLAIN TEXT (<p className='mono ... whitespace-pre-wrap'>), so the chain breaks at the last link. Route framing through Markdown and a form carrying ```sh fences gets working run-buttons + inline terminals with no new UI code. It improves every existing form too — a hint it is the right change, not a carve-out.")
-//! @yah:next("T7: author .yah/qed/release-wizard.toml composing version-bump + oss-publish (both exist, R620) via sub-pipeline steps, with manual steps between. Do not duplicate their steps.")
-//! @yah:next("OPEN QUESTIONS (W282): park timeout (leaning none, but pair park with a party.notify or runs get forgotten); desktop notification on park; whether validate() should reject manual steps on --where=remote or force host-native like SignNativeTarball.")
+//! @yah:handoff("DONE, all seven tasks. T1 StepKind::Manual + ManualConfig{prompt,terminal,advance,checklist,advance_poll_secs} on QedStep.manual + 6 StepValidationError variants + validate() arm mirroring WaitFor (types.rs). T2 RunStatus::AwaitingHuman, non-terminal, folded into aggregate's ignore-arm with decision-table cases (run_status_aggregate_ignores_awaiting_human) + a serde-spelling pin. T3 park/resume WITH lock release: new `ManualGate` trait in runner.rs (park/release_lock/reacquire_lock, the last two defaulting to no-ops) + `PipelineRunner::with_manual_gate`, inherited by sub-pipeline children. T4 the human surface IS the AnswerQueue — `QedFormManualGate` in camp.rs mints a W111 Form (by/job/session_id all None, which the schema documents as legal for scope-unaware callers) and awaits forms::submit::wait_for_resolution. T5 QedEvent::StepAwaitingHuman{index,name,form_id,advance} + QedEventWire kebab 'step-awaiting-human' + OnSubmit::ResumeQedRun{run_id,step_index} + a `qed.resume` RPC. T6 AnswerModal.tsx form.framing now renders through <Markdown campId={form.campId}> instead of a plain <p> — that one change is what buys the terminal prefill, since Markdown already mounts RunInTerminalButton + InlineTerminalPanel on any shell fence. T7 .yah/qed/release-wizard.toml composes version-bump + oss-publish as sub-pipelines with manual steps between.")
+//! @yah:handoff("DESIGN CALLS I made where W282 left them open. (1) Park order is: probe `advance` FIRST and skip the park entirely if it already holds (that is 'auto-advances the moment it exits 0' at its first tick, and it stops the wizard interrupting you to confirm what it can already see); then release the key; then race the human's answer against a poll of `advance`; then RE-EVALUATE `advance` on their answer — a failure RE-PARKS carrying the failing command's stderr rather than failing the step. (2) Headless (no gate installed, i.e. `yah qed run`): `advance` is the only door. Satisfied ⇒ pass; unsatisfied or absent ⇒ fail with a message naming the condition and pointing at the daemon. Deliberately NOT auto-advance — silently passing a human gate because nobody was listening would make the kind a lie. (3) W282 OQ3 (remote runs): decided — validate() rejects `runtime = \"container\"` on a manual step and resolve_runtime forces Native, same shape as SignNativeTarball. (4) W282 OQ1 (timeout): none, as leaned. (5) A dropped gate sender (daemon restart, cancelled form) fails the step loudly rather than hanging.")
+//! @yah:handoff("DISCOVERED WORK done in this pass, beyond the ticket. (a) runner.rs:20's stale gotcha CORRECTED in place (it claimed all qed runs are in-memory; R325-F3 landed long ago) — rewritten to state what is actually true, including that R622 adds the second non-terminal persist point after R603's. (b) camp.rs apply_qed_event_to_meta returned early unless status==Running, which would have dropped every event after a park; it now accepts AwaitingHuman and flips back to Running on the next event carrying the PARKED STEP'S OWN index — scoped that way because a `background` sidecar keeps emitting StepOutput throughout a park and would otherwise un-park the run. (c) The `.yah/schema/qed-pipeline.toml.schema.json` drift gate was RED in committed state (the R625-F3 note in xtask parked it as 'belongs to whoever changed the types'); regenerated via `cargo run -p xtask -- emit-schemas`, and `cargo test -p xtask --test schema_drift` is now 3/3 green. (d) `WorkspaceMode` was not re-exported from yah_qed's lib.rs, so no consumer could name the type of `Pipeline::workspace`; added. (e) New test `every_camp_pipeline_loads_and_validates` walks .yah/qed/ and asserts every file with a top-level [pipeline] table loads — nothing guarded that before, which is the class of rot that let oss-publish.toml drift.")
+//! @yah:verify("cargo test -p yah-qed --lib (from oss/qed) — 713 passed / 0 failed, incl. 16 new manual-step tests (8 validation in types.rs, 8 runner park/resume in runner.rs against a scripted gate)")
+//! @yah:verify("cargo test -p yah --lib — 906 passed / 0 failed, incl. every_camp_pipeline_loads_and_validates + release_wizard_composes_and_gates_on_advance")
+//! @yah:verify("cargo check --workspace clean; cargo test -p xtask --test schema_drift 3/3; cargo test -p yah-forms --lib 147/147")
+//! @yah:verify("packages/yah/ui: bun run typecheck clean; bun test src/components/forms src/components/terminal 219/220 — the one failure is pre-existing (classifyTool.test.ts:433 asserts a literal is >80 chars; it is 78) and predates this change")
+//! @yah:gotcha("OPERATOR ACTION BEFORE THIS IS USABLE: the running camp daemon is the OLD binary and does not know kind = \"manual\", so it will report .yah/qed/release-wizard.toml as a load error in the QED tab until `cargo xtask install` + a daemon restart. Not done here — restarting the daemon interrupts every live session in the camp, which is the operator's call, not mine.")
+//! @yah:gotcha("release-wizard.toml's `workspace = \"live\"` is a REAL COMPROMISE, documented at length in the file header — read it before running the wizard. A sub-pipeline child inherits the parent's positioned tree instead of positioning its own (runner.rs run_inner, W224 R533-F11), so the wizard's mode applies to BOTH children and their declared modes are ignored. version-bump REQUIRES `live` (it mutates the tree on purpose; in `isolated` the edits are torn down and it reports success having changed nothing), so `live` wins — which means the oss-publish leg runs against the live camp tree rather than the isolated worktree it declares. The commit-and-tag gate proves a tag exists at HEAD when it advances, but this is a SHARED tree and a peer can dirty it during the publish. For anything but a routine patch, run `release-patch` then `oss-publish` separately instead.")
+//! @yah:next("NOT DONE, genuinely separable: a parked run does not survive a DAEMON RESTART. The form does (it is on disk in .yah/forms/ the moment it is minted) and the run's non-terminal <run_id>.json is persisted on StepAwaitingHuman, but nothing reconciles the two on boot — the run TASK that was awaiting wait_for_resolution is gone, so answering the form after a restart resolves the form and nothing else. OnSubmit::ResumeQedRun{run_id,step_index} is stamped on the form precisely so a boot reconcile can find its way back; wiring that is the R603-T2-shaped follow-up (reconcile_inflight_qed_runs already exists as the place it belongs).")
+//! @yah:next("NOT DONE: the matrix-fanout (qed_run_matrix_fanout) and cloud-reconcile runner construction sites do not install a manual gate, so a manual step reached through either takes the headless advance-only path. Left deliberately — N matrix rows each parking on a human is a shape nobody has asked for, and guessing at it would be worse than the honest fallback. Wire it when a real case appears.")
+//! @yah:next("NOT DONE (W282 OQ2): no desktop notification on park. The run is invisible until someone looks, which W282 rightly says defeats a wizard — but the form DOES land in the AnswerQueue, so the operator gets the normal queue badge. A party.notify on park is the small addition that would close it properly.")
+//! @yah:cleanup("QedPanel.tsx has no styling for the new 'awaiting-human' run status — it falls to the `default:` arm and renders as pending, which is safe but reads wrong. QedRunTile.tsx got the one-line status-dot arm (pulsing --color-st-handoff, the board's 'waiting to be picked up' colour); QedPanel deserves the same treatment plus a way to jump from a parked run straight to its form.")
 //!
 //! @yah:ticket(R325-F3, "Backend: run-history persistence — QedRunId + step results queryable")
 //! @yah:at(2026-05-26T04:09:53Z)
@@ -165,6 +170,132 @@
 //! @yah:handoff("T5 shipped. Surfaces a typed reason on the R494-F1 remote-peer + unknown-peer paths so operators see an actionable message in StepFailed.msg instead of the generic 'target unresolvable' tail. (1) types.rs: SubPipelineResolver trait gained an optional `unresolved_reason(&SubPipelineRef) -> Option<String>` companion to `resolve` with a `None` default — preserves backward compat for the 3 existing impls (NoopSubPipelineResolver in runner.rs, MapResolver in types::tests + runner::tests). (2) config.rs LoaderSubPipelineResolver: impls unresolved_reason for Peer targets only; three branches — unknown camp routes to peers.toml with a copy-pasteable `[peer.<camp>]` skeleton; remote peer (entry.rig.is_some()) cites the camp + rig + R494-T5 and tells the operator to drop the `rig = ...` field or wait for R494-F10; known camp + missing pipeline names the resolved peer-camp path. Builtin/Path/GhaWorkflow return None (those misses already have their own surfaces). (3) runner.rs execute_step_sub_pipeline: when resolve returns None, query unresolved_reason and put it in StepFailed.msg verbatim; falls back to the previous debug-formatted message when the resolver doesn't diagnose. (4) Tests: 4 new in config::tests (typed remote-peer reason + camp/rig/ticket-id assertions; unknown-camp routes to peers.toml; missing-pipeline names the pipeline + camp; non-peer targets keep None). 1 new in runner::tests (DiagnosticResolver fixture + assertion that StepFailed.msg matches the resolver's typed message verbatim). The pre-existing `peer_resolver_swallows_remote_peers_until_t5_wires_constable` test was renamed to `peer_resolver_remote_peer_surfaces_typed_unsupported_reason` and extended. cargo test -p qed --lib: 218 pass + 1 pre-existing failure (test_builtin_release_build_pipeline 4-vs-6, documented across R488/R494 handoffs). cargo check -p qed -p yah -p desktop clean.")
 //! @yah:verify("cargo test -p qed --lib -- peer_resolver_remote_peer_surfaces peer_resolver_unknown_camp peer_resolver_unknown_pipeline peer_resolver_unresolved_reason_is_none sub_pipeline_unresolved_surfaces (5/5 pass)")
 //! @yah:verify("cargo check -p qed -p yah -p desktop")
+//!
+//! @yah:ticket(R703-F3, "Pipeline readme: parse a QED TOML's leading comment block into description, render it above inlined steps+graph, retire the sub-tab strip")
+//! @yah:status(review)
+//! @yah:at(2026-08-03T22:12:29Z)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R703)
+//! @yah:next("Every pipeline in .yah/qed/ already carries a genuinely good README in its leading TOML comment block -- cli-release's 'what it does NOT do, stated rather than discovered later' section is exactly the content an operator wants when they click the row. Today only the one-line `label` reaches the wire; those headers are read by humans in an editor and thrown away by the daemon.")
+//! @yah:next("Producer side: parse the contiguous leading `#` comment block of a pipeline TOML into the PipelineDef's `description` (the field already exists and is already carried to the UI). Strip the leading '# ' and preserve paragraph breaks; the blocks are already written as prose with markdown-ish section rules.")
+//! @yah:next("Consumer side: QedPanel.tsx:2263 holds `const [detailView, setDetailView] = useState<\"steps\"|\"graph\">(\"graph\")`. Collapse it -- delete the state and the sub-tab strip, stack description -> readme -> steps -> graph inline. Operator's framing: 'have a readme section, then steps, then graph inlined with no tabs.'")
+//! @yah:next("Long readmes want a collapse affordance rather than a tab -- default the readme open and let it fold, so the steps stay reachable without a click on a short pipeline.")
+//! @yah:verify("Clicking a pipeline row shows its TOML header as prose, followed by steps, followed by the graph, with no tab chrome")
+//! @yah:verify("A pipeline whose TOML has no leading comment block renders without an empty readme section")
+//! @yah:verify("bun run typecheck clean")
+//! @yah:gotcha("QedPanel.tsx is 4567 lines. The sub-tab strip is only rendered when def.steps.length > 1, so a naive removal changes behaviour for single-step pipelines too -- check that path.")
+//! @yah:gotcha("Some headers are long (release-build's is ~50 lines of design rationale). Do not truncate silently; that content is the point of the ticket.")
+//! @yah:gotcha("Not every .yah/qed/*.toml is a pipeline: peers.toml, registries.toml, baseline.toml, gha-actions.toml and transforms/ live in the same directory. The parser must not assume pipeline shape from location alone.")
+//! @yah:handoff("PRODUCER. qed types.rs: Pipeline gains description: Option String. config.rs: new pub fn leading_comment_block lifts the contiguous leading hash-comment block into it. Rules: first non-blank non-comment line ends the block; a line-initial @yah:/@arch: ends it, but a prose line that merely mentions one mid-sentence does not (four headers in this camp do exactly that); a taplo #:schema directive is skipped rather than treated as a terminator (dashboard-e2e.toml opens with one); exactly one leading space is stripped so box-rules and indented sub-lists survive; a bare hash becomes a paragraph break; empty or annotations-only yields None. An explicit [pipeline] description key wins (added to PipelineConfig so qed eject round-trips).")
+//! @yah:handoff("REFACTOR. Collapsed the two duplicate PipelineToml-to-Pipeline hoists (load_from_file and the cfg(test) load_from_str) onto one pipeline_from_str. That duplication is exactly what would have let a new field reach one path and not the other. 30 exhaustive Pipeline literal sites updated across config/eject/export/matrix/runner/types plus app/yah/cli/src/camp.rs:7529 (the synthesised cloud-reconcile pipeline).")
+//! @yah:handoff("WIRE. crates/yah/rpc/src/lib.rs: QedPipelineWire.description, serde default so an older daemon still deserializes. app/yah/cli/src/camp.rs qed_pipelines_handler populates it for user pipelines; None for auto-ingested GHA workflows, whose leading YAML comments are ceremony rather than a readme.")
+//! @yah:handoff("CONSUMER. QedPanel.tsx: detailView state, effectiveView and the whole Steps/Graph sub-tab strip are deleted. Body is now readme then steps then graph, stacked in one scroll. New exported PipelineReadme is collapsible and open by default; collapsed it keeps the first line as its own summary. It renders through the existing agent Markdown component, which is safe outside a TicketsContext provider because that context has a default value. New exported descriptionFromWire normalises absent/empty/whitespace-only to undefined so a single truthiness check decides whether the section exists at all. Single-step pipelines still get no graph, the same cut the retired strip made at steps.length less-than-or-equal 1, kept deliberately per gotcha 1.")
+//! @yah:handoff("DISCOVERED WORK, done in this pass. (1) Regenerated .yah/schema via cargo run -p xtask -- emit-schemas, required because PipelineConfig gained a field. That run also swept in @Ashguard:coffee's in-flight W265/R584 types (MirrorConfig::drivers, the local-process and local-pg-dev provider-kind arms) into mirror.toml.schema.json and provider.toml.schema.json. cargo test -p xtask --test schema_drift is now 3/3 green; it had been red since at least the R625-F3 note in xtask/src/main.rs, which parked it on 'belongs to whoever changed the types'. A durable @yah:notify_on(R703-F3) was written onto R584 saying what was regenerated. (2) Real-data probe (throwaway test, removed) over all 24 .yah/qed/*.toml through the new parser caught two defects the unit tests missed: the taplo #:schema directive leaked in as the readme's first line, and the annotation terminator needed to be line-initial rather than trimmed. Both fixed and now covered by tests.")
+//! @yah:next("NOT VERIFIED END-TO-END IN THE LIVE APP. Descriptions do not reach the desktop until the camp daemon runs a rebuilt yah binary. Deliberately did not run cargo xtask install or restart the daemon: 8 sessions are live in this camp and peers have uncommitted in-flight work (app/yah/cli/src/cloud.rs was mid-edit during this session), so a rebuild would ship half-landed peer code into ~/.local/bin/yah. Operator: cargo xtask install then restart the camp daemon to see it.")
+//! @yah:verify("VERIFIED cargo test -p yah-qed --lib -- --test-threads=1 : 682 pass, 0 fail, 1 ignored (7 new tests in config::tests covering paragraph breaks, box-rules, the annotation terminator, mid-sentence annotation mentions, the #:schema directive, no-header, comments-below-the-header, and the explicit-key override)")
+//! @yah:verify("VERIFIED cargo test -p xtask --test schema_drift : 3 pass, 0 fail")
+//! @yah:verify("VERIFIED cargo check -p yah, -p desktop : clean")
+//! @yah:verify("VERIFIED bun run typecheck in packages/yah/ui : clean")
+//! @yah:verify("VERIFIED bun test src/components/run/ : 56 pass, 0 fail (5 new in qedReadme.test.tsx: prose renders open by default, folds to first line and unfolds, a 50-line header is shown whole and never truncated, and absent/empty/whitespace-only all mean no readme section)")
+//! @yah:verify("VERIFIED by real-data probe over all 24 .yah/qed/*.toml: cli-release 50 lines, oss-publish 130, release-build 53, check 20 (stops correctly at its @yah: block); provider-smoke and publish-assets are annotations-only headers and correctly yield None; baseline/peers/gha-actions are not pipelines and error at load as before")
+//! @yah:cleanup("The MCP qed.pipelines tool (crates/yah/agent-tools/src/qed_tools.rs:397) still does not emit description. Left off on purpose: 24 pipelines times up to 130 lines of prose is a large unconditional tool result. If an agent should be able to read a pipeline readme, that wants an opt-in argument, not an always-on field.")
+//!
+//! @yah:ticket(R717-T1, "QedStep::inputs — content-hash an arbitrary step's declared source files (staleness, generalized off StepKind::Import)")
+//! @yah:status(review)
+//! @yah:assignee(agent:bundle-anthropic-glimmerstone)
+//! @yah:at(2026-08-08T21:19:30Z)
+//! @yah:phase(P1)
+//! @yah:parent(R717)
+//! @arch:see(.yah/docs/working/W296-executable-docs-notebook-cells.md)
+//! @yah:next("Add inputs: Vec<PathBuf> to QedStep (serde default, skip_serializing_if empty) — existing pipeline TOMLs must deserialize unchanged.")
+//! @yah:next("At run time blake3 each declared input and record the path->hash map on StepStatus. The recorded hashes are the ONLY persisted half: staleness is computed at read time (blake3(inputs now) != recorded), never stored as a RunStatus variant — W296 'Staleness is computed, never stored as a status'.")
+//! @yah:next("Model on ImportConfig's existing blake3 source pin (types.rs:841, 'the pinned hash is the guardrail that detects a drifted source'). This is that mechanism re-pointed off StepKind::Import onto any step kind, not a new one.")
+//! @yah:next("Tier: Warrior — small surface, but serde back-compat across 494 on-disk run metas and a hash that other tickets read.")
+//! @yah:verify("cargo test -p qed --lib — an existing .yah/qed/*.toml with no inputs= round-trips unchanged")
+//! @yah:gotcha("types.rs is under active edit by R622 (@Ashguard:coffee) landing StepKind::Manual + RunStatus::AwaitingHuman. Re-read before editing; keep the diff inside QedStep/StepStatus and do not touch StepKind or RunStatus.")
+//! @yah:handoff("SHIPPED (uncommitted). QedStep::inputs: Vec<PathBuf> with serde(default, skip_serializing_if = Vec::is_empty), and StepStatus::input_hashes: BTreeMap<String,String> with the same guard. BTreeMap not HashMap so the serialized journal is byte-stable across runs with identical inputs. Runner hashes in both step loops (main + [[finally]]) and both hash BEFORE the step executes — the digest has to answer 'which bytes produced this result?', and a step that rewrites its own input would otherwise pin the bytes it emitted. Skipped and background steps record an empty map: a skipped step produced no result for a digest to be about, and a sidecar is reaped rather than completed.")
+//! @yah:handoff("NEW FILE oss/qed/crates/qed/src/staleness.rs — the pure comparison core, re-exported from lib.rs. input_freshness(recorded, actual) -> InputFreshness::{Unrecorded, Fresh, Stale{changed}} plus hash_declared_inputs(root, declared) (the only fn here that touches the filesystem; import.rs stays side-effect-free, which is why this did not go in there). Three decisions worth keeping: (1) Unrecorded is a distinct variant from Fresh — a run that predates the field must render 'no freshness evidence', not a green badge. (2) A missing input records the sentinel ABSENT_INPUT (\"absent\", which cannot collide with a 64-char blake3 hex) rather than being omitted, so 'the file was missing when this ran' and 'this run predates the field' stay distinguishable. (3) Keys are the paths AS DECLARED, not as resolved, so the record is portable across machines with different camp roots.")
+//! @yah:handoff("DISCOVERED WORK, done in this pass. (a) transform.rs:526 carried a doc comment asserting 'QedStep has no Default; its literal sites construct all fields explicitly' — FALSE since R633 (types.rs impl Default for QedStep, which round-trips serde's own defaults and is therefore stricter than a hand-written literal). base_step() and both config.rs gha-synthesis literals now overlay on Default::default() instead of enumerating 30+ fields, and the comment says what is actually true. That is the churn this ticket paid twice. (b) Dropped now-unused imports (OnFail in config.rs; StepActivation/StepKind in transform.rs) and one stale `let mut` in types.rs graph_walk_detects_direct_self_cycle. (c) REGENERATED .yah/schema/qed-pipeline.toml.schema.json — QedStep is inside PipelineToml, which is the schema's source of truth, so the xtask drift gate would have gone red. Diff is exactly the two new fields.")
+//! @yah:gotcha("cargo test -p yah-qed --lib DOES NOT TERMINATE on a host without docker. runner::tests::local_container_step_routes_through_docker_path hangs indefinitely (cargo prints 'has been running for over 60 seconds' and never returns) rather than skipping — this is the test the R717 prompt describes as 'legitimately skipped', and that phrasing understates it: it blocks the whole suite, so every run here has to be `-- --skip local_container_step_routes_through_docker_path`. Also: two concurrent runs of the qed test binary deadlock each other, so do not launch a second while one is live.")
+//! @yah:handoff("Tree anchor at handoff: 85801e7f6b76b369c0c8ecd2e5c7874990cd9286 — the shared tree as I left it. Diff against it (`git diff 85801e7f6b76b369c0c8ecd2e5c7874990cd9286..HEAD`) to see what landed under you, and quote this SHA rather than 'HEAD' in any revert/restore instruction.")
+//! @yah:next("PATHSPEC (T1+T2+T3 land together — they touch the same two structs and one compile pass): oss/qed/crates/qed/src/{types.rs,runner.rs,staleness.rs,lib.rs,config.rs,transform.rs,matrix.rs} .yah/schema/qed-pipeline.toml.schema.json app/yah/cli/src/camp.rs")
+//! @yah:verify("cargo test -p yah-qed --lib -- --skip local_container_step_routes_through_docker_path (from oss/qed): 778 passed / 0 failed / 1 ignored / 1 filtered. Baseline quoted at dispatch was 729.")
+//! @yah:verify("cargo test -p yah --lib r325_f1: 36 passed / 0 failed — the daemon-side run-history + concurrency tests still green against the widened StepStatus.")
+//! @yah:verify("cargo check -p yah --lib --tests: clean (one pre-existing unused-import warning for WorkItemAnno, not mine).")
+//! @yah:verify("cargo run -p xtask -- emit-schemas: qed-pipeline.toml.schema.json regenerated; git diff shows only the inputs + secret properties.")
+//! @yah:handoff("Reconciliation audit: baton was verify+commit only, no residual noted. QedStep::inputs/StepStatus::input_hashes/staleness.rs confirmed landed in 871fde1c by content (git show). cargo test -p yah-qed --lib -- --skip local_container_step_routes_through_docker_path: 782 passed / 0 failed / 1 ignored (covers T1/T2/T3/T5/F4 together, same pathspec).")
+//!
+//! @yah:ticket(R717-T3, "CellRef on QedRunMeta: key a run by what it was about (doc, cell_id, param_fingerprint)")
+//! @yah:status(review)
+//! @yah:assignee(agent:bundle-anthropic-glimmerstone)
+//! @yah:at(2026-08-08T21:19:37Z)
+//! @yah:phase(P1)
+//! @yah:parent(R717)
+//! @arch:see(.yah/docs/working/W296-executable-docs-notebook-cells.md)
+//! @yah:next("Add CellRef { doc: String, cell_id: String, param_fingerprint: String } and QedRunMeta::cell: Option<CellRef> with serde(default, skip_serializing_if) so the ~494 existing run metas on disk deserialize untouched.")
+//! @yah:next("param_fingerprint = blake3 over the CANONICALIZED resolved params. Canonicalization is the whole ticket: sort keys, normalize value rendering, and decide explicitly whether unset-with-default participates — two operators reaching the same effective params must produce the same fingerprint or the badge splits in half.")
+//! @yah:next("This is W296's one structurally new mechanism: 'Nothing in the tree indexes a QED run by what it was about — runs are keyed by run_id and grouped by pipeline name.' It is what lets W257 render green for us-west-003 and unrun for us-west-013 at the same time.")
+//! @yah:next("Keep run meta the source of truth so the R717-F6 index stays rebuildable by rescan — the same property load_qed_history relies on today.")
+//! @yah:next("Tier: Warrior — tiny struct, but a fingerprint that is unstable across equivalent inputs silently shows a green light about the wrong box, which W296 calls out as worse than no light.")
+//! @yah:verify("cargo test -p qed --lib — a run meta written before this ticket still loads; two param orderings of the same values fingerprint identically")
+//! @yah:gotcha("types.rs is under active edit by R622 (@Ashguard:coffee). Re-read before editing.")
+//! @yah:handoff("SHIPPED (uncommitted). types.rs gains CellRef { doc, cell_id, param_fingerprint } and QedRunMeta::cell: Option<CellRef> with serde(default, skip_serializing_if = Option::is_none). Runner carries it as PipelineRunner::cell, set by a new with_cell() setter mirroring with_events/with_camp_root, and stamps it onto the terminal QedRunMeta — which is what keeps R717-F6's index rebuildable by rescanning .yah/jit/qed/*.json. Deliberately NOT inherited by sub-pipeline children (a child is a different pipeline; stamping the parent's key would file the child's verdict under the parent's badge) and NOT inherited by matrix fan-out children in camp.rs (a matrix row's params are a narrowing the doc never declared, so N rows would file N verdicts under one subject).")
+//! @yah:handoff("CANONICALIZATION, which the ticket correctly calls the whole job. New pub fn param_fingerprint(&HashMap<String,String>) -> String, blake3 hex. Four rules, each chosen against a specific way of getting it wrong. (1) SORTED BY KEY — HashMap iteration order is not stable across runs let alone processes, so hashing in iteration order would give the SAME operator a different fingerprint on a re-run. (2) FED THE POST-resolve_params MAP, so a param taken from its default is indistinguishable from the same value passed explicitly — that equivalence is the intent: the subject is what the run was about, not how it was spelled. (3) EMPTY VALUES PARTICIPATE — node=\"\" is not the same subject as an unset node, and collapsing them merges two histories. (4) LENGTH-PREFIXED FRAMING, not a delimiter join: {node:'a', x:'=b'} and {node:'a=', x:'b'} collide under a naive format!(\"{k}={v}\") concatenation, and a collision here shows one box's verdict for another — the exact failure W296 calls worse than no light. An empty param map fingerprints to a stable value rather than erroring: a doc with no params has exactly one subject, which is legitimate.")
+//! @yah:handoff("Tree anchor at handoff: 85801e7f6b76b369c0c8ecd2e5c7874990cd9286 — the shared tree as I left it. Diff against it (`git diff 85801e7f6b76b369c0c8ecd2e5c7874990cd9286..HEAD`) to see what landed under you, and quote this SHA rather than 'HEAD' in any revert/restore instruction.")
+//! @yah:next("R717-F6 consumes this: QedRunMeta::cell is the source of truth, so cells.json is a pure cache and a rescan of .yah/jit/qed/*.json rebuilds it. Nothing writes a CellRef yet — the producing call site is R717-T7 (CLI) / R717-T8 (agent door), which construct one from DocSource::doc + the cell id + param_fingerprint(resolved_params) and pass it to PipelineRunner::with_cell.")
+//! @yah:verify("types::tests::a_pre_r717_run_meta_still_deserializes — a hand-written pre-R717 meta JSON (no cell, no input_hashes) loads, and re-serializing it does NOT invent either key. That is the ~494-file back-compat contract, pinned.")
+//! @yah:verify("types::tests::fingerprint_is_stable_across_param_orderings / fingerprint_separates_two_subjects / fingerprint_cannot_be_forged_by_a_value_containing_the_delimiter / an_empty_value_is_not_the_same_subject_as_an_absent_one.")
+//! @yah:verify("runner::tests::a_cell_ref_reaches_the_terminal_run_meta — with_cell() survives to QedRunMeta::cell, and an ordinary run still reports None (cell is opt-in, not a new default).")
+//! @yah:verify("cargo test -p yah-qed --lib -- --skip local_container_step_routes_through_docker_path: 778 passed / 0 failed. cargo test -p yah --lib r325_f1: 36 passed / 0 failed.")
+//! @yah:handoff("Reconciliation audit: baton was verify+commit only, no residual noted. CellRef + param_fingerprint confirmed landed in 871fde1c by content. cargo test -p yah-qed --lib -- --skip local_container_step_routes_through_docker_path: 782 passed / 0 failed / 1 ignored.")
+//!
+//! @yah:relay(R719, "QED admission: serial outer pipelines by default, parallelism by opt-in")
+//! @yah:at(2026-08-05T05:38:10Z)
+//! @yah:status(open)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:gotcha("Operator intent, stated 2026-08-04: MOST of the time the outermost pipeline is serial — the QED runner consumes one at a time until success/failure. Two outer pipelines running concurrently is the OPT-IN, not the default. Multimachine fan-out INSIDE one pipeline stays parallel and is explicitly wanted.")
+//! @yah:gotcha("Today the default concurrency key is the pipeline's OWN NAME (types.rs::effective_concurrency_key), so the shipped semantics are 'one run at a time per pipeline', not 'one pipeline at a time'. Every cross-pipeline serialization in this camp is hand-stamped 'cargo-target' and was audited once, by hand, in R435-T3 — with no guard. Recipe #24 (desktop-release) missed the stamp and nobody noticed until an operator launched three releases and got four concurrent runners.")
+//! @yah:assumes("The inversion is safe for multimachine work because matrix fan-out already holds the parent's key ONCE and runs rows concurrently under it (camp.rs::qed_run_matrix_fanout), and sub-pipeline children never lock at all — so making the OUTER default stricter does not narrow any intra-pipeline parallelism that exists today.")
+//! @arch:see(.yah/docs/working/W298-shared-build-admission.md)
+//! @arch:see(.yah/docs/working/W170-qed-recipe-discipline.md)
+//! @yah:gotcha("STOPGAP ALREADY LANDED (2026-08-04, uncommitted): .yah/qed/desktop-release.toml now carries concurrency_key = \"cargo-target\". That restores serialization for the ONE recipe that triggered this relay; it does not fix the default, and it does not close R719-F2 (the `release` → sub_pipeline{desktop-release} path still bypasses the lock). Do not read the green behaviour as evidence the relay is done.")
+//!
+//! @yah:ticket(R719-F1, "Invert the default concurrency key: camp-global instead of pipeline-name")
+//! @yah:status(review)
+//! @yah:at(2026-08-08T23:16:47Z)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R719)
+//! @yah:next("Change Pipeline::effective_concurrency_key (types.rs:464) to fall back to a camp-global sentinel (propose \"@camp\") instead of &self.name. Keep explicit concurrency_key and the \"@parallel\" sentinel exactly as they are — this changes ONLY the unset case.")
+//! @yah:next("Sweep .yah/qed/*.toml: every recipe that today relies on the pipeline-name default now serializes camp-wide. Decide per recipe whether it wants @parallel (read-only / no shared resource), a narrow key, or the new default. The cloud-apply pair (publish-assets, yah-desktop-publish-assets) and pi-image-build already carry explicit keys and are unaffected.")
+//! @yah:next("Decide whether 'cargo-target' should simply BECOME the default rather than a distinct key — with the inversion, ~15 of the camp's recipes carry a key that means the same thing the default now means. Collapsing them is a separate, larger cleanup; do not fold it into this ticket without saying so.")
+//! @yah:next("Update the doc comment on Pipeline::concurrency_key (types.rs:379-386) — it currently documents the old default in prose and will be actively misleading.")
+//! @yah:next("Tier: Wizard — small diff, but it re-points the admission default for every recipe in every camp; the judgement is in the per-recipe sweep, not the edit.")
+//! @yah:verify("cargo test -p qed --lib concurrency")
+//! @yah:verify("Launch desktop-local + release + desktop-release from the QED tab; exactly one shows Running, the other two hold at Queued, and they drain in launch order (tokio::sync::Mutex is FIFO-fair).")
+//! @yah:gotcha("A test asserting the OLD default almost certainly exists — grep effective_concurrency_key across oss/qed/crates/qed/src before assuming a green suite means the inversion is inert.")
+//! @yah:handoff("SHIPPED, uncommitted. effective_concurrency_key now falls back to DEFAULT_CONCURRENCY_KEY (\"@camp\") instead of self.name; PARALLEL_CONCURRENCY_KEY named alongside it. Explicit keys and @parallel are untouched. types.rs field doc rewritten to lead with why the old default was backwards: forgetting a key used to buy you PARALLELISM silently, now it buys you serialization visibly.")
+//! @yah:next("SWEEP RESULT — after it, ZERO camp pipelines rely on the default, so no live recipe changed lanes. provider-smoke -> cargo-target (its one step is `cargo run -p runner --example hok_smoke`, which compiles against the shared target/; the file comment saying it 'builds nothing' is about the assertion, not the work — it was racing check/release under the old default). gha-schema-drift -> @parallel (curl+cmp, no shared resource). rusty-v8-musl -> \"rusty-v8\" (a multi-hour V8 build in a container on us-west-002; camp-global would park every local cargo recipe behind it for nothing). baseline.toml / gha-actions.toml / peers.toml are not pipelines and were left alone.")
+//! @yah:next("DEFERRED, NOT DONE (operator's explicit call): the 'cargo-target becomes the default' collapse. Worth filing as its own ticket, and here is the precise residual hole it closes — @camp and cargo-target are DIFFERENT lanes, so a future recipe that cargo-builds and forgets a key lands in @camp and still races the ~19 cargo-target recipes. Today that costs nothing because the sweep left @camp empty, so this is a latent trap, not a live bug. The fix is one line (DEFAULT_CONCURRENCY_KEY = \"cargo-target\") plus deleting ~19 now-redundant stamps, and the judgement call is whether a non-cargo recipe should inherit the cargo lane by default.")
+//! @yah:gotcha("I RENAMED camp::r325_f1_tests::queued_runs_serialize_per_pipeline to ...serialize_on_the_shared_key, because it no longer proves anything about the default (its two runs used to share the key via the pipeline name `slow`; they now share it via @camp, so it stays green either way — exactly the inert-suite trap this ticket's gotcha predicted). .yah/qed/baseline.toml named that test in a [[failures]] entry, so the rename orphaned it; the entry is updated in the same change. New test two_different_unkeyed_pipelines_serialize_camp_wide is the one that actually pins the inversion.")
+//! @yah:next("PATHSPEC (F1 only; camp.rs is shared with the uncommitted F4/F5 work, so it lands with them): oss/qed/crates/qed/src/types.rs .yah/qed/provider-smoke.toml .yah/qed/gha-schema-drift.toml .yah/qed/rusty-v8-musl.toml .yah/qed/baseline.toml app/yah/cli/src/camp.rs")
+//! @yah:verify("cargo test -p yah-qed --lib (720 pass / 0 fail; 5 formerly-documented pre-existing failures are gone)")
+//! @yah:verify("cargo test -p yah --lib r325_f1 (35 pass, incl. every_camp_pipeline_loads_and_validates over the 3 edited recipes)")
+//! @yah:verify("cargo test -p xtask --test schema_drift (3 pass — the doc change is on types::Pipeline, not the PipelineToml the schema derives from)")
+//! @yah:handoff("Tree anchor at handoff: 85801e7f6b76b369c0c8ecd2e5c7874990cd9286 — the shared tree as I left it. Diff against it (`git diff 85801e7f6b76b369c0c8ecd2e5c7874990cd9286..HEAD`) to see what landed under you, and quote this SHA rather than 'HEAD' in any revert/restore instruction.")
+//! @yah:handoff("VERIFIED AND COMMITTED. The F1 change is no longer uncommitted — types.rs, the 3 swept recipes and baseline.toml all landed in 871fde1c/5e86d6d9. Working tree now carries only the assignee flip from this session's claim.")
+//! @yah:verify("cargo test -p yah --lib r325_f1 — 36 pass / 0 fail, including two_different_unkeyed_pipelines_serialize_camp_wide (pins the inversion) and queued_runs_serialize_on_the_shared_key.")
+//! @yah:handoff("The DEFERRED cargo-target collapse is now filed as R719-T6 (open) rather than living only in this ticket's next-list.")
+//! @yah:verify("Re-swept .yah/qed/*.toml at 5e86d6d9: every pipeline file carries an explicit concurrency_key; the only keyless files are baseline.toml / gha-actions.toml / peers.toml, which are not pipelines. The @camp lane is empty, so no live recipe changed lanes.")
+//!
+//! @yah:ticket(R719-T6, "Collapse cargo-target into the default concurrency key (or decide not to)")
+//! @yah:at(2026-08-08T23:16:27Z)
+//! @yah:status(open)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R719)
+//! @yah:next("Decide whether DEFAULT_CONCURRENCY_KEY should become cargo-target instead of @camp. If yes: one line in types.rs plus deleting the ~19 now-redundant cargo-target stamps under .yah/qed/.")
+//! @yah:next("The judgement is the operators: should a non-cargo recipe that forgets a key inherit the cargo lane? Collapsing says yes and closes the hole; keeping them separate says no and leaves it. Deferred out of R719-F1 by explicit operator call, not oversight.")
+//! @yah:verify("cargo test -p yah --lib r325_f1")
+//! @yah:gotcha("Not a live bug today — R719-F1 swept every .yah/qed pipeline onto an explicit key, so the @camp lane is EMPTY. The hole is latent: a FUTURE recipe that cargo-builds and forgets a key lands in @camp and races the ~19 cargo-target recipes.")
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -272,6 +403,39 @@ pub enum WorkspaceMode {
 pub struct Pipeline {
     pub name: String,
     pub label: String,
+    /// Long-form prose about what this pipeline does — the readme the catalog
+    /// shows above the steps (R703-F3).
+    ///
+    /// Normally *not* written as a TOML key. The loader lifts it from the
+    /// file's leading `#` comment block, because that block is where every
+    /// pipeline in this camp already had its readme: authors write the
+    /// rationale at the top of the file where an editor shows it, and until
+    /// R703-F3 the daemon threw it away and shipped only the one-line `label`.
+    /// An explicit `[pipeline] description = "..."` still wins when present,
+    /// for a pipeline synthesised in code rather than parsed from a file.
+    ///
+    /// `skip_serializing_if` keeps it out of `qed eject`'s generated TOML when
+    /// absent; when present it ejects as a key, since eject has no comment
+    /// block to put it back into.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// Free-form classification tags (`tags = ["smoke", "cloud"]`). Purely a
+    /// catalog affordance — the runner never reads them. They exist because a
+    /// camp's `.yah/qed/` grows past the point where a flat alphabetical roster
+    /// is navigable, and the pipeline *name* is a poor carrier of genre (five
+    /// pipelines named `*-smoke` tested five unrelated things). The UI groups
+    /// and filters the roster by these; `yah qed pipelines` prints them.
+    ///
+    /// No vocabulary is enforced. A camp picks its own; yah's own convention is
+    /// one genre tag (`check` / `smoke` / `e2e` / `build` / `release` /
+    /// `publish` / `chore`) plus any number of subject tags (`desktop`, `cli`,
+    /// `cloud`, `oss`, …). Enforcing a closed set here would make the field a
+    /// second place to edit every time a camp grows a new kind of pipeline.
+    ///
+    /// `skip_serializing_if` keeps `tags = []` out of `qed eject`'s generated
+    /// TOML — an untagged pipeline should eject to a file with no tags line.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<String>,
     pub steps: Vec<QedStep>,
     #[serde(default)]
     pub params: HashMap<String, ParamDef>,
@@ -283,12 +447,29 @@ pub struct Pipeline {
     #[serde(default)]
     pub triggers: Vec<Trigger>,
     /// Lock key that serializes concurrent runs. When two runs share a key,
-    /// the second one is `Queued` until the first finishes. `None` defaults
-    /// to the pipeline's own name (= one-at-a-time per pipeline). Two
-    /// pipelines that fight for the same resource (e.g. `cargo`'s shared
-    /// `target/`) can pin to the same key to serialize across pipelines.
-    /// The sentinel `"@parallel"` opts out — runs of that pipeline never
-    /// block each other (use for read-only fan-outs).
+    /// the second one is `Queued` until the first finishes.
+    ///
+    /// `None` means [`DEFAULT_CONCURRENCY_KEY`] — **camp-global**: an unkeyed
+    /// pipeline serializes against every other unkeyed pipeline, not just
+    /// against other runs of itself. R719-F1 inverted this; it used to default
+    /// to the pipeline's own name.
+    ///
+    /// The inversion is about which mistake is cheap. Under the old default,
+    /// forgetting a key gave you *parallelism* — two unrelated recipes could
+    /// stomp each other's `target/` and nothing said so. That is how
+    /// `desktop-release` shipped unkeyed and an operator got four concurrent
+    /// runners off three launches (R435-T3 audited the stamps once, by hand,
+    /// with no guard). Under the new default, forgetting a key gives you
+    /// *serialization*: slower, visible, and safe. Opting a genuinely
+    /// independent recipe out is a one-line, deliberate act.
+    ///
+    /// Two other spellings:
+    /// - Any other string is a narrow lane. Pipelines that fight over one
+    ///   resource (cargo's shared `target/`, a build worker, a cloud apply)
+    ///   pin to a common key — `"cargo-target"`, `"pi-image"`, `"cloud-apply"`.
+    /// - [`PARALLEL_CONCURRENCY_KEY`] (`"@parallel"`) opts out entirely; runs
+    ///   never block each other. For recipes that touch no shared resource —
+    ///   read-only fan-outs, fetch-and-compare drift checks.
     #[serde(default)]
     pub concurrency_key: Option<String>,
     /// Where this recipe is allowed to run (W170). Defaults to
@@ -363,27 +544,110 @@ pub struct Pipeline {
     pub finally: Vec<QedStep>,
 }
 
+/// Key an unkeyed pipeline falls back to (R719-F1). Camp-global: every
+/// pipeline that declares no `concurrency_key` shares this one lane.
+///
+/// The `@` prefix marks it as a sentinel rather than a plausible user key,
+/// matching [`PARALLEL_CONCURRENCY_KEY`]. Unlike `@parallel` it needs no
+/// special handling anywhere — it is an ordinary map key that happens to be
+/// spelled so nobody types it by accident.
+pub const DEFAULT_CONCURRENCY_KEY: &str = "@camp";
+
+/// Sentinel that opts a pipeline out of serialization entirely.
+pub const PARALLEL_CONCURRENCY_KEY: &str = "@parallel";
+
 impl Pipeline {
-    /// The effective concurrency key for this pipeline — `concurrency_key`
-    /// if set, otherwise the pipeline name. The daemon's per-key mutex map
-    /// is keyed off this value.
+    /// The effective concurrency key for this pipeline — `concurrency_key` if
+    /// set, otherwise [`DEFAULT_CONCURRENCY_KEY`]. The daemon's per-key mutex
+    /// map is keyed off this value.
+    ///
+    /// R719-F1: this used to fall back to `self.name`, which made "I forgot to
+    /// set a key" mean "run me concurrently with anything" — see the field doc
+    /// on [`Pipeline::concurrency_key`] for why that default was backwards.
     pub fn effective_concurrency_key(&self) -> &str {
-        self.concurrency_key.as_deref().unwrap_or(&self.name)
+        self.concurrency_key
+            .as_deref()
+            .unwrap_or(DEFAULT_CONCURRENCY_KEY)
     }
 
     /// `true` when the pipeline opts out of serialization via the sentinel
     /// key `"@parallel"`.
     pub fn is_parallel(&self) -> bool {
-        self.effective_concurrency_key() == "@parallel"
+        self.effective_concurrency_key() == PARALLEL_CONCURRENCY_KEY
     }
 }
 
 impl Pipeline {
-    /// Substitute `{{key}}` placeholders in every step's `argv` and `env`
-    /// values with the supplied params (e.g. `provider=groq` turns
-    /// `"{{provider}}"` into `"groq"`). Unknown placeholders are left
-    /// untouched. Required-param *validation* is the caller's job — this
-    /// only performs the textual substitution.
+    /// Resolve the run's supplied params against this pipeline's declarations:
+    /// fill in defaults for anything absent, fail naming every required param
+    /// that has neither a supplied value nor a default, and reject any value
+    /// outside a param's declared `options` set.
+    ///
+    /// Both entry points (`yah qed run` and the camp daemon's `qed.run`) had
+    /// their own copy of the required-param loop and neither knew about
+    /// defaults, so this is the one place that decides what a run's params ARE.
+    /// Feed the result to [`Self::apply_params`].
+    ///
+    /// Unknown supplied params are currently passed through rather than
+    /// rejected: a typo'd `--param bord=x` substitutes nothing and the pipeline
+    /// runs with `{{board}}` intact. That is worth rejecting, but it is a
+    /// behaviour change across callers this crate cannot audit (desktop UI, MCP
+    /// tools, other repos' workflows), so it is deliberately left alone here.
+    pub fn resolve_params(
+        &self,
+        supplied: &HashMap<String, String>,
+    ) -> Result<HashMap<String, String>, ParamError> {
+        let mut resolved = supplied.clone();
+        let mut missing: Vec<String> = Vec::new();
+        for (name, def) in &self.params {
+            if resolved.contains_key(name.as_str()) {
+                continue;
+            }
+            match &def.default {
+                Some(d) => {
+                    resolved.insert(name.clone(), d.clone());
+                }
+                None if def.required => missing.push(name.clone()),
+                None => {}
+            }
+        }
+        if !missing.is_empty() {
+            missing.sort();
+            return Err(ParamError::MissingRequired {
+                pipeline: self.name.clone(),
+                names: missing,
+            });
+        }
+        // Enumerated params are a closed set — checked after defaults are
+        // filled so a bad default fails here too, on the paths that build a
+        // Pipeline without going through the config loader's load-time check.
+        let mut enumerated: Vec<(&String, &ParamDef)> = self
+            .params
+            .iter()
+            .filter(|(_, def)| !def.options.is_empty())
+            .collect();
+        enumerated.sort_by(|a, b| a.0.cmp(b.0));
+        for (name, def) in enumerated {
+            let Some(value) = resolved.get(name.as_str()) else {
+                continue;
+            };
+            if !def.options.iter().any(|o| o == value) {
+                return Err(ParamError::NotInOptions {
+                    pipeline: self.name.clone(),
+                    name: name.clone(),
+                    value: value.clone(),
+                    options: def.options.clone(),
+                });
+            }
+        }
+        Ok(resolved)
+    }
+
+    /// Substitute `{{key}}` placeholders in every step's `argv`, `env`, and a
+    /// `gha-workflow` step's `inputs` and `matrix` (a gha-workflow step has no
+    /// argv or env, so these are its only parameterisable surface). Unknown
+    /// placeholders are left untouched. Feed this the result of
+    /// [`Self::resolve_params`], which fills defaults and checks required params.
     pub fn apply_params(&mut self, params: &HashMap<String, String>) {
         if params.is_empty() {
             return;
@@ -394,6 +658,19 @@ impl Pipeline {
             }
             for value in step.env.values_mut() {
                 *value = substitute(value, params);
+            }
+            // A `gha-workflow` step carries no argv and no env — everything a run
+            // param could parameterise about it lives here, so without this a
+            // wrapped workflow could not be told which row to build or what
+            // dispatch input to use. `inputs` was reachable-but-unsubstituted
+            // before `matrix` existed.
+            if let Some(cfg) = step.gha_workflow.as_mut() {
+                for value in cfg.inputs.values_mut() {
+                    *value = substitute(value, params);
+                }
+                for value in cfg.matrix.values_mut() {
+                    *value = substitute(value, params);
+                }
             }
         }
     }
@@ -520,6 +797,55 @@ pub struct QedStep {
     /// advisory — undeclared keys are captured too.
     #[serde(default)]
     pub outputs: Vec<OutputDecl>,
+    /// Source files this step's result depends on, content-hashed at run time
+    /// (R717-T1, W296). Paths are camp-root-relative. Purely declarative — the
+    /// runner never *reads* them as data, it only blake3s them and records the
+    /// digests on [`StepStatus::input_hashes`] so a later reader can ask "is
+    /// this result still about the bytes that produced it?"
+    ///
+    /// This is [`ImportConfig::hash`]'s pin re-pointed off [`StepKind::Import`]
+    /// onto any step kind — the same guardrail, generalized. What it buys is
+    /// **freshness**, the one property prose cannot track: W257's stale-ISO trap
+    /// ("the only guard is habit: re-run `build-iso.sh` and reflash after **any**
+    /// `.cfg` edit") is a computable relation the moment the build step declares
+    /// `inputs = [".yah/infra/preseed/yah-x86-worker.cfg", …]`.
+    ///
+    /// **Staleness is computed, never stored.** No [`RunStatus`] variant means
+    /// stale; the recorded digests are the only persisted half, and
+    /// [`crate::staleness::input_freshness`] compares them against the tree at
+    /// read time. That is why a stale badge cannot rot: it is a pure function of
+    /// the tree plus the recorded run.
+    ///
+    /// Empty (the default) on every step that has never declared inputs — which
+    /// is every step in every pipeline TOML written before this field existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inputs: Vec<std::path::PathBuf>,
+    /// Opt this step out of every capture path into the run journal (R717-T2,
+    /// W296). When `true` the runner records **exit status and timings only**:
+    /// no stdout/stderr lines on the event stream, no `$YAH_OUTPUTS` capture, no
+    /// `StepStatus::error` stderr tail, no failure `msg` on `StepFinished`.
+    ///
+    /// Run journals are plain JSON under `.yah/jit/qed/` (`<run_id>.json` plus
+    /// `<run_id>.events.jsonl`), so a step that handles a cluster KEK — W296's
+    /// `kek-push` cell pipes one through `scp` — would otherwise leave the
+    /// material, or a stderr tail quoting it, on disk in cleartext. That is a
+    /// constraint, not a nicety.
+    ///
+    /// **A secret step is a sink, not a source.** It captures nothing, so it
+    /// also *passes* nothing downstream: its outputs never reach
+    /// `${{ steps.<name>.outputs.* }}`, because a downstream reference would
+    /// land the value in that step's `argv`, which is emitted on `StepStarted`
+    /// and lands in the journal anyway. If you need a value out of a secret
+    /// step, that value is by definition not secret — split the cell.
+    ///
+    /// **What `secret` does NOT hide is what the step IS.** `argv`, `name`, and
+    /// `cwd` are still emitted: they are the step's identity, and blanking them
+    /// would make a failing secret step undebuggable. A step that would put a
+    /// credential in its own `argv` is mis-shaped — pass it through `env` (whose
+    /// *values* are never emitted; [`crate::events::credential_env_keys`] emits
+    /// key names only) or a file.
+    #[serde(default)]
+    pub secret: bool,
     /// For `kind = gha-workflow` (W200-F9): path to a
     /// `.github/workflows/*.yml`, with optional event + dispatch inputs.
     /// Resolved relative to the camp root. Required when `kind = gha-workflow`;
@@ -563,7 +889,10 @@ pub struct QedStep {
     pub activation: StepActivation,
     /// Runtime conditional (R506) — a `${{ <expr> }}`-style expression
     /// evaluated against the W201-F4 context (matrix coords, env, prior
-    /// `steps.<X>.outputs.<Y>`, plus `success()` / `failure()`). When the
+    /// `steps.<X>.outputs.<Y>`, the run's resolved `params.<name>` (R653-F1),
+    /// plus `success()` / `failure()`). `params.<name>` is what makes a run
+    /// param a build VARIANT rather than a substitution — a step gated
+    /// `if = "params.variant == 'full'"` runs only for that value. When the
     /// expression evaluates to a falsy value the step is skipped at
     /// dispatch-time with [`RunStatus::Skipped`]. Bare expressions without
     /// `${{ }}` delimiters are evaluated as implicit-expression bodies (GHA
@@ -619,6 +948,13 @@ pub struct QedStep {
     /// `None` for every other step kind.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub wait_for: Option<WaitForConfig>,
+    /// For `kind = manual` (R622, W282): what the human has to accomplish, the
+    /// terminal commands to prefill for them, and the optional `advance`
+    /// condition that lets the pipeline *verify* they did it. Required when
+    /// `kind = manual`; `validate()` rejects a missing block / empty prompt at
+    /// parse time the same way `wait_for` does. `None` for every other kind.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub manual: Option<ManualConfig>,
     /// For `kind = manifest-stitch` (R590-F2): the arch-agnostic target tag and
     /// the per-arch source tags to fold into a multi-arch manifest list.
     /// Required when `kind = manifest-stitch`; `validate()` rejects a missing
@@ -757,6 +1093,29 @@ pub enum StepKind {
     /// `validate()` rejects `argv` and requires a `[manifest_stitch]` block with
     /// a target + at least one source.
     ManifestStitch,
+    /// Park the run on a **human** and advance when they say so (R622, W282).
+    /// The pure-gate sibling of [`StepKind::WaitFor`]: it runs no `argv` of its
+    /// own, produces nothing, and blocks until a condition is met — except the
+    /// condition is a person rather than a socket. Config lives on
+    /// [`QedStep::manual`]: the prompt, the terminal commands to prefill, an
+    /// optional `advance` shell condition, and an advisory checklist.
+    ///
+    /// The human surface is the AnswerQueue (W111): the step mints a `Form` and
+    /// parks on it, so durability, notification, and the approve/revise
+    /// affordance all come from the primitive the camp already has. The runner
+    /// itself only knows a [`crate::runner::ManualGate`] — the headless
+    /// (`yah qed run`) path installs no gate and resolves the step from
+    /// `advance` alone.
+    ///
+    /// A parked step **releases its `concurrency_key`** and reacquires it to
+    /// resume: holding `cargo-target` through an overnight park would stall
+    /// every cargo pipeline in the camp. The tree can therefore move while
+    /// parked, which is why resume re-evaluates `advance` instead of blindly
+    /// continuing.
+    ///
+    /// A manual step is a *coordination* point, not an authorization gate — it
+    /// does not know who answered and makes no claim they were entitled to.
+    Manual,
 }
 
 /// Maximum allowed sub-pipeline nesting depth, counted as the number of
@@ -869,6 +1228,26 @@ pub struct GhaWorkflowConfig {
     /// expression context. Ignored when `event != "workflow_dispatch"`.
     #[serde(default)]
     pub inputs: HashMap<String, String>,
+    /// Narrow the wrapped workflow's matrix fan-out by dimension VALUE, so a
+    /// pipeline can wrap a multi-row workflow and run one row:
+    ///
+    /// ```toml
+    /// [pipeline.steps.gha_workflow]
+    /// path   = ".github/workflows/appliance-image.yml"
+    /// matrix = { board = "{{board}}" }
+    /// ```
+    ///
+    /// Values go through [`Pipeline::apply_params`], so a run param picks the
+    /// row. A constraint over a dimension a job does not have is a no-op for that
+    /// job — this narrows a fan-out, it does not disable jobs. Lowered onto
+    /// `yah_qed_gha::Executor::matrix_filter`, where the full semantics live.
+    ///
+    /// Distinct from the run-time `selected_matrix_instances` RPC field, which is
+    /// POSITIONAL (`build#0`) because the dashboard seeds it from an observed run.
+    /// A checked-in pipeline must not depend on row order: inserting a value into
+    /// the workflow's matrix silently repoints every index after it.
+    #[serde(default)]
+    pub matrix: HashMap<String, String>,
 }
 
 /// Step-level config for [`StepKind::Import`] (W224, R533-F1). The W224 import
@@ -994,6 +1373,66 @@ impl WaitForConfig {
     }
 }
 
+/// Step-level config for [`StepKind::Manual`] (R622, W282). Describes the
+/// human's half of a pipeline: what they must accomplish, what to put in front
+/// of them, and how the pipeline confirms they did it.
+///
+/// ```toml
+/// [[pipeline.steps]]
+/// name = "commit-and-tag"
+/// kind = "manual"
+/// [pipeline.steps.manual]
+/// prompt = "Review the version bump, commit it, and tag the release."
+/// terminal = ["git status", "git diff --stat"]
+/// advance = "git describe --tags --exact-match"
+/// checklist = ["Diff reviewed", "Version matches intent"]
+/// ```
+///
+/// [`Self::advance`] is the field that matters. Without it a manual step is a
+/// button someone clicks to make the yellow box go away — it asserts nothing.
+/// With it the pipeline *confirms the human actually did the thing* before
+/// spending an irreversible step on it. Treat it as strongly encouraged; a
+/// manual step without one should be rare and deliberate.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct ManualConfig {
+    /// Rendered on the run card / answer form. Say what the human must
+    /// accomplish, not how — the `terminal` prefill covers the how.
+    pub prompt: String,
+    /// Commands to prefill terminal tiles with. **Not auto-run** — the human
+    /// reads, then executes. A pipeline that silently runs `git` commands on
+    /// someone's behalf is the opposite of what a manual step is for.
+    ///
+    /// Rendered into the form's `framing` as a ```sh fence, which the desktop
+    /// Markdown renderer already turns into a run-button + inline terminal.
+    #[serde(default)]
+    pub terminal: Vec<String>,
+    /// Shell condition that proves the human did the thing. Polled while
+    /// parked (auto-advancing the moment it exits 0) and **re-evaluated on
+    /// resume** — the tree can move during a park, so a resume is not a bare
+    /// continue. On a non-zero exit after a human answer the step re-parks
+    /// carrying the failing command and its stderr.
+    ///
+    /// Run through `sh -c` in the pipeline workspace. `None` ⇒ honour-system
+    /// advance on the human's word alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advance: Option<String>,
+    /// Advisory checkboxes on the card. Purely informational — they gate
+    /// nothing (that is [`Self::advance`]'s job).
+    #[serde(default)]
+    pub checklist: Vec<String>,
+    /// Cadence, in seconds, for polling [`Self::advance`] while parked.
+    /// Defaults to 5s — a park spans human time, so there is nothing to gain
+    /// from a tighter loop and a `git describe` per second is pure noise.
+    /// Ignored when `advance` is `None` (nothing to poll).
+    #[serde(default = "default_manual_advance_poll_secs")]
+    pub advance_poll_secs: u64,
+}
+
+fn default_manual_advance_poll_secs() -> u64 {
+    5
+}
+
 /// Step-level config for [`StepKind::ManifestStitch`] (R590-F2). Names the
 /// arch-agnostic manifest-list tag to publish and the per-arch source tags to
 /// fold into it.
@@ -1106,7 +1545,7 @@ pub trait SubPipelineResolver {
     ///
     /// For [`SubPipelineRef::Peer`] this is the *peer* camp's root, so a
     /// peer's `cargo` steps run in the peer's workspace rather than the
-    /// parent camp's — without this, `peer-release` runs yubaba's
+    /// parent camp's — without this, `peer-binaries` runs yubaba's
     /// `cargo publish -p workload-spec` from yah's root and fails with a
     /// "package ID did not match any packages" error.
     ///
@@ -1272,6 +1711,20 @@ pub enum StepValidationError {
          has no lifecycle yet (R513-F2)"
     )]
     BackgroundRequiresSubprocess(String),
+    #[error(
+        "step `{0}`: `secret = true` is only valid on subprocess steps — every other \
+         kind's output is qed's own text (docker build progress, a wait-for probe's \
+         verdict), so the runner has no step-authored capture there to suppress and \
+         the flag would silently do nothing (R717-T2)"
+    )]
+    SecretRequiresSubprocess(String),
+    #[error(
+        "step `{0}`: `secret = true` cannot be combined with declared `outputs` — a secret step's \
+         $YAH_OUTPUTS is dropped unread, so the output would always be empty and any [[bind]] \
+         reading it would bind nothing. If you need a value out of this step, that value is not \
+         secret: split it into its own step (R717-T2)"
+    )]
+    SecretCannotDeclareOutputs(String),
     #[error("step `{0}`: wait-for steps must omit `argv` (a wait-for is a pure gate)")]
     WaitForHasArgv(String),
     #[error(
@@ -1308,6 +1761,24 @@ pub enum StepValidationError {
          (the per-arch tags to fold into the manifest list)"
     )]
     ManifestStitchNeedsSources(String),
+    #[error("step `{0}`: manual steps must omit `argv` (a manual step is a pure gate — put the commands in `manual.terminal`, which the human runs, or in `manual.advance`, which verifies them)")]
+    ManualHasArgv(String),
+    #[error(
+        "step `{0}`: manual steps require a `[manual]` block with `prompt = \"...\"` \
+         (say what the human must accomplish)"
+    )]
+    ManualMissingConfig(String),
+    #[error("step `{0}`: manual `prompt` must not be empty — an unlabelled gate is unanswerable")]
+    ManualEmptyPrompt(String),
+    #[error("step `{0}`: manual `advance` must not be blank — omit it entirely for an honour-system gate")]
+    ManualBlankAdvance(String),
+    #[error("step `{0}`: manual `advance_poll_secs` must be greater than zero")]
+    ManualZeroPollInterval(String),
+    #[error(
+        "step `{0}`: a manual step parks on a human at the qed host and evaluates \
+         `advance` there — drop `runtime = \"container\"` or set `runtime = \"native\"`"
+    )]
+    ManualContainerRuntime(String),
     #[error(
         "finally step `{0}`: v1 `[[finally]]` teardown supports only `kind = subprocess` \
          (and never `background`) — composite / image / sidecar teardown is a follow-up"
@@ -1351,6 +1822,31 @@ impl QedStep {
         // offending step at parse time rather than mid-run.
         if self.is_background() && self.kind != StepKind::Subprocess {
             return Err(StepValidationError::BackgroundRequiresSubprocess(
+                self.name.clone(),
+            ));
+        }
+        // R717-T2: `secret` is a Subprocess-only knob, for the same reason
+        // `background` is — and rejecting it here is what makes the opt-out a
+        // closed set rather than a best effort. The runner gates the three
+        // subprocess output sinks (local native, local container, remote); every
+        // other kind's output is qed's own text (docker build progress, a
+        // wait-for probe's "healthy after 3s"), so accepting `secret` there
+        // would promise a suppression the runner does not perform. Better to
+        // fail at parse time than to ship a flag that silently does nothing on
+        // the step an author actually put it on.
+        if self.secret && self.kind != StepKind::Subprocess {
+            return Err(StepValidationError::SecretRequiresSubprocess(
+                self.name.clone(),
+            ));
+        }
+        // R717-T2: a secret step is a SINK, not a source. Its `$YAH_OUTPUTS` is
+        // dropped unread, so a declared output would be permanently empty and a
+        // `[[bind]]` reading it would silently bind nothing. Reject the pair at
+        // parse time — an author who wants a value out of a secret step is
+        // telling us that value is not actually secret, and the fix is to split
+        // the step, not to weaken the flag.
+        if self.secret && !self.outputs.is_empty() {
+            return Err(StepValidationError::SecretCannotDeclareOutputs(
                 self.name.clone(),
             ));
         }
@@ -1500,6 +1996,36 @@ impl QedStep {
                 }
                 Ok(())
             }
+            StepKind::Manual => {
+                if !self.argv.is_empty() {
+                    return Err(StepValidationError::ManualHasArgv(self.name.clone()));
+                }
+                let Some(cfg) = self.manual.as_ref() else {
+                    return Err(StepValidationError::ManualMissingConfig(self.name.clone()));
+                };
+                if cfg.prompt.trim().is_empty() {
+                    return Err(StepValidationError::ManualEmptyPrompt(self.name.clone()));
+                }
+                if cfg.advance.as_ref().is_some_and(|a| a.trim().is_empty()) {
+                    return Err(StepValidationError::ManualBlankAdvance(self.name.clone()));
+                }
+                if cfg.advance_poll_secs == 0 {
+                    return Err(StepValidationError::ManualZeroPollInterval(
+                        self.name.clone(),
+                    ));
+                }
+                // A manual step is a person at a keyboard on the qed host, and
+                // `advance` is evaluated in the pipeline workspace on that same
+                // host. A container has neither. Reject at parse time rather
+                // than resolving to Container on a Remote runner and surprising
+                // the author mid-release.
+                if matches!(self.runtime, Some(TaskRuntime::Container)) {
+                    return Err(StepValidationError::ManualContainerRuntime(
+                        self.name.clone(),
+                    ));
+                }
+                Ok(())
+            }
             StepKind::ManifestStitch => {
                 if !self.argv.is_empty() {
                     return Err(StepValidationError::ManifestStitchHasArgv(self.name.clone()));
@@ -1582,6 +2108,41 @@ impl Default for OnFail {
     }
 }
 
+/// Why a run's params could not be resolved against the pipeline's declarations.
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
+pub enum ParamError {
+    /// One or more required params have neither a supplied value nor a default.
+    /// Names every one of them, not just the first: a caller wiring up a
+    /// five-param recipe wants one message, not five round trips.
+    #[error(
+        "pipeline '{pipeline}': required parameter(s) not provided and no default declared: {}\n\
+         pass them with --param <name>=<value>, or give them `default = \"…\"` in the pipeline TOML",
+        names.join(", ")
+    )]
+    MissingRequired {
+        pipeline: String,
+        names: Vec<String>,
+    },
+    /// A param declaring `options` was given a value outside that set.
+    ///
+    /// Rejecting (rather than merely not suggesting) is safe *because*
+    /// `options` is opt-in: a pipeline that doesn't declare it cannot start
+    /// failing, so no existing `--param` call changes behaviour. The moment an
+    /// author writes `options = [...]` they are asserting the set is closed,
+    /// and a typo'd variant should stop the run rather than silently substitute
+    /// a value no step was written for.
+    #[error(
+        "pipeline '{pipeline}': parameter '{name}' = {value:?} is not one of its declared options: {}",
+        options.join(", ")
+    )]
+    NotInOptions {
+        pipeline: String,
+        name: String,
+        value: String,
+        options: Vec<String>,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct ParamDef {
@@ -1589,13 +2150,63 @@ pub struct ParamDef {
     pub required: bool,
     #[serde(default)]
     pub description: Option<String>,
+    /// Value used when the run supplies none. This is what makes a param
+    /// OPTIONAL in a usable way, because an absent param is not substituted at
+    /// all — [`substitute`] leaves unknown placeholders alone, so a step whose
+    /// `argv` says `{{features}}` ships the literal string `{{features}}` to the
+    /// process it execs.
+    ///
+    /// That footgun is currently worked around by convention rather than fixed:
+    /// `.yah/qed/release-build.toml` declares all five of its params
+    /// `required` and documents that callers must "ALWAYS pass (empty string
+    /// where N/A) … an omitted param would ship `{{features}}` straight into the
+    /// cross argv". `default = ""` expresses that directly, and a param with a
+    /// default no longer has to lie about being required.
+    #[serde(default)]
+    pub default: Option<String>,
+    /// The closed set of legal values, e.g.
+    /// `options = ["orangepi_zero2w", "rpi_zero2w"]`. Empty (the default) means
+    /// the param is free-form text.
+    ///
+    /// This is what turns a param into a *variant selector* rather than a
+    /// substitution: the operator surface renders a dropdown instead of a text
+    /// box, and [`Pipeline::resolve_params`] rejects anything outside the set
+    /// (see [`ParamError::NotInOptions`]). A `default` that isn't in `options`
+    /// is an authoring error, caught at load time by the config loader.
+    #[serde(default)]
+    pub options: Vec<String>,
+    /// A camp-relative path glob whose matches' **file stems** become
+    /// [`Self::options`] at READ time — R717-T10, W296 §Q3:
+    ///
+    /// ```toml
+    /// node = { required = true, options_from = ".yah/infra/machines/*.toml" }
+    /// ```
+    ///
+    /// It **composes with** `options` rather than adding a second validation
+    /// path: resolution *fills* `options`, so [`Pipeline::resolve_params`] and
+    /// [`ParamError::NotInOptions`] keep working unchanged and the desktop
+    /// renders the dropdown it already renders for a closed set.
+    ///
+    /// Read time, not load time, is the point: a machine added to
+    /// `.yah/infra/machines/` shows up in the selector without anyone editing
+    /// the doc. A glob naming a *directory convention* is also why this is not
+    /// `kind = "machine"` — a domain word here would put fleet concepts in
+    /// QED's param schema forever, while a glob is reusable by any other
+    /// domain (`.yah/qed/*.toml`, `.yah/docs/working/W*.md`).
+    ///
+    /// Resolution lives in
+    /// [`doc_source::resolve_options_from`](crate::doc_source::resolve_options_from);
+    /// a glob matching nothing is an authoring error there, never a silent
+    /// degrade to free text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options_from: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub enum Outcome {
-    WardenDeploy {
+    YubabaDeploy {
         service: String,
         env: String,
     },
@@ -1671,6 +2282,100 @@ pub struct QedRunMeta {
     /// on a top-level run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_run_id: Option<QedRunId>,
+    /// What this run was *about*, when it came from a doc cell (R717-T3, W296).
+    ///
+    /// Every other field here says what ran. This says what it was about — and
+    /// nothing in the tree indexed a QED run that way before: runs are keyed by
+    /// `run_id` and grouped by pipeline name, which is enough to answer "did
+    /// `node-onboard` pass?" and useless for answering "did it pass **for
+    /// `us-west-003`**?". Those are different questions and a runbook shared
+    /// between two operators only has the second one.
+    ///
+    /// `None` on every non-doc run and on all ~494 run metas already on disk.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cell: Option<CellRef>,
+    /// Compact per-row label for a matrix-fan-out child (e.g.
+    /// `"target=x86_64-unknown-linux-gnu"`, mirrors [`matrix::PlannedJob::label`]) —
+    /// distinguishes sibling children that otherwise share the parent's
+    /// `pipeline` name. The qed runner itself never sets this (it has no
+    /// notion of the matrix row it's running); the daemon stamps it on the
+    /// child's registered meta at fan-out time. `None` on a top-level run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+}
+
+/// What a run was about: the doc cell it came from and the subject it was
+/// resolved for (R717-T3, W296).
+///
+/// The three fields are one key, and the third is the load-bearing one. W257
+/// must render **green for `us-west-003` and unrun for `us-west-013` at the same
+/// time**; a badge keyed only by `(doc, cell_id)` would show the `us-west-003`
+/// result to an operator who opened the doc intending to build `us-west-013` —
+/// a green light about the wrong box, which is worse than no light at all.
+///
+/// The run meta stays the source of truth for this. Any derived index
+/// (R717-F6's `cells.json`) is therefore rebuildable by rescanning
+/// `.yah/jit/qed/*.json`, the same property `load_qed_history` already relies
+/// on — an index that can be regenerated cannot become authoritative by
+/// accident, and cannot rot into a lie when a run file is hand-deleted.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CellRef {
+    /// Camp-root-relative path of the source document, e.g.
+    /// `.yah/docs/working/W257-static-node-fleet-onboarding.md`. Relative so the
+    /// key means the same thing in two checkouts of the same camp.
+    pub doc: String,
+    /// The cell's author-assigned `cell=<id>`. **Never positional** — these docs
+    /// get reordered constantly, and a positional key would silently reattach a
+    /// run to whatever cell later occupied that slot.
+    pub cell_id: String,
+    /// [`param_fingerprint`] of the run's resolved params — the subject.
+    pub param_fingerprint: String,
+}
+
+/// blake3 over the canonicalized resolved params, hex-encoded: the subject half
+/// of a [`CellRef`] (R717-T3).
+///
+/// **Canonicalization is the whole point.** Two operators who reach the same
+/// effective params by different routes — one passing `--param node=us-west-003`
+/// explicitly, one taking a `default = "us-west-003"`, in whatever order their
+/// tooling happened to build the map — must produce the same fingerprint, or the
+/// badge for one box splits into two half-populated histories and neither reads
+/// as the truth.
+///
+/// The rules, each chosen against a way of getting this wrong:
+///
+/// - **Sorted by key.** `HashMap` iteration order is not stable across runs, let
+///   alone across processes, so hashing in iteration order would give the *same
+///   operator* a different fingerprint on a re-run.
+/// - **Fed the post-[`Pipeline::resolve_params`] map**, so a param taken from
+///   its `default` is indistinguishable from the same value passed explicitly.
+///   That is the intended equivalence: the subject is what the run was *about*,
+///   not how the operator spelled it.
+/// - **Empty values participate.** `node=""` is not the same subject as an unset
+///   `node`, and collapsing them would merge two histories.
+/// - **Length-prefixed framing** rather than a delimiter. `a=b&c=d` and
+///   `a=b&c` + `=d` are different param sets that a naive `join` can render
+///   identically; a value containing the delimiter is a real possibility in a
+///   free-text param, and a fingerprint collision here means showing one box's
+///   verdict for another.
+///
+/// An empty param map fingerprints to a stable value rather than being rejected:
+/// a doc with no params has exactly one subject, and that is a legitimate
+/// notebook, not an error.
+pub fn param_fingerprint(params: &HashMap<String, String>) -> String {
+    let mut keys: Vec<&String> = params.keys().collect();
+    keys.sort();
+    let mut hasher = blake3::Hasher::new();
+    for key in keys {
+        let value = &params[key];
+        // Length-prefixed: no byte sequence inside a key or value can forge a
+        // boundary, so distinct param maps cannot share a preimage.
+        hasher.update(&(key.len() as u64).to_le_bytes());
+        hasher.update(key.as_bytes());
+        hasher.update(&(value.len() as u64).to_le_bytes());
+        hasher.update(value.as_bytes());
+    }
+    hasher.finalize().to_hex().to_string()
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1682,6 +2387,16 @@ pub enum RunStatus {
     /// transitions to `Running` when the key's mutex is acquired.
     Queued,
     Running,
+    /// Parked on a human (R622, W282) — a [`StepKind::Manual`] step minted a
+    /// prompt and is waiting for someone to answer it (or for its `advance`
+    /// condition to start passing).
+    ///
+    /// **Non-terminal**, and deliberately so: like `Queued`/`Running` it
+    /// contributes nothing to [`RunStatus::aggregate`]. A parked run has
+    /// released its `concurrency_key` and re-enters `Queued` to reacquire it
+    /// on resume, so the full shape is
+    /// `Running → AwaitingHuman → Queued → Running`.
+    AwaitingHuman,
     Success,
     Failed,
     Cancelled,
@@ -1700,8 +2415,9 @@ impl RunStatus {
     /// for the same set of rows: any `Failed` wins, then `Cancelled`, then
     /// `Success`, and only an all-`Skipped` (or empty) set reports `Skipped`.
     ///
-    /// `Queued` / `Running` contribute nothing — `aggregate` is meant to be
-    /// called once every child has reached a terminal state.
+    /// `Queued` / `Running` / `AwaitingHuman` contribute nothing — `aggregate`
+    /// is meant to be called once every child has reached a terminal state, and
+    /// all three are non-terminal (a parked run is *waiting*, not a verdict).
     pub fn aggregate<I: IntoIterator<Item = RunStatus>>(children: I) -> RunStatus {
         let mut seen_success = false;
         let mut seen_failure = false;
@@ -1713,7 +2429,10 @@ impl RunStatus {
                 RunStatus::Failed => seen_failure = true,
                 RunStatus::Cancelled => seen_cancelled = true,
                 RunStatus::Success => seen_success = true,
-                RunStatus::Skipped | RunStatus::Queued | RunStatus::Running => {}
+                RunStatus::Skipped
+                | RunStatus::Queued
+                | RunStatus::Running
+                | RunStatus::AwaitingHuman => {}
             }
         }
         if !seen_any {
@@ -1761,6 +2480,26 @@ pub struct StepStatus {
     /// the step failed before any bind could fire.
     #[serde(default)]
     pub applied_binds: Vec<manifest_bind::AppliedBind>,
+    /// blake3 digest of every path this step declared in [`QedStep::inputs`],
+    /// hashed **immediately before** the step executed (R717-T1, W296). Keyed by
+    /// the declared (camp-root-relative) path; a path that did not exist or
+    /// could not be read records [`crate::staleness::ABSENT_INPUT`] rather than
+    /// being omitted, so "the file was missing when this ran" and "this run
+    /// predates the field" stay distinguishable.
+    ///
+    /// Hashed *before* rather than *after* on purpose: the digest answers "which
+    /// bytes produced this result?", and a step that rewrites its own input
+    /// would otherwise record the bytes it emitted instead of the ones it read.
+    ///
+    /// This is the **only** persisted half of staleness — there is no stale
+    /// `RunStatus`. A reader compares this map against the tree via
+    /// [`crate::staleness::input_freshness`] at read time. `BTreeMap` so the
+    /// serialized journal is byte-stable across runs with the same inputs.
+    ///
+    /// Empty for every step that declares no `inputs`, and for every one of the
+    /// ~494 run metas on disk that predate this field.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub input_hashes: std::collections::BTreeMap<String, String>,
     /// Per-job rows for a step that wraps a foreign pipeline (W223 R532-T1).
     /// Non-empty only when this step wraps a GitHub Actions workflow — whether
     /// reached as a [`StepKind::GhaWorkflow`] step or a [`StepKind::SubPipeline`]
@@ -1798,6 +2537,13 @@ pub struct JobRow {
     /// `None` for success / skipped rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Cause for a `Skipped` row (R330-B41) — a failed/skipped `needs:`
+    /// dependency (named), an `if:` condition that evaluated false, or a
+    /// matrix/instance-selector filter that excluded this row. Mirrors
+    /// [`yah_qed_gha::InstanceRun::skip_reason`] verbatim. `None` for
+    /// non-skipped rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<String>,
     /// Logical job ids this job `needs:` — the intra-workflow dependency edges
     /// already computed by `yah_qed_gha::plan` (W223 R532-F2). The graph viewer
     /// renders these as real dependency edges between the inlined job nodes, so
@@ -1813,12 +2559,17 @@ mod tests {
 
     fn one_step(argv: Vec<&str>, env: &[(&str, &str)]) -> Pipeline {
         Pipeline {
+            description: None,
+            tags: Vec::new(),
             name: "p".into(),
             label: "p".into(),
             steps: vec![QedStep {
+                inputs: Vec::new(),
+                secret: false,
                 background: false,
                 background_until: None,
                 wait_for: None,
+                manual: None,
                 manifest_stitch: None,
                 name: "s".into(),
                 argv: argv.into_iter().map(String::from).collect(),
@@ -1868,6 +2619,66 @@ mod tests {
         }
     }
 
+    // ---- R719-F1: the concurrency-key default ---------------------------
+    //
+    // These pin an inversion, so they are written to fail loudly if someone
+    // restores the old behaviour: the whole point is that forgetting a key now
+    // costs you serialization instead of silently costing you safety.
+
+    #[test]
+    fn an_unkeyed_pipeline_defaults_to_the_camp_global_key() {
+        let p = one_step(vec!["true"], &[]);
+        assert_eq!(p.concurrency_key, None, "fixture must be unkeyed");
+        assert_eq!(p.effective_concurrency_key(), DEFAULT_CONCURRENCY_KEY);
+        assert_ne!(
+            p.effective_concurrency_key(),
+            p.name,
+            "R719-F1 inverted this: the pipeline NAME must no longer be the default"
+        );
+    }
+
+    /// The behaviour change that matters, stated directly: two *different*
+    /// unkeyed pipelines now share one lane. Under the old default they had
+    /// two, which is how an unstamped `desktop-release` ran concurrently with
+    /// itself-by-another-name.
+    #[test]
+    fn two_different_unkeyed_pipelines_now_share_one_lane() {
+        let mut a = one_step(vec!["true"], &[]);
+        a.name = "alpha".into();
+        let mut b = one_step(vec!["true"], &[]);
+        b.name = "beta".into();
+        assert_eq!(a.effective_concurrency_key(), b.effective_concurrency_key());
+    }
+
+    #[test]
+    fn an_explicit_key_still_wins_and_is_untouched() {
+        let mut p = one_step(vec!["true"], &[]);
+        p.concurrency_key = Some("cargo-target".into());
+        assert_eq!(p.effective_concurrency_key(), "cargo-target");
+        assert!(!p.is_parallel());
+    }
+
+    #[test]
+    fn the_parallel_sentinel_still_opts_out() {
+        let mut p = one_step(vec!["true"], &[]);
+        p.concurrency_key = Some(PARALLEL_CONCURRENCY_KEY.into());
+        assert!(p.is_parallel());
+
+        // …and the new default is NOT an opt-out. A sentinel that accidentally
+        // read as parallel would invert the inversion.
+        let unkeyed = one_step(vec!["true"], &[]);
+        assert!(!unkeyed.is_parallel());
+    }
+
+    /// A pipeline literally named `@camp` must not accidentally join the
+    /// default lane by name — the fallback is on the *key*, not the name.
+    #[test]
+    fn the_sentinels_are_spelled_so_a_name_cannot_collide() {
+        assert!(DEFAULT_CONCURRENCY_KEY.starts_with('@'));
+        assert!(PARALLEL_CONCURRENCY_KEY.starts_with('@'));
+        assert_ne!(DEFAULT_CONCURRENCY_KEY, PARALLEL_CONCURRENCY_KEY);
+    }
+
     #[test]
     fn apply_params_substitutes_argv_and_env() {
         let mut p = one_step(
@@ -1879,6 +2690,210 @@ mod tests {
         p.apply_params(&params);
         assert_eq!(p.steps[0].argv, vec!["run", "--", "groq"]);
         assert_eq!(p.steps[0].env.get("KEY").unwrap(), "groq-x");
+    }
+
+    #[test]
+    fn resolve_params_fills_declared_defaults() {
+        // The release-build case, expressed properly. That pipeline declares
+        // all five params `required` and documents that callers must always pass
+        // them, "empty string where N/A", precisely because an absent param is
+        // left as a literal `{{features}}` in the argv. A default says that once,
+        // in the pipeline, instead of in every caller.
+        let mut p = one_step(vec!["build", "{{package}}", "{{features}}"], &[]);
+        p.params.insert(
+            "package".to_string(),
+            ParamDef { required: true, description: None, default: None, options: Vec::new(), options_from: None },
+        );
+        p.params.insert(
+            "features".to_string(),
+            ParamDef {
+                required: false,
+                description: None,
+                default: Some(String::new()),
+                options: Vec::new(),
+                options_from: None,
+            },
+        );
+
+        let supplied: HashMap<String, String> =
+            [("package".to_string(), "yah".to_string())].into_iter().collect();
+        let resolved = p.resolve_params(&supplied).expect("package supplied, features defaulted");
+        assert_eq!(resolved.get("features").map(String::as_str), Some(""));
+
+        p.apply_params(&resolved);
+        assert_eq!(p.steps[0].argv, vec!["build", "yah", ""]);
+    }
+
+    #[test]
+    fn resolve_params_names_every_missing_required_param_at_once() {
+        // A five-param recipe should cost one error message, not five round
+        // trips — and a `required` param that declares a default is satisfied.
+        let mut p = one_step(vec!["x"], &[]);
+        for name in ["board", "version"] {
+            p.params.insert(
+                name.to_string(),
+                ParamDef { required: true, description: None, default: None, options: Vec::new(), options_from: None },
+            );
+        }
+        p.params.insert(
+            "channel".to_string(),
+            ParamDef {
+                required: true,
+                description: None,
+                default: Some("stable".to_string()),
+                options: Vec::new(),
+                options_from: None,
+            },
+        );
+
+        let err = p.resolve_params(&HashMap::new()).expect_err("two params missing");
+        match &err {
+            ParamError::MissingRequired { names, .. } => {
+                assert_eq!(names, &vec!["board".to_string(), "version".to_string()]);
+            }
+            other => panic!("expected MissingRequired, got {other:?}"),
+        }
+        // The message has to name both and say how to fix it.
+        let msg = err.to_string();
+        assert!(msg.contains("board") && msg.contains("version"), "got: {msg}");
+        assert!(msg.contains("--param"), "got: {msg}");
+        assert!(!msg.contains("channel"), "a default satisfies required: {msg}");
+    }
+
+    #[test]
+    fn resolve_params_passes_supplied_values_through_untouched() {
+        // A supplied value always wins over a default, and an undeclared param is
+        // passed through rather than rejected (documented on `resolve_params`).
+        let mut p = one_step(vec!["x"], &[]);
+        p.params.insert(
+            "channel".to_string(),
+            ParamDef {
+                required: false,
+                description: None,
+                default: Some("stable".to_string()),
+                options: Vec::new(),
+                options_from: None,
+            },
+        );
+        let supplied: HashMap<String, String> = [
+            ("channel".to_string(), "beta".to_string()),
+            ("undeclared".to_string(), "kept".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let resolved = p.resolve_params(&supplied).expect("resolves");
+        assert_eq!(resolved.get("channel").map(String::as_str), Some("beta"));
+        assert_eq!(resolved.get("undeclared").map(String::as_str), Some("kept"));
+    }
+
+    /// A param with `options` is a variant selector: in-set values resolve, and
+    /// the default it falls back to is one of them.
+    #[test]
+    fn resolve_params_accepts_a_declared_option() {
+        let mut p = one_step(vec!["build", "--board", "{{board}}"], &[]);
+        p.params.insert(
+            "board".to_string(),
+            ParamDef {
+                required: false,
+                description: Some("Which appliance board to build for".to_string()),
+                default: Some("orangepi_zero2w".to_string()),
+                options: vec!["orangepi_zero2w".to_string(), "rpi_zero2w".to_string()],
+                options_from: None,
+            },
+        );
+
+        let supplied: HashMap<String, String> =
+            [("board".to_string(), "rpi_zero2w".to_string())].into_iter().collect();
+        let resolved = p.resolve_params(&supplied).expect("rpi_zero2w is declared");
+        assert_eq!(resolved.get("board").map(String::as_str), Some("rpi_zero2w"));
+
+        // Omitted ⇒ the default, which must itself be in the set.
+        let defaulted = p.resolve_params(&HashMap::new()).expect("default is in-set");
+        assert_eq!(defaulted.get("board").map(String::as_str), Some("orangepi_zero2w"));
+    }
+
+    #[test]
+    fn resolve_params_rejects_a_value_outside_the_declared_options() {
+        // The whole reason to reject rather than merely not-suggest: with R653-F1
+        // shipped, `params.board` can gate a step's `if=`, so a typo'd variant
+        // doesn't just substitute wrong text — it silently skips steps.
+        let mut p = one_step(vec!["build", "{{board}}"], &[]);
+        p.params.insert(
+            "board".to_string(),
+            ParamDef {
+                required: true,
+                description: None,
+                default: None,
+                options: vec!["orangepi_zero2w".to_string(), "rpi_zero2w".to_string()],
+                options_from: None,
+            },
+        );
+        let supplied: HashMap<String, String> =
+            [("board".to_string(), "rpi_zero2".to_string())].into_iter().collect();
+        let err = p.resolve_params(&supplied).expect_err("not a declared board");
+        match &err {
+            ParamError::NotInOptions { name, value, options, .. } => {
+                assert_eq!(name, "board");
+                assert_eq!(value, "rpi_zero2");
+                assert_eq!(options.len(), 2);
+            }
+            other => panic!("expected NotInOptions, got {other:?}"),
+        }
+        // The message has to show the legal set — that is the whole repair hint.
+        let msg = err.to_string();
+        assert!(msg.contains("orangepi_zero2w") && msg.contains("rpi_zero2w"), "got: {msg}");
+    }
+
+    #[test]
+    fn resolve_params_leaves_free_form_params_unconstrained() {
+        // Empty `options` is the default and means free-form: opting in is what
+        // closes the set, so no pre-existing pipeline starts rejecting values.
+        let mut p = one_step(vec!["tag", "{{version}}"], &[]);
+        p.params.insert(
+            "version".to_string(),
+            ParamDef {
+                required: true,
+                description: None,
+                default: None,
+                options: Vec::new(),
+                options_from: None,
+            },
+        );
+        let supplied: HashMap<String, String> =
+            [("version".to_string(), "v9.9.9-rc1".to_string())].into_iter().collect();
+        let resolved = p.resolve_params(&supplied).expect("free-form param takes anything");
+        assert_eq!(resolved.get("version").map(String::as_str), Some("v9.9.9-rc1"));
+    }
+
+    #[test]
+    fn apply_params_substitutes_gha_workflow_matrix_and_inputs() {
+        // A gha-workflow step has no argv and no env, so before this these two
+        // maps were the only parameterisable surface it had — and neither was
+        // substituted. `matrix = { board = "{{board}}" }` is the whole point of
+        // the row selector: without substitution it would filter on the literal
+        // string "{{board}}" and skip every row.
+        let mut p = one_step(vec![], &[]);
+        p.steps[0].kind = StepKind::GhaWorkflow;
+        p.steps[0].gha_workflow = Some(GhaWorkflowConfig {
+            path: ".github/workflows/appliance-image.yml".into(),
+            event: Some("workflow_dispatch".into()),
+            inputs: [("version".to_string(), "{{version}}".to_string())]
+                .into_iter()
+                .collect(),
+            matrix: [("board".to_string(), "{{board}}".to_string())]
+                .into_iter()
+                .collect(),
+        });
+        let params: HashMap<String, String> = [
+            ("board".to_string(), "rpi_zero2w".to_string()),
+            ("version".to_string(), "v0.1.0".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        p.apply_params(&params);
+        let cfg = p.steps[0].gha_workflow.as_ref().unwrap();
+        assert_eq!(cfg.matrix.get("board").unwrap(), "rpi_zero2w");
+        assert_eq!(cfg.inputs.get("version").unwrap(), "v0.1.0");
     }
 
     #[test]
@@ -1922,11 +2937,187 @@ mod tests {
         assert_eq!(RunStatus::aggregate([Queued, Running, Success]), Success);
     }
 
+    #[test]
+    fn run_status_aggregate_ignores_awaiting_human() {
+        use RunStatus::*;
+        // R622: a parked run is *waiting*, not a verdict — it joins
+        // Queued/Running on the "contributes nothing" side of the table.
+        assert_eq!(
+            RunStatus::aggregate([AwaitingHuman, Success]),
+            Success,
+            "a parked sibling must not downgrade a green aggregate"
+        );
+        assert_eq!(
+            RunStatus::aggregate([AwaitingHuman, Failed]),
+            Failed,
+            "nor mask a red one"
+        );
+        assert_eq!(
+            RunStatus::aggregate([AwaitingHuman, Skipped]),
+            Skipped,
+            "nor promote an all-skipped set"
+        );
+        // And on its own it is vacuous, exactly like [Running].
+        assert_eq!(RunStatus::aggregate([AwaitingHuman]), Skipped);
+        assert_eq!(RunStatus::aggregate([Running]), Skipped);
+    }
+
+    #[test]
+    fn run_status_awaiting_human_serializes_lowercase() {
+        // The wire mapping in camp.rs and the persisted `<run_id>.json` both
+        // depend on this spelling; a rename here silently orphans parked runs
+        // written by an older build.
+        assert_eq!(
+            serde_json::to_string(&RunStatus::AwaitingHuman).unwrap(),
+            "\"awaitinghuman\""
+        );
+        assert_eq!(
+            serde_json::from_str::<RunStatus>("\"awaitinghuman\"").unwrap(),
+            RunStatus::AwaitingHuman
+        );
+    }
+
+    // ── R622 (W282): manual steps ──────────────────────────────────────────
+
+    fn manual_step(name: &str, cfg: ManualConfig) -> QedStep {
+        let mut step = QedStep::default();
+        step.name = name.into();
+        step.kind = StepKind::Manual;
+        step.manual = Some(cfg);
+        step
+    }
+
+    fn manual_cfg(prompt: &str) -> ManualConfig {
+        ManualConfig {
+            prompt: prompt.into(),
+            terminal: vec![],
+            advance: None,
+            checklist: vec![],
+            advance_poll_secs: 5,
+        }
+    }
+
+    #[test]
+    fn manual_step_validates_with_just_a_prompt() {
+        // An honour-system gate (no `advance`) is legal — discouraged in the
+        // docs, but the schema is not the place to enforce taste.
+        assert!(manual_step("commit-and-tag", manual_cfg("Tag the release."))
+            .validate()
+            .is_ok());
+    }
+
+    #[test]
+    fn manual_step_rejects_argv() {
+        // The pure-gate rule, same as wait-for: a manual step's commands go in
+        // `terminal` (the human runs them) or `advance` (the pipeline checks
+        // them), never in argv where the runner would run them silently.
+        let mut step = manual_step("gate", manual_cfg("Do the thing."));
+        step.argv = vec!["git".into(), "tag".into()];
+        assert_eq!(
+            step.validate(),
+            Err(StepValidationError::ManualHasArgv("gate".into()))
+        );
+    }
+
+    #[test]
+    fn manual_step_rejects_missing_config_and_empty_prompt() {
+        let mut step = manual_step("gate", manual_cfg("Do the thing."));
+        step.manual = None;
+        assert_eq!(
+            step.validate(),
+            Err(StepValidationError::ManualMissingConfig("gate".into()))
+        );
+
+        let blank = manual_step("gate", manual_cfg("   "));
+        assert_eq!(
+            blank.validate(),
+            Err(StepValidationError::ManualEmptyPrompt("gate".into()))
+        );
+    }
+
+    #[test]
+    fn manual_step_rejects_blank_advance_but_allows_absent() {
+        let mut step = manual_step("gate", manual_cfg("Tag it."));
+        step.manual.as_mut().unwrap().advance = Some("  ".into());
+        assert_eq!(
+            step.validate(),
+            Err(StepValidationError::ManualBlankAdvance("gate".into()))
+        );
+        step.manual.as_mut().unwrap().advance = Some("git describe --tags --exact-match".into());
+        assert!(step.validate().is_ok());
+    }
+
+    #[test]
+    fn manual_step_rejects_zero_poll_interval() {
+        let mut step = manual_step("gate", manual_cfg("Tag it."));
+        step.manual.as_mut().unwrap().advance_poll_secs = 0;
+        assert_eq!(
+            step.validate(),
+            Err(StepValidationError::ManualZeroPollInterval("gate".into()))
+        );
+    }
+
+    #[test]
+    fn manual_step_rejects_container_runtime() {
+        // W282 open question 3, decided: a container has no human at a keyboard
+        // and no positioned workspace to evaluate `advance` in. Reject at parse
+        // time rather than surprising the author mid-release.
+        let mut step = manual_step("gate", manual_cfg("Tag it."));
+        step.runtime = Some(TaskRuntime::Container);
+        assert_eq!(
+            step.validate(),
+            Err(StepValidationError::ManualContainerRuntime("gate".into()))
+        );
+        step.runtime = Some(TaskRuntime::Native);
+        assert!(step.validate().is_ok());
+    }
+
+    #[test]
+    fn manual_step_rejects_background() {
+        // `background` is Subprocess-only (R513-F2); a detached human gate is
+        // meaningless. Covered by the pre-match guard, asserted here so the
+        // interaction is pinned.
+        let mut step = manual_step("gate", manual_cfg("Tag it."));
+        step.background = true;
+        assert_eq!(
+            step.validate(),
+            Err(StepValidationError::BackgroundRequiresSubprocess(
+                "gate".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn manual_config_parses_from_toml_with_defaults() {
+        let step: QedStep = toml::from_str(
+            r#"
+name = "commit-and-tag"
+kind = "manual"
+[manual]
+prompt = "Review the bump, commit it, and tag vX.Y.Z."
+terminal = ["git status", "git diff --stat"]
+advance = "git describe --tags --exact-match"
+checklist = ["Diff reviewed"]
+"#,
+        )
+        .expect("manual step parses");
+        assert_eq!(step.kind, StepKind::Manual);
+        let cfg = step.manual.as_ref().expect("[manual] block");
+        assert_eq!(cfg.terminal.len(), 2);
+        assert_eq!(cfg.checklist, vec!["Diff reviewed".to_string()]);
+        assert_eq!(cfg.advance.as_deref(), Some("git describe --tags --exact-match"));
+        assert_eq!(cfg.advance_poll_secs, 5, "poll cadence defaults to 5s");
+        assert!(step.validate().is_ok());
+    }
+
     fn build_image_step(name: &str) -> QedStep {
         QedStep {
+            inputs: Vec::new(),
+            secret: false,
             background: false,
             background_until: None,
             wait_for: None,
+            manual: None,
             manifest_stitch: None,
             name: name.into(),
             argv: Vec::new(),
@@ -1961,9 +3152,12 @@ mod tests {
 
     fn package_native_tarball_step(name: &str) -> QedStep {
         QedStep {
+            inputs: Vec::new(),
+            secret: false,
             background: false,
             background_until: None,
             wait_for: None,
+            manual: None,
             manifest_stitch: None,
             name: name.into(),
             argv: Vec::new(),
@@ -1998,9 +3192,12 @@ mod tests {
 
     fn musl_static_preflight_step(name: &str) -> QedStep {
         QedStep {
+            inputs: Vec::new(),
+            secret: false,
             background: false,
             background_until: None,
             wait_for: None,
+            manual: None,
             manifest_stitch: None,
             name: name.into(),
             argv: Vec::new(),
@@ -2189,9 +3386,12 @@ mod tests {
 
     fn sign_native_tarball_step(name: &str) -> QedStep {
         QedStep {
+            inputs: Vec::new(),
+            secret: false,
             background: false,
             background_until: None,
             wait_for: None,
+            manual: None,
             manifest_stitch: None,
             name: name.into(),
             argv: Vec::new(),
@@ -2388,13 +3588,219 @@ mod tests {
         ));
     }
 
+    // ----- R717-T1 `inputs` / R717-T2 `secret` --------------------------------
+
+    /// The back-compat contract both fields have to hold: every pipeline TOML in
+    /// this camp predates them, so a step that omits them must deserialize, and
+    /// re-serializing must not invent keys (`skip_serializing_if` on `inputs`).
+    #[test]
+    fn a_step_omitting_inputs_and_secret_round_trips_unchanged() {
+        let step: QedStep = toml::from_str(
+            r#"
+            name = "check"
+            argv = ["cargo", "check"]
+            "#,
+        )
+        .expect("a pre-R717 step still deserializes");
+        assert!(step.inputs.is_empty());
+        assert!(!step.secret);
+        assert!(step.validate().is_ok());
+
+        let back = toml::to_string(&step).unwrap();
+        assert!(
+            !back.contains("inputs"),
+            "an undeclared `inputs` must not appear in ejected TOML: {back}"
+        );
+    }
+
+    #[test]
+    fn inputs_and_secret_parse_from_toml() {
+        let step: QedStep = toml::from_str(
+            r#"
+            name = "build-iso"
+            argv = ["sh", "-c", "build-iso.sh"]
+            inputs = [".yah/infra/preseed/build-iso.sh", ".yah/infra/preseed/yah-x86-worker.cfg"]
+            secret = true
+            "#,
+        )
+        .unwrap();
+        assert_eq!(step.inputs.len(), 2);
+        assert_eq!(
+            step.inputs[1],
+            std::path::PathBuf::from(".yah/infra/preseed/yah-x86-worker.cfg")
+        );
+        assert!(step.secret);
+    }
+
+    /// `secret` promises a suppression the runner only performs on the three
+    /// subprocess sinks. Accepting it elsewhere would ship a flag that silently
+    /// does nothing on the step an author put it on.
+    #[test]
+    fn secret_on_non_subprocess_is_rejected() {
+        let mut s = sub_pipeline_step("push-kek", SubPipelineRef::Builtin("x".into()));
+        s.secret = true;
+        assert!(matches!(
+            s.validate(),
+            Err(StepValidationError::SecretRequiresSubprocess(_))
+        ));
+
+        let mut ok = QedStep::default();
+        ok.name = "push-kek".into();
+        ok.argv = vec!["scp".into(), "kek".into()];
+        ok.secret = true;
+        assert!(ok.validate().is_ok(), "secret IS valid on a subprocess step");
+    }
+
+    /// A secret step's `$YAH_OUTPUTS` is dropped unread, so a *declared* output
+    /// would be permanently empty and a `[[bind]]` reading it would bind
+    /// nothing — silently. Reject the pair where the author can still see it.
+    #[test]
+    fn secret_cannot_declare_outputs() {
+        let mut s = QedStep::default();
+        s.name = "kek-push".into();
+        s.argv = vec!["true".into()];
+        s.secret = true;
+        s.outputs = vec![OutputDecl {
+            name: "fingerprint".into(),
+            description: None,
+            kind: manifest_bind::ValueType::String,
+            validate: None,
+        }];
+        assert!(matches!(
+            s.validate(),
+            Err(StepValidationError::SecretCannotDeclareOutputs(_))
+        ));
+
+        s.secret = false;
+        assert!(s.validate().is_ok(), "outputs alone are fine");
+    }
+
+    /// `inputs` is deliberately NOT kind-restricted: freshness is a property of
+    /// the declared sources, not of how the step executes, and a `build-image`
+    /// step whose Dockerfile moved is exactly as stale as a subprocess one.
+    #[test]
+    fn inputs_are_accepted_on_every_step_kind() {
+        let mut s = sub_pipeline_step("child", SubPipelineRef::Builtin("x".into()));
+        s.inputs = vec![std::path::PathBuf::from("Cargo.toml")];
+        assert!(s.validate().is_ok());
+    }
+
+    // ----- R717-T3 CellRef + param fingerprint --------------------------------
+
+    /// The equivalence the whole mechanism rests on: two operators who reach the
+    /// same effective params — different insertion order, one via `default` —
+    /// must land on one subject, or W257's badge for a box splits in half.
+    #[test]
+    fn fingerprint_is_stable_across_param_orderings() {
+        let mut a = HashMap::new();
+        a.insert("node".to_string(), "us-west-003".to_string());
+        a.insert("channel".to_string(), "stable".to_string());
+
+        let mut b = HashMap::new();
+        b.insert("channel".to_string(), "stable".to_string());
+        b.insert("node".to_string(), "us-west-003".to_string());
+
+        assert_eq!(param_fingerprint(&a), param_fingerprint(&b));
+        assert_eq!(param_fingerprint(&a).len(), 64, "blake3 hex");
+    }
+
+    #[test]
+    fn fingerprint_separates_two_subjects() {
+        let one = HashMap::from([("node".to_string(), "us-west-003".to_string())]);
+        let other = HashMap::from([("node".to_string(), "us-west-013".to_string())]);
+        assert_ne!(
+            param_fingerprint(&one),
+            param_fingerprint(&other),
+            "W257 must render green for one box and unrun for the other AT THE SAME TIME"
+        );
+    }
+
+    /// Length-prefixed framing, not a delimiter join. `{node: "a", x: "=b"}` and
+    /// `{node: "a=", x: "b"}` would collide under a naive `format!("{k}={v}")`
+    /// concatenation, and a collision here shows one box's verdict for another.
+    #[test]
+    fn fingerprint_cannot_be_forged_by_a_value_containing_the_delimiter() {
+        let one = HashMap::from([
+            ("node".to_string(), "a".to_string()),
+            ("x".to_string(), "=b".to_string()),
+        ]);
+        let other = HashMap::from([
+            ("node".to_string(), "a=".to_string()),
+            ("x".to_string(), "b".to_string()),
+        ]);
+        assert_ne!(param_fingerprint(&one), param_fingerprint(&other));
+    }
+
+    #[test]
+    fn an_empty_value_is_not_the_same_subject_as_an_absent_one() {
+        let empty = HashMap::from([("node".to_string(), String::new())]);
+        assert_ne!(param_fingerprint(&empty), param_fingerprint(&HashMap::new()));
+        // A doc with no params has exactly one subject — legal, not an error.
+        assert_eq!(param_fingerprint(&HashMap::new()).len(), 64);
+    }
+
+    /// The ~494 run metas already on disk carry neither `cell` nor per-step
+    /// `input_hashes`. They have to keep loading, untouched.
+    #[test]
+    fn a_pre_r717_run_meta_still_deserializes() {
+        let json = r#"{
+            "id": "run-1",
+            "pipeline": "check",
+            "status": "success",
+            "created_at": "2026-05-26T04:09:53Z",
+            "completed_at": "2026-05-26T04:11:00Z",
+            "steps": [{
+                "name": "cargo check",
+                "task_run_id": null,
+                "status": "success",
+                "started_at": "2026-05-26T04:09:54Z",
+                "completed_at": "2026-05-26T04:10:59Z",
+                "outputs": {},
+                "applied_binds": []
+            }]
+        }"#;
+        let meta: QedRunMeta = serde_json::from_str(json).expect("pre-R717 meta loads");
+        assert!(meta.cell.is_none());
+        assert!(meta.steps[0].input_hashes.is_empty());
+
+        // And round-tripping must not invent the new keys on a run that has none.
+        let back = serde_json::to_string(&meta).unwrap();
+        assert!(!back.contains("\"cell\""), "{back}");
+        assert!(!back.contains("input_hashes"), "{back}");
+    }
+
+    #[test]
+    fn a_cell_ref_round_trips_through_the_run_meta() {
+        let json = r#"{
+            "id": "run-2",
+            "pipeline": "W257",
+            "status": "success",
+            "created_at": "2026-08-07T00:00:00Z",
+            "completed_at": null,
+            "steps": [],
+            "cell": {
+                "doc": ".yah/docs/working/W257-static-node-fleet-onboarding.md",
+                "cell_id": "probe-identity",
+                "param_fingerprint": "abc123"
+            }
+        }"#;
+        let meta: QedRunMeta = serde_json::from_str(json).unwrap();
+        let cell = meta.cell.clone().expect("cell parsed");
+        assert_eq!(cell.cell_id, "probe-identity");
+        let back: QedRunMeta = serde_json::from_str(&serde_json::to_string(&meta).unwrap()).unwrap();
+        assert_eq!(back.cell, meta.cell);
+    }
+
     // ----- SubPipeline (W201-F1) ----------------------------------------------
 
     fn sub_pipeline_step(name: &str, target: SubPipelineRef) -> QedStep {
         QedStep {
+            inputs: Vec::new(),
+            secret: false,
             background: false,
             background_until: None,
             wait_for: None,
+            manual: None,
             manifest_stitch: None,
             name: name.into(),
             argv: Vec::new(),
@@ -2434,6 +3840,8 @@ mod tests {
 
     fn pipeline_with(name: &str, steps: Vec<QedStep>) -> Pipeline {
         Pipeline {
+            description: None,
+            tags: Vec::new(),
             name: name.into(),
             label: name.into(),
             steps,
@@ -2489,6 +3897,7 @@ mod tests {
             path: std::path::PathBuf::from(".github/workflows/release.yml"),
             event: Some("push".into()),
             inputs: HashMap::new(),
+            matrix: HashMap::new(),
         });
         step
     }
@@ -2934,7 +4343,7 @@ mod tests {
     fn graph_walk_detects_direct_self_cycle() {
         // root -> root (builtin name matches itself's name — irrelevant to the
         // walker, but a likely real-world mistake)
-        let mut root = pipeline_with(
+        let root = pipeline_with(
             "self",
             vec![sub_pipeline_step(
                 "loop",

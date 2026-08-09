@@ -176,6 +176,7 @@ mod list {
             beholder_status: None,
             pinned: false,
             origin: None,
+            host_pid: None,
         };
         store.insert_run(&meta).await.expect("insert_run");
         id

@@ -31,7 +31,7 @@
 //! @yah:gotcha("yah_scryer::long_tier currently owns ObjectStore + InMemoryObjectStore; F1 must re-export from scryer to keep LongTierStore callers compiling")
 //! @yah:gotcha("GHA tarball is named yubaba-v0.8.9-{triple}.tar.gz but P007 documents the published key as yah-yubaba-{triple}.tar.gz — pick one convention in T4 and stick with it (lean toward dropping the v prefix to match the documented layout)")
 //! @yah:assumes("ObjectStore trait shape (put/get/list_prefix) is the right starting point; head+delete are additions, not redesigns")
-//! @arch:see(.yah/qed/P007-yubaba-release.toml)
+//! @arch:see(.yah/qed/release.toml)
 //! @arch:see(crates/yah/cloud/src/reconciler/r2_publish.rs)
 //!
 //! @yah:ticket(R498-F2, "R2ObjectStore impl over local_driver::s3_sign")

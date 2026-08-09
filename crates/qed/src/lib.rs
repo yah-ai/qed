@@ -230,10 +230,55 @@
 //! @yah:verify("cargo test -p yah --lib mcp::tools::tests::qed_tools_are_registered  # 1/1")
 //! @yah:verify("yah qed list  # with daemon: tabular history; without: 'no camp daemon' message")
 //! @yah:verify("yah qed status <run_id>  # with daemon: pipeline+steps; without: clear error")
+//!
+//! @yah:relay(R717, "Executable docs: subject-keyed runnable cells in W###/A### prose")
+//! @yah:at(2026-08-05T01:51:41Z)
+//! @yah:status(open)
+//! @arch:see(.yah/docs/working/W296-executable-docs-notebook-cells.md)
+//! @yah:next("Phase order: P0 (T12, independent — do it first) / P1 QED-core primitives (T1 inputs, T2 secret, T3 CellRef — all three are standalone and need no doc parser) / P2 markdown-as-source (F4 parser, T5 host=, S13 open questions) / P3 the two doors (F6 index+RPC, T7 CLI, T8 MCP) / P4 the renderer (F9 fences, T10 subject selector) / P5 manual cells (T11, blocked on R622).")
+//! @yah:next("The bill W296 signs up for is small and should stay small: ONE genuinely new mechanism (the subject key, T3+F6), TWO re-pointings of existing mechanisms (markdown as a QED source mirroring StepKind::Import; inputs= staleness generalized off ImportConfig's blake3 pin), ONE small safety flag (secret), ONE dependency (R622). Anything that does not fit that accounting is scope growth.")
+//! @yah:next("Status NEVER goes back into the .md. This is the decision that separates this from Jupyter: .ipynb stores outputs in the file, which is why every notebook repo is a merge-conflict farm. yah runs many sessions against one working tree; a doc that dirties itself on every run puts a git diff between an operator and a status badge. Run state lives in .yah/jit/qed/, already gitignored.")
+//! @yah:next("A doc is promoted to A### only after a SECOND runbook — a release runbook or an OSS-module procedure — survives contact with the cell vocabulary. W296 is explicit that promoting a schema on a sample size of one is how it acquires fields nobody can remove.")
+//! @yah:gotcha("R622 (@Ashguard, active) owns StepKind::Manual / RunStatus::AwaitingHuman / park-resume and is editing oss/qed/crates/qed/src/types.rs and runner.rs RIGHT NOW. P1 tickets touch the same two files — re-read before editing and keep diffs inside QedStep/StepStatus/QedRunMeta.")
+//! @yah:gotcha("No notebook.* MCP tool family, ever. These fold into qed.run params plus one qed.cells read view — mcp/tools.rs:348 is an open audit of per-tool token cost and a parallel family for a capability that is a parameter is exactly what it exists to prevent.")
+//! @yah:gotcha("The strongest argument in the spike is freshness, not execution: the bug that cost the W257 session most was a stale ISO, and W257 admits 'the only guard is habit'. If inputs= staleness (T1) gets cut for scope, the relay loses its main justification.")
+//! @yah:handoff("BACKEND LANE (oss/qed) DONE, uncommitted, at anchor 85801e7f6b76b369c0c8ecd2e5c7874990cd9286. S13 settled into W296; T1, T2, T3, F4, T5 all shipped and handed off with their own verifies. Two new files: oss/qed/crates/qed/src/staleness.rs (pure input-freshness core) and oss/qed/crates/qed/src/doc_source.rs (markdown-as-a-QED-source, incl. the T5 host= lowering). yah-qed lib: 778 pass / 0 fail / 1 ignored. cargo test -p yah --lib r325_f1: 36 pass. xtask schema_drift: 3 pass after regenerating qed-pipeline.toml.schema.json.")
+//! @yah:next("STOPPED AT THE OPERATOR GATE, not at a blocker. F6 / T7 / T8 are next and all three edit @Ashguard's lane (camp.rs, cli.rs, mcp/tools.rs); the dispatch said to check before starting them. Evidence the lane has drained: the R721 session (session:bd566f16) is no longer on camp.roster and all twelve R721 children read `open` with no live claim. Not treating that as the confirmation — a clean roster does not prove nobody else is in those files. R717-T11 (blocked on R622) and F9/T10 (desktop) remain deliberately untouched.")
+//! @yah:handoff("BACKEND LANE COMPLETE, uncommitted, anchor 85801e7f6b76b369c0c8ecd2e5c7874990cd9286. All eight dispatched tickets done and handed off: S13 (settled into W296), T1, T2, T3, F4, T5 (oss/qed), then F6, T7, T8 after the gate opened. Two new files in oss/qed (staleness.rs, doc_source.rs); one new RPC method (qed.cells) and two new qed.run params (doc, cell). Skipped as dispatched: T11 (blocked on R622), F9/T10 (desktop, sequenced separately).")
+//! @yah:next("PATHSPEC, whole relay: oss/qed/crates/qed/src/{types,runner,staleness,doc_source,lib,config,transform,matrix,import}.rs crates/yah/rpc/src/lib.rs crates/yah/agent-tools/src/qed_tools.rs app/yah/cli/src/{camp.rs,qed.rs,mcp/tools.rs} app/yah/desktop/src/qed.rs .yah/schema/qed-pipeline.toml.schema.json .yah/docs/working/W296-executable-docs-notebook-cells.md")
+//! @yah:next("FOR THE DESKTOP TICKETS (F9/T10) NOW UNBLOCKED: qed.cells returns {doc, param_fingerprint, cells[{cell_id, run_id, status, started_at, completed_at, error, outputs, input_hashes}]}; a cell absent from the result has NEVER run for that subject and renders unrun. Staleness is NOT on the wire — recompute it the way app/yah/cli/src/qed.rs::doc_cell_is_stale does (re-hash input_hashes' keys, compare via yah_qed::input_freshness). T10's subject selector wants ParamDef::options_from per R717-S13 Q3; that field is NOT built yet and T10 owns it. Cell inventory (ids, assert-vs-show, host) comes from parsing the .md with yah_qed::parse_doc, not from the RPC — the daemon owns run state, the tree owns what the doc says.")
+//!
+//! @yah:ticket(R717-S13, "Settle W296's four open questions: cell cwd, badge expiry, enumerable subjects, per-subject concurrency")
+//! @yah:status(review)
+//! @yah:assignee(agent:bundle-anthropic-glimmerstone)
+//! @yah:at(2026-08-08T21:20:01Z)
+//! @yah:kind(spike)
+//! @yah:phase(P2)
+//! @yah:parent(R717)
+//! @arch:see(.yah/docs/working/W296-executable-docs-notebook-cells.md)
+//! @yah:next("Q1 cwd — do cells share a working directory across a run? A QED run positions a workspace once; a runbook's cells mostly want the camp root; host= cells run somewhere else entirely. W296 leans 'yes, pipeline cwd semantics unchanged' but says the mental model must be STATED rather than discovered. Blocks nothing, but R717-T5 needs the answer written down.")
+//! @yah:next("Q2 expiry — what invalidates a green badge by time? A systemctl is-active docker that passed six weeks ago is not evidence about today. W296 leans on rendering AGE prominently plus staleness, and explicitly does NOT want a third expiry axis (per-cell ttl=). Confirm or overturn; do not add ttl= by default.")
+//! @yah:next("Q3 enumerable subjects — W257's subject is a machine name that already exists as a file in .yah/infra/machines/. A selector that enumerates those beats free-text params but couples the notebook to one domain. W296's lean: a param KIND that names an enumerable source. Affects R717-T10's selector.")
+//! @yah:next("Q4 concurrency — two operators bringing up two boxes from W257 at once is the EXPECTED case, and the param fingerprint already handles the state. Open: should concurrency_key default to per-subject rather than per-pipeline for doc runs? Note R622 decided a parked step RELEASES its concurrency_key, which bears on this.")
+//! @yah:next("Deliverable is an edit to W296 turning these four into decisions, not a separate doc. Tier: Wizard — four coupled design calls, one of which (Q3) shapes a public param vocabulary.")
+//! @yah:assumes("W296 leans a particular way on Q1, Q2 and Q4; those leans are unvalidated and the spike may overturn any of them.")
+//! @yah:handoff("SETTLED. W296's Open questions section is replaced by a Settled questions (R717-S13, 2026-08-07) section — four decisions, in the doc, not a separate one. Q1/Q2 confirm their leans, Q3 refines its lean, Q4 overturns its own premise.")
+//! @yah:handoff("Q1 cwd DECIDED: yes, pipeline cwd semantics unchanged; no per-cell workspace, no cell-to-cell cwd inheritance. Rider (a): a doc-sourced pipeline defaults to workspace = live, overridable only from the notebook= fence — WorkspaceMode's default Checkout bails on a dirty tree, which makes a runbook unrunnable on this shared tree, and is wrong semantics anyway (a runbook asserts about the operator's actual tree and the live world, not bytes at another ref). Rider (b): a host= cell has TWO cwds and QED owns one. Local cwd is the positioned root (where ssh is invoked); remote cwd is the SSH login default, because the machine TOML records a connection, not a remote workspace. A host= cell needing a remote directory writes an explicit cd in its body. Do NOT add remote_cwd= — it would be a second positioning mechanism against a tree QED neither owns nor versions. R717-T5 carries this rule as a module doc comment.")
+//! @yah:handoff("Q2 expiry DECIDED: confirmed, NO ttl=. Exactly two axes and neither is a RunStatus — staleness (computed at read time: blake3(inputs now) != recorded, or the cell body text changed since the run) and age (rendered, never a verdict). Why ttl is refused: staleness and age are facts about the tree and the clock; a ttl is a prediction about the world's volatility written at authoring time by someone who cannot know it, and a red carrying no evidence is exactly what trains readers to stop reading reds. The pressure goes to age as primary badge text (passed - 6w ago), a one-click re-run, and — where a doc genuinely needs decay — an assert cell that checks recency itself, which keeps the rule executable and visible in the prose.")
+//! @yah:handoff("Q3 enumerable subjects DECIDED: enumerate by PATH GLOB, not by domain kind. ParamDef gains options_from: Option<String>, a camp-relative glob whose matches' file stems become the param's options at read time (node = { required = true, options_from = .yah/infra/machines/*.toml }). This is the lean with the domain coupling removed: the coupling only bites if the vocabulary names the domain (kind = machine would put fleet concepts in QED's param schema forever); a path glob names a DIRECTORY CONVENTION, which a notebook with host= cells already depends on and any other domain reuses unchanged. Three details are the actual decision: it composes with the existing options path (resolution fills options, so resolve_params and ParamError::NotInOptions validate unchanged and the desktop gets the dropdown it already renders); resolution is at READ time not load time, so a newly-added machine appears without editing the doc; and a glob matching nothing is an AUTHORING ERROR, not a silent degrade to free text, since a typo'd glob must not be indistinguishable from a correct one. Implementing ticket is R717-T10; R717-T7 may consume it to validate --subject.")
+//! @yah:handoff("Q4 concurrency DECIDED, and the question's PREMISE WAS STALE. It asks per-subject rather than per-pipeline; it no longer defaults to per-pipeline. R719-F1 inverted DEFAULT_CONCURRENCY_KEY to @camp, camp-GLOBAL (types.rs:517) — strictly worse for this case than the default the question was written against, since two operators bringing up two different boxes would now serialize against each other AND against every other unkeyed recipe in the camp. Decision: a doc-sourced pipeline defaults concurrency_key to @doc:<doc_rel_path>#<param_fingerprint>. Two subjects run concurrently; two runs of the same subject serialize. An explicit key in the notebook= fence still wins. This is not a carve-out from R719-F1, it is that rule applied: the camp-global default exists because an unkeyed BUILD recipe's contended resource is the camp tree; a doc cell's contended resource is the remote SUBJECT, and the param fingerprint names it exactly — so the doc source is supplying the correct key, not forgetting one.")
+//! @yah:gotcha("Q4's known hole, deliberately NOT closed: a parked manual step releases its concurrency key and reacquires on resume (types.rs:2154, R622). So while an operator stands at the box answering a BIOS cell the per-subject key is free, and a second run of the SAME subject can start and interleave. That is a two-operator collision on one physical machine; a lock in QED cannot prevent it and pretending otherwise is worse than admitting it. Do NOT add a park-holds-the-key exception — R622 released it on purpose so a wizard parked overnight cannot hold a camp key hostage. Mitigation that does exist: both runs record the same param_fingerprint, so the collision is visible in cell history afterwards.")
+//! @yah:gotcha("CORRECTION found while settling, fixed in W296 in place: hostkey_fingerprint is NOT a top-level key in a machine TOML — it lives under [registration] (.yah/infra/machines/us-west-003.toml, stamped at TOFU time by R707-T1). So W296's cell-inventory bind row now reads path = registration.hostkey_fingerprint, and its Verification check 3 grep was anchored ^hostkey_fingerprint and matched nothing; unanchored now. Anyone writing the step-7 bind for a doc cell needs the dotted path.")
+//! @yah:handoff("Tree anchor at handoff: 85801e7f6b76b369c0c8ecd2e5c7874990cd9286 — the shared tree as I left it. Diff against it (`git diff 85801e7f6b76b369c0c8ecd2e5c7874990cd9286..HEAD`) to see what landed under you, and quote this SHA rather than 'HEAD' in any revert/restore instruction.")
+//! @yah:next("Deliverable is the W296 edit, done. Downstream consumers: R717-T5 writes the Q1 host= cwd rule as a module doc comment; R717-F4 defaults the synthesized Pipeline to workspace=live + concurrency_key=@doc:<doc>#<fp> per Q1/Q4; R717-T10 implements ParamDef::options_from per Q3; nobody adds ttl= per Q2.")
+//! @yah:verify("The four Open questions no longer exist in .yah/docs/working/W296-executable-docs-notebook-cells.md; the section is titled Settled questions (R717-S13, 2026-08-07) and each of Q1-Q4 states a decision plus the reason it beat its alternative.")
+//! @yah:handoff("Reconciliation audit: spike fully settled, no residual. W296 'Settled questions (R717-S13, 2026-08-07)' section confirmed landed verbatim in 871fde1c by content — doc-only ticket, no test suite applicable.")
 
 pub mod artifact_local;
 pub mod artifact_retrieval;
+pub mod build_context;
 pub mod config;
+pub mod doc_source;
 pub mod eject;
 pub mod events;
 pub mod export;
@@ -253,6 +298,7 @@ pub mod publish;
 pub mod registries;
 pub mod runner;
 pub mod secrets_bridge;
+pub mod staleness;
 pub mod toolchain;
 pub mod transform;
 pub mod types;
@@ -262,14 +308,15 @@ pub use config::{ConfigError, GhaWorkflowEntry, LoaderSubPipelineResolver, Pipel
 pub use events::{OutputStream, QedEvent};
 pub use images::{CatalogEntry, CatalogError, CatalogManifest, ProduceTarget};
 pub use eject::{
-    eject, freshness as eject_freshness, validate_ejected, EjectFreshness, GeneratedHeader,
-    ValidateError as EjectValidateError,
+    eject, freshness as eject_freshness, generated_header, validate_ejected, EjectFreshness,
+    GeneratedHeader, ValidateError as EjectValidateError,
 };
 pub use export::{export_pipeline, Degradation, ExportReport};
 pub use import::{content_hash, expand_import, ImportExpansion, ImportFreshness};
 pub use native::{
-    native_tarball_output_path, pack_native_tarball, tarball_stem, CosignSigner, LoggingSigner,
-    NativeTarballManifest, SignedBlob, SigstoreSigner,
+    native_tarball_output_path, pack_native_tarball, resolve_signer, tarball_stem, CosignSigner,
+    LoggingSigner, NativeTarballManifest, SignedBlob, SigningIdentity, SigstoreSigner,
+    ENV_COSIGN_IDENTITY_TOKEN, ENV_COSIGN_KEY,
 };
 pub use nativecross::{
     is_native_cross_target, plan_native_cross, rewrite_build_argv, select_cross_tool, CrossTool,
@@ -293,8 +340,9 @@ pub use provider::{
     ProviderRegistry, ProviderReport, ReleaseProvider, SecretSource, EVENT_LOG_PROVIDER,
 };
 pub use publish::{
-    resolve_release_version, stage_release, ChannelManifest, LoggingReleasePublisher,
-    PublishRequest, PublishingOutcomeDispatcher, ReleasePublisher, StageReport,
+    index_key, merge_index, resolve_release_version, stage_release, ChannelManifest, IndexTriple,
+    IndexUpdate, IndexVersion, LoggingReleasePublisher, PublishRequest,
+    PublishingOutcomeDispatcher, ReleaseIndex, ReleasePublisher, StageReport,
 };
 /// Re-exported so daemon/UI glue can match on workflow step shapes without
 /// taking a direct `qed-gha` dep edge — the catalog converter in
@@ -302,8 +350,10 @@ pub use publish::{
 pub use yah_qed_gha;
 pub use registries::{extract_registry_host, RegistryConfig, RegistryConfigError, RegistryEntry};
 pub use runner::{
-    pipeline_needs_offload, LoggingOutcomeDispatcher, OutcomeDispatcher, PipelineRunner, RunWhere,
-    RunnerError,
+    pipeline_is_fully_offloaded, pipeline_needs_offload, sub_pipeline_admission_gap, AdmissionGap,
+    LoggingOutcomeDispatcher,
+    ManualAnswer, ManualGate, ManualParkHandle, ManualParkRequest, OutcomeDispatcher,
+    PipelineRunner, RunWhere, RunnerError,
 };
 /// Re-exported so daemon glue (camp.rs boot-reconcile, R603-T4) can parse a
 /// persisted bare-uuid `task_run_id` back into the workload identity that
@@ -315,6 +365,8 @@ pub use velveteen_exec::{
     RecipeError, RecipeLocation, RecipePlacement, RecipeStep, TransformRecipe,
     TransformRecipeLoader,
 };
+pub use doc_source::{parse_doc, DocCell, DocSource, DocSourceError, NotebookConfig};
+pub use staleness::{hash_declared_inputs, input_freshness, InputFreshness, ABSENT_INPUT};
 pub use toolchain::{
     detect_host_versions, effective_pins, resolve_pin, version_satisfies, PinResolution,
     PreflightEntry, Tool, ToolchainPreflight, ToolchainSpec,
@@ -324,11 +376,14 @@ pub use transform::{
     TransformedStep,
 };
 pub use types::{
-    new_run_id, sub_pipeline_ref_token, validate_sub_pipeline_graph, GhaWorkflowConfig,
-    ImportConfig, JobRow, ManifestStitchConfig, Outcome, OutputDecl, Pipeline, Placement,
+    new_run_id, param_fingerprint, sub_pipeline_ref_token, validate_sub_pipeline_graph, CellRef,
+    GhaWorkflowConfig,
+    ImportConfig, JobRow, ManifestStitchConfig, ManualConfig, Outcome, OutputDecl, Pipeline,
+    Placement,
     ProducedArtifact, QedRunId, QedRunMeta, QedStep, RunStatus, StepActivation, StepKind,
     StepStatus, StepValidationError, SubPipelineCollect, SubPipelineConfig, SubPipelineError,
-    SubPipelineRef, SubPipelineResolver, Trigger, WaitForConfig, MAX_SUB_PIPELINE_DEPTH,
+    SubPipelineRef, SubPipelineResolver, Trigger, WaitForConfig, WorkspaceMode,
+    DEFAULT_CONCURRENCY_KEY, MAX_SUB_PIPELINE_DEPTH, PARALLEL_CONCURRENCY_KEY,
 };
 
 /// Returns the argv that an external scheduler (e.g. almanac) should submit as a TaskSpec
@@ -370,7 +425,7 @@ mod tests {
         let mut dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         loop {
             let candidate = dir.join(".yah").join("qed");
-            if candidate.join("P013-release.toml").is_file() {
+            if candidate.join("release.toml").is_file() {
                 return Some(candidate);
             }
             if !dir.pop() {
@@ -386,12 +441,12 @@ mod tests {
     // test below exercises the same `load_and_validate_graph` surface against
     // the workspace `.yah/qed/`.
 
-    /// R488-F6: `.yah/qed/P013-release.toml` parses, the SubPipeline graph
+    /// R488-F6: `.yah/qed/release.toml` parses, the SubPipeline graph
     /// (GhaWorkflow child + by-name desktop-release child) validates without
     /// cycles or depth violations, and a single terminal Outcome::Publish is
     /// declared at the parent so one revalidate POST fires after both
     /// children finish. (R499-T2: pipeline name was `full-release` until
-    /// P007-yubaba-release.toml collapsed into this file and the canonical
+    /// the yubaba-release wrapper collapsed into this file and the canonical
     /// name shifted to `release`.)
     #[test]
     fn test_release_composite_pipeline() {
@@ -420,27 +475,28 @@ mod tests {
         assert_eq!(pubs.len(), 1, "exactly one terminal Outcome::Publish");
     }
 
-    /// `peer-release` (R494-T3) — yah orchestrating a republish wave over its
+    /// `peer-binaries` (R494-T3; renamed from `peer-release` in R707) — yah
+    /// orchestrating a cross-build wave over its
     /// external/ peers, then itself, under one terminal publish. Loads
     /// against the real workspace `.yah/qed/peers.toml` registry so a
     /// missing or misspelled peer key surfaces here at parse time. Active
     /// children today (publish order): peer(yubaba) + peer(qed) +
-    /// peer(mesofact), then path(P013-release.toml) for yah itself. cheers is
+    /// peer(mesofact), then path(release.toml) for yah itself. cheers is
     /// registered but its `release-build` pipeline doesn't exist yet, so that
     /// SubPipeline step stays commented out. (R499-T1: yah step retargeted
-    /// from builtin(release-build) → path after P003-release-build.toml was
+    /// from builtin(release-build) → path after the old release-build card was
     /// retired.)
     #[test]
-    fn test_peer_release_composite_pipeline() {
+    fn test_peer_binaries_composite_pipeline() {
         let Some(qed_dir) = find_qed_dir() else {
             eprintln!("skip: yah .yah/qed pipelines not present (standalone export)");
             return;
         };
         let loader = PipelineLoader::new(qed_dir);
         let pipeline = loader
-            .load_and_validate_graph("peer-release")
-            .expect("peer-release pipeline loads + graph validates");
-        assert_eq!(pipeline.name, "peer-release");
+            .load_and_validate_graph("peer-binaries")
+            .expect("peer-binaries pipeline loads + graph validates");
+        assert_eq!(pipeline.name, "peer-binaries");
         assert_eq!(
             pipeline.steps.len(),
             4,
@@ -463,7 +519,7 @@ mod tests {
                 crate::SubPipelineRef::Path(p) => {
                     yah_path = Some(p.to_str().unwrap().to_string());
                 }
-                other => panic!("unexpected SubPipelineRef in peer-release: {other:?}"),
+                other => panic!("unexpected SubPipelineRef in peer-binaries: {other:?}"),
             }
         }
         assert_eq!(
@@ -473,7 +529,7 @@ mod tests {
         );
         assert_eq!(
             yah_path.as_deref(),
-            Some(".yah/qed/P013-release.toml"),
+            Some(".yah/qed/release.toml"),
             "yah self-release path step present",
         );
 
@@ -483,6 +539,128 @@ mod tests {
             .filter(|o| matches!(o, crate::Outcome::Publish { .. }))
             .collect();
         assert_eq!(pubs.len(), 1, "exactly one terminal Outcome::Publish");
+    }
+
+    /// R577-F2 — `desktop-release`'s pipeline-level matrix must dispatch each
+    /// row to a machine of that row's *platform*, and the whole point of the
+    /// darwin row is that it lands on the fleet's only Mac (`us-west-015`,
+    /// tagged `os:darwin` by R631) rather than on a Pi5 that cannot emit
+    /// Mach-O.
+    ///
+    /// This asserts the routing over the real checked-in recipe rather than
+    /// over a fixture, because the thing that can regress is the recipe: drop
+    /// `native = true` from a step, or add a row for a platform the fleet has
+    /// no node for, and the placement silently changes. Both host directions
+    /// are pinned — an arm64 Mac coordinator (this camp) and an arm64 Linux
+    /// one — since arch alone cannot tell those two apart and that blindness
+    /// is exactly what this ticket fixed in `resolve_placement`.
+    #[test]
+    fn desktop_release_matrix_routes_each_row_to_its_own_platform() {
+        let Some(qed_dir) = find_qed_dir() else {
+            eprintln!("skip: yah .yah/qed pipelines not present (standalone export)");
+            return;
+        };
+        let pipeline = PipelineLoader::new(qed_dir)
+            .load("desktop-release")
+            .expect("desktop-release pipeline loads");
+
+        const ARM_MAC: &str = "aarch64-apple-darwin";
+        const ARM_LINUX: &str = "aarch64-unknown-linux-gnu";
+
+        let jobs = crate::matrix::plan(&pipeline);
+        let mut rows: Vec<String> = Vec::new();
+        for job in &jobs {
+            // Every step of a row is pinned to that row's target (the matrix is
+            // at pipeline level precisely so no step escapes to the
+            // coordinator), so the row's target is well-defined.
+            let targets: std::collections::BTreeSet<Option<String>> = job
+                .pipeline
+                .steps
+                .iter()
+                .map(|s| s.platform.as_ref().and_then(|p| p.target.clone()))
+                .collect();
+            assert_eq!(
+                targets.len(),
+                1,
+                "row {} has steps on mixed targets: {targets:?}",
+                job.label()
+            );
+            let target = targets
+                .into_iter()
+                .next()
+                .flatten()
+                .unwrap_or_else(|| panic!("row {} declares no platform.target", job.label()));
+            for step in &job.pipeline.steps {
+                let spec = step.platform.as_ref().expect("every step declares platform");
+                assert!(
+                    spec.native,
+                    "step `{}` of row {} dropped native=true — it would cross-compile \
+                     or emulate instead of landing on real silicon",
+                    step.name,
+                    job.label(),
+                );
+                assert!(
+                    spec.container_platform.is_none(),
+                    "step `{}` of row {} declares a container_platform; desktop bundling \
+                     needs the host userland, and a container would exempt it from the \
+                     OS half of placement",
+                    step.name,
+                    job.label(),
+                );
+            }
+
+            let on_mac = crate::platform::resolve_placement(ARM_MAC, Some(&target), None, true);
+            let on_linux = crate::platform::resolve_placement(ARM_LINUX, Some(&target), None, true);
+            match crate::platform::os_tag_of(&target) {
+                "darwin" => {
+                    assert_eq!(
+                        on_mac,
+                        crate::platform::Resolution::NativeCross,
+                        "a darwin row on a Mac coordinator builds right here",
+                    );
+                    assert_eq!(
+                        on_linux,
+                        crate::platform::Resolution::Offload {
+                            target: target.clone()
+                        },
+                        "a darwin row on a Linux coordinator MUST offload — this is the \
+                         us-west-015 leg (R577)",
+                    );
+                    assert!(
+                        crate::platform::build_worker_mesh_tags(
+                            crate::platform::arch_of(&target),
+                            "darwin",
+                        )
+                        .contains(&"os:darwin".to_string()),
+                        "the darwin offload must request os:darwin so it cannot tag-match \
+                         the Linux Pi5s (R631)",
+                    );
+                }
+                "linux" => {
+                    assert_eq!(
+                        on_mac,
+                        crate::platform::Resolution::Offload {
+                            target: target.clone()
+                        },
+                        "a Linux row on this camp's arm64 Mac MUST offload — same arch is \
+                         not the same platform, and macOS cannot produce an AppImage/deb",
+                    );
+                }
+                other => panic!("row {} targets unexpected OS `{other}`", job.label()),
+            }
+            rows.push(target);
+        }
+
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![
+                "aarch64-apple-darwin",
+                "aarch64-unknown-linux-gnu",
+                "x86_64-unknown-linux-gnu",
+            ],
+            "the W235 fan-out rows; Windows stays absent until the fleet has a node",
+        );
     }
 
     #[test]

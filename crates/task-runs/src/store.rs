@@ -82,7 +82,8 @@ CREATE TABLE IF NOT EXISTS runs (
     beholder_status TEXT,
     archived_at     INTEGER,
     pinned          INTEGER NOT NULL DEFAULT 0,
-    origin          TEXT
+    origin          TEXT,
+    host_pid        INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS chunks (
@@ -179,6 +180,13 @@ impl TaskStore {
            predates `origin`, so add it idempotently for already-created DBs.
            A duplicate-column error means an up-to-date schema — swallow it. */
         let _ = conn.execute("ALTER TABLE runs ADD COLUMN origin TEXT", ()).await;
+        /* Same idempotent add for `host_pid` (R617-F6). A row that predates it
+           reads back `None`, which the stale-run policy treats as "owner
+           unknown" and therefore tombstones — i.e. an old DB keeps exactly the
+           old Lost-on-disappear behaviour. */
+        let _ = conn
+            .execute("ALTER TABLE runs ADD COLUMN host_pid INTEGER", ())
+            .await;
         Ok(TaskStore {
             db,
             seq: Mutex::new(SeqCounters {
@@ -261,8 +269,9 @@ impl TaskStore {
         self.exec_retry(
                 "INSERT INTO runs \
                  (id, command, cwd, env_json, started_at, ended_at, exit_code, signal, \
-                  status, status_detail, label, initiator, beholder_status, pinned, origin) \
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
+                  status, status_detail, label, initiator, beholder_status, pinned, origin, \
+                  host_pid) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
                 params![
                     meta.id.to_string(),
                     meta.command.clone(),
@@ -279,6 +288,7 @@ impl TaskStore {
                     beholder_json,
                     meta.pinned as i64,
                     meta.origin.clone(),
+                    meta.host_pid.map(|p| p as i64),
                 ],
             )
             .await?;
@@ -381,7 +391,8 @@ impl TaskStore {
             .conn()?
             .query(
                 "SELECT id, command, cwd, env_json, started_at, ended_at, exit_code, signal, \
-                        status, status_detail, label, initiator, beholder_status, pinned, origin \
+                        status, status_detail, label, initiator, beholder_status, pinned, origin, \
+                        host_pid \
                  FROM runs WHERE id = ?1",
                 params![id.to_string()],
             )
@@ -435,7 +446,8 @@ impl TaskStore {
 
         let sql = format!(
             "SELECT id, command, cwd, env_json, started_at, ended_at, exit_code, signal, \
-                    status, status_detail, label, initiator, beholder_status, pinned, origin \
+                    status, status_detail, label, initiator, beholder_status, pinned, origin, \
+                    host_pid \
              FROM runs \
              WHERE started_at >= ?1 {} {} \
              ORDER BY started_at DESC \
@@ -1308,6 +1320,9 @@ fn row_to_meta(row: &turso::Row) -> Result<TaskRunMeta, StoreError> {
     let beholder_json: Option<String> = row.get(12)?;
     let pinned: i64 = row.get(13).unwrap_or(0);
     let origin: Option<String> = row.get(14).ok().flatten();
+    // `ok().flatten()` (not `?`): a DB written before the column existed has
+    // no index 15 at all, and that must read as "owner unknown", not an error.
+    let host_pid: Option<i64> = row.get(15).ok().flatten();
 
     let status = reconstruct_status(
         &status_str,
@@ -1337,6 +1352,7 @@ fn row_to_meta(row: &turso::Row) -> Result<TaskRunMeta, StoreError> {
         beholder_status,
         pinned: pinned != 0,
         origin,
+        host_pid: host_pid.map(|p| p as u32),
     })
 }
 
@@ -1391,6 +1407,7 @@ mod tests {
             beholder_status: None,
             pinned: false,
             origin: None,
+            host_pid: None,
         }
     }
 
@@ -2092,6 +2109,7 @@ mod tests {
             beholder_status: None,
             pinned: false,
             origin: None,
+            host_pid: None,
         }
     }
 

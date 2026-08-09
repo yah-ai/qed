@@ -27,11 +27,13 @@ pub mod list;
 pub mod local;
 pub mod meta;
 pub mod remote;
+pub mod routing;
 pub mod transforms;
 pub mod triage;
 
 pub use executor::{
     ExecContext, ExecEvent, ExecOutcome, ForgeExecutor, ForgeExecutorError, OutputStream,
+    ProducedFile,
 };
 pub use integration::{
     ClusterClient, IntegrationForgeDriver, IntegrationForgeError, IntegrationRunHandle,
@@ -40,6 +42,7 @@ pub use list::{ForgeListFilter, forge_list};
 pub use local::LocalForgeDriver;
 pub use meta::ForgeMeta;
 pub use remote::{ForgeRunHandle, RemoteForgeDriver, RemoteForgeError, WardenClient};
+pub use routing::{PlacementRouter, RemoteExecutorFactory};
 pub use transforms::{
     substitute_argv, RecipeError, RecipeLocation, RecipePlacement, RecipeStep, TransformRecipe,
     TransformRecipeLoader, ENV_TRANSFORM_IN_0, ENV_TRANSFORM_OUT,

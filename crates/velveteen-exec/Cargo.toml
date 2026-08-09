@@ -12,11 +12,11 @@ name = "velveteen_exec"
 path = "src/lib.rs"
 
 [dependencies]
-velveteen = { path = "../velveteen", version = "0.8.21" }
-observation = { path = "../observation", version = "0.8.21" }
-workload-spec = { package = "yah-workload-spec", version = "0.8.21" }
-task-runs = { path = "../task-runs", version = "0.8.21" }
-yah-scryer = { path = "../scryer", version = "0.8.21" }
+velveteen = { path = "../velveteen", version = "0.8.22" }
+observation = { path = "../observation", version = "0.8.22" }
+workload-spec = { package = "yah-workload-spec", version = "0.8.22" }
+task-runs = { path = "../task-runs", version = "0.8.22" }
+yah-scryer = { path = "../scryer", version = "0.8.22" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 async-trait = "0.1"

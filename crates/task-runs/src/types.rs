@@ -112,6 +112,20 @@ pub struct TaskRunMeta {
     /// just its own runs from `task.list` without scooping up unrelated jobs.
     #[serde(default)]
     pub origin: Option<String>,
+    /// PID of the process whose [`crate::TaskDriver`] spawned this run — the
+    /// run's **owner**, not the child.
+    ///
+    /// Recorded so a driver starting up in one process can tell a genuinely
+    /// abandoned run from one a live peer process is still driving. Without
+    /// it, "leftover `Running` rows are stale" is only true when exactly one
+    /// process ever writes the store, and the moment a second one attaches it
+    /// tombstones the first one's live runs. See
+    /// [`crate::driver::StaleRunPolicy`].
+    ///
+    /// `None` for rows written before the column existed, which the policy
+    /// reads as "owner unknown" and treats conservatively (tombstone).
+    #[serde(default)]
+    pub host_pid: Option<u32>,
 }
 
 // ─── Stream ───────────────────────────────────────────────────────────────────

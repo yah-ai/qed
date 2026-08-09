@@ -6,9 +6,9 @@
 //! - [`crate::local::LocalForgeDriver`] — host subprocess (native or
 //!   container). Handles [`ForgeCommand::Subprocess`]; rejects `BuildImage`
 //!   and `Workload` with [`ForgeExecutorError::Unsupported`].
-//! - [`crate::remote::RemoteForgeDriver`] — yubaba RPC. Today exposes its
-//!   own `start()` shape; a `ForgeExecutor` impl is a follow-up when a
-//!   consumer needs to dispatch uniformly through `dyn ForgeExecutor`.
+//! - [`crate::remote::RemoteForgeDriver`] — yubaba RPC (R555-T2). Blocking
+//!   wrapper over its `start()` / `ForgeRunHandle::wait()` shape, which
+//!   callers that need the in-flight `ForgeId` still use directly.
 //!
 //! `ForgeSpec` already says *what* to run and *where/how* to sandbox it.
 //! [`ExecContext`] carries host-side execution detail (cwd, env) that the
@@ -34,11 +34,37 @@ use velveteen::{ForgeSpec, ForgeStatus};
 ///   beyond what the image declares; `platform`, when set, emits `--platform
 ///   <value>` so a single-arch upstream image can run under host emulation
 ///   (e.g. Apple Silicon hosts emulating `linux/amd64` via Rosetta).
+/// - `produced` is **remote-only** — see [`ProducedFile`].
 #[derive(Debug, Default, Clone)]
 pub struct ExecContext {
     pub cwd: Option<PathBuf>,
     pub env: Vec<(String, String)>,
     pub platform: Option<String>,
+    pub produced: Option<ProducedFile>,
+}
+
+/// A file the run writes on the *worker*, to be pulled back onto the caller's
+/// filesystem once the run succeeds (R555-F3).
+///
+/// This exists because the two placements disagree about what "the output
+/// path" means, and the disagreement is invisible at the type level. A local
+/// run writes its artifact straight onto the caller's disk, so the caller can
+/// read it back at the path it handed in. A remote run writes into the
+/// worker's `/yah/produced`, and nothing pulls those bytes back — the caller
+/// sees exit code 0 and an absent file. Every consumer of a remote forge
+/// therefore needs this retrieval leg, and expressing it here (rather than
+/// leaving each caller to hold a [`crate::remote::RemoteForgeDriver`] directly
+/// so it can call `fetch_produced_file`) is what keeps
+/// `Arc<dyn ForgeExecutor>` a complete surface for a remote build.
+#[derive(Debug, Clone)]
+pub struct ProducedFile {
+    /// Worker-side path the run writes. Must be under
+    /// `workload_spec::forge_produced::CONTAINER_DIR` — that dir is the only
+    /// one bind-mounted onto host-persistent storage, so a path outside it is
+    /// gone the moment kamaji reaps the container.
+    pub remote_path: PathBuf,
+    /// Host path the retrieved bytes are written to on success.
+    pub dest: PathBuf,
 }
 
 impl ExecContext {
@@ -54,6 +80,14 @@ impl ExecContext {
 
     pub fn with_platform(mut self, platform: String) -> Self {
         self.platform = Some(platform);
+        self
+    }
+
+    /// Ask the driver to retrieve `remote_path` off the worker and write it to
+    /// `dest` after a successful run. Remote-only; the local driver refuses a
+    /// spec carrying it rather than pretending the retrieval happened.
+    pub fn with_produced(mut self, remote_path: PathBuf, dest: PathBuf) -> Self {
+        self.produced = Some(ProducedFile { remote_path, dest });
         self
     }
 }
@@ -114,6 +148,12 @@ pub enum ForgeExecutorError {
     /// Underlying I/O failure mid-run (e.g. broken stdout pipe).
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
+    /// A remote dispatch failed on the yubaba side — deploy rejected, log
+    /// stream broke, teardown failed (R555-T2). Distinct from [`Self::Spawn`]:
+    /// nothing was spawned locally, so "is the runtime installed?" is the
+    /// wrong thing to tell the operator.
+    #[error("remote dispatch: {0}")]
+    Remote(String),
 }
 
 /// Driver that runs a [`ForgeSpec`] to terminal status.

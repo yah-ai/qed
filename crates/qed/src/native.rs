@@ -18,8 +18,10 @@
 //! lives in [`crate::runner::PipelineRunner::execute_step_package_native_tarball`].
 
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use flate2::write::GzEncoder;
@@ -131,22 +133,43 @@ pub fn native_tarball_output_path(camp_root: &Path, image_name: &str, triple: &s
         .join(format!("{}.tar.gz", tarball_stem(image_name, triple)))
 }
 
-// ── Sigstore signing seam (R407-T5, W154) ──────────────────────────────────
+// ── Sigstore signing seam (R407-T5, W154; identity split R605-F1) ──────────
 //
 // W154: "Sigstore signing extends to native tarballs (same trust model,
 // different artifact shape)." For OCI images, cosign signs the registry
 // digest (`cosign sign --yes <ref>@<digest>`). For tarballs, the equivalent
 // is `cosign sign-blob --yes`, which produces a detached signature and an
-// associated certificate / Rekor bundle. The trust model is the same:
-// keyless OIDC via the GHA token, identity matched at verification time by
-// regex against the workflow identity, transparency log entry in Rekor.
+// associated certificate / Rekor bundle.
+//
+// R605-F1 — *which* identity backs that signature is now explicit
+// ([`SigningIdentity`]), because it is exactly the thing that changes when a
+// release stops being cut on GitHub:
+//
+//   * [`SigningIdentity::Keyless`] — Fulcio mints a short-lived cert against
+//     an OIDC token. This is what GHA does today and stays the default. It is
+//     NOT portable off GitHub on its own: the public-good Fulcio only issues
+//     certs for OIDC issuers on its own configured allowlist (per Sigstore's
+//     "OIDC in Fulcio" docs — Dex/Google/GitHub/GitLab/SPIFFE/Kubernetes), so
+//     a camp-minted issuer cannot get a cert from it. The `identity_token`
+//     field carries a pre-minted token (`cosign --identity-token`) for the day
+//     a trusted issuer exists — a private Fulcio, or an upstream-registered
+//     one — but it does not conjure that trust into being.
+//
+//   * [`SigningIdentity::Key`] — a cosign key pair (`cosign.key` file or a KMS
+//     URI: `awskms://…`, `hashivault://…`, `k8s://…`). No OIDC, no Fulcio, so
+//     it works anywhere QED runs. This is the posture W235 §"Off-GHA forfeits
+//     GitHub OIDC keyless cosign" already committed to: "container signing
+//     moves to key-based cosign with the key vaulted in kamaji … a deliberate
+//     supply-chain posture change, not a transparent swap." The per-run vault
+//     grant that hands the key to a remote run is R555-F5.
 //
 // This module owns the abstraction; the runner attaches a concrete signer
 // via [`crate::runner::PipelineRunner::with_signer`]. The default in every
 // constructor is [`LoggingSigner`] — local `yah qed run` flows write
 // placeholder bytes and log a warning rather than fail when cosign isn't on
-// PATH. A real release pipeline (GHA or yubaba-run) wires [`CosignSigner`]
-// explicitly so an unsigned tarball never silently ships.
+// PATH. A release pipeline wires a real signer via [`resolve_signer`], which
+// reads the identity out of the environment and refuses to silently downgrade
+// to placeholders once one is configured.
 
 /// On-disk paths emitted by a successful [`SigstoreSigner::sign_blob`] call.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -154,10 +177,71 @@ pub struct SignedBlob {
     /// Detached signature, conventionally `<blob>.sig`.
     pub signature_path: PathBuf,
     /// Signing certificate (the leaf cert with the OIDC identity), `<blob>.crt`.
-    pub certificate_path: PathBuf,
+    ///
+    /// `None` for [`SigningIdentity::Key`] — a key-based signature has no
+    /// Fulcio certificate to emit, and verification pins the public key
+    /// instead of a certificate identity.
+    pub certificate_path: Option<PathBuf>,
     /// Cosign bundle (signature + cert + Rekor inclusion proof), `<blob>.bundle`.
     /// `None` when the signer doesn't emit a bundle.
     pub bundle_path: Option<PathBuf>,
+}
+
+/// Which Sigstore identity backs a signature (R605-F1).
+///
+/// See the module comment for why the two arms are not interchangeable off
+/// GitHub. `Default` is [`Self::Keyless`] with no pre-minted token — byte-for
+/// byte the pre-R605 behaviour.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SigningIdentity {
+    /// Fulcio-issued short-lived certificate bound to an OIDC identity.
+    Keyless {
+        /// Pre-minted OIDC token passed as `--identity-token`. `None` lets
+        /// cosign discover one from the ambient CI environment (what GHA's
+        /// `id-token: write` permission provides).
+        identity_token: Option<String>,
+    },
+    /// Long-lived cosign key pair. `key_ref` is a path to a `cosign.key` or a
+    /// KMS URI — whatever `cosign sign-blob --key` accepts.
+    Key { key_ref: String },
+}
+
+impl Default for SigningIdentity {
+    fn default() -> Self {
+        Self::Keyless {
+            identity_token: None,
+        }
+    }
+}
+
+/// Env var naming the cosign key (file path or KMS URI) for key-based signing.
+pub const ENV_COSIGN_KEY: &str = "QED_COSIGN_KEY";
+/// Env var carrying a pre-minted OIDC token for keyless signing.
+pub const ENV_COSIGN_IDENTITY_TOKEN: &str = "QED_COSIGN_IDENTITY_TOKEN";
+
+impl SigningIdentity {
+    /// Read the identity out of the environment.
+    ///
+    /// `QED_COSIGN_KEY` wins when both are set — an operator who vaulted a key
+    /// into the run meant to use it, and silently preferring an ambient OIDC
+    /// token would sign with a different identity than they configured.
+    /// Returns `None` when neither is set, which is the signal that no signing
+    /// identity was configured at all (see [`resolve_signer`]).
+    pub fn from_env() -> Option<Self> {
+        Self::from_env_with(|k| std::env::var(k).ok())
+    }
+
+    /// [`Self::from_env`] with an injectable lookup, so tests don't mutate
+    /// process-global env (which races across the test harness's threads).
+    pub fn from_env_with(lookup: impl Fn(&str) -> Option<String>) -> Option<Self> {
+        let non_empty = |k: &str| lookup(k).filter(|v| !v.trim().is_empty());
+        if let Some(key_ref) = non_empty(ENV_COSIGN_KEY) {
+            return Some(Self::Key { key_ref });
+        }
+        non_empty(ENV_COSIGN_IDENTITY_TOKEN).map(|t| Self::Keyless {
+            identity_token: Some(t),
+        })
+    }
 }
 
 /// Sign a single blob (a native tarball, conventionally) with the same
@@ -183,15 +267,89 @@ fn append_suffix(blob: &Path, suffix: &str) -> PathBuf {
 /// Set `cosign_bin` to `"cosign"` (PATH lookup) or an absolute path; a
 /// missing binary surfaces as a `NotFound` IO error so the runner reports a
 /// clean step-failure message at the call site.
+///
+/// `identity` picks the trust model (R605-F1). For
+/// [`SigningIdentity::Key`] with a passphrase-protected key file, cosign
+/// reads the passphrase from `COSIGN_PASSWORD` in the inherited environment —
+/// the signer does not plumb it, so the caller (or the vault grant that
+/// materialised the key) must set it, including to the empty string for a
+/// passphrase-less key.
 pub struct CosignSigner {
     pub cosign_bin: PathBuf,
+    pub identity: SigningIdentity,
 }
 
 impl Default for CosignSigner {
     fn default() -> Self {
         Self {
             cosign_bin: PathBuf::from("cosign"),
+            identity: SigningIdentity::default(),
         }
+    }
+}
+
+impl CosignSigner {
+    /// Keyless against the ambient CI OIDC token — today's GHA behaviour.
+    pub fn keyless() -> Self {
+        Self::default()
+    }
+
+    /// Key-based signing. `key_ref` is a `cosign.key` path or a KMS URI.
+    pub fn with_key(key_ref: impl Into<String>) -> Self {
+        Self {
+            identity: SigningIdentity::Key {
+                key_ref: key_ref.into(),
+            },
+            ..Self::default()
+        }
+    }
+
+    /// Point at a non-PATH cosign binary (tests, pinned installs).
+    pub fn with_bin(mut self, cosign_bin: impl Into<PathBuf>) -> Self {
+        self.cosign_bin = cosign_bin.into();
+        self
+    }
+
+    /// Whether this identity produces a Fulcio certificate alongside the
+    /// signature. Key-based signing does not.
+    fn emits_certificate(&self) -> bool {
+        matches!(self.identity, SigningIdentity::Keyless { .. })
+    }
+
+    /// Build the `cosign sign-blob` argv (minus the binary itself).
+    ///
+    /// Split out from [`SigstoreSigner::sign_blob`] so the flag shape per
+    /// identity is unit-testable without a cosign install — the flags are the
+    /// whole of what R605-F1 changes, and they only ever run for real on a
+    /// release cut.
+    fn sign_blob_argv(
+        &self,
+        blob_path: &Path,
+        sig: &Path,
+        crt: &Path,
+        bundle: &Path,
+    ) -> Vec<OsString> {
+        let mut argv: Vec<OsString> = vec!["sign-blob".into(), "--yes".into()];
+        match &self.identity {
+            SigningIdentity::Keyless { identity_token } => {
+                if let Some(token) = identity_token {
+                    argv.push("--identity-token".into());
+                    argv.push(token.into());
+                }
+                argv.push("--output-certificate".into());
+                argv.push(crt.into());
+            }
+            SigningIdentity::Key { key_ref } => {
+                argv.push("--key".into());
+                argv.push(key_ref.into());
+            }
+        }
+        argv.push("--output-signature".into());
+        argv.push(sig.into());
+        argv.push("--bundle".into());
+        argv.push(bundle.into());
+        argv.push(blob_path.into());
+        argv
     }
 }
 
@@ -203,15 +361,7 @@ impl SigstoreSigner for CosignSigner {
         let bundle = append_suffix(blob_path, ".bundle");
 
         let status = tokio::process::Command::new(&self.cosign_bin)
-            .arg("sign-blob")
-            .arg("--yes")
-            .arg("--output-signature")
-            .arg(&sig)
-            .arg("--output-certificate")
-            .arg(&crt)
-            .arg("--bundle")
-            .arg(&bundle)
-            .arg(blob_path)
+            .args(self.sign_blob_argv(blob_path, &sig, &crt, &bundle))
             .status()
             .await?;
         if !status.success() {
@@ -226,9 +376,45 @@ impl SigstoreSigner for CosignSigner {
         }
         Ok(SignedBlob {
             signature_path: sig,
-            certificate_path: crt,
+            certificate_path: self.emits_certificate().then_some(crt),
             bundle_path: Some(bundle),
         })
+    }
+}
+
+/// Pick the signer a pipeline run should use, from the environment.
+///
+/// The R605-F1 anti-footgun: once a signing identity is configured
+/// ([`SigningIdentity::from_env`]), this returns a real [`CosignSigner`] and a
+/// missing cosign binary becomes a hard step failure at sign time. With no
+/// identity configured it falls back to [`LoggingSigner`] — a local
+/// `yah qed run` still completes, loudly, with placeholder bytes.
+///
+/// This is what closes the runner.rs gotcha "release CI MUST wire CosignSigner
+/// explicitly … picking up the default in CI ships a tarball with stub files":
+/// CI now only has to export `QED_COSIGN_KEY`.
+pub fn resolve_signer() -> Arc<dyn SigstoreSigner> {
+    match SigningIdentity::from_env() {
+        Some(identity) => {
+            tracing::info!(
+                identity = match &identity {
+                    SigningIdentity::Key { .. } => "key",
+                    SigningIdentity::Keyless { .. } => "keyless",
+                },
+                "qed: signing with cosign"
+            );
+            Arc::new(CosignSigner {
+                identity,
+                ..CosignSigner::default()
+            })
+        }
+        None => {
+            tracing::debug!(
+                "qed: no signing identity configured ({ENV_COSIGN_KEY} / \
+                 {ENV_COSIGN_IDENTITY_TOKEN} unset) — using LoggingSigner placeholders"
+            );
+            Arc::new(LoggingSigner)
+        }
     }
 }
 
@@ -269,7 +455,7 @@ impl SigstoreSigner for LoggingSigner {
         );
         Ok(SignedBlob {
             signature_path: sig,
-            certificate_path: crt,
+            certificate_path: Some(crt),
             bundle_path: Some(bundle),
         })
     }
@@ -422,8 +608,12 @@ mod tests {
                 blob.file_name().unwrap().to_string_lossy()
             )),
         );
+        let cert = signed
+            .certificate_path
+            .clone()
+            .expect("LoggingSigner mirrors the keyless shape, cert included");
         assert_eq!(
-            signed.certificate_path,
+            cert,
             blob.with_file_name(format!(
                 "{}.crt",
                 blob.file_name().unwrap().to_string_lossy()
@@ -441,7 +631,7 @@ mod tests {
         // The placeholder files are non-empty so downstream tooling that
         // counts bytes / hashes contents doesn't get an empty-file footgun.
         assert!(fs::read(&signed.signature_path).unwrap().len() > 10);
-        assert!(fs::read(&signed.certificate_path).unwrap().len() > 10);
+        assert!(fs::read(&cert).unwrap().len() > 10);
         assert!(fs::read(&bundle).unwrap().len() > 10);
     }
 
@@ -462,10 +652,124 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let blob = dir.path().join("artifact.tar.gz");
         fs::write(&blob, b"x").unwrap();
-        let signer = CosignSigner {
-            cosign_bin: PathBuf::from("/definitely/not/a/real/cosign-binary"),
-        };
+        let signer = CosignSigner::keyless().with_bin("/definitely/not/a/real/cosign-binary");
         let err = signer.sign_blob(&blob).await.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    // ── R605-F1 signing identity ──────────────────────────────────────────
+
+    fn argv_of(signer: &CosignSigner) -> Vec<String> {
+        signer
+            .sign_blob_argv(
+                Path::new("/a/x.tar.gz"),
+                Path::new("/a/x.tar.gz.sig"),
+                Path::new("/a/x.tar.gz.crt"),
+                Path::new("/a/x.tar.gz.bundle"),
+            )
+            .into_iter()
+            .map(|s| s.to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn keyless_argv_is_unchanged_from_the_gha_shape() {
+        // The pre-R605 argv, byte for byte — GHA's release.yml signs with
+        // exactly `sign-blob --yes --output-signature … --output-certificate …`,
+        // so the default arm must not drift.
+        assert_eq!(
+            argv_of(&CosignSigner::keyless()),
+            vec![
+                "sign-blob",
+                "--yes",
+                "--output-certificate",
+                "/a/x.tar.gz.crt",
+                "--output-signature",
+                "/a/x.tar.gz.sig",
+                "--bundle",
+                "/a/x.tar.gz.bundle",
+                "/a/x.tar.gz",
+            ],
+        );
+    }
+
+    #[test]
+    fn keyless_with_token_passes_identity_token() {
+        let signer = CosignSigner {
+            identity: SigningIdentity::Keyless {
+                identity_token: Some("eyJhbGc.camp-minted".into()),
+            },
+            ..CosignSigner::default()
+        };
+        let argv = argv_of(&signer);
+        let i = argv.iter().position(|a| a == "--identity-token").unwrap();
+        assert_eq!(argv[i + 1], "eyJhbGc.camp-minted");
+    }
+
+    #[test]
+    fn key_argv_uses_key_and_emits_no_certificate() {
+        // A key-based signature has no Fulcio cert; asking cosign to write one
+        // is what would fail the step on a real release cut.
+        let argv = argv_of(&CosignSigner::with_key("awskms:///alias/yah-release"));
+        assert_eq!(
+            argv,
+            vec![
+                "sign-blob",
+                "--yes",
+                "--key",
+                "awskms:///alias/yah-release",
+                "--output-signature",
+                "/a/x.tar.gz.sig",
+                "--bundle",
+                "/a/x.tar.gz.bundle",
+                "/a/x.tar.gz",
+            ],
+        );
+        assert!(!argv.iter().any(|a| a == "--output-certificate"));
+    }
+
+    #[tokio::test]
+    async fn key_signing_reports_no_certificate_path() {
+        // Can't run cosign in the sandbox, so assert the mapping directly:
+        // the Key arm must not claim a `.crt` the signer never wrote.
+        assert!(!CosignSigner::with_key("cosign.key").emits_certificate());
+        assert!(CosignSigner::keyless().emits_certificate());
+    }
+
+    #[test]
+    fn from_env_prefers_key_over_ambient_token() {
+        let both = SigningIdentity::from_env_with(|k| match k {
+            ENV_COSIGN_KEY => Some("cosign.key".into()),
+            ENV_COSIGN_IDENTITY_TOKEN => Some("tok".into()),
+            _ => None,
+        });
+        assert_eq!(
+            both,
+            Some(SigningIdentity::Key {
+                key_ref: "cosign.key".into()
+            })
+        );
+    }
+
+    #[test]
+    fn from_env_is_none_when_unset_or_blank() {
+        assert_eq!(SigningIdentity::from_env_with(|_| None), None);
+        // A CI `export QED_COSIGN_KEY=` (unset secret) must read as "not
+        // configured", not as a key literally named empty-string.
+        assert_eq!(
+            SigningIdentity::from_env_with(|_| Some("   ".into())),
+            None
+        );
+    }
+
+    #[test]
+    fn from_env_token_only_is_keyless() {
+        assert_eq!(
+            SigningIdentity::from_env_with(|k| (k == ENV_COSIGN_IDENTITY_TOKEN)
+                .then(|| "tok".to_string())),
+            Some(SigningIdentity::Keyless {
+                identity_token: Some("tok".into())
+            })
+        );
     }
 }

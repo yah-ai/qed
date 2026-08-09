@@ -343,7 +343,7 @@ mod tests {
         );
     }
 
-    /// Smoke test against this very workspace: the qed crate is musl-clean
+    /// Smoke test against this very workspace: the yah-qed crate is musl-clean
     /// by design (no openssl-sys, no dbus, no cuda). If this test ever
     /// fails, either the qed dep tree gained a glibc-only dep (regression
     /// to fix) or [`KNOWN_GLIBC_ONLY_CRATES`] picked up a false positive
@@ -355,10 +355,10 @@ mod tests {
             .find(|p| p.join("Cargo.lock").is_file())
             .expect("workspace root has Cargo.lock")
             .to_path_buf();
-        // The qed crate itself is the safest target: pure data + tokio +
+        // The yah-qed crate itself is the safest target: pure data + tokio +
         // tar/flate2. If this errors with PackageNotFound the workspace
         // member name has drifted.
-        check_musl_compatibility(&workspace_root, "qed").expect("qed crate is musl-safe");
+        check_musl_compatibility(&workspace_root, "yah-qed").expect("yah-qed crate is musl-safe");
     }
 
     // ── R407-T4 workspace audit ────────────────────────────────────────────
@@ -372,13 +372,13 @@ mod tests {
             .to_path_buf();
         let audit = audit_workspace(&workspace_root).expect("workspace audit succeeds");
         assert!(!audit.rows.is_empty(), "workspace has members");
-        // qed must be in the audit and must be clean by design.
+        // yah-qed must be in the audit and must be clean by design.
         let qed = audit
             .rows
             .iter()
-            .find(|r| r.package == "qed")
-            .expect("qed appears in audit");
-        assert!(qed.is_clean(), "qed should be musl-static clean: {qed:?}");
+            .find(|r| r.package == "yah-qed")
+            .expect("yah-qed appears in audit");
+        assert!(qed.is_clean(), "yah-qed should be musl-static clean: {qed:?}");
         // Rows are sorted alphabetically.
         let mut sorted = audit.rows.clone();
         sorted.sort_by(|a, b| a.package.cmp(&b.package));

@@ -1,4 +1,5 @@
 # @yah:ticket(R633, "Remove the dead task-sessions crate from oss/qed (+ stale oss/yubaba patch line)")
+# @yah:at(2026-07-23T22:31:35Z)
 # @yah:kind(task)
 # @yah:parent(Q538)
 # @yah:assignee(agent:bundle-anthropic-ashguard)
@@ -23,7 +24,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.8.21"
+version = "0.8.22"
 edition = "2021"
 authors = ["yah Dev <human@yah.dev>"]
 license = "MIT OR Apache-2.0"

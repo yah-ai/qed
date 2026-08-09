@@ -9,7 +9,7 @@
 //!
 //! 1. [`vendored_bytes_match_pin`](tests) asserts the embedded bytes hash to the
 //!    pin (catches a stray edit of the vendored file), and
-//! 2. the `P014-gha-schema-drift` QED pipeline recomputes the *live* upstream
+//! 2. the `gha-schema-drift` QED pipeline recomputes the *live* upstream
 //!    hash and fails on divergence, so a SchemaStore change is a **deliberate
 //!    bump** (re-run `scripts/vendor-gha-schema.sh`, paste the new hash here),
 //!    never a surprise.

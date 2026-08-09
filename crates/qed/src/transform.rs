@@ -30,14 +30,43 @@
 //! declaration order; GHA workflows are a job DAG. The transform flattens jobs
 //! into a **topological linearization** ([`yah_qed_gha::topo_sort`]) — every job's
 //! `needs:` predecessors emit before it — so execution order is honest even
-//! though inter-job parallelism collapses to sequential. Matrix expansion and
-//! the `workflow_call` port contract are *not* handled here: target lifting out
-//! of `strategy.matrix` is R533-F9 (it layers onto the steps emitted here) and
-//! the down/up-port mapping is R533-F5.
+//! though the job grouping is lost.
+//!
+//! Read that as "the DAG is not *represented*", NOT as "the port gives up
+//! parallelism you had". QED has no inter-job parallelism to give up at either
+//! end: `QedStep` carries no dependency edges and the runner walks
+//! `pipeline.steps` in order, and the qed-gha emulator likewise computes waves
+//! and then executes every instance one at a time (`runtime.rs`, "Sequential
+//! within wave"). A flattened port therefore runs in the same wall-clock as the
+//! same workflow under the emulator; both are slower than GitHub, which schedules
+//! jobs across runners. Making QED honour the DAG is a *runner* feature (a
+//! dependency model on the step/job layer plus a concurrent scheduler), not
+//! something this transform can recover on its own — so do not "fix" it here by
+//! synthesising ordering the executor cannot act on.
+//!
+//! Matrix expansion and the `workflow_call` port contract are *not* handled
+//! here: target lifting out of `strategy.matrix` is R533-F9 (it layers onto the
+//! steps emitted here) and the down/up-port mapping is R533-F5.
+//!
+//! @yah:ticket(R605-F3, "QED executes a job DAG: dependency edges on the step/job layer + a concurrent scheduler")
+//! @yah:at(2026-08-03T06:12:20Z)
+//! @yah:status(open)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R605)
+//! @yah:next("Half (a) - qed-gha emulator: runtime.rs `for wave in &plan.waves { for instance in wave {` runs every instance serially ('Sequential within wave - F4 simplification'). The waves are ALREADY computed correctly by graph::plan; only the executor is serial. Needs a concurrency cap + shared-resource keys before turning on: unlike GHA these instances share one host, one cargo target dir and one docker daemon, so naive fan-out contends where GHA does not.")
+//! @yah:next("Half (b) - native pipelines: QedStep carries no dependency edges at all and PipelineRunner walks `for step in &self.pipeline.steps` in order, so an ejected pipeline cannot REPRESENT the DAG regardless of scheduling. This is the half that gates porting release.yml as anything but a flat list. Needs a dependency model (a `needs` on QedStep, or a job-grouping layer above steps) before the transform has anywhere to put the edges.")
+//! @yah:next("Only after (b): change transform.rs's topo_sort(...).map(|waves| waves.into_iter().flatten().collect()) to emit the wave structure instead of flattening. Do NOT do this first - synthesising ordering the executor cannot act on is worse than the honest flat list.")
+//! @yah:next("Blast radius on (b), scope before starting: PipelineRunner's sequential loop; remote-resume, which indexes by pipeline-local step index (runner.rs ~2659); background_until, whose contract is 'the named step must appear AFTER this one' - a partial order breaks 'after'; concurrency_key lock acquisition; and the per-step event/index stream the desktop QED tab renders.")
+//! @yah:verify("A pipeline with two independent branches and one join records overlapping start/end timestamps for the branches, and the join starts only after both finish")
+//! @yah:verify("yah qed eject on a multi-job workflow emits the job structure rather than a flat list, and `yah qed validate` still round-trips it")
+//! @yah:gotcha("The reporting layer already models this and is NOT the gap: the run-status wire struct carries `needs: Vec<String>` per job (W223 R532-F2) so the graph viewer can draw dependency edges for a WRAPPED workflow. That is display-only, fed from yah_qed_gha::plan - it does not mean native pipelines have dependencies.")
+//! @yah:gotcha("Do not file this as a release.yml blocker on parallelism grounds. Porting release.yml flat costs NOTHING against QED-today, because the emulator is serial too. The parallelism gap is against GitHub, and you already pay it the moment you run release.yml through QED at all. The real reasons to hold release.yml are its 52 tier-3 flags (several with no native replacement built yet) and it being a one-way move off the thing that currently ships releases.")
+//! @arch:see(oss/qed/crates/qed-gha/src/runtime.rs)
+//! @arch:see(oss/qed/crates/qed/src/transform.rs)
 
 use crate::matrix::MatrixSpec;
 use crate::platform::PlatformSpec;
-use crate::types::{OnFail, QedStep, StepActivation, StepKind};
+use crate::types::{OnFail, QedStep};
 use indexmap::IndexMap;
 use yah_qed_gha::{
     classify_step, topo_sort, Disposition, ExprString, ExprToken, Job, NativeReplacement,
@@ -128,6 +157,23 @@ pub enum FlagKind {
     /// won't expand. Convert to QED params / native outputs, or lift via
     /// import-time target lifting (R533-F9).
     UnresolvedExpression,
+    /// A surviving `${{ secrets.NAME }}` reference — split out of
+    /// [`UnresolvedExpression`] because its failure mode is categorically
+    /// worse than the rest of that bucket.
+    ///
+    /// Every other unresolved expression degrades to a visibly wrong literal:
+    /// a path that doesn't exist, a tag that doesn't match. A secret degrades
+    /// to a *non-empty string that looks like a credential*, so the usual
+    /// `if [ -z "$TOKEN" ]; then skip; fi` guard passes and the step proceeds
+    /// to make authenticated-looking calls with the literal text
+    /// `${{ secrets.NAME }}` as its bearer token. A step that would have
+    /// safely no-op'd instead fails deep inside a third-party API — which is
+    /// exactly the lossy-in-silence outcome this transform exists to prevent.
+    ///
+    /// The native replacement is real and nameable, which is why this is
+    /// `Review` and not `Info`: bridge the name through
+    /// `~/.yah/qed/secrets.toml`.
+    UnbridgedSecret { names: Vec<String> },
 }
 
 /// How loud a [`FlagKind`] is, for preflight summaries and reports.
@@ -157,7 +203,9 @@ impl FlagKind {
     pub fn severity(&self) -> FlagSeverity {
         match self {
             FlagKind::ReplaceWithNative(_) => FlagSeverity::Replace,
-            FlagKind::EmbeddedServiceTouch(_) | FlagKind::Unknown { .. } => FlagSeverity::Review,
+            FlagKind::EmbeddedServiceTouch(_)
+            | FlagKind::Unknown { .. }
+            | FlagKind::UnbridgedSecret { .. } => FlagSeverity::Review,
             FlagKind::ToolkitAction { .. } | FlagKind::UnresolvedExpression => FlagSeverity::Info,
         }
     }
@@ -185,11 +233,19 @@ impl FlagKind {
                  (qed-gha `classify_uses`); not run silently."
             ),
             FlagKind::UnresolvedExpression => {
-                "Script carries GHA `${{ … }}` expressions QED's subprocess substitution won't \
-                 expand; convert to QED params (`{{key}}`) / native outputs, or lift the build \
-                 target at import time (R533-F9)."
+                "Step carries GHA `${{ … }}` expressions (in the script or its `env:`) that \
+                 QED's subprocess substitution won't expand; convert to QED params \
+                 (`{{key}}`) / native outputs, or lift the build target at import time \
+                 (R533-F9)."
                     .to_string()
             }
+            FlagKind::UnbridgedSecret { names } => format!(
+                "References secret(s) {} which lower to the LITERAL text `${{{{ secrets.NAME }}}}`, \
+                 not to a value — a non-empty string that defeats an `if [ -z \"$TOKEN\" ]` guard \
+                 and is then sent as a live-looking credential. Bridge each name in \
+                 `~/.yah/qed/secrets.toml` (`NAME = \"vault:<slot>\"`) before running this step.",
+                names.join(", ")
+            ),
         }
     }
 }
@@ -256,6 +312,14 @@ fn transform_step(job_id: &str, job: &Job, step_index: usize, step: &Step) -> Tr
                 || step.env.values().any(|v| has_unresolved_expression(v, key))
             {
                 flags.push(FlagKind::UnresolvedExpression);
+            }
+            // Secrets are a subset of the unresolved expressions above, and are
+            // reported *in addition to* — not instead of — the general flag:
+            // the two want different fixes (params vs. the secrets bridge) and
+            // a step can need both.
+            let secrets = referenced_secrets(step, body);
+            if !secrets.is_empty() {
+                flags.push(FlagKind::UnbridgedSecret { names: secrets });
             }
         }
         // Tier-1/2 `uses:` toolkit action → flagged for the T7 executor.
@@ -327,6 +391,7 @@ fn map_run_step(
         background: false,
         background_until: None,
         wait_for: None,
+        manual: None,
         argv,
         cwd,
         env,
@@ -459,42 +524,18 @@ fn target_matrix(key: &str, values: &[String]) -> MatrixSpec {
 }
 
 /// A `QedStep` with every non-`Subprocess` field at its default — the spine
-/// `map_run_step` overlays argv/env/etc. onto. (QedStep has no `Default`; its
-/// literal sites construct all fields explicitly.)
+/// `map_run_step` overlays argv/env/etc. onto.
+///
+/// This used to spell all 30-odd fields out, with a comment saying `QedStep` has
+/// no `Default`. It has one (types.rs, R633) and that impl is *stricter* than a
+/// hand-written literal: it round-trips serde's own defaults, so it cannot drift
+/// from what a TOML file with only `name =` deserializes to. Enumerating the
+/// fields here bought nothing and cost an edit on every new `QedStep` field —
+/// including the two that led to this comment being disproved (R717-T1/T2).
 fn base_step(name: String) -> QedStep {
     QedStep {
-        background: false,
-        background_until: None,
-        wait_for: None,
-        manifest_stitch: None,
         name,
-        argv: Vec::new(),
-        cwd: None,
-        env: std::collections::HashMap::new(),
-        timeout: None,
-        on_fail: OnFail::Abort,
-        produces: Vec::new(),
-        runtime: None,
-        kind: StepKind::Subprocess,
-        image: None,
-        tag: None,
-        push: false,
-        platforms: Vec::new(),
-        binary_path: None,
-        triple: None,
-        package: None,
-        context: None,
-        load: false,
-        sub_pipeline: None,
-        outputs: Vec::new(),
-        gha_workflow: None,
-        import: None,
-        matrix: None,
-        enabled: true,
-        activation: StepActivation::Active,
-        if_cond: None,
-        platform: None,
-        toolchain: None,
+        ..Default::default()
     }
 }
 
@@ -545,6 +586,32 @@ fn has_unresolved_expression(s: &ExprString, resolved_matrix_key: Option<&str>) 
             _ => true,
         },
     })
+}
+
+/// Every distinct `secrets.NAME` referenced by a step's script or its `env:`,
+/// sorted and deduped.
+///
+/// Scans both surfaces because the `env:` case is the common and the more
+/// dangerous one — `env: { TOKEN: "${{ secrets.X }}" }` is how nearly every
+/// workflow hands a credential to a `run:` block, and it is precisely the shape
+/// that lowers to a plausible-looking non-empty literal.
+fn referenced_secrets(step: &Step, body: &ExprString) -> Vec<String> {
+    let mut names: Vec<String> = std::iter::once(body)
+        .chain(step.env.values())
+        .flat_map(|s| s.tokens.iter())
+        .filter_map(|t| match t {
+            ExprToken::Expr(raw) => raw.trim().strip_prefix("secrets."),
+            ExprToken::Literal(_) => None,
+        })
+        // `secrets.GITHUB_TOKEN` is tier-3 by nature and already reported by the
+        // service-touch classifier; listing it here as "bridge this" would point
+        // the human at a fix that cannot work — QED issues no GitHub tokens.
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty() && n != "GITHUB_TOKEN")
+        .collect();
+    names.sort();
+    names.dedup();
+    names
 }
 
 /// Sanitize a workflow name into a pipeline-name slug: lowercase, non-alnum runs
@@ -617,7 +684,7 @@ jobs:
         let r = xf(RUN_JOB);
         let step = native_at(&r, "build", 0);
         assert_eq!(step.name, "build: Compile");
-        assert_eq!(step.kind, StepKind::Subprocess);
+        assert_eq!(step.kind, crate::types::StepKind::Subprocess);
         assert_eq!(step.argv[0], "bash");
         assert_eq!(step.argv[1], "-c");
         assert!(step.argv[2].starts_with("set -eo pipefail\n"));
@@ -852,17 +919,124 @@ jobs:
 
     /// Locate yah's live `release.yml` by ascending to the `.github/workflows`
     /// marker. Absent in the standalone export mirror → the fixture test skips.
+    ///
+    /// `oss/qed` (this crate's own exportable subtree) carries a decoy
+    /// `.github/workflows/release.yml` of its own — a crates.io-publish
+    /// workflow for the standalone mirror, single `publish` job — which sits
+    /// *closer* to `CARGO_MANIFEST_DIR` than the monorepo's real CI workflow.
+    /// An ancestor-walk that stops at the first match silently transforms the
+    /// wrong file. `.yah/camp.toml` only exists at the true monorepo root
+    /// (oss/* subtrees are deliberately un-anchored so they stay transparent
+    /// to the camp's ticket index) — require it alongside the workflow file so
+    /// the walk skips the decoy and keeps ascending to the real root.
     fn release_yml() -> Option<String> {
         let mut dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         loop {
             let cand = dir.join(".github/workflows/release.yml");
-            if cand.is_file() {
+            if cand.is_file() && dir.join(".yah/camp.toml").is_file() {
                 return std::fs::read_to_string(cand).ok();
             }
             if !dir.pop() {
                 return None;
             }
         }
+    }
+
+    #[test]
+    fn env_secret_is_flagged_for_review_not_buried_in_info() {
+        // The smoke-sweeper shape: a credential handed to bash via `env:`, then
+        // guarded with `-z`. Lowered literally, the guard passes and the step
+        // calls a live API with `${{ secrets.X }}` as its bearer token.
+        let r = xf(r#"
+on: [push]
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Sweep
+        env:
+          HETZNER_API_TOKEN: ${{ secrets.HETZNER_API_TOKEN }}
+        run: |
+          if [ -z "$HETZNER_API_TOKEN" ]; then exit 0; fi
+          curl -H "Authorization: Bearer $HETZNER_API_TOKEN" https://api.example.com
+"#);
+        let flag = r
+            .flags()
+            .map(|(_, f)| f)
+            .find(|f| matches!(f, FlagKind::UnbridgedSecret { .. }))
+            .expect("env secret is flagged");
+        assert_eq!(
+            flag,
+            &FlagKind::UnbridgedSecret { names: vec!["HETZNER_API_TOKEN".into()] }
+        );
+        assert_eq!(
+            flag.severity(),
+            FlagSeverity::Review,
+            "a credential that lowers to a plausible non-empty literal is not informational"
+        );
+        assert!(flag.stanza_hint().contains("secrets.toml"));
+    }
+
+    #[test]
+    fn secrets_in_the_script_body_are_collected_deduped_and_sorted() {
+        let r = xf(r#"
+on: [push]
+jobs:
+  pub:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          echo "${{ secrets.R2_SECRET }}" > /dev/null
+          echo "${{ secrets.CF_TOKEN }}"
+          echo "${{ secrets.R2_SECRET }}"
+"#);
+        let flag = r
+            .flags()
+            .map(|(_, f)| f)
+            .find(|f| matches!(f, FlagKind::UnbridgedSecret { .. }))
+            .expect("script secrets are flagged");
+        assert_eq!(
+            flag,
+            &FlagKind::UnbridgedSecret {
+                names: vec!["CF_TOKEN".into(), "R2_SECRET".into()]
+            }
+        );
+    }
+
+    #[test]
+    fn github_token_is_not_reported_as_bridgeable() {
+        // QED issues no GitHub tokens, so "bridge this in secrets.toml" would be
+        // advice that cannot be followed. The service-touch classifier already
+        // owns this case.
+        let r = xf(r#"
+on: [push]
+jobs:
+  rel:
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload v1 ./dist/x
+"#);
+        assert!(
+            !r.flags().any(|(_, f)| matches!(f, FlagKind::UnbridgedSecret { .. })),
+            "GITHUB_TOKEN must not be offered as a bridgeable secret"
+        );
+    }
+
+    #[test]
+    fn a_step_with_no_secrets_raises_no_secret_flag() {
+        let r = xf(r#"
+on: [push]
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          RUSTFLAGS: -D warnings
+        run: cargo build --release
+"#);
+        assert!(!r.flags().any(|(_, f)| matches!(f, FlagKind::UnbridgedSecret { .. })));
     }
 
     #[test]
