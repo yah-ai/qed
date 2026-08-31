@@ -250,6 +250,7 @@ mod tests {
         "yah-yubaba",
         "yah-miniflare",
         "rusty-v8-musl-builder",
+        "mesofact-musl-builder",
     ];
 
     #[test]

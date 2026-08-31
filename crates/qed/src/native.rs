@@ -342,6 +342,12 @@ impl CosignSigner {
             SigningIdentity::Key { key_ref } => {
                 argv.push("--key".into());
                 argv.push(key_ref.into());
+                // Key-based signing has no OIDC identity for Rekor to attest
+                // to, and the whole point of this arm (W235) is not
+                // depending on public Sigstore infra to cut a release. The
+                // keyless arm keeps tlog upload on — that public record IS
+                // the point of Fulcio/Rekor certificate transparency.
+                argv.push("--tlog-upload=false".into());
             }
         }
         argv.push("--output-signature".into());
@@ -718,6 +724,7 @@ mod tests {
                 "--yes",
                 "--key",
                 "awskms:///alias/yah-release",
+                "--tlog-upload=false",
                 "--output-signature",
                 "/a/x.tar.gz.sig",
                 "--bundle",
@@ -726,6 +733,21 @@ mod tests {
             ],
         );
         assert!(!argv.iter().any(|a| a == "--output-certificate"));
+    }
+
+    #[test]
+    fn key_argv_disables_tlog_upload_but_keyless_does_not() {
+        // Live-verified 2026-08-16 against a real cosign v2.6.5 binary + a
+        // real (test) key pair: omitting --tlog-upload=false on the Key arm
+        // silently submits a public, permanent Rekor entry for a signature
+        // that has no OIDC identity to attest to — the opposite of what
+        // moving to key-based signing (off public Sigstore infra) is for.
+        assert!(argv_of(&CosignSigner::with_key("/vaulted/cosign.key"))
+            .iter()
+            .any(|a| a == "--tlog-upload=false"));
+        assert!(!argv_of(&CosignSigner::keyless())
+            .iter()
+            .any(|a| a == "--tlog-upload=false"));
     }
 
     #[tokio::test]

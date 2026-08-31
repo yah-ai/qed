@@ -236,10 +236,10 @@ pub enum TaskLocation {
     ///
     /// `mesh_tags` narrows the candidate set to nodes whose mesh tags are a
     /// **superset** of the requested ones (R594) — e.g.
-    /// `["tag:build-worker", "tier:x86"]` routes an amd64 image build to the
+    /// `["tag:build-worker", "arch:x86"]` routes an amd64 image build to the
     /// x86 build-worker fleet. Empty (the default) means "any node in `tier`",
     /// preserving the pre-R594 behavior. Arch is expressed as a mesh tag
-    /// (`tier:x86` / `tier:arm`), matching how the fleet nodes are tagged in
+    /// (`arch:x86` / `arch:arm`), matching how the fleet nodes are tagged in
     /// `.yah/infra/machines/*.toml`.
     RemoteAny {
         tier: TierTag,
@@ -257,6 +257,19 @@ pub enum TaskRuntime {
     Native,
     /// Image-backed container (docker/podman locally; containerd on yubaba).
     Container,
+    /// KVM microVM — the task boots its own kernel in its own guest
+    /// (R605-F8 / W325 §5).
+    ///
+    /// Remote-only, and refused locally: there is no dev-box story here the way
+    /// there is for `Container` (docker on the laptop). This exists so a build
+    /// can be placed on a node that is *also* running something that matters —
+    /// a raft voter, the public site — without the build sharing that node's
+    /// kernel. On a dev box there is nothing to be isolated from.
+    ///
+    /// Like `Native`, it is carried to kamaji as an annotation on an ordinary
+    /// `Workload::Container` rather than as a new wire shape; see
+    /// [`workload_spec::WorkloadSpec::wants_microvm`].
+    MicroVm,
 }
 
 /// Orthogonal placement of a task: *where* it runs (`location`) × *how* it's

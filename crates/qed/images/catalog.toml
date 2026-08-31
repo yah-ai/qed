@@ -73,3 +73,9 @@ name        = "rusty-v8-musl-builder"
 base        = "alpine:edge"
 description = "Expensive-leg builder for the rusty-v8-musl transform recipe (V8 from source → musl static lib) — R546. Alpine native-musl toolchain (no cross, no depot_tools); builds per-arch under the matching --platform."
 tools       = ["bash", "git", "curl", "cargo", "rustc", "gn", "samurai", "clang-22", "lld", "python3", "build-v8.sh"]
+
+[[image]]
+name        = "mesofact-musl-builder"
+base        = "alpine:3.22"
+description = "Builder for the mesofact-musl fleet pipeline (R560-T7) — Alpine + rustup musl HOST toolchain 1.97.0 + the prebuilt musl librusty_v8 archive baked in. Consumes rusty-v8-musl-builder's output; it is NOT a fork of it (that image is a V8 toolbox on apk rust 1.96 and bakes V8_FROM_SOURCE, both disqualifying here). Per-arch, no cross-compile."
+tools       = ["bash", "git", "curl", "cargo", "rustc", "cmake", "clang", "nodejs", "build-mesofact.sh"]

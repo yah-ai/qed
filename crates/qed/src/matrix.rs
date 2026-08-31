@@ -280,6 +280,34 @@ impl PlannedJob {
 /// pipeline as-is. Step-level matrices are expanded *within* each job —
 /// every step that carries its own `[matrix]` block fans out into N step
 /// instances substituted against that row's coord.
+/// Does this pipeline have any matrix to expand — at the pipeline level, or on
+/// any single step?
+///
+/// Both run paths (`camp.rs`'s `qed_run` handler and `qed.rs`'s in-process
+/// runner) used to gate [`plan`] on `pipeline.matrix` alone, on the reasoning
+/// that "step-level matrices keep their existing runner-side handling". There
+/// is no runner-side handling: [`crate::runner::PipelineRunner`] never reads
+/// [`QedStep::matrix`], and [`expand_step`] has exactly one production caller —
+/// [`plan`]. So a step matrix on a pipeline with no pipeline matrix silently
+/// never expanded, and the step ran ONCE with `${{ matrix.<key> }}` still
+/// literal in its argv.
+///
+/// That went unnoticed because no `.yah/qed/*.toml` in this camp declares a
+/// step-level matrix. It stopped being harmless with R533-F9: `qed eject`'s
+/// `lift_target` emits exactly this shape — a step matrix over the triples
+/// lifted out of a GHA `strategy.matrix.target` — so every ported multi-target
+/// workflow would have produced one step running an unexpanded expression.
+///
+/// Gate on this instead. A pipeline with neither kind of matrix still skips
+/// planning entirely, so the no-matrix path stays byte-for-byte unchanged.
+pub fn needs_expansion(pipeline: &Pipeline) -> bool {
+    pipeline.matrix.as_ref().is_some_and(|m| !m.is_empty())
+        || pipeline
+            .steps
+            .iter()
+            .any(|s| s.matrix.as_ref().is_some_and(|m| !m.is_empty()))
+}
+
 pub fn plan(pipeline: &Pipeline) -> Vec<PlannedJob> {
     let pipeline_rows: Vec<Option<MatrixCoord>> = match &pipeline.matrix {
         Some(spec) if !spec.is_empty() => {
@@ -386,6 +414,41 @@ fn apply_matrix_to_step(step: &mut QedStep, coord: &MatrixCoord) {
         }
         if let Some(cp) = &mut platform.container_platform {
             *cp = substitute_matrix(cp, &lookup);
+        }
+    }
+    // R605-F3: the shared-resource key is per-INSTANCE, not per-step. Left
+    // unsubstituted, `resource = "target-${{ matrix.arch }}"` stays one literal
+    // across every fanned row, so rows building into genuinely separate target
+    // dirs all serialize against each other — a fan-out capped at its pessimal
+    // answer. Substituting makes each row's key its own.
+    if let Some(resource) = &mut step.resource {
+        *resource = substitute_matrix(resource, &lookup);
+    }
+    // Same reasoning for the runtime gate: `if = "'${{ matrix.arch }}' == 'x86'"`
+    // is how a row selects itself, and unsubstituted it compares the literal
+    // expression text and is false for every row.
+    //
+    // This covers the `${{ … }}` spelling only. The BARE spelling
+    // (`if = "matrix.arch == 'x86'"`) resolves through the evaluator's
+    // `ctx.matrix`, which `PipelineRunner` builds from `self.matrix_coord` —
+    // the PIPELINE-level coord. A step-level matrix instance has no coord
+    // there, so a bare reference is `Null` and every instance skips. Carrying a
+    // per-step coord into the context is a runner change, not a substitution
+    // one; see the R605-F3 gotcha.
+    if let Some(if_cond) = &mut step.if_cond {
+        *if_cond = substitute_matrix(if_cond, &lookup);
+    }
+    // And the edges. Without this, `needs = ["build-${{ matrix.arch }}"]` — a
+    // CORRELATED edge, this row of `test` waiting on the matching row of
+    // `build` rather than on all of them — carries the literal expression into
+    // the graph, where it resolves to no step at all: rejected at load, and
+    // silently dropped by the runner's lenient resolver. Substituting makes the
+    // correlated edge writable; the un-correlated `needs = ["build"]` still
+    // joins on every row, since `dag::name_matches` matches the un-suffixed
+    // name against every `build [k=v]`.
+    if let Some(needs) = &mut step.needs {
+        for entry in needs.iter_mut() {
+            *entry = substitute_matrix(entry, &lookup);
         }
     }
 }
@@ -750,6 +813,7 @@ target = ["x86_64", "aarch64"]
 
     fn test_pipeline(matrix: Option<MatrixSpec>, steps: Vec<QedStep>) -> Pipeline {
         Pipeline {
+            max_parallel: None,
             description: None,
             tags: Vec::new(),
             name: "test".into(),
@@ -767,12 +831,16 @@ target = ["x86_64", "aarch64"]
             toolchain: None,
             binds: Vec::new(),
             on_change: Vec::new(),
+            alias_of: None,
+            pins: Default::default(),
             finally: Vec::new(),
         }
     }
 
     fn test_step(name: &str, argv: &[&str], env_pairs: Option<&[(&str, &str)]>) -> QedStep {
         QedStep {
+            needs: None,
+            resource: None,
             inputs: Vec::new(),
             secret: false,
             background: false,
@@ -799,6 +867,7 @@ target = ["x86_64", "aarch64"]
             triple: None,
             package: None,
             context: None,
+            source_context: Vec::new(),
             load: false,
             sub_pipeline: None,
             outputs: Default::default(),
@@ -811,6 +880,146 @@ target = ["x86_64", "aarch64"]
             platform: None,
             toolchain: None,
         }
+    }
+
+    /// R605-F3 (found by R776-T2): a step-level matrix under a pipeline with no
+    /// pipeline-level matrix must still expand. Both run paths used to gate
+    /// `plan()` on `pipeline.matrix` alone, so this shape ran ONCE with the
+    /// expression literal in argv. Nothing else expands it — `PipelineRunner`
+    /// never reads `QedStep::matrix`.
+    #[test]
+    fn a_step_matrix_alone_needs_expansion_and_gets_it() {
+        let mut step = QedStep {
+            name: "build".into(),
+            argv: vec!["echo".into(), "${{ matrix.arch }}".into()],
+            ..Default::default()
+        };
+        let mut dims: IndexMap<String, Vec<toml::Value>> = IndexMap::new();
+        dims.insert(
+            "arch".into(),
+            vec![
+                toml::Value::String("x86".into()),
+                toml::Value::String("arm".into()),
+            ],
+        );
+        step.matrix = Some(MatrixSpec { dimensions: dims, include: vec![], exclude: vec![] });
+
+        let pipeline = test_pipeline(None, vec![step]);
+        assert!(
+            needs_expansion(&pipeline),
+            "a step matrix is a matrix; gating on pipeline.matrix alone is the bug",
+        );
+        let jobs = plan(&pipeline);
+        assert_eq!(jobs.len(), 1, "a step matrix yields ONE job, not a fan-out");
+        let steps = &jobs[0].pipeline.steps;
+        assert_eq!(steps.len(), 2, "…whose steps fanned out");
+        assert_eq!(steps[0].argv[1], "x86");
+        assert_eq!(steps[1].argv[1], "arm");
+    }
+
+    /// A pipeline with neither kind of matrix skips planning entirely — the
+    /// byte-for-byte-unchanged path the old gate was protecting.
+    #[test]
+    fn a_pipeline_with_no_matrix_at_all_needs_no_expansion() {
+        let step = QedStep { name: "a".into(), argv: vec!["true".into()], ..Default::default() };
+        assert!(!needs_expansion(&test_pipeline(None, vec![step])));
+    }
+
+    /// R605-F3: a per-row edge has to be writable. `needs` was the last field
+    /// left out of the substitution list once `resource` and `if_cond` joined
+    /// it, and an unsubstituted edge resolves to no step at all — rejected at
+    /// load, silently dropped by the runner.
+    #[test]
+    fn a_matrix_row_can_declare_a_correlated_per_row_edge() {
+        let mut dims: IndexMap<String, Vec<toml::Value>> = IndexMap::new();
+        dims.insert(
+            "arch".into(),
+            vec![
+                toml::Value::String("x86".into()),
+                toml::Value::String("arm".into()),
+            ],
+        );
+        let spec = MatrixSpec { dimensions: dims, include: vec![], exclude: vec![] };
+
+        let build = QedStep {
+            name: "build".into(),
+            argv: vec!["true".into()],
+            needs: Some(vec![]),
+            matrix: Some(spec.clone()),
+            ..Default::default()
+        };
+        let test = QedStep {
+            name: "test".into(),
+            argv: vec!["true".into()],
+            // Correlated: this row waits on ITS build, not on every build.
+            needs: Some(vec!["build [arch=${{ matrix.arch }}]".into()]),
+            matrix: Some(spec),
+            ..Default::default()
+        };
+
+        let jobs = plan(&test_pipeline(None, vec![build, test]));
+        let steps = &jobs[0].pipeline.steps;
+        assert_eq!(steps[2].name, "test [arch=x86]");
+        assert_eq!(steps[2].needs.as_deref(), Some(&["build [arch=x86]".to_string()][..]));
+        assert_eq!(steps[3].needs.as_deref(), Some(&["build [arch=arm]".to_string()][..]));
+
+        // …and the resulting graph is two independent chains, not a join.
+        let waves = crate::dag::waves(steps, crate::dag::Missing::Reject).unwrap();
+        assert_eq!(waves, vec![vec![0, 1], vec![2, 3]]);
+    }
+
+    /// R605-F3 (found by R776-T3): a row selects itself with `if=`, so the
+    /// `${{ … }}` spelling has to be substituted per row — unsubstituted it
+    /// compares the literal expression text and every row skips.
+    #[test]
+    fn a_matrix_row_substitutes_its_own_if_gate() {
+        let mut step = QedStep {
+            name: "build".into(),
+            argv: vec!["true".into()],
+            if_cond: Some("'${{ matrix.arch }}' == 'x86'".into()),
+            ..Default::default()
+        };
+        let mut dims: IndexMap<String, Vec<toml::Value>> = IndexMap::new();
+        dims.insert(
+            "arch".into(),
+            vec![
+                toml::Value::String("x86".into()),
+                toml::Value::String("arm".into()),
+            ],
+        );
+        step.matrix = Some(MatrixSpec { dimensions: dims, include: vec![], exclude: vec![] });
+
+        let jobs = plan(&test_pipeline(None, vec![step]));
+        let steps = &jobs[0].pipeline.steps;
+        assert_eq!(steps[0].if_cond.as_deref(), Some("'x86' == 'x86'"));
+        assert_eq!(steps[1].if_cond.as_deref(), Some("'arm' == 'x86'"));
+    }
+
+    /// R605-F3 (found by R776-T3): the shared-resource key is per-instance. Left
+    /// unsubstituted it stays one literal across every row, so rows building
+    /// into separate target dirs would all serialize against each other.
+    #[test]
+    fn a_matrix_row_gets_its_own_resource_key() {
+        let mut step = QedStep {
+            name: "build".into(),
+            argv: vec!["true".into()],
+            resource: Some("target-${{ matrix.arch }}".into()),
+            ..Default::default()
+        };
+        let mut dims: IndexMap<String, Vec<toml::Value>> = IndexMap::new();
+        dims.insert(
+            "arch".into(),
+            vec![
+                toml::Value::String("x86".into()),
+                toml::Value::String("arm".into()),
+            ],
+        );
+        step.matrix = Some(MatrixSpec { dimensions: dims, include: vec![], exclude: vec![] });
+
+        let jobs = plan(&test_pipeline(None, vec![step]));
+        let steps = &jobs[0].pipeline.steps;
+        assert_eq!(steps[0].resource.as_deref(), Some("target-x86"));
+        assert_eq!(steps[1].resource.as_deref(), Some("target-arm"));
     }
 
     #[test]

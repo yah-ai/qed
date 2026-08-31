@@ -210,6 +210,7 @@ fn report_to_pipeline(header: &GeneratedHeader, report: &TransformReport) -> Pip
         on_fail: Vec::new(),
         triggers: Vec::new(),
         concurrency_key: None,
+        max_parallel: None,
         placement: Placement::default(),
         workspace: crate::types::WorkspaceMode::default(),
         // Record that this pipeline exists *because* it composes a workflow, so
@@ -229,6 +230,8 @@ fn report_to_pipeline(header: &GeneratedHeader, report: &TransformReport) -> Pip
         toolchain: None,
         binds: Vec::new(),
         on_change: Vec::new(),
+        alias_of: None,
+        pins: Default::default(),
         finally: Vec::new(),
     }
 }
@@ -268,6 +271,7 @@ fn strip_header(text: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dag as yah_qed_dag;
 
     const WF: &str = r#"
 name: Release Flow
@@ -317,6 +321,82 @@ jobs:
         // And specifically NOT the slug, which is what the name-based token
         // would have produced.
         assert_ne!(pipeline.wraps.as_deref(), Some("gha:release-flow"));
+    }
+
+    /// R605-F3 — the whole point of the field: a multi-job workflow ejects with
+    /// its job graph on the steps, and the graph re-reads out of the TOML into
+    /// a plan with genuinely parallel waves instead of a topological line.
+    #[test]
+    fn a_multi_job_workflow_ejects_the_job_structure_not_a_flat_list() {
+        const MULTI: &str = r#"
+name: Fan Out
+on: push
+jobs:
+  setup:
+    runs-on: x
+    steps:
+      - name: prep
+        run: echo prep
+  left:
+    needs: setup
+    runs-on: x
+    steps:
+      - name: build
+        run: echo left
+  right:
+    needs: setup
+    runs-on: x
+    steps:
+      - name: build
+        run: echo right
+  ship:
+    needs: [left, right]
+    runs-on: x
+    steps:
+      - name: publish
+        run: echo ship
+"#;
+        let doc = eject(Path::new("wf.yml"), MULTI.as_bytes(), &wf(MULTI));
+        assert!(doc.contains("needs = "), "the edges reach the file:\n{doc}");
+
+        let pipeline: Pipeline =
+            toml::from_str(strip_header(&doc)).expect("ejected body is valid Pipeline TOML");
+        let waves = yah_qed_dag::waves(&pipeline.steps, yah_qed_dag::Missing::Reject)
+            .expect("the ejected graph resolves");
+        assert_eq!(
+            waves.len(),
+            3,
+            "root, the two branches, the join — not four sequential waves: {waves:?}",
+        );
+        assert_eq!(waves[1].len(), 2, "the two independent jobs share a wave");
+    }
+
+    /// A round trip through TOML must not lose the edges — `needs` is written
+    /// as an array *after* several inline tables, which is exactly the shape a
+    /// TOML serializer gets wrong if the field lands in the wrong place.
+    #[test]
+    fn needs_survives_the_toml_round_trip() {
+        const TWO: &str = r#"
+on: push
+jobs:
+  a:
+    runs-on: x
+    steps:
+      - name: one
+        run: echo a
+        env:
+          K: v
+  b:
+    needs: a
+    runs-on: x
+    steps:
+      - name: two
+        run: echo b
+"#;
+        let doc = eject(Path::new("wf.yml"), TWO.as_bytes(), &wf(TWO));
+        let pipeline: Pipeline = toml::from_str(strip_header(&doc)).expect("valid TOML");
+        assert_eq!(pipeline.steps[0].needs, Some(vec![]));
+        assert_eq!(pipeline.steps[1].needs, Some(vec!["a: one".to_string()]));
     }
 
     #[test]

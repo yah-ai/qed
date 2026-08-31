@@ -250,11 +250,11 @@
 //! @yah:severity(high)
 //! @yah:verify("From an arm64 host, `yah qed images build <catalog-image> --platform linux/amd64` builds on us-west-002 and writes/publishes without a camp-root mount error")
 //! @yah:verify("The worker's runc task mounts a worker-local context dir, not the qed host's /Users/... path")
-//! @yah:gotcha("Two OTHER gaps sit in front of this one on the offload path and are already cleared, so don't re-chase them: (1) build-image remote routing used the runner's HOST arch not the step's TARGET arch — an amd64 build from an arm64 Mac went to a tier:arm RPi (us-west-011) that then failed on a loopback yubaba URL; FIXED in R636 via remote_build_image_arch. (2) us-west-002's containerd `yah` namespace lacked moby/buildkit:v0.12.5-rootless; pre-pulled 2026-07-23 (node bootstrap, same class as P018's deferred image pre-pull).")
+//! @yah:gotcha("Two OTHER gaps sit in front of this one on the offload path and are already cleared, so don't re-chase them: (1) build-image remote routing used the runner's HOST arch not the step's TARGET arch — an amd64 build from an arm64 Mac went to a arch:arm RPi (us-west-011) that then failed on a loopback yubaba URL; FIXED in R636 via remote_build_image_arch. (2) us-west-002's containerd `yah` namespace lacked moby/buildkit:v0.12.5-rootless; pre-pulled 2026-07-23 (node bootstrap, same class as P018's deferred image pre-pull).")
 //! @yah:next("DEPLOYABLE FIX DESIGN (qed-side only, NO fleet redeploy needed — the workload spec's command+mounts are authored by the qed dispatcher and merely executed by the existing 0.8.20 yubaba/kamaji): in build_image_workload_spec (velveteen-exec/src/remote.rs), when the target worker != qed host, stop bind-mounting camp-host paths. Instead (a) tar the resolved context dir, (b) upload it to a worker-reachable URL (yah-cloud R2 → cdn.yah.dev/yah-cloud/qed-context/<forge_id>.tar.gz; unique key per forge_id sidesteps the CDN-stale gotcha), (c) change buildctl_argv from `--local context=... --local dockerfile=...` to buildkit's remote-context `--opt context=<url> --opt filename=<Dockerfile>`, and (d) drop the two camp-host VolumeMounts. The OCI-archive OUT mount (BUILDKIT_HOST_OUT_DIR, worker-local) stays. Validate live via `yah qed images build rusty-v8-musl-builder --platform linux/amd64` from the arm64 Mac.")
 //! @yah:next("ALTERNATIVE (higher-fidelity, needs redeploy): carry the context inline in WorkloadSpec (new VolumeSource::Inline or a context payload) and have kamaji materialize it to a worker-local dir + bind-mount that. Cleaner model but touches workload-spec + kamaji and only takes effect after the fleet is redeployed off 0.8.20 — so it cannot deliver until a redeploy anyway. Prefer the deployable design above unless kamaji is being redeployed for other reasons.")
 //! @yah:next("AFTER the fix lands: re-run the amd64 build through the offload path to prove it end-to-end, then the workaround's native-on-box step is retired.")
-//! @yah:handoff("2026-07-23: the two upstream gaps on the offload path are CLEARED and the amd64 builder image was DELIVERED via the native-host workaround. (1) build-image remote routing now uses the step's TARGET arch (R636 remote_build_image_arch) — an amd64 build from the arm64 Mac now lands on us-west-002 (tier:x86, mesh 100.64.0.4), not the tier:arm RPi. (2) moby/buildkit:v0.12.5-rootless pre-pulled into us-west-002's `yah` containerd namespace (node bootstrap). With both cleared, the offload dispatch reaches BuildKit and fails ONLY on this ticket's cross-host mount: runc `open /Users/leif/ss/yah: no such file or directory` — the camp Mac's camp_root bind-mounted onto the worker.")
+//! @yah:handoff("2026-07-23: the two upstream gaps on the offload path are CLEARED and the amd64 builder image was DELIVERED via the native-host workaround. (1) build-image remote routing now uses the step's TARGET arch (R636 remote_build_image_arch) — an amd64 build from the arm64 Mac now lands on us-west-002 (arch:x86, mesh 100.64.0.4), not the arch:arm RPi. (2) moby/buildkit:v0.12.5-rootless pre-pulled into us-west-002's `yah` containerd namespace (node bootstrap). With both cleared, the offload dispatch reaches BuildKit and fails ONLY on this ticket's cross-host mount: runc `open /Users/leif/ss/yah: no such file or directory` — the camp Mac's camp_root bind-mounted onto the worker.")
 //! @yah:handoff("DELIVERED anyway (native path): built the amd64 builder image ON us-west-002 with `docker buildx --platform linux/amd64 -o type=oci` (byte-equivalent to what the verb shells, native arch, no emulation), pulled the OCI layout to camp, published via `yah cloud cr push`. LIVE + VERIFIED: cr.yah.dev/rusty-v8-musl-builder:v149.4.0-amd64-r636 @ sha256:7e9f0327255c8b96e65864c6324c9412b03558dd8fcdb50e1958734722171c9d — pulled back, arch=x86_64, baked /usr/local/bin/build-v8.sh has 4x `features simdutf` (the old v149.4.0-amd64 had ZERO). The stale-builder-image root cause of the broken published rusty_v8 artifact is fixed. NOT YET re-pinned into P018 / the transform recipe (busts derivation caches; sequence with the R546 owner) and the actual librusty_v8 artifact still needs a recipe run with this image.")
 //! @yah:handoff("DEFERRED (not blocked): the durable transport fix below was NOT implemented this session — velveteen-exec is a published OSS crate inside the active 0.8.21 release window and a peer was building the workspace (R629); churning it half-validated would be reckless. Sequence post-release.")
 //! @yah:handoff("FIXED + LANDED 2026-08-04 (@Ashguard:dove). The offloaded build-image path no longer references the qed host's filesystem at all. Shape: velveteen::ForgeCommand::BuildImage gains `context_url: Option<String>` (serde default + skip_serializing_if, so a kamaji predating it still parses a newer qed's spec); when set, build_image_workload_spec emits `--opt context=<url>` and pushes NO context/dockerfile bind mounts — the only surviving bind is the worker-local OCI out dir. New yah_qed::build_context module: a BuildContextPublisher trait (same seam shape as ReleasePublisher — declared in qed, implemented where credentials live) plus pack_context(), which tars the context and appends the compiled Dockerfile LAST so it wins extraction over any same-named file. app/yah/cli/src/qed_build_context.rs is the R2 impl (bucket yah-dev, key qed-context/<run>-<step>.tar.gz, served at cdn.yah.dev/<key> — mapping confirmed live with a probe put + curl); wired onto the fleet branch of run_one_in_process only. The key is derived from the run id so it is single-use, and it is deleted on BOTH the success and failure legs.")
@@ -343,6 +343,87 @@
 //! @yah:verify("cargo test -p yah-qed --lib — 782 pass / 0 fail / 1 ignored (skipping local_container_step_routes_through_docker_path, which needs a docker daemon).")
 //! @yah:handoff("DISCOVERED FIX (not in the ticket): sub_pipeline_admission_gap's rustdoc at runner.rs:4950 opened with two paragraphs describing OTHER functions. The W201-F4 substitution doc and the R488-F5 target-label doc had both come unglued from their items and F2 stacked its own doc on the pile. Pre-existing at 0aff48aa, not introduced by F2. Moved the W201-F4 block back onto substitute_step_context (runner.rs:5056, which had NO doc) and merged the R488-F5 token-discipline sentence into sub_pipeline_target_label's own doc.")
 //! @yah:verify("cargo test -p yah --lib — 1033 pass / 0 fail, including no_camp_pipeline_hands_a_child_a_key_its_parent_does_not_hold (the real-.yah/qed-tree walker).")
+//!
+//! @yah:relay(R766, "Resume-from-step for `workspace = \"isolated\"` pipelines: retain the run's worktree, and bound the retention")
+//! @yah:at(2026-08-15T03:53:59Z)
+//! @yah:status(open)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:next("CONTEXT: the cheap half of this already shipped. QedRunMeta / QedRunWire now carry the run's resolved `params`, and the desktop's resume-from-step button replays them, so a `workspace = \"live\"` pipeline (release-wizard) resumes correctly today. This relay is the EXPENSIVE half that was deliberately deferred: `workspace = \"isolated\"` pipelines still cannot resume, because their filesystem state is destroyed.")
+//! @yah:next("THE MECHANISM: runner.rs positions an isolated run at `std::env::temp_dir()/qed-worktree-{run_id}` via `git worktree add --force`, and the guard tears it down when the run ends (see the WorktreeGuard around runner.rs:1418 and the test `workspace_isolated_builds_in_a_worktree_and_guard_cleans_up`). Resuming step N of an isolated run therefore starts from a FRESH checkout of the ref -- every mutation steps 1..N-1 made is gone. For a publish wave that is not merely incomplete, it is wrong: the resume would re-derive state the earlier steps had already changed.")
+//! @yah:next("SCOPE: (1) retain the worktree when a run FAILS (a successful run has nothing to resume, so retaining it is pure cost); (2) record its path on the run meta so a resume can re-enter it instead of positioning a new one; (3) a retention policy, because this is the first qed feature whose per-run footprint is GB-scale rather than KB-scale -- a yah worktree with a populated target/ dwarfs the entire 29 MB run-meta history.")
+//! @yah:next("POLICY SHAPE, not yet decided -- this is the part worth thinking about before coding. A count-bounded LRU over retained worktrees (keep the N most recent failed runs) is the obvious default and is probably right, because the operator resumes a run they just watched fail, not one from last week. A time-bound alone is worse: it does not bound the footprint. `git worktree remove --force` plus `git worktree prune` is the eviction primitive; eviction must also survive a daemon restart, since the temp dirs outlive the process that made them.")
+//! @yah:gotcha("Do NOT let this relay grow to cover 'store intermediate step results'. That framing over-scopes the work: named step outputs are ALREADY persisted in `StepStatus::outputs`, and step stdout/stderr is ALREADY in the task-runs sqlite store keyed by `StepStatus::task_run_id`. The filesystem is the only inter-step state qed does not keep, and only under `isolated`. Storing 'results and caches' generally would rebuild two things that work.")
+//! @yah:gotcha("`.yah/jit/qed/*.json` has NO garbage collection of any kind today -- 646 files / 29 MB as of 2026-08-15, growing one file per run forever. That is pre-existing and independent of this ticket (the params field added ~nothing), but a reader who arrives here via the word 'GC' will conflate the two. Run-history storage is R623's territory (miravel: migrate that history to turso); THIS ticket's GC is about multi-GB worktrees, a different order of magnitude and a different eviction primitive. Coordinate rather than overlap.")
+//! @yah:gotcha("release-wizard is `workspace = \"live\"` (release-wizard.toml:107) and a sub-pipeline child inherits the parent's positioned tree unless it sets `own_workspace = true`. So the pipeline that MOTIVATED this work is not the one that needs it -- do not use release-wizard to test an isolated resume. Pick a pipeline that actually declares `workspace = \"isolated\"` (oss-publish does, but running it is IRREVERSIBLE; use a scratch pipeline).")
+//! @yah:verify("An isolated pipeline whose step 2 fails leaves its worktree on disk, and resuming from step 2 re-enters THAT worktree (assert on the path, not just on success) and sees a file step 1 wrote.")
+//! @yah:assumes("That anyone actually wants to resume an isolated run. No pipeline has asked for it yet -- the demand is inferred from the live-workspace case, not observed. If it stays hypothetical, closing this as won't-do is a legitimate outcome; the cost here is real and the benefit is not yet.")
+//! @yah:verify("Eviction is enforced across a daemon restart: retain N+2 failed isolated runs over a restart, assert only N worktrees survive on disk and `git worktree list` has no stale entries.")
+//!
+//! @yah:relay(R768, "QED run observability: sub-pipeline children are invisible — no events, no persisted run, no recoverable failure reason")
+//! @yah:status(review)
+//! @yah:at(2026-08-15T22:26:26Z)
+//! @yah:assignee(agent:bundle-anthropic-miravel)
+//! @yah:handoff("SHIPPED (uncommitted). runner.rs:3538 set `events: None` on every sub-pipeline child. That is worse than 'not persisted': a local subprocess step's stdout/stderr goes ONLY to the event channel (task_run_id tracks REMOTE dispatch -- see the assertion at runner.rs:10257 'task_run_id stays None, that field tracks remote dispatch only'), so a silent child DISCARDED the output of everything it ran. Measured symptom: release-wizard run ae047e61 reports `sub-pipeline failed at child step 'cargo-test' (run_id=5595e0d0...)`, `qed status 5595e0d0...` answers 'run not found', and no log for it exists on disk. 0.8.22 through 0.8.26 all failed this way with no recoverable reason.")
+//! @yah:handoff("WHY IT WAS None, which is the part that constrains the fix: the daemon's drain folds events into the registered meta BY STEP INDEX (camp.rs apply_qed_event_to_meta), so handing a child the parent's sender would have the child's step 0 overwrite the parent's step 0. The fix is therefore a FACTORY returning a distinct channel per child, not a clone. New in oss/qed: `ChildRunInfo` {run_id, pipeline, parent_run_id}, `ChildEventFactory` alias, `PipelineRunner::with_child_event_factory`, field inherited by children so grandchildren work too (release-wizard -> release-check -> check -> cargo-test is three levels). Returning None restores the old silent behaviour, so `yah qed run` with no daemon is unchanged.")
+//! @yah:handoff("DAEMON SIDE (camp.rs): new `child_event_factory(state)` registers the child (parent_run_id set) and THEN spawns the standard drain, both inside one spawned task in that order -- the drain kills itself if the run is not registered when the first event lands, and events queue harmlessly in the unbounded channel meanwhile. Two supporting changes: (1) `apply_qed_event_to_meta` now handles `E::RunFinished` (it fell through to `_ => {}`); a child has no run task of its own, so without this its meta sits at Running forever and history drops it as non-terminal. (2) `spawn_qed_event_drain` gained `persist_on_complete`, true ONLY for children -- a top-level run's run task writes the authoritative meta and racing it would overwrite the good copy with the lossy event-derived projection.")
+//! @yah:verify("cargo test -p yah --lib sub_pipeline_child_is_registered -> ok. The test plants a parent whose sub-pipeline child runs `sh -c 'echo BURIED_TREASURE; exit 1'` and asserts the child is registered under its parent, that .yah/jit/qed/<child>.json exists and is terminal (Failed, completed_at set), and that <child>.events.jsonl contains BURIED_TREASURE. The child FAILS on purpose -- a failing child is the only case anyone needs the log for. Genuinely red before the fix: with events: None no child drain existed, so no <child>.events.jsonl was written at all.")
+//! @yah:gotcha("THE FIX IS NOT LIVE FOR THE OPERATOR until the daemon binary is rebuilt AND reinstalled. Per app/yah/cli/CLAUDE.md there are two installed binaries and `cargo xtask install` updates only ~/.local/bin/yah; the daemon serving the desktop is /Applications/yah.app/Contents/MacOS/yah (`cargo xtask install --dest ...`). Re-running release-check against a stale daemon still captures nothing, which is exactly the trap that makes this look unfixed.")
+//! @yah:gotcha("CORRECTION to the prior gotcha: `/Applications/yah.app/Contents/MacOS/yah` is NOT the daemon serving live QED runs. `lsof -U` shows the camp sockets (`/tmp/yah-camp-*.sock`) are held by the `desktop` binary (PID of `/Applications/yah.app/Contents/MacOS/desktop`), which embeds `yah::camp::DaemonState` in-process (app/yah/desktop/src/camp_socket.rs:575, Cargo.toml path-deps on `../cli`). `qed_run_handler` calls `yah_qed::PipelineRunner::new_auto(...).with_child_event_factory(...)` directly in that process (camp.rs:8915) -- there is no child `yah-camp` subprocess. Reinstalling the `yah` CLI binary (either location) only changes what a fresh `yah mcp` subprocess or a no-daemon CLI fallback runs; it does nothing for a live desktop daemon, which keeps running the code it loaded at launch until the `desktop` process itself is killed and relaunched. `cargo xtask install` + `--dest .../MacOS/yah` were done (both succeeded, build id yah 0.8.26+5f2ad531-dirty) but that alone does NOT make the fix live.")
+//! @yah:handoff("Desktop app rebuilt, signed, notarized, and installed to /Applications/yah.app (`./app/yah/desktop/install-mac.sh --mode dev --rust-only`, 1654s wall, 2 attempts -- first hit the same orphan-gc race as R770, cleared and retried clean). This is the binary that matters: the live camp daemon (holds /tmp/yah-camp-*.sock per lsof) is the `desktop` Tauri process, which embeds yah::camp::DaemonState in-process (app/yah/desktop/src/camp_socket.rs:575, Cargo.toml path-dep on ../cli) -- NOT the standalone `yah` binary. `cargo xtask install` (both plain and --dest .../MacOS/yah, done earlier this session) only affects per-session `yah mcp` subprocesses and the no-daemon CLI fallback; it does nothing for a live desktop daemon, which runs whatever code it loaded at launch until the process itself is killed and relaunched.")
+//! @yah:handoff("REMAINING STEP, operator-only: the running desktop process (PID observed 46512 this session) must be quit and relaunched to actually load this build -- that kills every live agent session in this camp (all in-flight relays), so I did not do it myself. Posed as a call to the operator in chat; recommended they restart whenever convenient rather than me doing it now and interrupting Ashguard's two active relays (R737, R757).")
+//! @yah:verify("cargo test -p yah --lib sub_pipeline_child_is_registered -> ok (camp::r325_f1_tests::sub_pipeline_child_is_registered_persisted_and_keeps_its_output)")
+//! @yah:verify("cargo xtask install -> installed ~/.local/bin/yah, sha256 b6a9ba9108885e4690302a0d58062a69c1ff60f62d867493df5ecc5d5fcc7ce6")
+//! @yah:verify("cargo xtask install --dest /Applications/yah.app/Contents/MacOS/yah -> installed, sha256 2c7570e76fce8177c6a1e260cbdebc23e77ce6df9b03f68f60fde441a69761b6")
+//! @yah:verify("./app/yah/desktop/install-mac.sh --mode dev --rust-only -> Finished release-dev in 14m53s, notarization Accepted, installed to /Applications/yah.app. Live daemon still needs operator restart to pick it up -- not yet verified end-to-end against a real sub-pipeline failure post-restart.")
+//!
+//! @yah:ticket(R833-F8, "Imperative remote invocation: name a target node explicitly, rather than inferring one only from a cross-arch step")
+//! @yah:status(review)
+//! @yah:at(2026-08-30T02:38:56Z)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:phase(P4)
+//! @yah:parent(R833)
+//! @arch:see(.yah/docs/working/W330-distributing-camp-compute.md)
+//! @yah:next("DECIDE BY SPIKE FIRST, then build: either unblock the stubbed yubaba-workload path (--where=remote, hard-refused today, blocked on the yubaba RPC client) or extend the offload path that already works. The second is likely cheaper and the first is more general. W330 does not pick; whoever takes this ticket picks, and records why.")
+//! @yah:next("Tier: Wizard -- the deliverable is a fork in the road between a general path and a cheap one, with an existing relay on the other side of it.")
+//! @yah:gotcha("IF THE SPIKE PICKS THE YUBABA-WORKLOAD PATH, THE WORK CONTINUES UNDER R555, NOT HERE. R555 (Remote QED: dispatch pipeline runs to a camp's cloud, W235) already owns those seams -- camp-scoped cloud handle and dispatcher routing (F3), kamaji signed-recipe admission (F4), per-run ephemeral secret grants (F5), remote-run lifecycle (F6, open). Filing a parallel implementation here would duplicate them. This ticket owns the DECISION and, if the answer is 'extend the offload path', the implementation.")
+//! @yah:gotcha("THIS IS THE NEAREST-TO-DONE PIECE IN THE WHOLE RELAY, and the two pieces it rests on are verified working, not assumed: --where=auto already routes an amd64 build from the arm64 Mac to us-west-002 and builds green, and the camp daemon already makes such a run durable, resumable and visible in qed.status rather than dying with the terminal. That is gh-workflow-run semantics with no new service. Do not re-verify or re-file either -- they are in W330's shipped inventory.")
+//! @yah:handoff("DECISION (the fork this ticket owned): EXTENDED THE OFFLOAD PATH; did not unblock the stubbed yubaba-workload path, so the R555 seams stay R555's. Reason: velveteen already had TaskLocation::Remote { node }, and the offload chain (qed runner -> build_workload_spec -> WorkloadSpec annotations -> CloudConfig::admit_workload -> MeshYubabaClient::deploy) already carried everything EXCEPT the node name. Imperative targeting was therefore one missing axis on an existing admission seam, not a new transport. The general path still needs the R091 RPC client that does not exist.")
+//! @yah:handoff("FLAG SURFACE: `yah qed run <p> --where=node:<machine>` — same flag, fourth value, alongside auto|local|remote. The `node:` prefix is deliberate over a bare machine name: without it `--where=remot` becomes a request for a node called `remot` that fails minutes later at admission instead of at parse. Semantics: a pin is `remote` (every step leaves this box) PLUS an answer to which box. It travels on the qed.run wire verbatim as `node:<machine>` and the daemon parses the same grammar — one spelling on both ends.")
+//! @yah:handoff("IMPLEMENTATION, four seams. (1) oss/qed/crates/qed/src/runner.rs: PipelineRunner gains `pinned_node: Option<MeshIdent>` + `with_pinned_node()`, and a single private `remote_location(mesh_tags)` that BOTH remote dispatch sites (execute_step_remote's subprocess spec and the build-image spec) now go through — one seam, so a pin cannot be honoured by one and dropped by the other. Inherited by sub-pipeline children next to run_where. Kept ORTHOGONAL to RunWhere (which stays Copy): RunWhere answers whether a step leaves the box, pinned_node answers which box, so a pin composes with new_auto as well as new_remote.")
+//! @yah:handoff("(2) DISCOVERED BUG, FIXED HERE — oss/qed/crates/velveteen-exec/src/remote.rs:704 (pre-change) DROPPED the node outright: `TaskLocation::Remote { .. } => (TierTag(infra), vec![])`, i.e. a node-pinned spec was admitted identically to an unconstrained RemoteAny. So the variant existed and was inert; anyone using it got declaration-order placement and no error. It now emits NODE_SELECTOR_NODE_ANNOTATION (`yah.node-selector.node`), the imperative sibling of R594's `yah.node-selector.mesh-tags`. A pinned spec emits the node and NOT the tags — naming the box IS the constraint, and layering an inferred arch filter on top could only make an explicit target unschedulable.")
+//! @yah:handoff("(3) oss/yubaba/crates/cloud/src/config.rs: new `RequiredSpec.nodes` axis + `node_selector_node(ws)` reader, wired into `admission_spec`. This follows that file's own extension rule (a new constraint is a field on RequiredSpec; a new scope is a candidate set) rather than forking a second selector. The pin NARROWS the candidate set and still runs the capacity floor, taint repulsion and taint affinity — a named node that cannot serve refuses BY NAME instead of silently re-routing. (4) app/yah/cli/src/qed.rs CliPlacement::{Node, parse, pinned_node, wire_where} and app/yah/cli/src/camp.rs DaemonPlacement::{Node, is_forced_remote, pinned_node}; a pin takes the @fleet admission lane exactly like where=remote, since none of its work touches this box.")
+//! @yah:handoff("LIVE DEMONSTRATION against us-west-003 (up; 002 was tailscale-offline 18h, so 003 was the target the ticket preferred anyway). New pipeline .yah/qed/node-pin-smoke.toml declares NO platform block on purpose — there is nothing to infer from, so under --where=auto it runs local, and only an operator naming a node can send it to the fleet. `yah qed run node-pin-smoke --where=node:us-west-003 --in-process` -> Success, and us-west-003's kamaji journal records `containerd workload deployed container_id=forge-34f657d0-405e-4a61-993f-752c0d1219a0` plus the step's own stdout `node-pin-smoke: Linux 6.12.100+deb13-amd64 x86_64 nproc=16` — from an aarch64-apple-darwin camp, so the work provably left this box.")
+//! @yah:handoff("TWO CONTROLS, because a green run alone does not prove the PIN chose the node. `--where=node:us-west-002` dialled `POST http://100.64.0.4:7443/workloads/deploy` and failed with a transport error — 100.64.0.4 IS us-west-002, the box that is asleep, so routing followed the name rather than falling through to the reachable 003. `--where=node:us-west-404` was refused at admission: `no candidates matching required.nodes=[us-west-404] + memory_mb>=2048 + cpu_millis>=512 + not-tainted(no-job) — declared machines: us-east-001, ...` . And `--where=remot` is refused at parse naming all four accepted values.")
+//! @yah:handoff("TESTS — all green, no pre-existing failures in the crates touched. yah-qed 886/886 (+2: a_pinned_run_puts_the_named_node_on_the_wire, an_unpinned_run_still_infers_its_target_from_the_step, both asserting on the DEPLOYED WorkloadSpec via the existing DeployCapturingWarden). velveteen-exec 125/125 (+2 on build_workload_spec). yah-cloud 924/924 (+4 admission tests incl. a pin beating the declaration-order tie-break and a pin still failing the capacity floor). yah CLI lib 1226/1226 (+3 CliPlacement, +3 DaemonPlacement). xtask 42/42. Every added test has an unpinned twin asserting the R594 inference path is byte-identical, which is how `--where=auto unchanged` is proven rather than asserted.")
+//! @yah:gotcha("UNCOMMITTED. The `git commit` (pathspec-scoped to app/yah/cli/src/qed.rs, oss/qed/crates/qed/src/runner.rs, oss/qed/crates/velveteen-exec/src/remote.rs, oss/yubaba/crates/cloud/src/config.rs, .yah/qed/node-pin-smoke.toml) was DENIED at the approval gate, so every edit is live in the working tree and in nothing else. app/yah/cli/src/camp.rs was deliberately NOT in that pathspec: its diff vs HEAD is ~780 lines of which ~80 are mine, the rest peers' in-flight work, and a whole-file commit would have swept it in. Whoever sweeps next: the daemon half of this ticket lives in camp.rs's DaemonPlacement and qed_run_handler.")
+//! @yah:gotcha("WHY THE LIVE PROOF USED --in-process, and what is therefore NOT live-proven. `yah qed run` proxies to the camp daemon, which is the long-running desktop process built before this change — it would reject `where=node:us-west-003` with the old parser's 'expected auto, local, or remote'. So the demonstration forced the in-process path, which runs THIS binary's code. The daemon half (DaemonPlacement::Node -> new_remote().with_pinned_node()) is unit-tested but not live-exercised; it becomes live after a desktop rebuild + relaunch (app/yah/desktop/install-mac.sh), not after `cargo xtask install`. No install was run: this tree carries several peers' half-landed work and pushing it into the operator's PATH binary was not this ticket's call.")
+//! @yah:gotcha("PRE-EXISTING, NOT MINE: `cargo test -p xtask` has one failure, workload_envelope::every_on_disk_workload_toml_parses_through_the_envelope — `oss/mesofact/crates/mesofact/src/cli/new/template/workload.toml (kind = mesofact-static): missing field command`. That template file is CLEAN in git, so the break is on the code side of the envelope (a peer's in-flight mesofact-static change), untouched by this ticket. The other 42 xtask tests, including fleet_build_placement, pass. `scripts/check-schema-drift.sh` reports .yah/schema in sync — RequiredSpec is not a schema-emitted type, so the new `nodes` axis produced no drift.")
+//! @yah:verify("yah qed run node-pin-smoke --where=node:us-west-003 --in-process   # Success; then on the box: sudo journalctl -u kamaji --since '-6 min' | grep node-pin-smoke  -> 'Linux 6.12.100+deb13-amd64 x86_64'")
+//! @yah:verify("yah qed run node-pin-smoke --where=node:us-west-404 --in-process   # refused: no candidates matching required.nodes=[us-west-404], naming the declared pool")
+//! @yah:verify("cargo test --manifest-path oss/qed/Cargo.toml -p yah-qed -p velveteen-exec --lib && cargo test --manifest-path oss/yubaba/Cargo.toml -p yah-cloud --lib && cargo test -p yah --lib")
+//!
+//! @yah:ticket(R833-F9, "Artifact retrieval to the invoker: point produces / Outcome::Publish at the Phase 1 LAN store")
+//! @yah:at(2026-08-29T20:53:54Z)
+//! @yah:status(open)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:phase(P4)
+//! @yah:parent(R833)
+//! @arch:see(.yah/docs/working/W330-distributing-camp-compute.md)
+//! @yah:depends_on(R833-T2)
+//! @yah:next("Artifacts are build outputs and DO NOT belong in git history -- that is the constraint this ticket exists to respect. ProducedArtifact / produces / Outcome::Publish already work, including object-store staging; the change is pointing that staging at the Phase 1 LAN store (R833-T2) so a remote run's outputs come back to the invoker over the mesh.")
+//! @yah:next("Tier: Warrior -- the publish machinery exists and works; this is wiring it to a new destination plus the retrieval leg back to the invoker.")
+//! @yah:gotcha("ONE STORE SERVES BOTH. W330 is explicit that the LAN store carries the compile cache AND the QED artifacts -- do not stand up a second store for artifacts. If R833-T2 has not landed yet, that is what this ticket is waiting on; it is the only cross-phase dependency in the relay.")
+//!
+//! @yah:ticket(R833-T17, "Give isolated runs a stable worktree path so they at least share a cache with each other")
+//! @yah:at(2026-08-30T03:01:58Z)
+//! @yah:status(open)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R833)
+//! @yah:next("R833-S1 measured that a workspace='isolated' run gets 0 percent sccache reuse against the camp tree (1 hit / 727 misses on cargo build -p camp-identity), and that this is NOT configurable -- sccache 0.17.0 applies basedirs on the C/C++ path only and hashes cwd plus CARGO_MANIFEST_DIR into every Rust key. Sharing with the camp tree is therefore off the table.")
+//! @yah:next("WHAT IS STILL AVAILABLE: sharing between isolated runs. prepare_workspace (runner.rs:1635) builds at std::env::temp_dir()/qed-worktree-{run_id}, so the path is fresh every run and consecutive release runs share nothing with each other either. A path keyed on something stable -- the pipeline name rather than the run id -- would let the second release run of the day reuse the first.")
+//! @yah:next("THE REASON THIS IS A TICKET AND NOT A ONE-LINE EDIT: two concurrent isolated runs of the same pipeline would collide on one path, and R766 wants per-run worktrees RETAINED for resume-from-step. Settle those two before changing the path. A per-pipeline path plus a lock, or a small pool of numbered slots, are the shapes worth costing.")
+//! @yah:verify("Two consecutive isolated runs of the same pipeline, no source change between them, and the second run's sccache hit rate is materially above zero.")
+//! @yah:gotcha("Do not 'fix' this by moving the worktrees under /Users/leif/ss so a common base dir covers them and the camp tree. That was R833-S1's assigned hypothesis and it was measured false: a common ancestor cannot make two different sub-paths hash alike, and sccache strips nothing on the Rust path regardless. Measured with the common ancestor as a single basedir, and with both roots listed as basedirs -- 0 hits either way.")
 
 use std::sync::Arc;
 
@@ -524,6 +605,63 @@ pub trait ManualGate: Send + Sync {
     async fn reacquire_lock(&self) {}
 }
 
+/// Which admission lane the run's *current* unit of work belongs in
+/// (R719-F7, W298).
+///
+/// Named symbolically rather than by key, because the runner does not know
+/// what key it was admitted on: `qed_run_handler` rewrites a run's declared
+/// `concurrency_key` before taking it (R719-F3 routes a fully-offloaded run to
+/// the fleet lane). The runner knows *what kind of work comes next*; the
+/// [`AdmissionControl`] implementation owns the mapping to a concrete lane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdmissionLane {
+    /// The lane this run was admitted on — whatever key the caller resolved.
+    Base,
+    /// This stretch of work lands on a build worker, not on this box — so
+    /// whatever the run holds for local work, it does not need it now. What
+    /// that resolves to concretely (hold nothing, or keep a lane the caller
+    /// already derived from placement) is the implementation's decision.
+    Fleet,
+    /// A named lane, for a sub-pipeline child whose `concurrency_key` its
+    /// parent is not standing in (see [`sub_pipeline_admission_gap`]).
+    Named(String),
+}
+
+/// Dynamic admission (R719-F7, W298): the runner tells whoever admitted it
+/// which lane the *next* unit of work belongs in, so a long stretch of work
+/// that does not touch the run's lane can give it back.
+///
+/// Two holes close on this one surface, which is why it is one trait:
+///
+/// - A mixed `auto` run interleaving local and offloaded steps used to hold its
+///   *local* key across the offloaded stretches — hours of wall clock spent
+///   compiling on another machine while every local recipe in the camp queued
+///   behind it. R719-F1 made the default lane camp-global, so over-holding now
+///   parks the whole camp rather than one pipeline's own name.
+/// - A sub-pipeline child whose key its parent is not holding was serialized
+///   against nothing at all (R719-F2 reported it and could not fix it, because
+///   fixing it needs exactly this: admission that can be handed back and
+///   retaken).
+///
+/// **The implementation must release before it acquires.** Never hold two lanes
+/// at once: a run that keeps lane A while queueing for lane B is the hold-and-
+/// wait edge a deadlock cycle needs, and there is no lock ordering to impose
+/// across recipes an operator writes. Releasing first can only cost throughput.
+///
+/// `None` on the runner — what `yah qed run` uses — means no admission control
+/// at all: every call is a no-op and the run's lane, if any, is whatever its
+/// launcher holds for the whole duration.
+#[async_trait]
+pub trait AdmissionControl: Send + Sync {
+    /// Move the run into `lane`, releasing whatever it currently holds.
+    ///
+    /// Called at every step boundary, so it must be cheap and idempotent:
+    /// re-entering the lane already held is a no-op, not a release/reacquire
+    /// round-trip (which would re-queue the run behind every waiter for no
+    /// reason).
+    async fn enter(&self, lane: AdmissionLane);
+}
+
 #[derive(Error, Debug)]
 pub enum RunnerError {
     #[error("Step '{step}' failed: {msg}")]
@@ -656,8 +794,10 @@ pub fn pipeline_is_fully_offloaded(pipeline: &Pipeline, host: &str) -> bool {
 
 /// Map a Docker image tag (`reg/repo:ver`) to a filesystem-safe stem for
 /// OCI archive output under `.yah/cache/images/`. Replaces every byte that
-/// isn't `[A-Za-z0-9_.-]` with `_`.
-fn tag_to_filename(tag: &str) -> String {
+/// isn't `[A-Za-z0-9_.-]` with `_`. `pub(crate)` so [`crate::image_overlay`]
+/// can derive the same kind of collision-free stem for a GHA-emulator
+/// build-context publish key (R605-F2) without duplicating the mapping.
+pub(crate) fn tag_to_filename(tag: &str) -> String {
     tag.chars()
         .map(|c| {
             if c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-') {
@@ -686,10 +826,20 @@ struct PreparedBuildImage {
     tag: String,
 }
 
+/// A source context that has been uploaded and is waiting to be fetched once
+/// and then deleted (R560-T8).
+///
+/// Both halves are kept because they are used by different sides: the worker
+/// only ever sees `url`, and only the runner can `discard` the `key`.
+struct PublishedSourceContext {
+    key: String,
+    url: String,
+}
+
 /// Placement mesh-tags for a remote **subprocess** step (R590-F2).
 ///
 /// When the step declares a target arch via `[platform].target`, return the
-/// arch-matched build-worker selector (`tag:build-worker` + `tier:x86|arm`) so
+/// arch-matched build-worker selector (`tag:build-worker` + `arch:x86|arm`) so
 /// the run is placed on a node of that arch and executes *natively* — the whole
 /// point of the fleet path is that an arm64 host can drive an
 /// `x86_64-unknown-linux-musl` build on the x86 box (us-west-002) instead of
@@ -755,6 +905,27 @@ fn step_image_override(
     Ok(Some(velveteen_exec::default_image::catalog_image(image)))
 }
 
+/// Identifies the sub-pipeline child a [`ChildEventFactory`] is being asked to
+/// open a channel for (R768). Everything the host needs to register the run
+/// before its first event arrives.
+#[derive(Debug, Clone)]
+pub struct ChildRunInfo {
+    /// The child's freshly-minted run id — the same one that shows up in the
+    /// parent's `sub-pipeline failed at child step …(run_id=…)` message, and
+    /// the id an operator will type into `qed.status`.
+    pub run_id: QedRunId,
+    /// The child pipeline's declared name (e.g. `release-check`).
+    pub pipeline: String,
+    /// The immediate parent's run id — the child is registered under this so
+    /// the nested tree is walkable from history alone.
+    pub parent_run_id: QedRunId,
+}
+
+/// Host hook that hands a sub-pipeline child its own event channel.
+/// See [`PipelineRunner::with_child_event_factory`].
+pub type ChildEventFactory =
+    Arc<dyn Fn(&ChildRunInfo) -> Option<UnboundedSender<QedEvent>> + Send + Sync>;
+
 pub struct PipelineRunner {
     pipeline: Pipeline,
     run_id: QedRunId,
@@ -766,6 +937,19 @@ pub struct PipelineRunner {
     /// See [`crate::build_context`].
     build_context_publisher: Option<Arc<dyn crate::build_context::BuildContextPublisher>>,
     run_where: RunWhere,
+    /// R833-F8: the operator's **imperative** target — one named fleet node that
+    /// every remotely-placed step of this run is pinned to
+    /// (`yah qed run <p> --where=node:us-west-003`).
+    ///
+    /// Orthogonal to [`run_where`](Self::run_where) on purpose. `run_where`
+    /// answers *whether* a step leaves this box (and `Auto` derives that per
+    /// step from the platform resolution); this answers *which* box it lands on
+    /// once it does. Keeping them separate is what lets an explicit target win
+    /// over inference without disturbing inference: `None` — every caller
+    /// before this field existed — leaves placement to the arch/tag matcher
+    /// exactly as R594 shipped it, and `Some` replaces the *node-selection*
+    /// half only. See [`with_pinned_node`](Self::with_pinned_node).
+    pinned_node: Option<workload_spec::MeshIdent>,
     outcome_dispatcher: Arc<dyn OutcomeDispatcher>,
     /// Optional live-event sink (R325-F2). When set, `run()` emits a
     /// [`QedEvent`] at each lifecycle boundary; when `None` the runner is
@@ -778,6 +962,26 @@ pub struct PipelineRunner {
     /// alone; tests override via [`Self::with_camp_root`] to avoid leaking
     /// `.yah/cache/` into the working directory.
     camp_root: Option<std::path::PathBuf>,
+    /// Environment the embedder wants under **every locally-executed** step,
+    /// below the step's own `env` (R744-T2). Empty by default — a bare `qed`
+    /// has no opinion about the host's toolchain configuration.
+    ///
+    /// This exists because a step inherits this process's environment, and
+    /// "this process's environment" is the wrong place for a value that the
+    /// embedder computes *per camp*. The motivating case is the host's shared
+    /// Rust build cache: `.cargo/config.toml` declares `SCCACHE_DIR` relative
+    /// to itself, an isolated run copies that file into a worktree under
+    /// `$TMPDIR`, and the per-user sccache singleton then gets pinned to a
+    /// throwaway directory by whichever build reached it first. The embedder
+    /// knows the real absolute path; this is how it says so.
+    ///
+    /// Deliberately **not** applied to offloaded steps: their env is resolved
+    /// against a worker's filesystem, where a coordinator-side absolute path
+    /// names nothing. Container steps are excluded for the same reason.
+    ///
+    /// Inherited by sub-pipeline children — a nested `cargo` step is no less
+    /// local than a top-level one.
+    base_env: Vec<(String, String)>,
     /// Sigstore signer for `kind = "sign-native-tarball"` steps (R407-T5).
     /// Defaults to [`LoggingSigner`], which writes placeholder bytes and
     /// logs a warning so a local `yah qed run` doesn't fail when cosign
@@ -815,6 +1019,34 @@ pub struct PipelineRunner {
     /// the nested tree can be rebuilt from history alone. `None` on
     /// top-level runs.
     parent_run_id: Option<QedRunId>,
+    /// Host-supplied factory that gives a sub-pipeline CHILD its own event
+    /// channel (R768). Inherited by children, so it reaches every depth.
+    ///
+    /// Without it a child runs with `events: None` — and because a local
+    /// subprocess step's stdout/stderr goes ONLY to the event channel
+    /// (`task_run_id` tracks remote dispatch, not local execution), a failing
+    /// child step's output is not merely unpersisted, it is discarded. That is
+    /// how `release-wizard` came to report `sub-pipeline failed at child step
+    /// 'cargo-test' (run_id=…)` for a run id that resolves to nothing and a
+    /// log that was never written: five failed releases with no readable
+    /// reason.
+    ///
+    /// A child cannot simply share the parent's sender. The daemon's drain
+    /// folds events into the registered meta BY STEP INDEX, so a child's step 0
+    /// would overwrite the parent's step 0 — which is why this is a factory
+    /// handing back a distinct channel per child run rather than a clone.
+    /// Returning `None` restores the old silent behaviour.
+    child_event_factory: Option<ChildEventFactory>,
+    /// Mirrors [`crate::types::SubPipelineConfig::own_workspace`] onto the
+    /// child runner (R755). `false` on every top-level runner (there is
+    /// nothing to opt out of — a top-level run always positions its own
+    /// workspace) and on a child by default (W224/R533-F11 inheritance).
+    /// `true` only when this child's `[sub_pipeline]` block set it, which
+    /// makes [`Self::run_inner`]'s positioning skip
+    /// (`self.parent_run_id.is_some()`) additionally check `!own_workspace`
+    /// — so an opted-in child repositions per its OWN [`WorkspaceMode`]
+    /// instead of building from the parent's already-positioned tree.
+    own_workspace: bool,
     /// Added to every emitted step `index` so that a resume-from-step run
     /// (where the pipeline had its leading steps drained) still shows the
     /// original step position in the UI (e.g. step 6 of 6 instead of 1 of 1).
@@ -935,6 +1167,23 @@ pub struct PipelineRunner {
     /// crate ships standalone (`oss/qed`), and "the system is blocked on a
     /// human" is a camp concept, not a CI-scheduler concept.
     manual_gate: Option<Arc<dyn ManualGate>>,
+    /// Dynamic admission (R719-F7, W298). `None` — the default, and what
+    /// `yah qed run` uses — means the run's lane is whatever its launcher took
+    /// for the whole duration; every lane call below is a no-op. The camp
+    /// daemon installs a control backed by its `qed_locks` map. Inherited by
+    /// sub-pipeline children.
+    admission: Option<Arc<dyn AdmissionControl>>,
+    /// The concrete lane this runner's *local* work belongs in, when it is not
+    /// the lane its launcher was admitted on (R719-F7).
+    ///
+    /// `None` for a top-level run: its ordinary work belongs in
+    /// [`AdmissionLane::Base`], the lane the daemon resolved for it. `Some(key)`
+    /// on a sub-pipeline child that wants a lane its parent is not standing in
+    /// — the case [`sub_pipeline_admission_gap`] reports. Every lane decision
+    /// this runner makes then names that key instead of `Base`, so a child's own
+    /// steps (and its own children) admit against the child's key, not the
+    /// parent's.
+    admission_lane: Option<String>,
     /// What this run is *about*, when it was launched from a doc cell (R717-T3,
     /// W296). Copied verbatim onto the terminal [`QedRunMeta::cell`] so the run
     /// meta stays the source of truth and any derived cell index is rebuildable
@@ -976,9 +1225,45 @@ struct BackgroundTask {
     /// Event index (with offset) for the deferred `StepFinished` emit.
     event_index: usize,
     name: String,
-    /// Step name after which to reap; `None` ⇒ reap at end of the loop.
-    until: Option<String>,
+    /// The step indices this sidecar's `background_until` resolved to at
+    /// preflight — every row of it, when it names a fanned-out matrix step
+    /// (R605-F3). The reap fires once all of them are done, so a gate over N
+    /// rows means "after the last row", not "after whichever finished first".
+    ///
+    /// Indices rather than the raw name because the name is ambiguous under
+    /// matrix expansion, and because resolving once at preflight is what lets
+    /// the reap be a set-membership check instead of a string compare per
+    /// completed step. **Empty ⇒ no gate**: reap at the end of the step loop,
+    /// which is what `background_until = None` has always meant.
+    gate: Vec<usize>,
     join: tokio::task::JoinHandle<Result<(), RunnerError>>,
+}
+
+/// Everything one finished step hands back to the R605-F3 scheduler.
+///
+/// With the step loop concurrent, a step's body can no longer reach into the
+/// run-level accumulators as it goes — two steps folding into the same
+/// `produced` Vec would land in completion order, which is nondeterministic.
+/// So [`PipelineRunner::run_one_step`] returns its effects and the scheduler
+/// applies them, keyed by [`Self::index`], in declaration order.
+struct StepOutcome {
+    /// Position in `pipeline.steps` — the scheduler's key for readiness, for
+    /// the status row's slot, and for the produced-artifact fold.
+    index: usize,
+    /// Step name, for the `background_until` gate match and the named-output
+    /// context.
+    name: String,
+    /// The step did LOCAL work, so the run's admission lane had to cover this
+    /// host for its duration (see the lane note in the scheduler).
+    was_local: bool,
+    /// The [`QedStep::resource`](crate::types::QedStep::resource) key this step
+    /// held, released back to the scheduler on completion.
+    resource: Option<String>,
+    /// Failed with `on_fail = abort` — stop admitting new steps.
+    abort: bool,
+    produced: Vec<ProducedArtifact>,
+    outputs: std::collections::HashMap<String, String>,
+    row: StepStatus,
 }
 
 /// Reap one background sidecar (R513-F2), returning its terminal status.
@@ -1024,14 +1309,20 @@ impl PipelineRunner {
             remote_driver: None,
             build_context_publisher: None,
             run_where: RunWhere::Local,
+            pinned_node: None,
             outcome_dispatcher: Arc::new(LoggingOutcomeDispatcher),
             events: None,
             camp_root: None,
+            base_env: Vec::new(),
             signer: Arc::new(LoggingSigner),
             executor: Arc::new(LocalForgeDriver::new()),
             sub_pipeline_resolver: Arc::new(NoopSubPipelineResolver),
             suppress_publish_outcomes: false,
             parent_run_id: None,
+            own_workspace: false,
+            // Top-level runs have no factory until a host installs one via
+            // `with_child_event_factory`; children inherit it below.
+            child_event_factory: None,
             index_offset: 0,
             gha_matrix_subset: std::collections::HashMap::new(),
             include_stubbed: false,
@@ -1046,6 +1337,8 @@ impl PipelineRunner {
             params: std::collections::HashMap::new(),
             positioned_workspace: std::sync::OnceLock::new(),
             manual_gate: None,
+            admission: None,
+            admission_lane: None,
             cell: None,
         }
     }
@@ -1059,14 +1352,20 @@ impl PipelineRunner {
             remote_driver: None,
             build_context_publisher: None,
             run_where: RunWhere::Local,
+            pinned_node: None,
             outcome_dispatcher: dispatcher,
             events: None,
             camp_root: None,
+            base_env: Vec::new(),
             signer: Arc::new(LoggingSigner),
             executor: Arc::new(LocalForgeDriver::new()),
             sub_pipeline_resolver: Arc::new(NoopSubPipelineResolver),
             suppress_publish_outcomes: false,
             parent_run_id: None,
+            own_workspace: false,
+            // Top-level runs have no factory until a host installs one via
+            // `with_child_event_factory`; children inherit it below.
+            child_event_factory: None,
             index_offset: 0,
             gha_matrix_subset: std::collections::HashMap::new(),
             include_stubbed: false,
@@ -1081,6 +1380,8 @@ impl PipelineRunner {
             params: std::collections::HashMap::new(),
             positioned_workspace: std::sync::OnceLock::new(),
             manual_gate: None,
+            admission: None,
+            admission_lane: None,
             cell: None,
         }
     }
@@ -1095,12 +1396,40 @@ impl PipelineRunner {
         self
     }
 
+    /// Install the factory that gives each sub-pipeline child its own event
+    /// channel (R768). Inherited by children, so nesting works at any depth.
+    ///
+    /// `with_events` covers only THIS run; a child gets `events: None` unless
+    /// this is set, and a silent child discards the output of every local step
+    /// it runs. The camp daemon supplies a factory that registers the child run
+    /// and spawns the same drain a top-level run gets, which is what makes
+    /// `qed.status <child_run_id>` resolve and `<child_run_id>.events.jsonl`
+    /// exist. `yah qed run` without a daemon leaves it unset and keeps the old
+    /// behaviour.
+    pub fn with_child_event_factory(mut self, factory: ChildEventFactory) -> Self {
+        self.child_event_factory = Some(factory);
+        self
+    }
+
     /// Install the human surface for `kind = "manual"` steps (R622, W282).
     /// The camp daemon wires a gate backed by W111 forms; `yah qed run` leaves
     /// this unset and takes the headless path (advance-only). Inherited by
     /// sub-pipeline children.
     pub fn with_manual_gate(mut self, gate: Arc<dyn ManualGate>) -> Self {
         self.manual_gate = Some(gate);
+        self
+    }
+
+    /// Install dynamic admission (R719-F7, W298): the runner hands its lane
+    /// back across work that does not use it — an offloaded step, or a
+    /// sub-pipeline child that belongs in a different lane — and retakes it
+    /// before the next step that does. Inherited by sub-pipeline children.
+    ///
+    /// The camp daemon wires a control over its `qed_locks` map; `yah qed run`
+    /// leaves this unset, which keeps the pre-F7 behaviour (one lane, held for
+    /// the whole run, by whoever launched it).
+    pub fn with_admission(mut self, admission: Arc<dyn AdmissionControl>) -> Self {
+        self.admission = Some(admission);
         self
     }
 
@@ -1135,6 +1464,18 @@ impl PipelineRunner {
     /// the workspace.
     pub fn with_camp_root(mut self, root: std::path::PathBuf) -> Self {
         self.camp_root = Some(root);
+        self
+    }
+
+    /// Environment to underlay beneath every locally-executed step's own `env`
+    /// — R744-T2. See the [`base_env`](Self::base_env) field docs for what
+    /// belongs here and, more importantly, what does not.
+    ///
+    /// A step's own `env` wins on a key collision: the recipe is closer to the
+    /// work than the embedder is, and a pipeline that explicitly sets a key has
+    /// said something the host should not quietly overrule.
+    pub fn with_base_env(mut self, env: Vec<(String, String)>) -> Self {
+        self.base_env = env;
         self
     }
 
@@ -1743,14 +2084,20 @@ impl PipelineRunner {
             remote_driver: Some(remote_driver),
             build_context_publisher: None,
             run_where: RunWhere::Remote,
+            pinned_node: None,
             outcome_dispatcher: Arc::new(LoggingOutcomeDispatcher),
             events: None,
             camp_root: None,
+            base_env: Vec::new(),
             signer: Arc::new(LoggingSigner),
             executor: Arc::new(LocalForgeDriver::new()),
             sub_pipeline_resolver: Arc::new(NoopSubPipelineResolver),
             suppress_publish_outcomes: false,
             parent_run_id: None,
+            own_workspace: false,
+            // Top-level runs have no factory until a host installs one via
+            // `with_child_event_factory`; children inherit it below.
+            child_event_factory: None,
             index_offset: 0,
             gha_matrix_subset: std::collections::HashMap::new(),
             include_stubbed: false,
@@ -1765,6 +2112,8 @@ impl PipelineRunner {
             params: std::collections::HashMap::new(),
             positioned_workspace: std::sync::OnceLock::new(),
             manual_gate: None,
+            admission: None,
+            admission_lane: None,
             cell: None,
         }
     }
@@ -1786,6 +2135,47 @@ impl PipelineRunner {
         let mut runner = Self::new_remote(pipeline, scryer, yubaba);
         runner.run_where = RunWhere::Auto;
         runner
+    }
+
+    /// R833-F8: pin every remotely-placed step of this run to one **named**
+    /// fleet node (`--where=node:us-west-003`).
+    ///
+    /// The imperative half of placement. Until this, a target could only be
+    /// *inferred* — `RemoteAny` plus the arch/OS mesh tags derived from a
+    /// cross-arch step, resolved by declaration order in `.yah/infra/machines/`
+    /// — so there was no way to say "run it on that box", and no way to use a
+    /// build node the inference did not happen to elect. This composes with
+    /// either constructor:
+    ///
+    /// - with [`new_remote`](Self::new_remote): every step runs on `node`.
+    /// - with [`new_auto`](Self::new_auto): inference still decides *which*
+    ///   steps leave this host, and the ones that do all land on `node`.
+    ///
+    /// **Explicit beats inferred**: a pinned run stops emitting the mesh-tag
+    /// node-selector altogether (see
+    /// [`remote_location`](Self::remote_location)), so the operator's node is
+    /// not silently filtered back out by an arch tag derived from the step.
+    /// Whether that node can actually serve the step is then a live admission
+    /// answer — a refusal naming the node — rather than a quiet re-route.
+    pub fn with_pinned_node(mut self, node: workload_spec::MeshIdent) -> Self {
+        self.pinned_node = Some(node);
+        self
+    }
+
+    /// The [`TaskLocation`] a remotely-placed step dispatches to: the pinned
+    /// node when the operator named one (R833-F8), otherwise the R594
+    /// tag-matched `RemoteAny` the caller derived from the step.
+    ///
+    /// Single seam for both remote dispatch sites (subprocess and build-image)
+    /// so a pin cannot be honoured by one and dropped by the other.
+    fn remote_location(&self, mesh_tags: Vec<String>) -> TaskLocation {
+        match &self.pinned_node {
+            Some(node) => TaskLocation::Remote { node: node.clone() },
+            None => TaskLocation::RemoteAny {
+                tier: TierTag("infra".into()),
+                mesh_tags,
+            },
+        }
     }
 
     /// Attach a custom [`ForgeExecutor`] for local subprocess steps
@@ -2012,6 +2402,47 @@ impl PipelineRunner {
         }
     }
 
+    /// The lane this runner's own local work belongs in (R719-F7): the lane it
+    /// was admitted on, unless it is a sub-pipeline child running in a lane of
+    /// its own (see `admission_lane`).
+    fn base_lane(&self) -> AdmissionLane {
+        match &self.admission_lane {
+            Some(key) => AdmissionLane::Named(key.clone()),
+            None => AdmissionLane::Base,
+        }
+    }
+
+    /// The lane a step's work belongs in, given its resolved placement
+    /// (R719-F7, W298). Pure, so the policy is testable without a daemon.
+    ///
+    /// A [`Remote`](RunWhere::Remote) step's work lands on a build worker, so
+    /// the run does not need its own lane while it runs — that is all the
+    /// runner claims. What `Fleet` *resolves* to is the caller's call: the camp
+    /// daemon holds nothing for a mixed `auto` run's offloaded stretch and
+    /// keeps the base lane for a run it already placed by placement (R719-F3).
+    /// Everything else runs here and takes this runner's own lane.
+    ///
+    /// Deliberately NOT special-cased: `gha-workflow` and `import` steps. They
+    /// read as "dispatched to GitHub" and are not — `execute_step_gha_workflow`
+    /// runs the workflow locally through `yah_qed_gha::Executor`, spawning
+    /// `bash`/`docker`/`git` on this box, so they contend for the local lane
+    /// like any other step.
+    fn step_lane(&self, placement: RunWhere) -> AdmissionLane {
+        match placement {
+            RunWhere::Remote => AdmissionLane::Fleet,
+            RunWhere::Local | RunWhere::Auto => self.base_lane(),
+        }
+    }
+
+    /// Tell the admission control which lane the next unit of work needs. A
+    /// no-op when nothing is installed (`yah qed run`), and a no-op on the
+    /// implementation side when the lane is unchanged.
+    async fn enter_lane(&self, lane: AdmissionLane) {
+        if let Some(admission) = &self.admission {
+            admission.enter(lane).await;
+        }
+    }
+
     /// Plan the host-native cross build for a step that resolves to the
     /// [`NativeCross`](crate::platform::Resolution::NativeCross) tier (R531-F5,
     /// W222) — the concrete cargo-zigbuild / musl-cross invocation that should
@@ -2142,7 +2573,6 @@ impl PipelineRunner {
     pub(crate) async fn run_inner(
         &self,
     ) -> Result<(QedRunMeta, Vec<crate::types::ProducedArtifact>), RunnerError> {
-        let mut step_statuses = Vec::new();
         let created_at = Utc::now();
         let mut overall_status = RunStatus::Success;
         // Artifacts declared by steps that *succeed* — handed to an
@@ -2201,18 +2631,35 @@ impl PipelineRunner {
         // instead of silently costing an hour. Fail-fast, like the toolchain gate.
         self.emulation_gate()?;
 
+        // R605-F3: resolve the step dependency graph once, before anything
+        // runs. `Missing::Satisfied` because a resume-from-step run is handed a
+        // pipeline whose leading steps were `drain`ed (see
+        // [`Self::with_index_offset`]) — a surviving `needs` that names one of
+        // them names a step that genuinely already ran. Typos are still caught,
+        // at load time, by `PipelineLoader::validate_dag` against the undrained
+        // file; this is the only place that leniency is applied.
+        let step_preds =
+            crate::dag::predecessors(&self.pipeline.steps, crate::dag::Missing::Satisfied)
+                .map_err(|e| RunnerError::InvalidConfig(e.to_string()))?;
+        // Cycle check up front: a graph that never drains would otherwise show
+        // up as a run that finishes instantly having executed nothing.
+        crate::dag::waves(&self.pipeline.steps, crate::dag::Missing::Satisfied)
+            .map_err(|e| RunnerError::InvalidConfig(e.to_string()))?;
+        let dag_is_explicit = crate::dag::is_explicit(&self.pipeline.steps);
+
         // R513-F2: background sidecar pre-flight. v1 supports local + native
         // subprocess sidecars only, and a `background_until` target must name a
         // step that appears *later* in the pipeline. Fail loudly here, before
         // any step runs, rather than spawning a sidecar that can never be
         // reaped on schedule (a typo'd `background_until`) or routing one
         // through a runtime that can't honour `kill_on_drop` teardown.
-        let step_names: Vec<&str> = self
-            .pipeline
-            .steps
-            .iter()
-            .map(|s| s.name.as_str())
-            .collect();
+        // R605-F3: per-sidecar gate, resolved to step INDICES at preflight and
+        // carried onto the BackgroundTask. Indices rather than the raw name
+        // because a gate naming a matrix step covers every row of it, and the
+        // reap must fire when the LAST of them finishes — an exact-name compare
+        // at reap time would have fired on the first.
+        let mut background_gates: Vec<Vec<usize>> =
+            (0..self.pipeline.steps.len()).map(|_| Vec::new()).collect();
         for (i, step) in self.pipeline.steps.iter().enumerate() {
             if !step.is_background() {
                 continue;
@@ -2236,7 +2683,21 @@ impl PipelineRunner {
                 )));
             }
             if let Some(until) = &step.background_until {
-                match step_names.iter().position(|n| n == until) {
+                // R605-F3: resolved with the same matcher `needs` uses, so a
+                // gate naming a matrix step resolves to ALL of its rows. Before
+                // this it was an exact name compare, and `background_until =
+                // "build"` against a fanned-out `build` failed preflight with
+                // "unknown step" — the post-expansion name is `build [k=v]`,
+                // which no author writes by hand.
+                let gate: Vec<usize> = self
+                    .pipeline
+                    .steps
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, s)| crate::dag::name_matches(&s.name, until))
+                    .map(|(j, _)| j)
+                    .collect();
+                match gate.first().copied() {
                     None => {
                         return Err(RunnerError::InvalidConfig(format!(
                             "step `{}`: background_until names unknown step `{until}`",
@@ -2251,8 +2712,32 @@ impl PipelineRunner {
                             step.name,
                         )));
                     }
+                    // R605-F3: once a pipeline declares `needs`, "later in the
+                    // file" stops meaning "after". A gate step on a PARALLEL
+                    // branch can finish while the branch that actually talks to
+                    // the sidecar is still mid-run, and the reap would kill the
+                    // server out from under it — a race whose symptom is a
+                    // connection-refused three steps away from its cause.
+                    // Require the gate to be a genuine descendant. Not applied
+                    // to the implicit chain, where every later step already is
+                    // one, so this can only reject something newly expressible.
+                    Some(_)
+                        if dag_is_explicit && {
+                            let deps = crate::dag::dependents(&step_preds, i);
+                            !gate.iter().all(|g| deps.contains(g))
+                        } =>
+                    {
+                        return Err(RunnerError::InvalidConfig(format!(
+                            "step `{}`: background_until names `{until}`, which does not \
+                             depend on it — under a declared `needs` graph the gate step \
+                             must be a descendant of the sidecar, or the reap races the \
+                             steps that use it",
+                            step.name,
+                        )));
+                    }
                     Some(_) => {}
                 }
+                background_gates[i] = gate;
             }
         }
 
@@ -2268,7 +2753,14 @@ impl PipelineRunner {
         // wrong. `_run_worktree_guard` is held for the entire step loop so an
         // Isolated worktree outlives the whole run and is torn down on drop,
         // even when a step below returns early with an error.
-        let _run_worktree_guard = if self.parent_run_id.is_some() {
+        //
+        // R755: `own_workspace` (set from the step's own
+        // `[sub_pipeline] own_workspace = true`) opts a child OUT of that
+        // inheritance — it repositions per its OWN declared WorkspaceMode
+        // instead. `base_camp_root()` still resolves to the PARENT's
+        // (already-positioned) tree in that case, so `git worktree add`
+        // runs against the same repository the parent is standing in.
+        let _run_worktree_guard = if self.parent_run_id.is_some() && !self.own_workspace {
             None
         } else {
             let base = self.base_camp_root()?;
@@ -2280,399 +2772,283 @@ impl PipelineRunner {
             guard
         };
 
-        for (index, step) in self.pipeline.steps.iter().enumerate() {
-            let event_index = index + self.index_offset;
-            // Apply accumulated step-output + host substitution to argv / env /
-            // produces before the step runs. Clones only when there is
-            // something to substitute.
-            let step_modified = substituted_step(step, &step_context, &self.host_triple);
-            let step = step_modified.as_ref().unwrap_or(step);
+        // ── R605-F3: the step scheduler ──────────────────────────────────
+        //
+        // A step becomes eligible when every predecessor in its `needs` graph
+        // is done; up to `max_parallel` eligible steps run at once, minus any
+        // whose `resource` key is already held. A pipeline that declares no
+        // `needs` resolves to the chain `0 → 1 → 2 → …` (see [`crate::dag`]),
+        // so exactly one step is ever eligible and this degenerates to the
+        // sequential walk it replaced — same order, same events, same rows.
+        // That equivalence is the safety property: every pipeline TOML in
+        // every camp predates the field.
+        //
+        // Rows land in `main_statuses` BY STEP INDEX rather than being pushed,
+        // so a concurrent run still reports its steps in declaration order.
+        // `None` marks a step the run never reached, which is exactly what the
+        // old `break`-on-failure left out of the Vec.
+        let total = self.pipeline.steps.len();
+        let mut main_statuses: Vec<Option<StepStatus>> = (0..total).map(|_| None).collect();
+        // Produced artifacts folded back per step index for the same reason:
+        // the publish leg should see them in declaration order whether or not
+        // the steps that made them overlapped.
+        let mut produced_by_index: Vec<Vec<crate::types::ProducedArtifact>> =
+            (0..total).map(|_| Vec::new()).collect();
+        let mut done: Vec<bool> = vec![false; total];
+        let mut dispatched: Vec<bool> = vec![false; total];
+        let max_parallel = self
+            .pipeline
+            .max_parallel
+            .unwrap_or(crate::dag::DEFAULT_MAX_PARALLEL)
+            .max(1);
+        // Resource keys held by in-flight steps, and how many of those are
+        // doing LOCAL work (the lane decision below needs the count, not a
+        // boolean — two offloaded steps must not hand the local lane back
+        // while a third step is still compiling on this host).
+        let mut held_resources: Vec<String> = Vec::new();
+        let mut local_inflight: usize = 0;
+        // Set when a step fails with `on_fail = abort`: stop admitting, let
+        // whatever is already running finish, then leave the loop. The old
+        // code's `break` with nothing in flight is the same thing.
+        let mut aborting = false;
+        let mut inflight = futures_util::stream::FuturesUnordered::new();
 
-            // R506: declarative + runtime gating. Resolve the reason (if any)
-            // *before* emitting StepStarted so a skipped step's lifecycle
-            // pair carries a Skipped terminal status with no "Running"
-            // intermediate state on the wire.
-            let skip_reason = self.resolve_skip_reason(step, &step_context, overall_status);
+        loop {
+            // ── admit ────────────────────────────────────────────────────
+            while !aborting && inflight.len() < max_parallel {
+                let ready = (0..total).find(|&i| {
+                    !dispatched[i]
+                        && step_preds[i].iter().all(|&p| done[p])
+                        && match &self.pipeline.steps[i].resource {
+                            Some(key) => !held_resources.iter().any(|h| h == key),
+                            None => true,
+                        }
+                });
+                let Some(index) = ready else { break };
+                dispatched[index] = true;
+                let event_index = index + self.index_offset;
+                let raw = &self.pipeline.steps[index];
+                // Apply accumulated step-output + host substitution to argv /
+                // env / produces before the step runs. Clones only when there
+                // is something to substitute.
+                let step_modified = substituted_step(raw, &step_context, &self.host_triple);
+                let step = step_modified.as_ref().unwrap_or(raw);
 
-            let started_at = Utc::now();
-            self.emit(QedEvent::StepStarted {
-                index: event_index,
-                name: step.name.clone(),
-                argv: step.argv.clone(),
-                env_keys: crate::events::credential_env_keys(std::env::vars()),
-                at: started_at,
-            });
+                // R506: declarative + runtime gating. Resolve the reason (if
+                // any) *before* emitting StepStarted so a skipped step's
+                // lifecycle pair carries a Skipped terminal status with no
+                // "Running" intermediate state on the wire.
+                let skip_reason = self.resolve_skip_reason(step, &step_context, overall_status);
 
-            if let Some(reason) = skip_reason {
-                let completed_at = Utc::now();
-                self.emit(QedEvent::StepFinished {
+                let started_at = Utc::now();
+                self.emit(QedEvent::StepStarted {
                     index: event_index,
                     name: step.name.clone(),
-                    status: RunStatus::Skipped,
-                    msg: Some(reason.clone()),
-                    at: completed_at,
+                    argv: step.argv.clone(),
+                    env_keys: crate::events::credential_env_keys(std::env::vars()),
+                    at: started_at,
                 });
-                step_statuses.push(StepStatus {
-                    name: step.name.clone(),
-                    task_run_id: None,
-                    status: RunStatus::Skipped,
-                    started_at: Some(started_at),
-                    completed_at: Some(completed_at),
-                    // R330-B41: persist the same reason onto the terminal meta
-                    // that was already computed for the live event above —
-                    // previously dropped here, so `qed.status` / the report
-                    // could show *that* a step skipped but never *why*.
-                    error: Some(reason),
-                    outputs: std::collections::HashMap::new(),
-                    applied_binds: Vec::new(),
-                    jobs: Vec::new(),
-                    // A skipped step ran nothing, so it has no result for an
-                    // input digest to be about (R717-T1).
-                    input_hashes: std::collections::BTreeMap::new(),
-                });
-                continue;
-            }
 
-            // R717-T1 (W296): digest this step's declared `inputs` BEFORE it
-            // runs, so the recorded map answers "which bytes produced this
-            // result?" — a step that rewrites its own input would otherwise pin
-            // the bytes it emitted. Recorded onto `StepStatus::input_hashes`
-            // below; the staleness *verdict* is never stored, only computed at
-            // read time by `crate::staleness::input_freshness`. Skipped steps
-            // above never reach here, and rightly so: they produced no result
-            // for an input digest to be about.
-            let input_hashes = if step.inputs.is_empty() {
-                std::collections::BTreeMap::new()
-            } else {
-                crate::staleness::hash_declared_inputs(&self.resolve_camp_root()?, &step.inputs)
-            };
+                if let Some(reason) = skip_reason {
+                    let completed_at = Utc::now();
+                    self.emit(QedEvent::StepFinished {
+                        index: event_index,
+                        name: step.name.clone(),
+                        status: RunStatus::Skipped,
+                        msg: Some(reason.clone()),
+                        at: completed_at,
+                    });
+                    main_statuses[index] = Some(StepStatus {
+                        name: step.name.clone(),
+                        task_run_id: None,
+                        status: RunStatus::Skipped,
+                        started_at: Some(started_at),
+                        completed_at: Some(completed_at),
+                        // R330-B41: persist the same reason onto the terminal
+                        // meta that was already computed for the live event
+                        // above — previously dropped here, so `qed.status` /
+                        // the report could show *that* a step skipped but never
+                        // *why*.
+                        error: Some(reason),
+                        outputs: std::collections::HashMap::new(),
+                        applied_binds: Vec::new(),
+                        jobs: Vec::new(),
+                        // A skipped step ran nothing, so it has no result for
+                        // an input digest to be about (R717-T1).
+                        input_hashes: std::collections::BTreeMap::new(),
+                    });
+                    // A skipped step still SATISFIES its dependents — GHA
+                    // semantics, and the only reading under which `enabled =
+                    // false` on one step doesn't silently strand the rest of
+                    // the branch. Downstream steps gate on the run status via
+                    // `if = "success()"` if they care.
+                    done[index] = true;
+                    continue;
+                }
 
-            let runtime = self.resolve_runtime(step);
-            // R590-F4: derive this step's concrete placement (Local/Remote) from
-            // the `--where` force-mode + its declared platform. Under the default
-            // Auto mode a `native = true` cross-arch step routes to the fleet
-            // here without any `--where=remote` flag.
-            let placement = self.effective_placement(step);
-
-            // R513-F2: a background sidecar is *spawned*, not awaited. Emit only
-            // its StepStarted (already done above), kick the subprocess onto its
-            // own task, record a `Running` placeholder row finalized at reap, and
-            // advance to the next step. Pre-flight above guarantees this is a
-            // local + native subprocess step. Output collection ($YAH_OUTPUTS) is
-            // skipped — a long-lived sidecar has no terminal moment to read it
-            // back, and downstream substitution can't wait on a server that
-            // never exits.
-            if step.is_background() {
-                let spec = build_subprocess_spec(step, TaskRuntime::Native, None);
-                let camp_root = self.resolve_camp_root()?;
-                let cwd = match step.cwd.as_ref() {
-                    Some(rel) => camp_root.join(rel),
-                    None => camp_root,
+                // R717-T1 (W296): digest this step's declared `inputs` BEFORE
+                // it runs, so the recorded map answers "which bytes produced
+                // this result?" — a step that rewrites its own input would
+                // otherwise pin the bytes it emitted. Recorded onto
+                // `StepStatus::input_hashes`; the staleness *verdict* is never
+                // stored, only computed at read time by
+                // `crate::staleness::input_freshness`. Skipped steps above
+                // never reach here, and rightly so: they produced no result for
+                // an input digest to be about.
+                let input_hashes = if step.inputs.is_empty() {
+                    std::collections::BTreeMap::new()
+                } else {
+                    crate::staleness::hash_declared_inputs(&self.resolve_camp_root()?, &step.inputs)
                 };
-                let env: Vec<(String, String)> =
-                    step.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-                let ctx = ExecContext::default().with_cwd(cwd).with_env(env);
-                let join = self.spawn_background_step(event_index, step, spec, ctx);
-                let status_index = step_statuses.len();
-                step_statuses.push(StepStatus {
-                    name: step.name.clone(),
-                    task_run_id: None,
-                    status: RunStatus::Running,
-                    started_at: Some(started_at),
-                    completed_at: None,
-                    error: None,
-                    outputs: std::collections::HashMap::new(),
-                    applied_binds: Vec::new(),
-                    jobs: Vec::new(),
-                    // R717-T1: a sidecar is reaped, not completed — it has no
-                    // terminal moment its inputs would be evidence about.
-                    input_hashes: std::collections::BTreeMap::new(),
-                });
-                background_tasks.push(BackgroundTask {
-                    status_index,
-                    event_index,
-                    name: step.name.clone(),
-                    until: step.background_until.clone(),
-                    join,
-                });
-                continue;
+
+                let runtime = self.resolve_runtime(step);
+                // R590-F4: derive this step's concrete placement (Local/Remote)
+                // from the `--where` force-mode + its declared platform. Under
+                // the default Auto mode a `native = true` cross-arch step routes
+                // to the fleet here without any `--where=remote` flag.
+                let placement = self.effective_placement(step);
+
+                // R513-F2: a background sidecar is *spawned*, not awaited. Emit
+                // only its StepStarted (already done above), kick the subprocess
+                // onto its own task, record a `Running` placeholder row finalized
+                // at reap, and advance. Pre-flight above guarantees this is a
+                // local + native subprocess step. Output collection
+                // ($YAH_OUTPUTS) is skipped — a long-lived sidecar has no
+                // terminal moment to read it back, and downstream substitution
+                // can't wait on a server that never exits.
+                if step.is_background() {
+                    let spec = build_subprocess_spec(step, TaskRuntime::Native, None);
+                    let camp_root = self.resolve_camp_root()?;
+                    let cwd = match step.cwd.as_ref() {
+                        Some(rel) => camp_root.join(rel),
+                        None => camp_root,
+                    };
+                    // R744-T2: same base-env underlay as `execute_step_local` —
+                    // a background sidecar is a local native subprocess too,
+                    // and a `cargo run`-shaped one wants the host's build cache
+                    // exactly as much as a foreground build does.
+                    let mut env: Vec<(String, String)> =
+                        step.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+                    for (k, v) in &self.base_env {
+                        if !env.iter().any(|(existing, _)| existing == k) {
+                            env.push((k.clone(), v.clone()));
+                        }
+                    }
+                    let ctx = ExecContext::default().with_cwd(cwd).with_env(env);
+                    let join = self.spawn_background_step(event_index, step, spec, ctx);
+                    main_statuses[index] = Some(StepStatus {
+                        name: step.name.clone(),
+                        task_run_id: None,
+                        status: RunStatus::Running,
+                        started_at: Some(started_at),
+                        completed_at: None,
+                        error: None,
+                        outputs: std::collections::HashMap::new(),
+                        applied_binds: Vec::new(),
+                        jobs: Vec::new(),
+                        // R717-T1: a sidecar is reaped, not completed — it has
+                        // no terminal moment its inputs would be evidence about.
+                        input_hashes: std::collections::BTreeMap::new(),
+                    });
+                    background_tasks.push(BackgroundTask {
+                        status_index: index,
+                        event_index,
+                        name: step.name.clone(),
+                        gate: background_gates[index].clone(),
+                        join,
+                    });
+                    // R605-F3: a sidecar satisfies its dependents at SPAWN. It
+                    // has no exit to wait for, so any other reading would make
+                    // `needs = ["server"]` an unsatisfiable edge. See
+                    // [`crate::types::QedStep::needs`].
+                    done[index] = true;
+                    continue;
+                }
+
+                // R719-F7 (W298): resolve the admission lane this step's work
+                // needs. Computed after the skip / background arms on purpose:
+                // neither does work the run's lane is protecting (a skipped step
+                // does nothing; a sidecar is spawned, not awaited), so neither
+                // should re-queue.
+                //
+                // R605-F3: the lane is a property of the RUN, not of a step, so
+                // with several steps in flight it has to cover the most
+                // demanding of them. One branch offloading to the fleet does not
+                // make this host idle while another branch is still compiling on
+                // it, so `Fleet` is downgraded to the run's own lane whenever
+                // local work is in flight. On the implicit chain `local_inflight`
+                // is always 0 here and the arm never fires.
+                //
+                // The `enter_lane` itself happens inside the step's own future
+                // rather than here, so a run that has to QUEUE for its lane
+                // doesn't stall the steps already in flight — the admission
+                // loop must not block on anything, because nothing else is
+                // being polled while it runs. The observable sequence is
+                // unchanged on the serial path: StepStarted, then the lane,
+                // then execution.
+                let lane = match self.step_lane(placement) {
+                    AdmissionLane::Fleet if local_inflight > 0 => self.base_lane(),
+                    other => other,
+                };
+
+                if placement == RunWhere::Local {
+                    local_inflight += 1;
+                }
+                if let Some(key) = &step.resource {
+                    held_resources.push(key.clone());
+                }
+                let owned = step.clone();
+                inflight.push(self.run_one_step(
+                    index,
+                    owned,
+                    started_at,
+                    input_hashes,
+                    runtime,
+                    placement,
+                    lane,
+                ));
             }
 
-            // step_outputs: key → value collected from this step (W201-F4).
-            // step_jobs: per-job rows when this step wraps a GHA workflow
-            // (W223 R532-T1); stays empty for every other step kind.
-            let mut step_jobs: Vec<crate::types::JobRow> = Vec::new();
-            // R590-F6: when a remote step's produced artifacts are retrieved off
-            // the build-worker, the path-rewritten list lands here and replaces
-            // the raw `step.produces` declarations at the aggregation point
-            // below. Stays `None` for local steps and remote steps with no
-            // produced artifacts (the common case).
-            let mut remote_produced: Option<Vec<ProducedArtifact>> = None;
-            let (result, task_run_id, step_outputs) = match step.kind {
-                crate::types::StepKind::BuildImage => {
-                    match self.execute_step_build_image(event_index, step).await {
-                        Ok(Some(forge_id)) => (
-                            Ok(()),
-                            Some(forge_id.to_string()),
-                            std::collections::HashMap::new(),
-                        ),
-                        Ok(None) => (Ok(()), None, std::collections::HashMap::new()),
-                        Err(e) => (Err(e), None, std::collections::HashMap::new()),
-                    }
-                }
-                crate::types::StepKind::PackageNativeTarball => (
-                    self.execute_step_package_native_tarball(step).await,
-                    None,
-                    std::collections::HashMap::new(),
-                ),
-                crate::types::StepKind::MuslStaticPreflight => (
-                    self.execute_step_musl_static_preflight(step).await,
-                    None,
-                    std::collections::HashMap::new(),
-                ),
-                crate::types::StepKind::SignNativeTarball => (
-                    self.execute_step_sign_native_tarball(step).await,
-                    None,
-                    std::collections::HashMap::new(),
-                ),
-                crate::types::StepKind::SubPipeline => {
-                    match self
-                        .execute_step_sub_pipeline(event_index, step, &mut step_jobs)
-                        .await
-                    {
-                        Ok((child_produced, child_outputs)) => {
-                            // Aggregation happens here (not below) so child
-                            // produces flow into the parent's `Outcome::Publish`
-                            // exactly like a sibling step's `produces`. The
-                            // generic `produced.extend(step.produces.iter())`
-                            // below is a no-op for SubPipeline (validate
-                            // rejects direct `produces` on this kind).
-                            produced.extend(child_produced);
-                            (Ok(()), None, child_outputs)
-                        }
-                        Err(e) => (Err(e), None, std::collections::HashMap::new()),
-                    }
-                }
-                crate::types::StepKind::GhaWorkflow => {
-                    let cfg = step.gha_workflow.clone();
-                    let dispatch = match cfg.as_ref() {
-                        Some(cfg) => self.execute_step_gha_workflow(event_index, step, cfg, &mut step_jobs).await,
-                        None => Err(RunnerError::InvalidConfig(format!(
-                            "step `{}`: kind=gha-workflow with no [gha_workflow] block (validate() should have caught this)",
-                            step.name,
-                        ))),
-                    };
-                    match dispatch {
-                        Ok((workflow_produced, workflow_outputs)) => {
-                            // Same aggregation policy as SubPipeline: the
-                            // GHA child's artifacts flow into the parent's
-                            // Outcome::Publish in one terminal stage/sync,
-                            // not N per workflow job. Job-level outputs are
-                            // surfaced as `<job_id>.<key>` so the enclosing
-                            // SubPipeline parent's `propagate.outputs` can
-                            // pick them up (R488-F6).
-                            produced.extend(workflow_produced);
-                            (Ok(()), None, workflow_outputs)
-                        }
-                        Err(e) => (Err(e), None, std::collections::HashMap::new()),
-                    }
-                }
-                crate::types::StepKind::Import => {
-                    match self
-                        .execute_step_import(event_index, step, &mut step_jobs)
-                        .await
-                    {
-                        Ok((import_produced, import_outputs)) => {
-                            // The imported workflow's expansion rolls up exactly
-                            // like a GhaWorkflow step (W224 keeps the front-end):
-                            // produced artifacts into the parent's terminal
-                            // Outcome::Publish, job-level outputs as `<job>.<key>`.
-                            produced.extend(import_produced);
-                            (Ok(()), None, import_outputs)
-                        }
-                        Err(e) => (Err(e), None, std::collections::HashMap::new()),
-                    }
-                }
-                crate::types::StepKind::WaitFor => (
-                    self.execute_step_wait_for(event_index, step).await,
-                    None,
-                    std::collections::HashMap::new(),
-                ),
-                crate::types::StepKind::ManifestStitch => (
-                    self.execute_step_manifest_stitch(event_index, step).await,
-                    None,
-                    std::collections::HashMap::new(),
-                ),
-                crate::types::StepKind::Manual => (
-                    self.execute_step_manual(event_index, step).await,
-                    None,
-                    std::collections::HashMap::new(),
-                ),
-                crate::types::StepKind::Subprocess => match (placement, runtime) {
-                    (RunWhere::Local, TaskRuntime::Native) => {
-                        // Inject $YAH_OUTPUTS so the step can write key=value
-                        // output lines (W201-F4). Read back after exit regardless
-                        // of success/failure, then clean up the temp file.
-                        //
-                        // R717-T2: a `secret` step still GETS $YAH_OUTPUTS; the
-                        // runner just never reads it back.
-                        //
-                        // Withholding the variable was the first cut and it was
-                        // wrong: `echo k=v >> "$YAH_OUTPUTS"` against an unset
-                        // variable is `>> ""`, which fails — so adding `secret`
-                        // to a step would have changed its EXIT CODE. A capture
-                        // opt-out must change what is *recorded*, never whether
-                        // the step works. (Caught by
-                        // `a_secret_step_emits_nothing_into_either_on_disk_sink`.)
-                        //
-                        // Nothing enters memory: the file is dropped unread, so
-                        // no value reaches `step_context` and no downstream
-                        // `${{ steps.X.outputs.Y }}` can lift it into an argv
-                        // that would be journalled. `validate()` rejects `secret`
-                        // alongside a declared `outputs` list, so the silent drop
-                        // can only ever hit an *undeclared* key.
-                        let outputs_path = std::env::temp_dir()
-                            .join(format!("yah-qed-{}-{}.env", &self.run_id, index));
-                        let mut yah_env = std::collections::HashMap::new();
-                        yah_env.insert(
-                            "YAH_OUTPUTS".to_string(),
-                            outputs_path.display().to_string(),
-                        );
-                        let result = self
-                            .execute_step_local(event_index, step, Some(&yah_env))
-                            .await;
-                        let collected = if step.secret {
-                            std::collections::HashMap::new()
-                        } else {
-                            parse_yah_outputs(&outputs_path)
-                        };
-                        let _ = std::fs::remove_file(&outputs_path);
-                        (result, None, collected)
-                    }
-                    (RunWhere::Local, TaskRuntime::Container) => (
-                        self.execute_step_local_container(event_index, step).await,
-                        None,
-                        std::collections::HashMap::new(),
-                    ),
-                    // Auto is resolved to Local/Remote by effective_placement.
-                    (RunWhere::Remote | RunWhere::Auto, _) => match self.execute_step_remote(event_index, step, runtime).await {
-                        Ok(forge_id) => {
-                            // R590-F6 leg 2: retrieve any produced artifacts off
-                            // the build-worker into camp's content-addressed
-                            // store before they feed the publish leg. No-op when
-                            // the step declares no `produces`.
-                            let retrieve = if step.produces.is_empty() {
-                                Ok(())
-                            } else {
-                                match self.retrieve_remote_artifacts(&forge_id, step).await {
-                                    Ok(rp) => {
-                                        remote_produced = Some(rp);
-                                        Ok(())
-                                    }
-                                    Err(e) => Err(e),
-                                }
-                            };
-                            (retrieve, Some(forge_id.to_string()), std::collections::HashMap::new())
-                        }
-                        Err(e) => (Err(e), None, std::collections::HashMap::new()),
-                    },
-                },
+            // ── collect ──────────────────────────────────────────────────
+            let Some(outcome) = futures_util::StreamExt::next(&mut inflight).await else {
+                break;
             };
-
+            let index = outcome.index;
+            done[index] = true;
+            if outcome.was_local {
+                local_inflight -= 1;
+            }
+            if let Some(key) = &outcome.resource {
+                if let Some(pos) = held_resources.iter().position(|h| h == key) {
+                    held_resources.remove(pos);
+                }
+            }
             // Store outputs in the step context for downstream substitution.
             // Stored even when the step failed — a continue-on-error sibling
             // may still reference whatever was written before the failure.
-            if !step_outputs.is_empty() {
-                step_context.insert(step.name.clone(), step_outputs.clone());
+            if !outcome.outputs.is_empty() {
+                step_context.insert(outcome.name.clone(), outcome.outputs.clone());
             }
+            produced_by_index[index] = outcome.produced;
+            if outcome.row.status == RunStatus::Failed {
+                overall_status = RunStatus::Failed;
+            }
+            main_statuses[index] = Some(outcome.row);
 
-            let (status, msg) = match &result {
-                Ok(_) => {
-                    // R590-F6: a remote step's retrieved (path-rewritten)
-                    // artifacts replace the raw container-path declarations, so
-                    // the publish leg reads the bytes landed in camp.
-                    match remote_produced.take() {
-                        Some(rp) => produced.extend(rp),
-                        None => produced.extend(step.produces.iter().cloned()),
-                    }
-                    (RunStatus::Success, None)
-                }
-                Err(e) => {
-                    overall_status = RunStatus::Failed;
-                    let msg = match e {
-                        RunnerError::StepFailed { msg, .. } => Some(msg.clone()),
-                        RunnerError::InvalidConfig(m) => Some(m.clone()),
-                        other => Some(other.to_string()),
-                    };
-                    (RunStatus::Failed, msg)
-                }
-            };
-
-            // W209: when the step succeeded, evaluate every bind whose
-            // `from` references one of its outputs. Each AppliedBind is
-            // persisted on the StepStatus so the qed-run tile (F7) and
-            // hash-change hooks (F6) can drive off it. A failed step skips
-            // its binds entirely — the source tree should only be touched
-            // by receipts that came from a clean run. (Prior steps'
-            // already-written binds remain on disk; the operator triages
-            // via `git diff`, per W209 § Failure handling.)
-            let applied_binds = if status == RunStatus::Success {
-                self.apply_step_binds(step, &step_outputs)
-            } else {
-                Vec::new()
-            };
-
-            let completed_at = Utc::now();
-            // R717-T2: a `secret` step's failure detail is a stderr tail, and a
-            // stderr tail is the single most likely place for the material to
-            // surface (`scp: ...: Permission denied` is harmless; a tool echoing
-            // its argument is not). It is replaced — not merely dropped — so the
-            // card still reads "this step failed" rather than "this step failed
-            // for no reason", which is the shape that gets misread as a bug in
-            // qed. Both sinks take the same substitute: the live event that
-            // becomes `<run_id>.events.jsonl`, and the meta that becomes
-            // `<run_id>.json`.
-            let msg = match (step.secret, status) {
-                (true, RunStatus::Failed) => Some(SECRET_STEP_REDACTED.to_string()),
-                (true, _) => None,
-                (false, _) => msg,
-            };
-            // Keep the failure reason on the persisted StepStatus (not only in
-            // the live StepFinished event) so `qed.status` surfaces *why* a
-            // step failed after the run ends.
-            let error = if status == RunStatus::Failed {
-                msg.clone()
-            } else {
-                None
-            };
-            self.emit(QedEvent::StepFinished {
-                index: event_index,
-                name: step.name.clone(),
-                status,
-                msg,
-                at: completed_at,
-            });
-
-            step_statuses.push(StepStatus {
-                name: step.name.clone(),
-                task_run_id,
-                status,
-                started_at: Some(started_at),
-                completed_at: Some(completed_at),
-                error,
-                outputs: step_outputs,
-                applied_binds,
-                jobs: step_jobs,
-                input_hashes,
-            });
-
-            // R513-F2: reap any background sidecar gated on this step finishing
-            // (`background_until = step.name`). Reaping here — before the
-            // `on_fail` break below — means a sidecar is torn down right after
-            // its gate step regardless of whether that step passed or failed.
+            // R513-F2: reap any background sidecar whose gate has now fully
+            // fired. Reaping here — before the `on_fail` abort below — means a
+            // sidecar is torn down right after its gate regardless of whether
+            // the gate step passed or failed.
+            //
+            // R605-F3: "fully" is the operative word. The gate is a set of step
+            // indices (every row, when it names a matrix step), so the reap
+            // waits for the LAST of them; with a single un-fanned gate step
+            // that is exactly the old `until == step.name` compare.
             let mut i = 0;
             while i < background_tasks.len() {
-                if background_tasks[i].until.as_deref() == Some(step.name.as_str()) {
+                let fired = !background_tasks[i].gate.is_empty()
+                    && background_tasks[i].gate.iter().all(|&g| done[g]);
+                if fired {
                     let bg = background_tasks.remove(i);
                     let (bg_status, bg_msg) = reap_background(bg.join).await;
                     let bg_completed_at = Utc::now();
@@ -2686,21 +3062,22 @@ impl PipelineRunner {
                         msg: bg_msg.clone(),
                         at: bg_completed_at,
                     });
-                    let row = &mut step_statuses[bg.status_index];
-                    row.status = bg_status;
-                    row.completed_at = Some(bg_completed_at);
-                    row.error = if bg_status == RunStatus::Failed {
-                        bg_msg
-                    } else {
-                        None
-                    };
+                    if let Some(row) = main_statuses[bg.status_index].as_mut() {
+                        row.status = bg_status;
+                        row.completed_at = Some(bg_completed_at);
+                        row.error = if bg_status == RunStatus::Failed {
+                            bg_msg
+                        } else {
+                            None
+                        };
+                    }
                 } else {
                     i += 1;
                 }
             }
 
-            if status == RunStatus::Failed && !matches!(step.on_fail, OnFail::Continue) {
-                break;
+            if outcome.abort {
+                aborting = true;
             }
         }
 
@@ -2722,14 +3099,23 @@ impl PipelineRunner {
                 msg: bg_msg.clone(),
                 at: bg_completed_at,
             });
-            let row = &mut step_statuses[bg.status_index];
-            row.status = bg_status;
-            row.completed_at = Some(bg_completed_at);
-            row.error = if bg_status == RunStatus::Failed {
-                bg_msg
-            } else {
-                None
-            };
+            if let Some(row) = main_statuses[bg.status_index].as_mut() {
+                row.status = bg_status;
+                row.completed_at = Some(bg_completed_at);
+                row.error = if bg_status == RunStatus::Failed {
+                    bg_msg
+                } else {
+                    None
+                };
+            }
+        }
+
+        // Flatten back to the wire shape: declaration order, with the steps the
+        // run never reached simply absent — identical to what the pre-scheduler
+        // `break` produced.
+        let mut step_statuses: Vec<StepStatus> = main_statuses.into_iter().flatten().collect();
+        for slot in produced_by_index {
+            produced.extend(slot);
         }
 
         // R513-F4 (W207 Gap #6): always-run `finally:` teardown. Runs after the
@@ -2815,6 +3201,7 @@ impl PipelineRunner {
                 (RunWhere::Local, TaskRuntime::Container) => {
                     self.execute_step_local_container(event_index, step).await
                 }
+                (RunWhere::Local, TaskRuntime::MicroVm) => Err(local_microvm_is_refused(step)),
                 // Auto is resolved to Local/Remote by effective_placement.
                 (RunWhere::Remote | RunWhere::Auto, _) => self
                     .execute_step_remote(event_index, step, runtime)
@@ -2904,9 +3291,335 @@ impl PipelineRunner {
                 // so this write is what makes any derived index rebuildable by
                 // rescanning `.yah/jit/qed/*.json`.
                 cell: self.cell.clone(),
+                // The resolved map, so "resume from step" can replay this run
+                // instead of re-entering `resolve_params` empty-handed. The
+                // runner already holds it for the `params.<name>` gating
+                // namespace; before this it died with the runner.
+                params: self.params.clone(),
+                // The runner is handed an already-resolved Pipeline and cannot
+                // see the request that shaped it (a step subset arrives as
+                // steps that simply aren't there). The daemon carries this
+                // over from the meta it registered before spawning.
+                launch: None,
             },
             produced,
         ))
+    }
+
+    /// Execute one already-admitted, already-substituted step to completion
+    /// (R605-F3).
+    ///
+    /// Lifted verbatim out of `run_inner`'s step loop when that loop became a
+    /// DAG scheduler: several of these are in flight at once now, so the body
+    /// can no longer reach the run-level accumulators. Everything it used to
+    /// mutate in place — the produced-artifact list, the named-output context,
+    /// the status row, the abort decision — comes back on a [`StepOutcome`] and
+    /// is folded by the scheduler in declaration order.
+    ///
+    /// Takes the step **by value** so the returned future owns it: the caller's
+    /// substituted copy is a temporary, and a borrow would pin the scheduler's
+    /// loop body for as long as the step runs.
+    ///
+    /// `started_at` / `input_hashes` / `runtime` / `placement` are computed at
+    /// admission because they must be — the StepStarted event and the input
+    /// digest both have to precede execution, and the placement decides which
+    /// admission lane the run takes before this is spawned.
+    async fn run_one_step(
+        &self,
+        index: usize,
+        step: crate::types::QedStep,
+        started_at: chrono::DateTime<Utc>,
+        input_hashes: std::collections::BTreeMap<String, String>,
+        runtime: TaskRuntime,
+        placement: RunWhere,
+        lane: AdmissionLane,
+    ) -> StepOutcome {
+        // R719-F7 (W298): hold the lane this step's work actually uses. An
+        // offloaded step gives the local key back for its duration and the next
+        // local step retakes it — before this, a mixed `auto` run held its local
+        // lane across hours of fleet build, and R719-F1's camp-global default
+        // made that park the whole camp. The scheduler resolved WHICH lane at
+        // admission (it is the only place that knows how much other local work
+        // is in flight); awaiting it here rather than there keeps a queued run
+        // from stalling the steps already running.
+        self.enter_lane(lane).await;
+
+        let step = &step;
+        let event_index = index + self.index_offset;
+        let mut produced: Vec<ProducedArtifact> = Vec::new();
+        // step_outputs: key → value collected from this step (W201-F4).
+        // step_jobs: per-job rows when this step wraps a GHA workflow
+        // (W223 R532-T1); stays empty for every other step kind.
+        let mut step_jobs: Vec<crate::types::JobRow> = Vec::new();
+        // R590-F6: when a remote step's produced artifacts are retrieved off
+        // the build-worker, the path-rewritten list lands here and replaces
+        // the raw `step.produces` declarations at the aggregation point
+        // below. Stays `None` for local steps and remote steps with no
+        // produced artifacts (the common case).
+        let mut remote_produced: Option<Vec<ProducedArtifact>> = None;
+        let (result, task_run_id, step_outputs) = match step.kind {
+            crate::types::StepKind::BuildImage => {
+                match self.execute_step_build_image(event_index, step).await {
+                    Ok(Some(forge_id)) => (
+                        Ok(()),
+                        Some(forge_id.to_string()),
+                        std::collections::HashMap::new(),
+                    ),
+                    Ok(None) => (Ok(()), None, std::collections::HashMap::new()),
+                    Err(e) => (Err(e), None, std::collections::HashMap::new()),
+                }
+            }
+            crate::types::StepKind::PackageNativeTarball => (
+                self.execute_step_package_native_tarball(step).await,
+                None,
+                std::collections::HashMap::new(),
+            ),
+            crate::types::StepKind::MuslStaticPreflight => (
+                self.execute_step_musl_static_preflight(step).await,
+                None,
+                std::collections::HashMap::new(),
+            ),
+            crate::types::StepKind::SignNativeTarball => (
+                self.execute_step_sign_native_tarball(step).await,
+                None,
+                std::collections::HashMap::new(),
+            ),
+            crate::types::StepKind::SubPipeline => {
+                match self
+                    .execute_step_sub_pipeline(event_index, step, &mut step_jobs)
+                    .await
+                {
+                    Ok((child_produced, child_outputs)) => {
+                        // Aggregation happens here (not below) so child
+                        // produces flow into the parent's `Outcome::Publish`
+                        // exactly like a sibling step's `produces`. The
+                        // generic `produced.extend(step.produces.iter())`
+                        // below is a no-op for SubPipeline (validate
+                        // rejects direct `produces` on this kind).
+                        produced.extend(child_produced);
+                        (Ok(()), None, child_outputs)
+                    }
+                    Err(e) => (Err(e), None, std::collections::HashMap::new()),
+                }
+            }
+            crate::types::StepKind::GhaWorkflow => {
+                let cfg = step.gha_workflow.clone();
+                let dispatch = match cfg.as_ref() {
+                    Some(cfg) => self.execute_step_gha_workflow(event_index, step, cfg, &mut step_jobs).await,
+                    None => Err(RunnerError::InvalidConfig(format!(
+                        "step `{}`: kind=gha-workflow with no [gha_workflow] block (validate() should have caught this)",
+                        step.name,
+                    ))),
+                };
+                match dispatch {
+                    Ok((workflow_produced, workflow_outputs)) => {
+                        // Same aggregation policy as SubPipeline: the
+                        // GHA child's artifacts flow into the parent's
+                        // Outcome::Publish in one terminal stage/sync,
+                        // not N per workflow job. Job-level outputs are
+                        // surfaced as `<job_id>.<key>` so the enclosing
+                        // SubPipeline parent's `propagate.outputs` can
+                        // pick them up (R488-F6).
+                        produced.extend(workflow_produced);
+                        (Ok(()), None, workflow_outputs)
+                    }
+                    Err(e) => (Err(e), None, std::collections::HashMap::new()),
+                }
+            }
+            crate::types::StepKind::Import => {
+                match self
+                    .execute_step_import(event_index, step, &mut step_jobs)
+                    .await
+                {
+                    Ok((import_produced, import_outputs)) => {
+                        // The imported workflow's expansion rolls up exactly
+                        // like a GhaWorkflow step (W224 keeps the front-end):
+                        // produced artifacts into the parent's terminal
+                        // Outcome::Publish, job-level outputs as `<job>.<key>`.
+                        produced.extend(import_produced);
+                        (Ok(()), None, import_outputs)
+                    }
+                    Err(e) => (Err(e), None, std::collections::HashMap::new()),
+                }
+            }
+            crate::types::StepKind::WaitFor => (
+                self.execute_step_wait_for(event_index, step).await,
+                None,
+                std::collections::HashMap::new(),
+            ),
+            crate::types::StepKind::ManifestStitch => (
+                self.execute_step_manifest_stitch(event_index, step).await,
+                None,
+                std::collections::HashMap::new(),
+            ),
+            crate::types::StepKind::Manual => (
+                self.execute_step_manual(event_index, step).await,
+                None,
+                std::collections::HashMap::new(),
+            ),
+            crate::types::StepKind::Subprocess => match (placement, runtime) {
+                (RunWhere::Local, TaskRuntime::Native) => {
+                    // Inject $YAH_OUTPUTS so the step can write key=value
+                    // output lines (W201-F4). Read back after exit regardless
+                    // of success/failure, then clean up the temp file.
+                    //
+                    // R717-T2: a `secret` step still GETS $YAH_OUTPUTS; the
+                    // runner just never reads it back.
+                    //
+                    // Withholding the variable was the first cut and it was
+                    // wrong: `echo k=v >> "$YAH_OUTPUTS"` against an unset
+                    // variable is `>> ""`, which fails — so adding `secret`
+                    // to a step would have changed its EXIT CODE. A capture
+                    // opt-out must change what is *recorded*, never whether
+                    // the step works. (Caught by
+                    // `a_secret_step_emits_nothing_into_either_on_disk_sink`.)
+                    //
+                    // Nothing enters memory: the file is dropped unread, so
+                    // no value reaches `step_context` and no downstream
+                    // `${{ steps.X.outputs.Y }}` can lift it into an argv
+                    // that would be journalled. `validate()` rejects `secret`
+                    // alongside a declared `outputs` list, so the silent drop
+                    // can only ever hit an *undeclared* key.
+                    let outputs_path = std::env::temp_dir()
+                        .join(format!("yah-qed-{}-{}.env", &self.run_id, index));
+                    let mut yah_env = std::collections::HashMap::new();
+                    yah_env.insert(
+                        "YAH_OUTPUTS".to_string(),
+                        outputs_path.display().to_string(),
+                    );
+                    let result = self
+                        .execute_step_local(event_index, step, Some(&yah_env))
+                        .await;
+                    let collected = if step.secret {
+                        std::collections::HashMap::new()
+                    } else {
+                        parse_yah_outputs(&outputs_path)
+                    };
+                    let _ = std::fs::remove_file(&outputs_path);
+                    (result, None, collected)
+                }
+                (RunWhere::Local, TaskRuntime::Container) => (
+                    self.execute_step_local_container(event_index, step).await,
+                    None,
+                    std::collections::HashMap::new(),
+                ),
+                (RunWhere::Local, TaskRuntime::MicroVm) => (
+                    Err(local_microvm_is_refused(step)),
+                    None,
+                    std::collections::HashMap::new(),
+                ),
+                // Auto is resolved to Local/Remote by effective_placement.
+                (RunWhere::Remote | RunWhere::Auto, _) => match self.execute_step_remote(event_index, step, runtime).await {
+                    Ok(forge_id) => {
+                        // R590-F6 leg 2: retrieve any produced artifacts off
+                        // the build-worker into camp's content-addressed
+                        // store before they feed the publish leg. No-op when
+                        // the step declares no `produces`.
+                        let retrieve = if step.produces.is_empty() {
+                            Ok(())
+                        } else {
+                            match self.retrieve_remote_artifacts(&forge_id, step).await {
+                                Ok(rp) => {
+                                    remote_produced = Some(rp);
+                                    Ok(())
+                                }
+                                Err(e) => Err(e),
+                            }
+                        };
+                        (retrieve, Some(forge_id.to_string()), std::collections::HashMap::new())
+                    }
+                    Err(e) => (Err(e), None, std::collections::HashMap::new()),
+                },
+            },
+        };
+
+        let (status, msg) = match &result {
+            Ok(_) => {
+                // R590-F6: a remote step's retrieved (path-rewritten)
+                // artifacts replace the raw container-path declarations, so
+                // the publish leg reads the bytes landed in camp.
+                match remote_produced.take() {
+                    Some(rp) => produced.extend(rp),
+                    None => produced.extend(step.produces.iter().cloned()),
+                }
+                (RunStatus::Success, None)
+            }
+            Err(e) => {
+                let msg = match e {
+                    RunnerError::StepFailed { msg, .. } => Some(msg.clone()),
+                    RunnerError::InvalidConfig(m) => Some(m.clone()),
+                    other => Some(other.to_string()),
+                };
+                (RunStatus::Failed, msg)
+            }
+        };
+
+        // W209: when the step succeeded, evaluate every bind whose
+        // `from` references one of its outputs. Each AppliedBind is
+        // persisted on the StepStatus so the qed-run tile (F7) and
+        // hash-change hooks (F6) can drive off it. A failed step skips
+        // its binds entirely — the source tree should only be touched
+        // by receipts that came from a clean run. (Prior steps'
+        // already-written binds remain on disk; the operator triages
+        // via `git diff`, per W209 § Failure handling.)
+        let applied_binds = if status == RunStatus::Success {
+            self.apply_step_binds(step, &step_outputs)
+        } else {
+            Vec::new()
+        };
+
+        let completed_at = Utc::now();
+        // R717-T2: a `secret` step's failure detail is a stderr tail, and a
+        // stderr tail is the single most likely place for the material to
+        // surface (`scp: ...: Permission denied` is harmless; a tool echoing
+        // its argument is not). It is replaced — not merely dropped — so the
+        // card still reads "this step failed" rather than "this step failed
+        // for no reason", which is the shape that gets misread as a bug in
+        // qed. Both sinks take the same substitute: the live event that
+        // becomes `<run_id>.events.jsonl`, and the meta that becomes
+        // `<run_id>.json`.
+        let msg = match (step.secret, status) {
+            (true, RunStatus::Failed) => Some(SECRET_STEP_REDACTED.to_string()),
+            (true, _) => None,
+            (false, _) => msg,
+        };
+        // Keep the failure reason on the persisted StepStatus (not only in
+        // the live StepFinished event) so `qed.status` surfaces *why* a
+        // step failed after the run ends.
+        let error = if status == RunStatus::Failed {
+            msg.clone()
+        } else {
+            None
+        };
+        self.emit(QedEvent::StepFinished {
+            index: event_index,
+            name: step.name.clone(),
+            status,
+            msg,
+            at: completed_at,
+        });
+
+        StepOutcome {
+            index,
+            name: step.name.clone(),
+            was_local: placement == RunWhere::Local,
+            resource: step.resource.clone(),
+            abort: status == RunStatus::Failed && !matches!(step.on_fail, OnFail::Continue),
+            produced,
+            outputs: step_outputs.clone(),
+            row: StepStatus {
+                name: step.name.clone(),
+                task_run_id,
+                status,
+                started_at: Some(started_at),
+                completed_at: Some(completed_at),
+                error,
+                outputs: step_outputs,
+                applied_binds,
+                jobs: step_jobs,
+                input_hashes,
+            },
+        }
     }
 
     /// R603-T4: dispatch the pipeline's terminal outcomes (Publish / Provider /
@@ -3285,31 +3998,87 @@ impl PipelineRunner {
         // lane its parent is not standing in is serialized against nothing.
         //
         // Computed before `child` is moved into the child runner.
-        {
-            let parent_key = self.pipeline.effective_concurrency_key();
+        //
+        // R719-F7 closes the gap where the daemon installed an
+        // [`AdmissionControl`]: the child takes its own lane for the duration
+        // of the step and the parent's lane is handed back while it runs (the
+        // parent is not building — its child is, somewhere else). Without one,
+        // nothing can take a second lane and the warning stands, which is the
+        // `yah qed run` / headless case.
+        let child_lane: Option<String> = {
+            let parent_key = match &self.admission_lane {
+                // A child of a child admits against the lane THIS runner is
+                // standing in, not against the pipeline key its own parent
+                // declared — otherwise a nested child re-reports a gap that
+                // was already closed one level up.
+                Some(lane) => lane.as_str(),
+                None => self.pipeline.effective_concurrency_key(),
+            };
             let child_key = child.effective_concurrency_key();
-            if let Some(gap) = sub_pipeline_admission_gap(parent_key, child_key) {
-                tracing::warn!(
-                    parent_pipeline = %self.pipeline.name,
-                    parent_key = %gap.parent_key,
-                    child_key = %gap.child_key,
-                    step = %step.name,
-                    "{}",
-                    gap.message(&sub_pipeline_target_label(&cfg.target), &step.name),
-                );
+            match sub_pipeline_admission_gap(parent_key, child_key) {
+                None => None,
+                Some(gap) => {
+                    if self.admission.is_some() {
+                        tracing::info!(
+                            parent_pipeline = %self.pipeline.name,
+                            parent_key = %gap.parent_key,
+                            child_key = %gap.child_key,
+                            step = %step.name,
+                            "admission: sub-pipeline child takes its own lane `{}` for the \
+                             duration of the step; the parent's `{}` is released while it runs \
+                             (R719-F7)",
+                            gap.child_key,
+                            gap.parent_key,
+                        );
+                        Some(gap.child_key.to_string())
+                    } else {
+                        tracing::warn!(
+                            parent_pipeline = %self.pipeline.name,
+                            parent_key = %gap.parent_key,
+                            child_key = %gap.child_key,
+                            step = %step.name,
+                            "{}",
+                            gap.message(&sub_pipeline_target_label(&cfg.target), &step.name),
+                        );
+                        None
+                    }
+                }
             }
-        }
+        };
 
         let child_run_id = Uuid::new_v4().to_string();
+        // R768: ask the host for a channel of the child's own before running
+        // it. `None` (no daemon, or a host that declines) keeps the historical
+        // silent behaviour; a `Some` makes the child's steps and output
+        // observable and durable exactly like a top-level run's. Deliberately
+        // NOT `self.events.clone()` — the drain folds events into a registered
+        // meta by step index, so sharing the parent's channel would have a
+        // child's step 0 overwrite the parent's step 0.
+        let child_events = self.child_event_factory.as_ref().and_then(|make| {
+            make(&ChildRunInfo {
+                run_id: child_run_id.clone(),
+                pipeline: child.name.clone(),
+                parent_run_id: self.run_id.clone(),
+            })
+        });
         let child_runner = Self {
             pipeline: child,
             run_id: child_run_id.clone(),
             remote_driver: self.remote_driver.clone(),
             build_context_publisher: self.build_context_publisher.clone(),
             run_where: self.run_where,
+            // R833-F8: inherited for the same reason `run_where` is — a child's
+            // remote step is dispatched by the parent's driver, so it must land
+            // on the node the operator named, not on whatever the tag matcher
+            // would have picked for it.
+            pinned_node: self.pinned_node.clone(),
             outcome_dispatcher: self.outcome_dispatcher.clone(),
-            events: None,
+            events: child_events,
             camp_root: child_camp_root,
+            // Inherited (R744-T2): a `cargo` step buried in a sub-pipeline runs
+            // on this same host, in this same tree, and needs the same
+            // toolchain environment the parent's steps got.
+            base_env: self.base_env.clone(),
             signer: self.signer.clone(),
             executor: self.executor.clone(),
             sub_pipeline_resolver: self.sub_pipeline_resolver.clone(),
@@ -3319,6 +4088,13 @@ impl PipelineRunner {
             // to the parent (returned as empty below).
             suppress_publish_outcomes: cfg.propagate.produces,
             parent_run_id: Some(self.run_id.clone()),
+            // R755: mirrors the step's own opt-out (see the field doc) so
+            // `run_inner`'s positioning skip can see it on this instance.
+            own_workspace: cfg.own_workspace,
+            // Inherited, not reset: a grandchild is exactly as invisible as a
+            // child was, and `release-wizard → release-check → check →
+            // cargo-test` is three levels deep.
+            child_event_factory: self.child_event_factory.clone(),
             index_offset: 0,
             // Inherit so a SubPipeline whose child is a gha-workflow
             // step still honors the operator's matrix selection.
@@ -3376,6 +4152,12 @@ impl PipelineRunner {
             // and dropping the gate here would silently downgrade it to the
             // headless path (advance-only, or a hard fail).
             manual_gate: self.manual_gate.clone(),
+            // R719-F7: inherit the admission control, but not necessarily the
+            // lane — a child with an admission gap runs in its OWN lane, and
+            // everything it does (its steps, its own children) admits against
+            // that key instead of the parent's.
+            admission: self.admission.clone(),
+            admission_lane: child_lane.clone().or_else(|| self.admission_lane.clone()),
             // R717-T3: NOT inherited — see the field docs.
             cell: None,
         };
@@ -3391,6 +4173,12 @@ impl PipelineRunner {
 
         // Async recursion needs explicit boxing.
         let outcome = Box::pin(child_runner.run_inner()).await;
+        // R719-F7: whatever lane the child left the run standing in — its own,
+        // or the fleet lane if its last step offloaded — stand back in ours
+        // before returning to the step loop. Same discipline as the R622 manual
+        // park's `reacquire_lock`: a step hands control back in the lane it was
+        // called in, whatever its outcome.
+        self.enter_lane(self.base_lane()).await;
         let (meta, child_produced) = match outcome {
             Ok(pair) => pair,
             Err(e) => {
@@ -3565,6 +4353,19 @@ impl PipelineRunner {
         let step_index = event_index;
         let parent_step_name = step.name.clone();
 
+        // R605-F2: hand the GHA-emulator's image builder the SAME
+        // remote-dispatch substrate the native `build-image` step kind
+        // already uses (RemoteForgeDriver + BuildContextPublisher) — captured
+        // here, in the async fn, so `Handle::current()` is unambiguous before
+        // crossing into the sync `spawn_blocking` closure below. Both are
+        // `None` unless this runner was constructed with fleet dispatch
+        // wired (`new_remote` / `with_build_context_publisher`), in which
+        // case a slug still has to opt in per-camp via the W200 overlay
+        // (`config.remote = true`) — the default stays host-local docker.
+        let gha_remote_driver = self.remote_driver.clone();
+        let gha_build_context_publisher = self.build_context_publisher.clone();
+        let gha_tokio_handle = tokio::runtime::Handle::current();
+
         // Bridge qed_gha's sync std::sync::mpsc sender into our async
         // event sink (R325-F2). We spawn a forwarder *before* the blocking
         // task so the channel is live the moment the runtime starts
@@ -3595,17 +4396,26 @@ impl PipelineRunner {
                 msg: format!("parse {}: {e}", workflow_path.display()),
             })?;
             let secrets = crate::secrets_bridge::SecretsConfig::load_default().resolve_all();
-            // R594: inject the docker push-family image builder so the runtime
-            // actually builds + pushes the workflow's image jobs (local buildx
-            // now; arch-matched build-worker fleet dispatch in phase C) instead
-            // of declining them with a tier-3 error. It reads the W200 overlay
-            // (`.yah/qed/gha-actions.toml` registry_route / registry_auth) to
-            // retarget the workflow's hard-coded ghcr.io push to a registry the
-            // local token can write — the Dockerfiles + release.yml stay ghcr.io.
-            let image_builder = std::sync::Arc::new(crate::image_overlay::QedImageBuilder::new(
-                &workspace,
-                secrets.clone(),
-            ));
+            // R594/R605-F2: inject the docker push-family image builder so the
+            // runtime actually builds + pushes the workflow's image jobs
+            // instead of declining them with a tier-3 error. It reads the
+            // W200 overlay (`.yah/qed/gha-actions.toml` registry_route /
+            // registry_auth / remote) to retarget the workflow's hard-coded
+            // ghcr.io push to a registry the local token can write, and — when
+            // a slug's overlay entry sets `config.remote = true` — to dispatch
+            // the build itself to a fleet build-worker via the same
+            // RemoteForgeDriver + BuildContextPublisher the native
+            // `build-image` step kind uses, instead of requiring a live
+            // docker/buildx daemon on this host. Local `docker buildx` stays
+            // the default when no slug opts in.
+            let image_builder = std::sync::Arc::new(
+                crate::image_overlay::QedImageBuilder::new(&workspace, secrets.clone())
+                    .with_remote(
+                        gha_tokio_handle,
+                        gha_remote_driver,
+                        gha_build_context_publisher,
+                    ),
+            );
             // R594: single-host content-addressed artifact store so a job that
             // uploads binaries and a later job that downloads them move files
             // through an on-disk store — the retired upload/download-artifact
@@ -4325,6 +5135,12 @@ impl PipelineRunner {
         for (k, v) in cross_env {
             merged_env.entry(k).or_insert(v);
         }
+        // R744-T2: the embedder's per-camp toolchain env, the bottom layer of
+        // all — it is a default the host computed, not an instruction the
+        // recipe gave.
+        for (k, v) in &self.base_env {
+            merged_env.entry(k.clone()).or_insert_with(|| v.clone());
+        }
         if let Some(extra) = extra_env {
             merged_env.extend(extra.iter().map(|(k, v)| (k.clone(), v.clone())));
         }
@@ -4367,19 +5183,19 @@ impl PipelineRunner {
         // (linux/arm64/v8)` case). That is a hard failure, not a warning: refuse to
         // emulate rather than start a build that can't succeed on this host.
         if let crate::platform::Resolution::Offload { target } = self.resolve_step(step) {
-            let tier = crate::platform::build_worker_mesh_tags(
+            let arch_tag = crate::platform::build_worker_mesh_tags(
                 crate::platform::arch_of(&target),
                 crate::platform::os_tag_of(&target),
             )
             .into_iter()
-            .find(|t| t.starts_with("tier:"))
-            .unwrap_or_else(|| "tier:?".to_string());
+            .find(|t| t.starts_with("arch:"))
+            .unwrap_or_else(|| "arch:?".to_string());
             return Err(RunnerError::StepFailed {
                 step: step.name.clone(),
                 msg: format!(
                     "step '{}' declares a native `{target}` build but is running locally on \
                      host `{}`: a native cross-arch build must offload to an arch-matched \
-                     build-worker (`{tier}`), not emulate under QEMU. Re-run with `--where auto` \
+                     build-worker (`{arch_tag}`), not emulate under QEMU. Re-run with `--where auto` \
                      (policy routes native steps to the fleet) or on a `{target}`-arch host.",
                     step.name, self.host_triple,
                 ),
@@ -4970,7 +5786,16 @@ fn build_subprocess_spec(
 ///   configuration rather than on an unlucky one. Do not re-propose this.
 /// - **(c) a reentrant admission handle from the daemon.** Correct, and much
 ///   more machinery than rung 1 justifies — the runner would need a live handle
-///   back into `qed_locks` across a process boundary.
+///   back into `qed_locks` across a process boundary. **Adopted in R719-F7**:
+///   that handle is [`AdmissionControl`], and where one is installed the child
+///   now takes the lane this function names, for the duration of the step, with
+///   the parent's lane released while it runs. It is *not* re-entrant locking —
+///   the control releases before it acquires, so no run ever holds two lanes.
+///
+/// So this predicate has two readings now, and both matter. With an
+/// `AdmissionControl` installed (the camp daemon) it names the lane the child
+/// should be moved into. Without one (`yah qed run`, headless) nothing can take
+/// a second lane, (a) still applies, and it is a warning.
 ///
 /// (a) is sound exactly when the parent's key **covers** the child's: the child
 /// must want either the same key, or `@parallel` (no key at all). This function
@@ -5007,14 +5832,22 @@ pub struct AdmissionGap<'a> {
 }
 
 impl AdmissionGap<'_> {
-    /// The warning text. Names both keys and the fix, because "admission gap"
-    /// alone tells a reader nothing they can act on.
+    /// The warning text for a run with no [`AdmissionControl`] installed —
+    /// where the gap is real and unclosable, because nothing can take a second
+    /// lane. Names both keys and the fix, because "admission gap" alone tells a
+    /// reader nothing they can act on.
+    ///
+    /// Under the camp daemon this text is never emitted: R719-F7 moves the
+    /// child into its own lane instead, and the gap is closed rather than
+    /// reported.
     pub fn message(&self, target_label: &str, step: &str) -> String {
         format!(
             "admission gap: sub-pipeline `{target_label}` (step `{step}`) wants concurrency key \
-             `{}`, but its parent holds `{}`. Sub-pipeline children inherit the parent's grant \
-             (W298 / R719-F2) and never take a key of their own, so this child is serialized \
-             against nothing — a top-level run on `{}` can execute concurrently with it. Fix by \
+             `{}`, but its parent holds `{}`. This run has no admission control installed, so a \
+             sub-pipeline child inherits the parent's grant (W298 / R719-F2) and takes no key of \
+             its own — this child is serialized against nothing, and a top-level run on `{}` can \
+             execute concurrently with it. Run it under the camp daemon, where the child takes \
+             its own lane (R719-F7); or fix the recipe by \
              giving the parent `concurrency_key = \"{}\"`, or by setting the child to \
              \"@parallel\" if it genuinely shares no resource.",
             self.child_key, self.parent_key, self.child_key, self.child_key,
@@ -5132,6 +5965,29 @@ fn substituted_step(
         }
     }
     Some(s)
+}
+
+/// The refusal for a `runtime = microvm` step that resolved to local placement
+/// (R605-F8).
+///
+/// `InvalidConfig` rather than `StepFailed`: nothing ran and nothing could,
+/// because this is a pipeline-authoring mistake and not a transient condition —
+/// exactly the shape the local+container guard already uses (see this module's
+/// R325 gotcha about wanting a pre-flight validator hook for both).
+///
+/// The reason it is a mistake at all: a microVM isolates a build from the *rest
+/// of the node*, and on a dev box that is the author's own machine. Booting a
+/// guest kernel to protect a developer from their own build costs a boot and
+/// buys nothing, so the honest answer is to say so rather than to quietly run
+/// it in a container and let the pipeline believe it got isolation.
+fn local_microvm_is_refused(step: &crate::types::QedStep) -> RunnerError {
+    RunnerError::InvalidConfig(format!(
+        "step `{}` declares runtime = microvm, which is remote-only: a microVM isolates a \
+         build from whatever else the node is running, and locally that is you. Use \
+         runtime = container (or native) for a local run, or place the step remotely \
+         (R605-F8 / W325)",
+        step.name
+    ))
 }
 
 /// Parse a `KEY=VALUE\n`-formatted file written by a step to `$YAH_OUTPUTS`.
@@ -5422,17 +6278,17 @@ impl PipelineRunner {
             // Docker `--platform` values are always Linux container images
             // (buildx has no darwin/windows image target), so the OS is
             // implicit here rather than derived from a triple.
-            let tier = crate::platform::build_worker_mesh_tags(want, "linux")
+            let arch_tag = crate::platform::build_worker_mesh_tags(want, "linux")
                 .into_iter()
-                .find(|t| t.starts_with("tier:"))
-                .unwrap_or_else(|| "tier:?".to_string());
+                .find(|t| t.starts_with("arch:"))
+                .unwrap_or_else(|| "arch:?".to_string());
             return Err(RunnerError::StepFailed {
                 step: step.name.clone(),
                 msg: format!(
                     "build-image step '{}' targets platform `{platform}` ({want}) but this host \
                      is `{}`: building it here means QEMU emulation, not a native image. Declare \
                      `platform = {{ native = true, target = \"...\" }}` on the step and run with \
-                     `--where auto` so it routes to a `{tier}` build-worker, or run on a {want} host.",
+                     `--where auto` so it routes to a `{arch_tag}` build-worker, or run on a {want} host.",
                     step.name, self.host_triple,
                 ),
             });
@@ -5609,6 +6465,82 @@ impl PipelineRunner {
         publisher.publish(forge_key, tarball).await
     }
 
+    /// Pack + publish a remote subprocess step's declared `source_context`,
+    /// returning the key to discard and the URL the step fetches (R560-T8).
+    ///
+    /// `Ok(None)` for a step that declares none — which is every step in every
+    /// pipeline written before the key existed, so the common path does no
+    /// work, makes no network call, and cannot fail.
+    async fn publish_source_context(
+        &self,
+        step: &crate::types::QedStep,
+    ) -> Result<Option<PublishedSourceContext>, RunnerError> {
+        if step.source_context.is_empty() {
+            return Ok(None);
+        }
+
+        let camp_root = self.resolve_camp_root()?;
+        let tarball =
+            crate::build_context::pack_source_context(&camp_root, &step.source_context)
+                // pack_source_context labels its errors "source-context"; re-stamp
+                // with the real step name so the failure points at a line in the
+                // operator's pipeline.
+                .map_err(|e| RunnerError::StepFailed {
+                    step: step.name.clone(),
+                    msg: e.to_string(),
+                })?;
+
+        self.emit_step_note(
+            step,
+            format!(
+                "source context: {} ({} KiB packed) → uploading for the build-worker",
+                step.source_context
+                    .iter()
+                    .map(|p| p.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                tarball.len() / 1024,
+            ),
+        );
+
+        let publisher = self
+            .build_context_publisher
+            .clone()
+            .unwrap_or_else(|| Arc::new(crate::build_context::NoBuildContextPublisher));
+        let key = tag_to_filename(&format!("{}-{}-src", self.run_id, step.name));
+        let url = publisher.publish(&key, tarball).await?;
+        Ok(Some(PublishedSourceContext { key, url }))
+    }
+
+    /// Best-effort delete of a published source context. Mirrors
+    /// [`crate::build_context::BuildContextPublisher::discard`]'s contract:
+    /// the build has already happened, so an undeleted temp object must never
+    /// turn a green run red.
+    async fn discard_source_context(&self, published: Option<&PublishedSourceContext>) {
+        let Some(published) = published else { return };
+        let publisher = self
+            .build_context_publisher
+            .clone()
+            .unwrap_or_else(|| Arc::new(crate::build_context::NoBuildContextPublisher));
+        publisher.discard(&published.key).await;
+    }
+
+    /// Emit an operator-facing stderr note against `step`, honouring
+    /// [`QedStep::secret`](crate::types::QedStep::secret).
+    fn emit_step_note(&self, step: &crate::types::QedStep, line: String) {
+        if step.secret {
+            return;
+        }
+        if let Some(tx) = &self.events {
+            let _ = tx.send(QedEvent::StepOutput {
+                index: 0,
+                name: step.name.clone(),
+                stream: OutputStream::Stderr,
+                line,
+            });
+        }
+    }
+
     async fn execute_step_build_image_remote(
         &self,
         step: &crate::types::QedStep,
@@ -5648,26 +6580,26 @@ impl PipelineRunner {
                 load: step.load,
             },
             where_: TaskPlacement::new(
-                TaskLocation::RemoteAny {
-                    tier: TierTag("infra".into()),
-                    // R594/R636: route to a build-worker matching the step's
-                    // TARGET arch, not the runner's host arch. A `yah qed images
-                    // build --platform linux/amd64` from an arm64 Mac declares a
-                    // `native = true` x86 target and must land on a `tier:x86`
-                    // worker — deriving the tier from `self.host_triple` (arm64)
-                    // instead sent it to a `tier:arm` RPi that then failed on an
-                    // unreachable loopback URL. `remote_build_image_arch` reads
-                    // the step's Offload target and falls back to the host arch
-                    // only when the step declares no cross-arch target (a plain
-                    // host-native build-image under `--where remote`).
-                    // Catalog build-image steps always produce Linux container
-                    // images (buildx has no darwin/windows target), so the OS
-                    // is implicit here rather than derived from a triple.
-                    mesh_tags: crate::platform::build_worker_mesh_tags(
-                        &self.remote_build_image_arch(step),
-                        "linux",
-                    ),
-                },
+                // R594/R636: route to a build-worker matching the step's
+                // TARGET arch, not the runner's host arch. A `yah qed images
+                // build --platform linux/amd64` from an arm64 Mac declares a
+                // `native = true` x86 target and must land on a `arch:x86`
+                // worker — deriving the tier from `self.host_triple` (arm64)
+                // instead sent it to a `arch:arm` RPi that then failed on an
+                // unreachable loopback URL. `remote_build_image_arch` reads
+                // the step's Offload target and falls back to the host arch
+                // only when the step declares no cross-arch target (a plain
+                // host-native build-image under `--where remote`).
+                // Catalog build-image steps always produce Linux container
+                // images (buildx has no darwin/windows target), so the OS
+                // is implicit here rather than derived from a triple.
+                //
+                // R833-F8: unless the operator named a node, in which case that
+                // wins over the derived tags — see `remote_location`.
+                self.remote_location(crate::platform::build_worker_mesh_tags(
+                    &self.remote_build_image_arch(step),
+                    "linux",
+                )),
                 TaskRuntime::Container,
             ),
             timeout: step.timeout.map(Millis::from_secs),
@@ -6048,18 +6980,23 @@ impl PipelineRunner {
             }
         }
 
+        // R560-T8: a remote subprocess gets image + argv + the /yah/produced
+        // mount and NOTHING ELSE — in particular, no source. A step that
+        // compiles the camp tree (the `mesofact-musl` legs) therefore has
+        // nothing to compile unless its source travels as bytes, exactly the
+        // way R636-B1 made a build-image context travel. Publish it here and
+        // hand the step the URL through the env; the argv fetches it.
+        let source_context = self.publish_source_context(step).await?;
+
         let spec = ForgeSpec {
             command: ForgeCommand::Subprocess {
                 argv: step.argv.clone(),
                 image,
             },
-            where_: TaskPlacement::new(
-                TaskLocation::RemoteAny {
-                    tier: TierTag("infra".into()),
-                    mesh_tags,
-                },
-                runtime,
-            ),
+            // R833-F8: `remote_location` returns the pinned node when the
+            // operator named one and the R594 tag-matched `RemoteAny`
+            // otherwise, so inference is untouched for every unpinned run.
+            where_: TaskPlacement::new(self.remote_location(mesh_tags), runtime),
             timeout: step.timeout.map(Millis::from_secs),
             label: Some(step.name.clone()),
             // Camp name will be threaded through once yubaba RPC stabilises (R091).
@@ -6124,17 +7061,31 @@ impl PipelineRunner {
         // working directory, which `apply_exec_context` refuses outright
         // (R577-T1). Dropping it keeps today's behaviour; wiring it needs the
         // input channel first.
-        let ctx = ExecContext::default().with_env(
-            step.env
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
-        );
+        let mut env: Vec<(String, String)> = step
+            .env
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        // R560-T8. The step's own spelling of this key is DROPPED, not merged
+        // behind ours: the URL is run-scoped and minted milliseconds ago, so a
+        // literal in the TOML can only be a stale one, and `with_env` takes a
+        // Vec whose duplicate-key precedence is not ours to assume.
+        if let Some(published) = &source_context {
+            let key = crate::build_context::SOURCE_CONTEXT_URL_ENV;
+            env.retain(|(k, _)| k != key);
+            env.push((key.to_string(), published.url.clone()));
+        }
+        let ctx = ExecContext::default().with_env(env);
 
-        let handle = driver
-            .start_with_context(spec, Some(tx), &ctx)
-            .await
-            .map_err(|e| RunnerError::Remote(e.to_string()))?;
+        let handle = match driver.start_with_context(spec, Some(tx), &ctx).await {
+            Ok(handle) => handle,
+            Err(e) => {
+                // Nothing ever fetched these bytes; don't leave them in the
+                // bucket because the dispatch lost a race with the worker.
+                self.discard_source_context(source_context.as_ref()).await;
+                return Err(RunnerError::Remote(e.to_string()));
+            }
+        };
 
         let forge_id = handle.id.clone();
         // R603-T1: publish the workload identity the moment it exists, before we
@@ -6150,6 +7101,10 @@ impl PipelineRunner {
         let status = handle.wait().await;
         // Drain any remaining buffered lines before the step is marked done.
         let _ = adapter.await;
+        // Single-use key, dropped on BOTH legs — same discipline as the
+        // build-image context (R636-B1). A failed build is exactly when the
+        // temp object is least wanted and most likely to be forgotten.
+        self.discard_source_context(source_context.as_ref()).await;
 
         match status {
             ForgeStatus::Done { exit_code: 0, .. } => Ok(forge_id),
@@ -6218,9 +7173,29 @@ impl PipelineRunner {
                     ),
                 })?;
             let landed = store.land(&bytes).map_err(RunnerError::Io)?;
+            // R560-T9: hand the publish leg a path whose BASENAME is still the
+            // build's own filename. `stage_release` keys a release object as
+            // `<binary>/<version>/<triple>/<basename>`, so rewriting `path` to
+            // the bare CAS address would publish the tarball under its 64-hex
+            // BLAKE3 — a URL no install script constructs. The CAS entry is
+            // untouched (it is R546-T3's input and the preservation check); the
+            // named path is a hard link into the same bytes.
+            let filename = remote_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or_else(|| RunnerError::StepFailed {
+                    step: step.name.clone(),
+                    msg: format!(
+                        "produced artifact path `{}` has no filename component",
+                        artifact.path
+                    ),
+                })?;
+            let named = store
+                .link_named(&landed, filename)
+                .map_err(RunnerError::Io)?;
             retrieved.push(ProducedArtifact {
                 binary: artifact.binary.clone(),
-                path: landed.path.to_string_lossy().into_owned(),
+                path: named.to_string_lossy().into_owned(),
                 triple: artifact.triple.clone(),
             });
         }
@@ -6309,6 +7284,518 @@ mod tests {
         assert!(msg.contains("release-lane"), "{msg}");
         assert!(msg.contains("cargo-target"), "{msg}");
         assert!(msg.contains("@parallel"), "must offer the opt-out: {msg}");
+    }
+
+    // ─── R605-F3: the step DAG + concurrent scheduler ───────────────────────
+
+    /// A step that sleeps, so overlap is observable in the recorded timestamps.
+    fn sleep_step(name: &str, secs: &str, needs: Option<Vec<&str>>) -> crate::types::QedStep {
+        let mut s = shell_step(name, vec!["sleep", secs]);
+        s.needs = needs.map(|n| n.into_iter().map(String::from).collect());
+        s
+    }
+
+    /// Did two recorded steps overlap in wall-clock?
+    fn overlaps(a: &StepStatus, b: &StepStatus) -> bool {
+        let (a0, a1) = (a.started_at.unwrap(), a.completed_at.unwrap());
+        let (b0, b1) = (b.started_at.unwrap(), b.completed_at.unwrap());
+        a0 < b1 && b0 < a1
+    }
+
+    fn row<'a>(meta: &'a QedRunMeta, name: &str) -> &'a StepStatus {
+        meta.steps
+            .iter()
+            .find(|s| s.name == name)
+            .unwrap_or_else(|| panic!("no step row `{name}` in {:?}", meta.steps.iter().map(|s| &s.name).collect::<Vec<_>>()))
+    }
+
+    /// The ticket's own verify criterion. Two independent branches off one root
+    /// with a join: the branches must overlap in wall-clock, and the join must
+    /// start only after both of them finished.
+    #[tokio::test]
+    async fn two_branches_overlap_and_the_join_waits_for_both() {
+        let camp = tempfile::tempdir().unwrap();
+        let pipeline = make_pipeline(
+            "diamond",
+            vec![
+                sleep_step("root", "0", Some(vec![])),
+                sleep_step("left", "1", Some(vec!["root"])),
+                sleep_step("right", "1", Some(vec!["root"])),
+                sleep_step("join", "0", Some(vec!["left", "right"])),
+            ],
+        );
+        let meta = PipelineRunner::new(pipeline)
+            .with_camp_root(camp.path().to_path_buf())
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(meta.status, RunStatus::Success);
+
+        let (left, right, join) = (row(&meta, "left"), row(&meta, "right"), row(&meta, "join"));
+        assert!(
+            overlaps(left, right),
+            "the two independent branches must run concurrently: left {:?}..{:?}, right {:?}..{:?}",
+            left.started_at, left.completed_at, right.started_at, right.completed_at,
+        );
+        assert!(
+            join.started_at.unwrap() >= left.completed_at.unwrap()
+                && join.started_at.unwrap() >= right.completed_at.unwrap(),
+            "the join must not start before both branches finished",
+        );
+        // Rows stay in DECLARATION order even though `right` may finish first.
+        let names: Vec<&str> = meta.steps.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["root", "left", "right", "join"]);
+    }
+
+    /// The compatibility property the whole design rests on: a pipeline that
+    /// declares no `needs` is still strictly serial. If this ever goes green
+    /// with overlap, every pipeline TOML in every camp just became parallel.
+    #[tokio::test]
+    async fn a_pipeline_without_needs_stays_strictly_serial() {
+        let camp = tempfile::tempdir().unwrap();
+        let pipeline = make_pipeline(
+            "chain",
+            vec![
+                sleep_step("one", "1", None),
+                sleep_step("two", "1", None),
+                sleep_step("three", "0", None),
+            ],
+        );
+        let meta = PipelineRunner::new(pipeline)
+            .with_camp_root(camp.path().to_path_buf())
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(meta.status, RunStatus::Success);
+        assert!(!overlaps(row(&meta, "one"), row(&meta, "two")));
+        assert!(
+            row(&meta, "two").started_at.unwrap() >= row(&meta, "one").completed_at.unwrap(),
+            "an absent `needs` means the implicit chain edge, not 'no dependencies'",
+        );
+    }
+
+    /// `max_parallel = 1` pins a genuine DAG back to serial — the escape hatch
+    /// for a pipeline that turns out to contend in a way its `resource` keys
+    /// don't describe yet.
+    #[tokio::test]
+    async fn max_parallel_one_serializes_a_dag() {
+        let camp = tempfile::tempdir().unwrap();
+        let mut pipeline = make_pipeline(
+            "diamond",
+            vec![
+                sleep_step("left", "1", Some(vec![])),
+                sleep_step("right", "1", Some(vec![])),
+            ],
+        );
+        pipeline.max_parallel = Some(1);
+        let meta = PipelineRunner::new(pipeline)
+            .with_camp_root(camp.path().to_path_buf())
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(meta.status, RunStatus::Success);
+        assert!(!overlaps(row(&meta, "left"), row(&meta, "right")));
+    }
+
+    /// Two independent steps that both name the same `resource` never overlap,
+    /// even though the DAG says they may and the budget would allow it. This is
+    /// the shared-`target/` case: parallel in the graph, serial on the disk.
+    #[tokio::test]
+    async fn a_shared_resource_key_serializes_independent_steps() {
+        let camp = tempfile::tempdir().unwrap();
+        let mut a = sleep_step("build-a", "1", Some(vec![]));
+        let mut b = sleep_step("build-b", "1", Some(vec![]));
+        a.resource = Some("cargo-target".into());
+        b.resource = Some("cargo-target".into());
+        let free = sleep_step("free", "1", Some(vec![]));
+        let meta = PipelineRunner::new(make_pipeline("res", vec![a, b, free]))
+            .with_camp_root(camp.path().to_path_buf())
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(meta.status, RunStatus::Success);
+        assert!(
+            !overlaps(row(&meta, "build-a"), row(&meta, "build-b")),
+            "steps sharing a resource key must not overlap",
+        );
+        assert!(
+            overlaps(row(&meta, "build-a"), row(&meta, "free")),
+            "a step holding no key is unaffected by someone else's",
+        );
+    }
+
+    /// A failed branch stops the run without stranding the branch that was
+    /// already in flight: the sibling still records a terminal row, and the
+    /// join — whose predecessor failed — never starts at all.
+    #[tokio::test]
+    async fn an_aborting_branch_stops_admission_but_lets_inflight_work_finish() {
+        let camp = tempfile::tempdir().unwrap();
+        let pipeline = make_pipeline(
+            "fail",
+            vec![
+                shell_step("boom", vec!["false"]),
+                sleep_step("sibling", "1", Some(vec![])),
+                sleep_step("join", "0", Some(vec!["boom", "sibling"])),
+            ],
+        );
+        // `boom` is declared first and has no needs, so it is the chain root;
+        // `sibling` is an explicit root, so both are admitted together.
+        let mut pipeline = pipeline;
+        pipeline.steps[0].needs = Some(vec![]);
+        let meta = PipelineRunner::new(pipeline)
+            .with_camp_root(camp.path().to_path_buf())
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(meta.status, RunStatus::Failed);
+        assert_eq!(row(&meta, "boom").status, RunStatus::Failed);
+        assert_eq!(
+            row(&meta, "sibling").status,
+            RunStatus::Success,
+            "a step already in flight is not cancelled by a sibling's abort",
+        );
+        assert!(
+            meta.steps.iter().all(|s| s.name != "join"),
+            "a step the run never reached records no row, same as before the scheduler",
+        );
+    }
+
+    /// A cycle is a load-time error, not a run that hangs or silently does
+    /// nothing. The runner re-checks because it is handed pipelines built in
+    /// code as well as parsed from TOML.
+    #[tokio::test]
+    async fn a_cyclic_needs_graph_fails_the_run_up_front() {
+        let camp = tempfile::tempdir().unwrap();
+        let mut a = shell_step("a", vec!["true"]);
+        let mut b = shell_step("b", vec!["true"]);
+        a.needs = Some(vec!["b".into()]);
+        b.needs = Some(vec!["a".into()]);
+        let err = PipelineRunner::new(make_pipeline("cyc", vec![a, b]))
+            .with_camp_root(camp.path().to_path_buf())
+            .run()
+            .await
+            .expect_err("a cycle must fail the run");
+        assert!(
+            matches!(&err, RunnerError::InvalidConfig(m) if m.contains("cycle")),
+            "got {err:?}",
+        );
+    }
+
+    /// Resume-from-step drains the leading steps and offsets the indices, so a
+    /// surviving `needs` points at a step that is no longer in the slice — and
+    /// genuinely already ran. It must resolve as satisfied, not deadlock.
+    #[tokio::test]
+    async fn a_resumed_run_treats_a_drained_dependency_as_satisfied() {
+        let camp = tempfile::tempdir().unwrap();
+        let mut publish = shell_step("publish", vec!["true"]);
+        publish.needs = Some(vec!["build".into()]);
+        let meta = PipelineRunner::new(make_pipeline("resumed", vec![publish]))
+            .with_camp_root(camp.path().to_path_buf())
+            .with_index_offset(3)
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(meta.status, RunStatus::Success);
+        assert_eq!(row(&meta, "publish").status, RunStatus::Success);
+    }
+
+    /// A `needs` on a fanned-out matrix step joins on every row, not on none —
+    /// `matrix::plan` renames instances `"<name> [k=v]"` and the join has to
+    /// still find them.
+    #[tokio::test]
+    async fn a_join_waits_for_every_row_of_a_matrix_step() {
+        let camp = tempfile::tempdir().unwrap();
+        let mut build = sleep_step("build", "1", Some(vec![]));
+        let mut dims: indexmap::IndexMap<String, Vec<toml::Value>> = indexmap::IndexMap::new();
+        dims.insert(
+            "arch".to_string(),
+            vec![
+                toml::Value::String("x86".into()),
+                toml::Value::String("arm".into()),
+            ],
+        );
+        build.matrix = Some(crate::matrix::MatrixSpec {
+            dimensions: dims,
+            include: Vec::new(),
+            exclude: Vec::new(),
+        });
+        let join = sleep_step("join", "0", Some(vec!["build"]));
+        let planned = crate::matrix::plan(&make_pipeline("fan", vec![build, join]));
+        let expanded = planned.into_iter().next().unwrap().pipeline;
+        // Both rows are explicit roots (they inherit the step's own `needs`),
+        // so they run together and the join waits for the later of the two.
+        let meta = PipelineRunner::new(expanded)
+            .with_camp_root(camp.path().to_path_buf())
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(meta.status, RunStatus::Success);
+        let x86 = row(&meta, "build [arch=x86]");
+        let arm = row(&meta, "build [arch=arm]");
+        assert!(overlaps(x86, arm), "matrix rows sharing a `needs` fan out");
+        let join = row(&meta, "join");
+        assert!(join.started_at.unwrap() >= x86.completed_at.unwrap());
+        assert!(join.started_at.unwrap() >= arm.completed_at.unwrap());
+    }
+
+    /// R605-F3 (found by R776-T2): `background_until` naming a matrix step must
+    /// resolve to every row of it and reap after the LAST one. It used to be an
+    /// exact name compare, so this shape failed preflight with "unknown step" —
+    /// the post-expansion name is `client [n=1]`, which no author writes by
+    /// hand — and, had it resolved, would have reaped on the first row.
+    #[tokio::test]
+    async fn background_until_gates_on_the_last_row_of_a_matrix_step() {
+        let camp = tempfile::tempdir().unwrap();
+        let mut sidecar = shell_step("server", vec!["sleep", "30"]);
+        sidecar.background = true;
+        sidecar.background_until = Some("client".into());
+        sidecar.needs = Some(vec![]);
+
+        let mut client = sleep_step("client", "1", Some(vec!["server"]));
+        let mut dims: indexmap::IndexMap<String, Vec<toml::Value>> = indexmap::IndexMap::new();
+        dims.insert(
+            "n".to_string(),
+            vec![toml::Value::Integer(1), toml::Value::Integer(2)],
+        );
+        client.matrix = Some(crate::matrix::MatrixSpec {
+            dimensions: dims,
+            include: Vec::new(),
+            exclude: Vec::new(),
+        });
+
+        let planned = crate::matrix::plan(&make_pipeline("bg-fan", vec![sidecar, client]));
+        let expanded = planned.into_iter().next().unwrap().pipeline;
+        assert_eq!(expanded.steps.len(), 3, "the client fanned out");
+
+        let meta = PipelineRunner::new(expanded)
+            .with_camp_root(camp.path().to_path_buf())
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(meta.status, RunStatus::Success);
+
+        // The sidecar's terminal row lands at reap, so its completed_at is the
+        // observable: it must be at or after BOTH rows finished, not just one.
+        let server = row(&meta, "server");
+        let r1 = row(&meta, "client [n=1]");
+        let r2 = row(&meta, "client [n=2]");
+        assert_eq!(server.status, RunStatus::Success);
+        assert!(
+            server.completed_at.unwrap() >= r1.completed_at.unwrap()
+                && server.completed_at.unwrap() >= r2.completed_at.unwrap(),
+            "the reap waits for the last row: server {:?}, rows {:?} / {:?}",
+            server.completed_at, r1.completed_at, r2.completed_at,
+        );
+    }
+
+    /// Under a declared DAG, `background_until` pointing at a step on another
+    /// branch is rejected: that gate can fire while the branch that actually
+    /// uses the sidecar is mid-run.
+    #[tokio::test]
+    async fn background_until_must_name_a_descendant_under_a_declared_dag() {
+        let camp = tempfile::tempdir().unwrap();
+        let mut sidecar = shell_step("server", vec!["sleep", "5"]);
+        sidecar.background = true;
+        sidecar.background_until = Some("other".into());
+        sidecar.needs = Some(vec![]);
+        let other = sleep_step("other", "0", Some(vec![]));
+        let err = PipelineRunner::new(make_pipeline("bg", vec![sidecar, other]))
+            .with_camp_root(camp.path().to_path_buf())
+            .run()
+            .await
+            .expect_err("a gate on a parallel branch races the reap");
+        assert!(
+            matches!(&err, RunnerError::InvalidConfig(m) if m.contains("does not depend on it")),
+            "got {err:?}",
+        );
+    }
+
+    /// …and a gate that IS a descendant is fine. Also pins the other half of
+    /// the sidecar rule: a background step satisfies its dependents at spawn,
+    /// so `needs = ["server"]` is a runnable edge rather than a deadlock.
+    #[tokio::test]
+    async fn a_sidecar_satisfies_its_dependents_at_spawn() {
+        let camp = tempfile::tempdir().unwrap();
+        let mut sidecar = shell_step("server", vec!["sleep", "30"]);
+        sidecar.background = true;
+        sidecar.background_until = Some("client".into());
+        sidecar.needs = Some(vec![]);
+        let client = sleep_step("client", "0", Some(vec!["server"]));
+        let meta = PipelineRunner::new(make_pipeline("bg", vec![sidecar, client]))
+            .with_camp_root(camp.path().to_path_buf())
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(meta.status, RunStatus::Success);
+        assert_eq!(
+            row(&meta, "server").status,
+            RunStatus::Success,
+            "a sidecar torn down on its gate is the expected lifecycle",
+        );
+    }
+
+    // ─── R719-F7 (W298): dynamic admission ──────────────────────────────────
+
+    /// Records the lane sequence a run asks for. The daemon's control does the
+    /// actual locking; what the runner owes is the right sequence.
+    #[derive(Default)]
+    struct RecordingAdmission(std::sync::Mutex<Vec<AdmissionLane>>);
+
+    impl RecordingAdmission {
+        fn lanes(&self) -> Vec<AdmissionLane> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl AdmissionControl for RecordingAdmission {
+        async fn enter(&self, lane: AdmissionLane) {
+            self.0.lock().unwrap().push(lane);
+        }
+    }
+
+    /// The mixed-`auto` half of R719-F3: work that lands on a build worker
+    /// belongs in the fleet lane for exactly as long as it runs, so the local
+    /// key is free meanwhile. Local work keeps the run's own lane.
+    #[test]
+    fn an_offloaded_step_belongs_in_the_fleet_lane_and_a_local_one_does_not() {
+        let runner = PipelineRunner::new(make_pipeline("p", vec![]));
+        assert_eq!(runner.step_lane(RunWhere::Remote), AdmissionLane::Fleet);
+        assert_eq!(runner.step_lane(RunWhere::Local), AdmissionLane::Base);
+        assert_eq!(runner.step_lane(RunWhere::Auto), AdmissionLane::Base);
+    }
+
+    /// A sub-pipeline child running in a lane of its own admits against THAT
+    /// key for its local work — otherwise its steps would re-enter the parent's
+    /// lane and undo the very move that closed the R719-F2 gap.
+    #[test]
+    fn a_child_in_its_own_lane_names_it_instead_of_base() {
+        let mut runner = PipelineRunner::new(make_pipeline("child", vec![]));
+        runner.admission_lane = Some("peer:cheers".to_string());
+        assert_eq!(
+            runner.step_lane(RunWhere::Local),
+            AdmissionLane::Named("peer:cheers".to_string())
+        );
+        // Offload still wins: where the work lands beats which lane owns it.
+        assert_eq!(runner.step_lane(RunWhere::Remote), AdmissionLane::Fleet);
+    }
+
+    /// One lane call per step that actually runs — and none for a step that
+    /// doesn't. A skipped step does no work the lane is protecting, so making
+    /// it re-queue would be a pure loss.
+    #[tokio::test]
+    async fn every_executed_step_admits_and_a_skipped_one_does_not() {
+        let camp = tempfile::tempdir().unwrap();
+        let mut skipped = shell_step("skipped", vec!["true"]);
+        skipped.enabled = false;
+        let pipeline = make_pipeline(
+            "two-plus-one",
+            vec![
+                shell_step("one", vec!["true"]),
+                skipped,
+                shell_step("two", vec!["true"]),
+            ],
+        );
+        let admission = Arc::new(RecordingAdmission::default());
+        let meta = PipelineRunner::new(pipeline)
+            .with_camp_root(camp.path().to_path_buf())
+            .with_admission(admission.clone())
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(meta.status, RunStatus::Success);
+        assert_eq!(
+            admission.lanes(),
+            vec![AdmissionLane::Base, AdmissionLane::Base],
+            "two executed steps, two lane calls; the disabled step must not re-queue"
+        );
+    }
+
+    /// The R719-F2 peer-child hole, closed. The child wants `peer:cheers`, its
+    /// parent stands in `cargo-target` — before F7 the child took no key at all
+    /// and was serialized against nothing. Now it moves into its own lane, and
+    /// the parent stands back in its own when the child returns.
+    #[tokio::test]
+    async fn a_child_wanting_another_lane_moves_into_it_and_hands_it_back() {
+        let camp = tempfile::tempdir().unwrap();
+        let mut child = make_pipeline("peer-build", vec![shell_step("build", vec!["true"])]);
+        child.concurrency_key = Some("peer:cheers".to_string());
+        let resolver = MapResolver(
+            [("peer:cheers:peer-build".to_string(), child)]
+                .into_iter()
+                .collect(),
+        );
+
+        let mut parent = make_pipeline(
+            "release",
+            vec![sub_step(
+                "peer",
+                SubPipelineRef::Peer {
+                    camp: "cheers".into(),
+                    pipeline: "peer-build".into(),
+                },
+                false,
+            )],
+        );
+        parent.concurrency_key = Some("cargo-target".to_string());
+
+        let admission = Arc::new(RecordingAdmission::default());
+        let meta = PipelineRunner::new(parent)
+            .with_camp_root(camp.path().to_path_buf())
+            .with_sub_pipeline_resolver(Arc::new(resolver))
+            .with_admission(admission.clone())
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(meta.status, RunStatus::Success);
+        assert_eq!(
+            admission.lanes(),
+            vec![
+                // The parent's own sub-pipeline step.
+                AdmissionLane::Base,
+                // The child's step, in the child's lane.
+                AdmissionLane::Named("peer:cheers".to_string()),
+                // Back in the parent's lane before the step returns.
+                AdmissionLane::Base,
+            ],
+        );
+    }
+
+    /// A child whose key its parent IS standing in changes nothing — no gap,
+    /// no lane move, and none of the re-queueing a move costs.
+    #[tokio::test]
+    async fn a_child_sharing_the_parents_key_never_leaves_the_lane() {
+        let camp = tempfile::tempdir().unwrap();
+        let mut child = make_pipeline("inner", vec![shell_step("build", vec!["true"])]);
+        child.concurrency_key = Some("cargo-target".to_string());
+        let resolver = MapResolver(
+            [("builtin:inner".to_string(), child)]
+                .into_iter()
+                .collect(),
+        );
+
+        let mut parent = make_pipeline(
+            "outer",
+            vec![sub_step("inner", SubPipelineRef::Builtin("inner".into()), false)],
+        );
+        parent.concurrency_key = Some("cargo-target".to_string());
+
+        let admission = Arc::new(RecordingAdmission::default());
+        PipelineRunner::new(parent)
+            .with_camp_root(camp.path().to_path_buf())
+            .with_sub_pipeline_resolver(Arc::new(resolver))
+            .with_admission(admission.clone())
+            .run()
+            .await
+            .unwrap();
+        assert!(
+            admission
+                .lanes()
+                .iter()
+                .all(|lane| *lane == AdmissionLane::Base),
+            "an inherited grant needs no lane move: {:?}",
+            admission.lanes()
+        );
     }
 
     #[test]
@@ -6403,11 +7890,14 @@ mod tests {
 
     fn one_step_pipeline(name: &str, argv: Vec<String>) -> Pipeline {
         Pipeline {
+            max_parallel: None,
             description: None,
             tags: Vec::new(),
             name: name.to_string(),
             label: name.to_string(),
             steps: vec![crate::types::QedStep {
+                needs: None,
+                resource: None,
                 inputs: Vec::new(),
                 secret: false,
                 background: false,
@@ -6432,6 +7922,7 @@ mod tests {
                 triple: None,
                 package: None,
                 context: None,
+                source_context: Vec::new(),
                 load: false,
                 sub_pipeline: None,
                 gha_workflow: None,
@@ -6456,6 +7947,8 @@ mod tests {
             toolchain: None,
             binds: Vec::new(),
             on_change: Vec::new(),
+            alias_of: None,
+            pins: Default::default(),
             finally: Vec::new(),
         }
     }
@@ -6754,6 +8247,193 @@ mod tests {
         }
     }
 
+    /// R833-F8: `--where=node:<machine>` reaches the wire. A pinned run's
+    /// deployed spec carries the imperative node selector, and NOT the mesh-tag
+    /// selector — the operator named a box, so the arch/tag filter that would
+    /// otherwise narrow the candidate set must not also apply and risk
+    /// excluding it.
+    #[tokio::test]
+    async fn a_pinned_run_puts_the_named_node_on_the_wire() {
+        let dir = TempDir::new().unwrap();
+        let scryer = make_scryer(&dir);
+        let yubaba = Arc::new(DeployCapturingWarden::new(vec!["ok".into()], 0));
+
+        let mut pipeline = one_step_pipeline("pinned", vec!["true".to_string()]);
+        // A cross-arch target: the tag matcher WOULD have inferred a node from
+        // this, which is exactly what the pin has to win against.
+        pipeline.steps[0].platform = Some(crate::platform::PlatformSpec {
+            target: Some("x86_64-unknown-linux-musl".into()),
+            container_platform: None,
+            native: false,
+        });
+
+        let runner = PipelineRunner::new_remote(pipeline, scryer, yubaba.clone())
+            .with_pinned_node(MeshIdent("us-west-003".into()));
+        let meta = runner.run().await.unwrap();
+        assert_eq!(meta.status, RunStatus::Success);
+
+        let spec = yubaba.only_spec();
+        assert_eq!(
+            spec.annotations
+                .get(velveteen_exec::remote::NODE_SELECTOR_NODE_ANNOTATION)
+                .map(String::as_str),
+            Some("us-west-003"),
+        );
+        assert!(
+            !spec
+                .annotations
+                .contains_key(velveteen_exec::remote::NODE_SELECTOR_MESH_TAGS_ANNOTATION),
+            "an explicit target must not be re-filtered by inferred arch tags",
+        );
+    }
+
+    /// The other half of the same guarantee: with no pin, placement is
+    /// byte-for-byte what R594 shipped — the arch-matched mesh-tag selector and
+    /// no node annotation. This is the regression test for "inference keeps
+    /// working exactly as it does today".
+    #[tokio::test]
+    async fn an_unpinned_run_still_infers_its_target_from_the_step() {
+        let dir = TempDir::new().unwrap();
+        let scryer = make_scryer(&dir);
+        let yubaba = Arc::new(DeployCapturingWarden::new(vec!["ok".into()], 0));
+
+        let mut pipeline = one_step_pipeline("inferred", vec!["true".to_string()]);
+        pipeline.steps[0].platform = Some(crate::platform::PlatformSpec {
+            target: Some("x86_64-unknown-linux-musl".into()),
+            container_platform: None,
+            native: false,
+        });
+
+        let runner = PipelineRunner::new_remote(pipeline, scryer, yubaba.clone());
+        assert_eq!(runner.run().await.unwrap().status, RunStatus::Success);
+
+        let spec = yubaba.only_spec();
+        assert_eq!(
+            spec.annotations
+                .get(velveteen_exec::remote::NODE_SELECTOR_MESH_TAGS_ANNOTATION)
+                .map(String::as_str),
+            Some("tag:build-worker,arch:x86,os:linux"),
+        );
+        assert!(
+            !spec
+                .annotations
+                .contains_key(velveteen_exec::remote::NODE_SELECTOR_NODE_ANNOTATION),
+            "no pin ⇒ no imperative selector",
+        );
+    }
+
+    /// A camp root that is a real git repo with one tracked file, so
+    /// `pack_source_context`'s `git ls-files` has something to find.
+    fn git_camp_with_tracked_file() -> TempDir {
+        let camp = TempDir::new().unwrap();
+        let root = camp.path();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::create_dir_all(root.join("oss/mesofact/src")).unwrap();
+        std::fs::write(root.join("oss/mesofact/src/main.rs"), b"fn main() {}\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "init"]);
+        camp
+    }
+
+    /// R560-T8 end-to-end on the unit path: a remote subprocess step that
+    /// declares `source_context` has its tree packed, published, and the
+    /// resulting URL delivered to the worker as `YAH_SOURCE_CONTEXT_URL` — then
+    /// the single-use object is discarded once the step ends.
+    ///
+    /// Each half has its own silent-failure mode. Skip the publish and the step
+    /// runs with the variable unset, which is only visible once the argv's `:?`
+    /// fires on the worker. Skip the discard and every run of every fleet build
+    /// leaves a source tarball in the bucket forever — the exact leak R636-B1
+    /// deletes on both legs to avoid.
+    #[tokio::test]
+    async fn remote_step_publishes_its_source_context_and_reclaims_the_key() {
+        let dir = TempDir::new().unwrap();
+        let camp = git_camp_with_tracked_file();
+        let scryer = make_scryer(&dir);
+        let yubaba = Arc::new(DeployCapturingWarden::new(vec!["ok".into()], 0));
+        // The same recorder R636-B1's build-image tests use — one seam, so a
+        // regression in either transport shows up against the same fixture.
+        let publisher = Arc::new(RecordingContextPublisher::default());
+
+        let mut pipeline =
+            one_step_pipeline("mesofact-musl", vec!["build-mesofact.sh".to_string()]);
+        pipeline.steps[0].source_context = vec![std::path::PathBuf::from("oss/mesofact")];
+
+        let runner = PipelineRunner::new_remote(pipeline, scryer, yubaba.clone())
+            .with_camp_root(camp.path().to_path_buf())
+            .with_build_context_publisher(publisher.clone());
+        let meta = runner.run().await.unwrap();
+        assert_eq!(meta.status, RunStatus::Success);
+
+        let published = publisher.published.lock().unwrap().clone();
+        assert_eq!(published.len(), 1, "exactly one source context per step");
+        let (key, tarball) = &published[0];
+        assert!(!tarball.is_empty(), "the packed tar must carry bytes");
+
+        let spec = yubaba.only_spec();
+        let var = spec
+            .env
+            .iter()
+            .find(|e| e.name == crate::build_context::SOURCE_CONTEXT_URL_ENV)
+            .unwrap_or_else(|| {
+                panic!(
+                    "the worker must learn where to fetch its source; spec carried {:?}",
+                    spec.env.iter().map(|e| &e.name).collect::<Vec<_>>()
+                )
+            });
+        match &var.value {
+            workload_spec::EnvValue::Literal { value } => {
+                assert_eq!(value, &format!("https://ctx.test/{key}.tar.gz"))
+            }
+            other => panic!("expected a literal env value, got {other:?}"),
+        }
+
+        assert_eq!(
+            *publisher.discarded.lock().unwrap(),
+            vec![key.clone()],
+            "the single-use key must be reclaimed once the step ends",
+        );
+    }
+
+    /// The whole existing corpus declares no `source_context`, and must
+    /// therefore make no upload and see no new variable. Without this, adding
+    /// the field would have quietly put a network call on the critical path of
+    /// every remote step in every pipeline.
+    #[tokio::test]
+    async fn remote_step_without_source_context_publishes_nothing() {
+        let dir = TempDir::new().unwrap();
+        let scryer = make_scryer(&dir);
+        let yubaba = Arc::new(DeployCapturingWarden::new(vec!["ok".into()], 0));
+        let publisher = Arc::new(RecordingContextPublisher::default());
+
+        let pipeline = one_step_pipeline("plain-remote", vec!["true".to_string()]);
+        let runner = PipelineRunner::new_remote(pipeline, scryer, yubaba.clone())
+            .with_build_context_publisher(publisher.clone());
+        assert_eq!(runner.run().await.unwrap().status, RunStatus::Success);
+
+        assert!(publisher.published.lock().unwrap().is_empty());
+        assert!(publisher.discarded.lock().unwrap().is_empty());
+        assert!(
+            !yubaba
+                .only_spec()
+                .env
+                .iter()
+                .any(|e| e.name == crate::build_context::SOURCE_CONTEXT_URL_ENV),
+            "a step that declares no source context must see no new variable",
+        );
+    }
+
     /// Remote path happy: single step exits 0, task_run_id populated in step status.
     #[tokio::test]
     async fn remote_step_success() {
@@ -6819,6 +8499,28 @@ mod tests {
         let on_disk = std::fs::read(&landed).unwrap();
         assert_eq!(on_disk, payload, "bytes must survive the transport unchanged");
         assert_eq!(blake3::hash(&on_disk).to_hex().to_string(), expected_blake3);
+
+        // R560-T9: retrieval also materialises a NAMED view carrying the
+        // build's own filename, and that is the path handed to the publish leg.
+        // `stage_release` keys a release object as
+        // `<binary>/<version>/<triple>/<basename>`, so a bare CAS path would
+        // publish the tarball under its 64-hex BLAKE3 — a URL install.sh never
+        // constructs, discovered only after a multi-hour fleet build.
+        let named = camp
+            .path()
+            .join(".yah/cache/artifacts/named")
+            .join(&expected_blake3)
+            .join("librusty_v8-x86_64-unknown-linux-musl.tar.gz");
+        assert!(
+            named.exists(),
+            "retrieval must leave a named view at {}",
+            named.display(),
+        );
+        assert_eq!(
+            std::fs::read(&named).unwrap(),
+            payload,
+            "the named view must be the same bytes as the CAS entry",
+        );
     }
 
     /// Remote path failure: non-zero exit code propagates as Failed status.
@@ -6972,6 +8674,8 @@ mod tests {
 
         let mut pipeline = one_step_pipeline("test-abort", vec!["false".to_string()]);
         pipeline.steps.push(crate::types::QedStep {
+            needs: None,
+            resource: None,
             inputs: Vec::new(),
             secret: false,
             background: false,
@@ -6996,6 +8700,7 @@ mod tests {
             triple: None,
             package: None,
             context: None,
+            source_context: Vec::new(),
             load: false,
             sub_pipeline: None,
             gha_workflow: None,
@@ -7077,11 +8782,14 @@ mod tests {
         argv: Vec<String>,
     ) -> Pipeline {
         Pipeline {
+            max_parallel: None,
             description: None,
             tags: Vec::new(),
             name: "test".to_string(),
             label: "test".to_string(),
             steps: vec![crate::types::QedStep {
+                needs: None,
+                resource: None,
                 inputs: Vec::new(),
                 secret: false,
                 background: false,
@@ -7106,6 +8814,7 @@ mod tests {
                 triple: None,
                 package: None,
                 context: None,
+                source_context: Vec::new(),
                 load: false,
                 sub_pipeline: None,
                 gha_workflow: None,
@@ -7130,6 +8839,8 @@ mod tests {
             toolchain: None,
             binds: Vec::new(),
             on_change: Vec::new(),
+            alias_of: None,
+            pins: Default::default(),
             finally: Vec::new(),
         }
     }
@@ -7593,7 +9304,7 @@ mod tests {
             remote_subprocess_mesh_tags(&x86),
             vec![
                 "tag:build-worker".to_string(),
-                "tier:x86".to_string(),
+                "arch:x86".to_string(),
                 "os:linux".to_string()
             ],
         );
@@ -7608,7 +9319,7 @@ mod tests {
             remote_subprocess_mesh_tags(&arm),
             vec![
                 "tag:build-worker".to_string(),
-                "tier:arm".to_string(),
+                "arch:arm".to_string(),
                 "os:linux".to_string()
             ],
         );
@@ -7978,7 +9689,7 @@ mod tests {
             RunnerError::StepFailed { step: s, msg } => {
                 assert_eq!(s, "build-v8");
                 assert!(msg.contains("must offload"), "message: {msg}");
-                assert!(msg.contains("tier:x86"), "message: {msg}");
+                assert!(msg.contains("arch:x86"), "message: {msg}");
                 assert!(msg.contains("aarch64-apple-darwin"), "message: {msg}");
             }
             other => panic!("expected StepFailed, got {other:?}"),
@@ -8064,8 +9775,8 @@ mod tests {
 
     /// R636: a remote build-image step must route to a worker of the step's
     /// TARGET arch, not the runner's host arch. An amd64 image build offloaded
-    /// from an arm64 Mac has to land on `tier:x86`; deriving the tier from the
-    /// host sent it to a `tier:arm` node that failed on an unreachable URL.
+    /// from an arm64 Mac has to land on `arch:x86`; deriving the tier from the
+    /// host sent it to a `arch:arm` node that failed on an unreachable URL.
     #[test]
     fn remote_build_image_routes_by_target_arch_not_host() {
         let amd64 = build_image_step(
@@ -8085,7 +9796,7 @@ mod tests {
             crate::platform::build_worker_mesh_tags(&runner.remote_build_image_arch(&amd64), "linux"),
             vec![
                 "tag:build-worker".to_string(),
-                "tier:x86".to_string(),
+                "arch:x86".to_string(),
                 "os:linux".to_string()
             ]
         );
@@ -8278,7 +9989,7 @@ mod tests {
             RunnerError::StepFailed { step: s, msg } => {
                 assert_eq!(s, "build-rusty-v8-musl-builder");
                 assert!(msg.contains("linux/amd64"), "message: {msg}");
-                assert!(msg.contains("tier:x86"), "message: {msg}");
+                assert!(msg.contains("arch:x86"), "message: {msg}");
                 assert!(msg.contains("aarch64-apple-darwin"), "message: {msg}");
             }
             other => panic!("expected StepFailed, got {other:?}"),
@@ -8916,6 +10627,89 @@ mod tests {
         );
     }
 
+    // ── R717-T11 (W296): a manual CELL, end to end ───────────────────────────
+
+    /// The T11 verify. A doc run that reaches a manual cell parks and stops:
+    /// the cell itself never executes, the following cell never starts, and
+    /// nothing inside the runner can answer the gate on the caller's behalf —
+    /// which is the whole property when the caller is an agent, since an agent
+    /// otherwise *can* resolve forms.
+    ///
+    /// W257's BIOS block is the shape used deliberately: no `advance`, because
+    /// a person at the box setting restore-on-AC-power-loss has no
+    /// out-of-band proof to offer. That is exactly the cell an agent would
+    /// sail through.
+    #[tokio::test]
+    async fn a_doc_manual_cell_parks_the_run_and_nothing_downstream_executes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("ran-after-the-gate");
+        let md = format!(
+            "```toml notebook=node-onboard\n```\n\n\
+             ```bash cell=bios manual\n\
+             # At the box: set Restore-on-AC-power-loss.\n\
+             # checklist: Restore-on-AC-power-loss = On\n\
+             ```\n\n\
+             ```bash cell=after assert\ntouch {}\n```\n",
+            marker.display(),
+        );
+        let doc = crate::parse_doc("W257.md", &md).unwrap();
+        let pipeline = doc
+            .lower(tmp.path(), &std::collections::HashMap::new(), None)
+            .unwrap();
+
+        // A gate that accepts the park and never answers — the agent-initiated
+        // case, where the only thing that can move this run is a person.
+        let mut gate = ScriptedGate::new(vec![]);
+        gate.never_answers = true;
+        let gate = Arc::new(gate);
+        let parks = Arc::clone(&gate.parks);
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let runner = PipelineRunner::new(pipeline)
+            .with_camp_root(tmp.path().to_path_buf())
+            .with_events(tx)
+            .with_manual_gate(gate);
+        let elapsed = tokio::time::timeout(
+            std::time::Duration::from_millis(600),
+            runner.run(),
+        )
+        .await;
+        assert!(
+            elapsed.is_err(),
+            "the run must STAY parked — it resolved itself without a human"
+        );
+
+        let events = drain_events(&mut rx);
+        let parked = events
+            .iter()
+            .find_map(|e| match e {
+                QedEvent::StepAwaitingHuman { name, form_id, advance, .. } => {
+                    Some((name.clone(), form_id.clone(), advance.clone()))
+                }
+                _ => None,
+            })
+            .expect("the doc's manual cell emits StepAwaitingHuman");
+        assert_eq!(parked.0, "bios", "the step name IS the cell id");
+        assert!(parked.1.is_some(), "and it carries the minted form's id");
+        assert!(parked.2.is_none(), "advance is optional — this cell has none");
+
+        let req = &parks.lock().unwrap()[0];
+        assert_eq!(req.prompt, "At the box: set Restore-on-AC-power-loss.");
+        assert_eq!(req.checklist, vec!["Restore-on-AC-power-loss = On"]);
+
+        assert!(
+            finished_pos(&events, "bios").is_none(),
+            "a parked step has not finished"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, QedEvent::StepStarted { name, .. } if name == "after")),
+            "and the cell after the gate must not start"
+        );
+        assert!(!marker.exists(), "nothing downstream of the gate ran");
+    }
+
     /// An `https://` URL is rejected up front with a pointed message rather than
     /// silently failing a plaintext GET against a TLS port for the whole budget.
     #[tokio::test]
@@ -9196,8 +10990,9 @@ mod tests {
     }
 
     /// `native_cross_plan` (R531-F5) gates on the NativeCross verdict and a
-    /// foreign target, then routes the step's argv to zigbuild. A host-arch
-    /// (plain native) step and a non-NativeCross verdict both yield `None`.
+    /// foreign (arch OR OS, R786-B1) target, then routes the step's argv to
+    /// zigbuild. Only a truly host-matching target and a non-NativeCross
+    /// verdict yield `None`.
     #[test]
     fn native_cross_plan_routes_foreign_target_to_zigbuild() {
         let pipeline = one_step_pipeline(
@@ -9221,10 +11016,33 @@ mod tests {
         assert_eq!(plan.argv[1], "zigbuild");
         assert!(plan.argv.iter().any(|a| a == "x86_64-unknown-linux-musl"));
 
-        // Host-arch target → plain native build, not this tier → None.
+        // R786-B1: same arch, foreign OS (aarch64-unknown-linux-gnu from an
+        // aarch64-apple-darwin host) is ALSO NativeCross-tier, not a plain
+        // native build — Apple's `ld` can't produce an ELF binary regardless
+        // of arch match (reproduced live; see nativecross.rs's
+        // same_arch_foreign_os_is_not_native test). This used to assert
+        // `None` on the wrong assumption that arch-match alone was enough.
+        let mut foreign_os = runner.pipeline.steps[0].clone();
+        foreign_os.platform = Some(crate::platform::PlatformSpec {
+            target: Some("aarch64-unknown-linux-gnu".into()),
+            container_platform: None,
+            native: false,
+        });
+        let plan = runner
+            .native_cross_plan(&foreign_os, &crate::nativecross::ToolAvailability::FULL)
+            .expect("same-arch foreign-OS step also yields a plan")
+            .expect("toolchain available");
+        assert_eq!(plan.tool, crate::nativecross::CrossTool::CargoZigbuild);
+        assert!(plan
+            .argv
+            .iter()
+            .any(|a| a == "aarch64-unknown-linux-gnu"));
+
+        // Truly host-matching target (arch AND OS) → plain native build, not
+        // this tier → None.
         let mut native = runner.pipeline.steps[0].clone();
         native.platform = Some(crate::platform::PlatformSpec {
-            target: Some("aarch64-unknown-linux-gnu".into()),
+            target: Some("aarch64-apple-darwin".into()),
             container_platform: None,
             native: false,
         });
@@ -9491,11 +11309,14 @@ mod tests {
 
     fn build_image_pipeline(image: &str) -> Pipeline {
         Pipeline {
+            max_parallel: None,
             description: None,
             tags: Vec::new(),
             name: "image".to_string(),
             label: "Bake image".to_string(),
             steps: vec![crate::types::QedStep {
+                needs: None,
+                resource: None,
                 inputs: Vec::new(),
                 secret: false,
                 background: false,
@@ -9520,6 +11341,7 @@ mod tests {
                 triple: None,
                 package: None,
                 context: None,
+                source_context: Vec::new(),
                 load: false,
                 sub_pipeline: None,
                 gha_workflow: None,
@@ -9544,6 +11366,8 @@ mod tests {
             toolchain: None,
             binds: Vec::new(),
             on_change: Vec::new(),
+            alias_of: None,
+            pins: Default::default(),
             finally: Vec::new(),
         }
     }
@@ -9751,11 +11575,14 @@ description = "smoke test image"
     /// don't depend on a real cross build.
     fn package_native_tarball_pipeline(image: &str, binary_rel: &str, triple: &str) -> Pipeline {
         Pipeline {
+            max_parallel: None,
             description: None,
             tags: Vec::new(),
             name: "pack".to_string(),
             label: "Package native tarball".to_string(),
             steps: vec![crate::types::QedStep {
+                needs: None,
+                resource: None,
                 inputs: Vec::new(),
                 secret: false,
                 background: false,
@@ -9780,6 +11607,7 @@ description = "smoke test image"
                 triple: Some(triple.to_string()),
                 package: None,
                 context: None,
+                source_context: Vec::new(),
                 load: false,
                 sub_pipeline: None,
                 gha_workflow: None,
@@ -9804,6 +11632,8 @@ description = "smoke test image"
             toolchain: None,
             binds: Vec::new(),
             on_change: Vec::new(),
+            alias_of: None,
+            pins: Default::default(),
             finally: Vec::new(),
         }
     }
@@ -10018,11 +11848,14 @@ produces    = ["native-tarball"]
 
     fn musl_preflight_pipeline(package: &str) -> Pipeline {
         Pipeline {
+            max_parallel: None,
             description: None,
             tags: Vec::new(),
             name: "preflight".to_string(),
             label: "musl-static preflight".to_string(),
             steps: vec![crate::types::QedStep {
+                needs: None,
+                resource: None,
                 inputs: Vec::new(),
                 secret: false,
                 background: false,
@@ -10047,6 +11880,7 @@ produces    = ["native-tarball"]
                 triple: None,
                 package: Some(package.to_string()),
                 context: None,
+                source_context: Vec::new(),
                 load: false,
                 sub_pipeline: None,
                 gha_workflow: None,
@@ -10071,6 +11905,8 @@ produces    = ["native-tarball"]
             toolchain: None,
             binds: Vec::new(),
             on_change: Vec::new(),
+            alias_of: None,
+            pins: Default::default(),
             finally: Vec::new(),
         }
     }
@@ -10148,12 +11984,15 @@ produces    = ["native-tarball"]
     /// the same image+triple → on-disk-path convention both steps share.
     fn pack_and_sign_pipeline(image: &str, binary_rel: &str, triple: &str) -> Pipeline {
         Pipeline {
+            max_parallel: None,
             description: None,
             tags: Vec::new(),
             name: "pack-and-sign".to_string(),
             label: "Package + sign native tarball".to_string(),
             steps: vec![
                 crate::types::QedStep {
+                    needs: None,
+                    resource: None,
                     inputs: Vec::new(),
                     secret: false,
                     background: false,
@@ -10178,6 +12017,7 @@ produces    = ["native-tarball"]
                     triple: Some(triple.to_string()),
                     package: None,
                     context: None,
+                    source_context: Vec::new(),
                     load: false,
                     sub_pipeline: None,
                     gha_workflow: None,
@@ -10191,6 +12031,8 @@ produces    = ["native-tarball"]
                     outputs: Vec::new(),
                 },
                 crate::types::QedStep {
+                    needs: None,
+                    resource: None,
                     inputs: Vec::new(),
                     secret: false,
                     background: false,
@@ -10215,6 +12057,7 @@ produces    = ["native-tarball"]
                     triple: Some(triple.to_string()),
                     package: None,
                     context: None,
+                    source_context: Vec::new(),
                     load: false,
                     sub_pipeline: None,
                     gha_workflow: None,
@@ -10240,6 +12083,8 @@ produces    = ["native-tarball"]
             toolchain: None,
             binds: Vec::new(),
             on_change: Vec::new(),
+            alias_of: None,
+            pins: Default::default(),
             finally: Vec::new(),
         }
     }
@@ -10248,11 +12093,14 @@ produces    = ["native-tarball"]
     /// already exist" gate without coupling to the packaging step.
     fn sign_only_pipeline(image: &str, triple: &str) -> Pipeline {
         Pipeline {
+            max_parallel: None,
             description: None,
             tags: Vec::new(),
             name: "sign".to_string(),
             label: "Sign native tarball".to_string(),
             steps: vec![crate::types::QedStep {
+                needs: None,
+                resource: None,
                 inputs: Vec::new(),
                 secret: false,
                 background: false,
@@ -10277,6 +12125,7 @@ produces    = ["native-tarball"]
                 triple: Some(triple.to_string()),
                 package: None,
                 context: None,
+                source_context: Vec::new(),
                 load: false,
                 sub_pipeline: None,
                 gha_workflow: None,
@@ -10301,6 +12150,8 @@ produces    = ["native-tarball"]
             toolchain: None,
             binds: Vec::new(),
             on_change: Vec::new(),
+            alias_of: None,
+            pins: Default::default(),
             finally: Vec::new(),
         }
     }
@@ -10466,6 +12317,8 @@ produces    = ["native-tarball"]
 
     fn shell_step(name: &str, argv: Vec<&str>) -> crate::types::QedStep {
         crate::types::QedStep {
+            needs: None,
+            resource: None,
             inputs: Vec::new(),
             secret: false,
             background: false,
@@ -10490,6 +12343,7 @@ produces    = ["native-tarball"]
             triple: None,
             package: None,
             context: None,
+            source_context: Vec::new(),
             load: false,
             sub_pipeline: None,
             gha_workflow: None,
@@ -10502,6 +12356,90 @@ produces    = ["native-tarball"]
             toolchain: None,
             outputs: Vec::new(),
         }
+    }
+
+    // ----- R744-T2 `base_env` ------------------------------------------------
+
+    /// The point of the field: a local step sees the embedder's env without the
+    /// recipe naming it. This is what carries the host's absolute `SCCACHE_DIR`
+    /// into a step whose cwd is a worktree copy — the case where letting the
+    /// tree answer "where is the cache" pinned a per-user sccache server to a
+    /// `$TMPDIR` path for every camp on the machine.
+    #[tokio::test]
+    async fn base_env_reaches_a_local_step() {
+        let camp = tempfile::tempdir().unwrap();
+        let step = shell_step("probe", vec!["sh", "-c", "printf %s \"$R744_PROBE\" > out"]);
+        let meta = PipelineRunner::new(make_pipeline("base-env", vec![step]))
+            .with_camp_root(camp.path().to_path_buf())
+            .with_base_env(vec![("R744_PROBE".into(), "from-host".into())])
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(meta.status, RunStatus::Success);
+        assert_eq!(
+            std::fs::read_to_string(camp.path().join("out")).unwrap(),
+            "from-host",
+        );
+    }
+
+    /// …and loses to the step's own `env`. The recipe is closer to the work
+    /// than the host is, so a pipeline that spells a key out has said something
+    /// the embedder's default must not quietly overrule.
+    #[tokio::test]
+    async fn a_steps_own_env_outranks_base_env() {
+        let camp = tempfile::tempdir().unwrap();
+        let mut step = shell_step("probe", vec!["sh", "-c", "printf %s \"$R744_PROBE\" > out"]);
+        step.env
+            .insert("R744_PROBE".to_string(), "from-step".to_string());
+        let meta = PipelineRunner::new(make_pipeline("base-env-prec", vec![step]))
+            .with_camp_root(camp.path().to_path_buf())
+            .with_base_env(vec![("R744_PROBE".into(), "from-host".into())])
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(meta.status, RunStatus::Success);
+        assert_eq!(
+            std::fs::read_to_string(camp.path().join("out")).unwrap(),
+            "from-step",
+        );
+    }
+
+    /// Inheritance, which is the half that regresses silently: a `cargo` step
+    /// buried in a sub-pipeline runs on this same host and needs the same env.
+    /// `release-wizard → release-check → check → cargo-test` is three levels
+    /// deep, and it is the level that actually compiles.
+    #[tokio::test]
+    async fn a_sub_pipeline_child_inherits_base_env() {
+        let camp = tempfile::tempdir().unwrap();
+        let child = make_pipeline(
+            "inner",
+            vec![shell_step(
+                "probe",
+                vec!["sh", "-c", "printf %s \"$R744_PROBE\" > out"],
+            )],
+        );
+        let resolver = MapResolver([("builtin:inner".to_string(), child)].into_iter().collect());
+        let parent = make_pipeline(
+            "outer",
+            vec![sub_step(
+                "nested",
+                SubPipelineRef::Builtin("inner".into()),
+                false,
+            )],
+        );
+
+        let meta = PipelineRunner::new(parent)
+            .with_camp_root(camp.path().to_path_buf())
+            .with_sub_pipeline_resolver(Arc::new(resolver))
+            .with_base_env(vec![("R744_PROBE".into(), "from-host".into())])
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(meta.status, RunStatus::Success);
+        assert_eq!(
+            std::fs::read_to_string(camp.path().join("out")).unwrap(),
+            "from-host",
+        );
     }
 
     // ----- R717-T1 `inputs` / R717-T2 `secret`, at the runner ----------------
@@ -10771,6 +12709,8 @@ produces    = ["native-tarball"]
         propagate_produces: bool,
     ) -> crate::types::QedStep {
         crate::types::QedStep {
+            needs: None,
+            resource: None,
             inputs: Vec::new(),
             secret: false,
             background: false,
@@ -10795,6 +12735,7 @@ produces    = ["native-tarball"]
             triple: None,
             package: None,
             context: None,
+            source_context: Vec::new(),
             load: false,
             sub_pipeline: Some(SubPipelineConfig {
                 target,
@@ -10804,6 +12745,7 @@ produces    = ["native-tarball"]
                     outputs: Vec::new(),
                 },
                 opaque: false,
+                own_workspace: false,
             }),
             outputs: Vec::new(),
             gha_workflow: None,
@@ -10819,6 +12761,7 @@ produces    = ["native-tarball"]
 
     fn make_pipeline(name: &str, steps: Vec<crate::types::QedStep>) -> Pipeline {
         Pipeline {
+            max_parallel: None,
             description: None,
             tags: Vec::new(),
             name: name.into(),
@@ -10840,6 +12783,8 @@ produces    = ["native-tarball"]
             toolchain: None,
             binds: Vec::new(),
             on_change: Vec::new(),
+            alias_of: None,
+            pins: Default::default(),
             finally: Vec::new(),
         }
     }
@@ -11496,6 +13441,96 @@ produces    = ["native-tarball"]
         assert_eq!(meta.status, RunStatus::Failed);
     }
 
+    // R755: `own_workspace` — a child records where it actually built by
+    // writing `pwd` to a marker file the test reads back afterward (the
+    // child's own worktree/positioned-tree is torn down by the time `run()`
+    // returns, so asserting on it post-hoc via `git worktree list` would not
+    // see it — this has to be observed from inside the running step).
+    fn pwd_marker_step(marker: &std::path::Path) -> crate::types::QedStep {
+        let mut step = shell_step("where", vec!["sh", "-c", "pwd > \"$MARKER\""]);
+        step.env.insert("MARKER".to_string(), marker.display().to_string());
+        step
+    }
+
+    #[tokio::test]
+    async fn sub_pipeline_own_workspace_true_isolates_from_live_parent() {
+        let repo = init_git_repo();
+        let marker_dir = tempfile::tempdir().unwrap();
+        let marker = marker_dir.path().join("where.txt");
+
+        let mut child = make_pipeline("child", vec![pwd_marker_step(&marker)]);
+        child.workspace = crate::types::WorkspaceMode::Isolated;
+        let root = make_pipeline(
+            "root",
+            vec![{
+                let mut s = sub_step("compose", SubPipelineRef::Builtin("child".into()), false);
+                s.sub_pipeline.as_mut().unwrap().own_workspace = true;
+                s
+            }],
+        );
+        let mut map = std::collections::HashMap::new();
+        map.insert("builtin:child".to_string(), child);
+        let resolver: Arc<dyn SubPipelineResolver + Send + Sync> = Arc::new(MapResolver(map));
+        let runner = PipelineRunner::new(root)
+            .with_camp_root(repo.path().to_path_buf())
+            .with_sub_pipeline_resolver(resolver);
+        let meta = runner.run().await.unwrap();
+        assert_eq!(meta.status, RunStatus::Success);
+
+        let where_built = std::fs::read_to_string(&marker).unwrap();
+        let where_built = where_built.trim();
+        // Canonicalize: macOS's /tmp is a /private/tmp symlink, so a raw
+        // string compare of `pwd`'s resolved output against tempfile's
+        // unresolved TempDir path spuriously differs even when they name the
+        // same directory.
+        let repo_canon = std::fs::canonicalize(repo.path()).unwrap();
+        assert_ne!(
+            where_built,
+            repo_canon.to_string_lossy(),
+            "own_workspace=true must build the child in its OWN (isolated) worktree, \
+             not the live parent's camp root"
+        );
+    }
+
+    #[tokio::test]
+    async fn sub_pipeline_own_workspace_default_false_inherits_live_parent() {
+        let repo = init_git_repo();
+        let marker_dir = tempfile::tempdir().unwrap();
+        let marker = marker_dir.path().join("where.txt");
+
+        // Child declares Isolated too — but WITHOUT own_workspace, W224/R533-F11
+        // inheritance still wins: this is the pre-R755 default behaviour and
+        // must not regress.
+        let mut child = make_pipeline("child", vec![pwd_marker_step(&marker)]);
+        child.workspace = crate::types::WorkspaceMode::Isolated;
+        let root = make_pipeline(
+            "root",
+            vec![sub_step(
+                "compose",
+                SubPipelineRef::Builtin("child".into()),
+                false,
+            )],
+        );
+        let mut map = std::collections::HashMap::new();
+        map.insert("builtin:child".to_string(), child);
+        let resolver: Arc<dyn SubPipelineResolver + Send + Sync> = Arc::new(MapResolver(map));
+        let runner = PipelineRunner::new(root)
+            .with_camp_root(repo.path().to_path_buf())
+            .with_sub_pipeline_resolver(resolver);
+        let meta = runner.run().await.unwrap();
+        assert_eq!(meta.status, RunStatus::Success);
+
+        let where_built = std::fs::read_to_string(&marker).unwrap();
+        let where_built = where_built.trim();
+        let repo_canon = std::fs::canonicalize(repo.path()).unwrap();
+        assert_eq!(
+            where_built,
+            repo_canon.to_string_lossy(),
+            "without own_workspace, a child inherits the parent's positioned tree \
+             even when its own pipeline declares Isolated"
+        );
+    }
+
     #[tokio::test]
     async fn sub_pipeline_inlines_child_steps_as_rows_by_default() {
         // W223 R532-F3: transparent-by-default generalizes beyond GHA. A
@@ -11606,6 +13641,8 @@ jobs:
         // Synthesised one-step pipeline carrying the GhaWorkflow step,
         // exactly as `LoaderSubPipelineResolver::resolve` would build it.
         let step = crate::types::QedStep {
+            needs: None,
+            resource: None,
             inputs: Vec::new(),
             secret: false,
             background: false,
@@ -11630,6 +13667,7 @@ jobs:
             triple: None,
             package: None,
             context: None,
+            source_context: Vec::new(),
             load: false,
             sub_pipeline: None,
             outputs: Vec::new(),
@@ -11648,6 +13686,7 @@ jobs:
             toolchain: None,
         };
         let child = Pipeline {
+            max_parallel: None,
             description: None,
             tags: Vec::new(),
             name: "fail".into(),
@@ -11665,6 +13704,8 @@ jobs:
             toolchain: None,
             binds: Vec::new(),
             on_change: Vec::new(),
+            alias_of: None,
+            pins: Default::default(),
             finally: Vec::new(),
         };
 
@@ -11880,6 +13921,8 @@ jobs:
         // Synthesised one-step pipeline carrying the GhaWorkflow step, exactly
         // as `LoaderSubPipelineResolver::resolve` would build it.
         let step = crate::types::QedStep {
+            needs: None,
+            resource: None,
             inputs: Vec::new(),
             secret: false,
             background: false,
@@ -11904,6 +13947,7 @@ jobs:
             triple: None,
             package: None,
             context: None,
+            source_context: Vec::new(),
             load: false,
             sub_pipeline: None,
             outputs: Vec::new(),
@@ -11922,6 +13966,7 @@ jobs:
             toolchain: None,
         };
         let child = Pipeline {
+            max_parallel: None,
             description: None,
             tags: Vec::new(),
             name: "mix".into(),
@@ -11939,6 +13984,8 @@ jobs:
             toolchain: None,
             binds: Vec::new(),
             on_change: Vec::new(),
+            alias_of: None,
+            pins: Default::default(),
             finally: Vec::new(),
         };
 
@@ -12455,6 +14502,49 @@ jobs:
         // Successful = `true hello` exited 0. We don't capture argv here but
         // a `false {{greeting}}` would fail the same; this proves the step
         // ran post-substitution.
+        assert_eq!(meta.status, RunStatus::Success);
+    }
+
+    /// R755: the exact release-wizard shape — a parent step's own
+    /// `sub_pipeline.params` entry is ITSELF a `{{placeholder}}` referencing
+    /// the parent's own declared param (`params = { spec = "{{spec}}" }`),
+    /// not a literal value. `Pipeline::apply_params` used to substitute
+    /// `{{key}}` in a step's `argv`/`env`/`gha_workflow` fields only, so this
+    /// placeholder survived into `resolve_params` and then the child's argv
+    /// literally, unrelated to whatever the operator actually passed. Caught
+    /// by a real `yah qed run release-wizard --param spec=patch` run failing
+    /// with `expected patch|minor|major or a literal X.Y.Z, got {{spec}}`.
+    #[tokio::test]
+    async fn sub_pipeline_param_placeholder_substitutes_from_parent_before_forwarding() {
+        let child = make_pipeline(
+            "child",
+            vec![shell_step("check", vec!["test", "{{spec}}", "=", "patch"])],
+        );
+        let mut step = sub_step("compose", SubPipelineRef::Builtin("child".into()), false);
+        if let Some(cfg) = step.sub_pipeline.as_mut() {
+            cfg.params
+                .insert("spec".to_string(), "{{spec}}".to_string());
+        }
+        let mut root = make_pipeline("root", vec![step]);
+        root.params
+            .insert("spec".to_string(), param_def(None, true));
+
+        // Mirrors the CLI/daemon boundary (qed.rs / camp.rs): resolve the
+        // operator-supplied params against root's declarations, then apply —
+        // BEFORE the runner ever sees the pipeline.
+        let resolved = root
+            .resolve_params(&HashMap::from([("spec".to_string(), "patch".to_string())]))
+            .unwrap();
+        root.apply_params(&resolved);
+
+        let mut map = std::collections::HashMap::new();
+        map.insert("builtin:child".to_string(), child);
+        let resolver: Arc<dyn SubPipelineResolver + Send + Sync> = Arc::new(MapResolver(map));
+        let meta = PipelineRunner::new(root)
+            .with_sub_pipeline_resolver(resolver)
+            .run()
+            .await
+            .unwrap();
         assert_eq!(meta.status, RunStatus::Success);
     }
 
@@ -13227,6 +15317,8 @@ jobs:
 
     fn gating_step(name: &str) -> crate::types::QedStep {
         crate::types::QedStep {
+            needs: None,
+            resource: None,
             inputs: Vec::new(),
             secret: false,
             background: false,
@@ -13253,6 +15345,7 @@ jobs:
             triple: None,
             package: None,
             context: None,
+            source_context: Vec::new(),
             load: false,
             sub_pipeline: None,
             outputs: Vec::new(),
@@ -13272,6 +15365,7 @@ jobs:
         let mut s = gating_step("disabled");
         s.enabled = false;
         let pipeline = Pipeline {
+            max_parallel: None,
             description: None,
             tags: Vec::new(),
             name: "p".into(),
@@ -13289,6 +15383,8 @@ jobs:
             toolchain: None,
             binds: Vec::new(),
             on_change: Vec::new(),
+            alias_of: None,
+            pins: Default::default(),
             finally: Vec::new(),
         };
         let meta = PipelineRunner::new(pipeline).run().await.unwrap();
@@ -13310,6 +15406,7 @@ jobs:
         let mut s = gating_step("stubbed");
         s.activation = crate::types::StepActivation::Stubbed;
         let pipeline = Pipeline {
+            max_parallel: None,
             description: None,
             tags: Vec::new(),
             name: "p".into(),
@@ -13327,6 +15424,8 @@ jobs:
             toolchain: None,
             binds: Vec::new(),
             on_change: Vec::new(),
+            alias_of: None,
+            pins: Default::default(),
             finally: Vec::new(),
         };
         let meta = PipelineRunner::new(pipeline).run().await.unwrap();
@@ -13344,6 +15443,7 @@ jobs:
         let mut s = gating_step("stubbed");
         s.activation = crate::types::StepActivation::Stubbed;
         let pipeline = Pipeline {
+            max_parallel: None,
             description: None,
             tags: Vec::new(),
             name: "p".into(),
@@ -13361,6 +15461,8 @@ jobs:
             toolchain: None,
             binds: Vec::new(),
             on_change: Vec::new(),
+            alias_of: None,
+            pins: Default::default(),
             finally: Vec::new(),
         };
         let meta = PipelineRunner::new(pipeline)
@@ -13381,6 +15483,7 @@ jobs:
         s.enabled = false;
         s.activation = crate::types::StepActivation::Stubbed; // both knobs set
         let pipeline = Pipeline {
+            max_parallel: None,
             description: None,
             tags: Vec::new(),
             name: "p".into(),
@@ -13398,6 +15501,8 @@ jobs:
             toolchain: None,
             binds: Vec::new(),
             on_change: Vec::new(),
+            alias_of: None,
+            pins: Default::default(),
             finally: Vec::new(),
         };
         let meta = PipelineRunner::new(pipeline)
@@ -13417,6 +15522,7 @@ jobs:
         let mut s = gating_step("conditional");
         s.if_cond = Some("matrix.target == 'ios-device'".into());
         let pipeline = Pipeline {
+            max_parallel: None,
             description: None,
             tags: Vec::new(),
             name: "p".into(),
@@ -13434,6 +15540,8 @@ jobs:
             toolchain: None,
             binds: Vec::new(),
             on_change: Vec::new(),
+            alias_of: None,
+            pins: Default::default(),
             finally: Vec::new(),
         };
         let mut coord = indexmap::IndexMap::new();
@@ -13460,6 +15568,7 @@ jobs:
         let mut s = gating_step("conditional");
         s.if_cond = Some("matrix.target == 'ios-device'".into());
         let pipeline = Pipeline {
+            max_parallel: None,
             description: None,
             tags: Vec::new(),
             name: "p".into(),
@@ -13477,6 +15586,8 @@ jobs:
             toolchain: None,
             binds: Vec::new(),
             on_change: Vec::new(),
+            alias_of: None,
+            pins: Default::default(),
             finally: Vec::new(),
         };
         let mut coord = indexmap::IndexMap::new();
@@ -13497,6 +15608,7 @@ jobs:
         let mut s = gating_step("conditional");
         s.if_cond = Some("${{ matrix.target == 'ios-device' }}".into());
         let pipeline = Pipeline {
+            max_parallel: None,
             description: None,
             tags: Vec::new(),
             name: "p".into(),
@@ -13514,6 +15626,8 @@ jobs:
             toolchain: None,
             binds: Vec::new(),
             on_change: Vec::new(),
+            alias_of: None,
+            pins: Default::default(),
             finally: Vec::new(),
         };
         let mut coord = indexmap::IndexMap::new();
@@ -13545,6 +15659,7 @@ jobs:
         params: HashMap<String, crate::types::ParamDef>,
     ) -> Pipeline {
         Pipeline {
+            max_parallel: None,
             description: None,
             tags: Vec::new(),
             name: "p".into(),
@@ -13562,6 +15677,8 @@ jobs:
             toolchain: None,
             binds: Vec::new(),
             on_change: Vec::new(),
+            alias_of: None,
+            pins: Default::default(),
             finally: Vec::new(),
         }
     }
@@ -13711,6 +15828,7 @@ jobs:
         let mut gated = gating_step("cleanup");
         gated.if_cond = Some("always()".into());
         let pipeline = Pipeline {
+            max_parallel: None,
             description: None,
             tags: Vec::new(),
             name: "p".into(),
@@ -13728,6 +15846,8 @@ jobs:
             toolchain: None,
             binds: Vec::new(),
             on_change: Vec::new(),
+            alias_of: None,
+            pins: Default::default(),
             finally: Vec::new(),
         };
         let meta = PipelineRunner::new(pipeline).run().await.unwrap();
@@ -13744,6 +15864,7 @@ jobs:
         let mut gated = gating_step("only-on-fail");
         gated.if_cond = Some("failure()".into());
         let pipeline = Pipeline {
+            max_parallel: None,
             description: None,
             tags: Vec::new(),
             name: "p".into(),
@@ -13761,6 +15882,8 @@ jobs:
             toolchain: None,
             binds: Vec::new(),
             on_change: Vec::new(),
+            alias_of: None,
+            pins: Default::default(),
             finally: Vec::new(),
         };
         let meta = PipelineRunner::new(pipeline).run().await.unwrap();
@@ -13772,6 +15895,7 @@ jobs:
         let mut gated = gating_step("only-on-fail");
         gated.if_cond = Some("failure()".into());
         let pipeline = Pipeline {
+            max_parallel: None,
             description: None,
             tags: Vec::new(),
             name: "p".into(),
@@ -13789,6 +15913,8 @@ jobs:
             toolchain: None,
             binds: Vec::new(),
             on_change: Vec::new(),
+            alias_of: None,
+            pins: Default::default(),
             finally: Vec::new(),
         };
         let meta = PipelineRunner::new(pipeline).run().await.unwrap();
@@ -13800,6 +15926,7 @@ jobs:
         let mut gated = gating_step("only-on-success");
         gated.if_cond = Some("success()".into());
         let pipeline = Pipeline {
+            max_parallel: None,
             description: None,
             tags: Vec::new(),
             name: "p".into(),
@@ -13817,6 +15944,8 @@ jobs:
             toolchain: None,
             binds: Vec::new(),
             on_change: Vec::new(),
+            alias_of: None,
+            pins: Default::default(),
             finally: Vec::new(),
         };
         let meta = PipelineRunner::new(pipeline).run().await.unwrap();
@@ -13828,6 +15957,7 @@ jobs:
         let mut gated = gating_step("on-cancel");
         gated.if_cond = Some("cancelled()".into());
         let pipeline = Pipeline {
+            max_parallel: None,
             description: None,
             tags: Vec::new(),
             name: "p".into(),
@@ -13845,6 +15975,8 @@ jobs:
             toolchain: None,
             binds: Vec::new(),
             on_change: Vec::new(),
+            alias_of: None,
+            pins: Default::default(),
             finally: Vec::new(),
         };
         let meta = PipelineRunner::new(pipeline).run().await.unwrap();

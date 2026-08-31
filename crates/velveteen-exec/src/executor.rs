@@ -35,12 +35,43 @@ use velveteen::{ForgeSpec, ForgeStatus};
 ///   <value>` so a single-arch upstream image can run under host emulation
 ///   (e.g. Apple Silicon hosts emulating `linux/amd64` via Rosetta).
 /// - `produced` is **remote-only** — see [`ProducedFile`].
+/// - `admission` is **remote-only in effect** — see [`AdmissionEnvelope`].
 #[derive(Debug, Default, Clone)]
 pub struct ExecContext {
     pub cwd: Option<PathBuf>,
     pub env: Vec<(String, String)>,
     pub platform: Option<String>,
     pub produced: Option<ProducedFile>,
+    pub admission: Option<AdmissionEnvelope>,
+    /// Vault credentials the run needs on the worker (R555-F5). Remote-only,
+    /// and **refused** by the local driver rather than ignored: a dev box has
+    /// no cluster secret store, so honoring it is impossible and dropping it
+    /// yields a build that runs without the credential it declared and fails
+    /// somewhere less legible than here.
+    pub secrets: Vec<workload_spec::SecretMount>,
+}
+
+/// The three opaque strings a signed recipe carries to kamaji's admission gate
+/// (R555-F4 / W235 §(c)).
+///
+/// Opaque on purpose: the dispatcher neither computes nor checks a signature,
+/// it forwards what the recipe author produced. That is what keeps the signing
+/// key off every machine that dispatches — see
+/// [`workload_spec::admission`](workload_spec::admission) for the model.
+///
+/// Unlike [`ProducedFile`], the local driver **ignores** this rather than
+/// refusing it. A local run does not pass through kamaji at all, so there is no
+/// gate to satisfy; refusing would mean a recipe becomes un-runnable on the
+/// developer's own box the moment it is signed, which is precisely the
+/// incentive not to sign.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmissionEnvelope {
+    /// The encoded grant document, byte-for-byte as signed.
+    pub grant: String,
+    /// Hex Ed25519 detached signature over `grant`.
+    pub signature: String,
+    /// Hex Ed25519 public key that produced `signature`.
+    pub public_key: String,
 }
 
 /// A file the run writes on the *worker*, to be pulled back onto the caller's
@@ -88,6 +119,23 @@ impl ExecContext {
     /// spec carrying it rather than pretending the retrieval happened.
     pub fn with_produced(mut self, remote_path: PathBuf, dest: PathBuf) -> Self {
         self.produced = Some(ProducedFile { remote_path, dest });
+        self
+    }
+
+    /// Carry a signed recipe's admission grant to the node (R555-F4).
+    pub fn with_admission(mut self, envelope: AdmissionEnvelope) -> Self {
+        self.admission = Some(envelope);
+        self
+    }
+
+    /// Mount the recipe's declared vault credentials on the worker (R555-F5).
+    ///
+    /// These must be the same mounts the signed grant enumerates —
+    /// `RecipeSecret::to_mount` and `RecipeSecret::to_grant` are the paired
+    /// constructors that keep them so. A mount the grant does not admit is
+    /// refused by the node, not silently dropped.
+    pub fn with_secrets(mut self, secrets: Vec<workload_spec::SecretMount>) -> Self {
+        self.secrets = secrets;
         self
     }
 }

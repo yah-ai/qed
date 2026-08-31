@@ -133,6 +133,16 @@ pub struct Job {
     pub timeout_minutes: Option<u32>,
     pub continue_on_error: Option<bool>,
     pub defaults: Option<Defaults>,
+    /// Job-level `concurrency:` (real GHA syntax — same shape as the
+    /// workflow-level key, just scoped to this job). R605-T4 half (a): the
+    /// emulator reads `group` as the per-job shared-resource key that gates
+    /// [`Executor::max_parallel_jobs`] fan-out — two same-wave instances
+    /// whose evaluated groups match run serially even when the cap allows
+    /// more, because GHA's own concurrency semantics say they must. `None`
+    /// (the common case: no `concurrency:` on the job) means the job
+    /// declares no shared resource and is free to run alongside anything
+    /// else the cap admits.
+    pub concurrency: Option<Concurrency>,
     pub steps: Vec<Step>,
 }
 

@@ -29,6 +29,10 @@
 //! @yah:depends_on(R555)
 //! @yah:depends_on(R546)
 //! @yah:depends_on(R577)
+//! @yah:notify_on(R785-B1, "R785-B1 fixes qed-gha's run_bash_step ignoring working-directory: on `run:` steps — this is a concrete new blocker on R605's own verify criterion ('yah qed run release single-slice executes end-to-end with no GitHub round-trip'). qed run 690455c1 (2026-08-19) hit this exact bug in BOTH the yubaba-build job (pre-existing) and the mesofact-build job, cascading to skip/fail cli-build, camp-build, smoke, and all publish-image-* jobs. Re-run the release pipeline once R785-B1 lands to see if it clears that verify line.")
+//! @yah:gotcha("GITHUB ACTIONS IS NOT DEGRADED, IT IS HARD-STOPPED ON BILLING -- measured 2026-08-24, and it upgrades this relay from an architectural preference to the only working release path. Every release run since v0.8.20 (2026-07-17) has failed in under 16 seconds with ZERO steps executed. The check-run annotation on run 32416829619 (tag v0.8.27, 2026-08-20) reads verbatim: 'The job was not started because recent account payments have failed or your spending limit needs to be increased. Please check the Billing and plans section in your settings'. gh release list confirms the last GitHub Release is v0.8.20; tags v0.8.21 through v0.8.28 have no release behind them. So any ticket whose verify step is 'confirm on the next real release tag push' is currently unverifiable by construction, not merely unrun.")
+//! @yah:gotcha("PROVEN ALTERNATIVE, exercised end to end by R746-F9 on 2026-08-24: a full four-triple mesofact release was built, signed and published from a dev Mac with no GitHub involvement at all -- scripts/cross-build-guarded.sh for the builds (cargo zigbuild for the linux triples, cargo --target for darwin), local cosign against the release-cosign-key vault slot, and 'yah cloud bucket put --bucket yah-dev' for the R2 upload. Published as mesofact 0.8.28.1; cdn.yah.dev/mesofact/latest.json now carries all four triples where every prior version carried only aarch64-apple-darwin. Verified by cold install on stock debian:12 containers, both amd64 and arm64, with no Rust toolchain. The pieces this relay wants to build already exist as a working manual sequence -- worth reading it before designing the automated one.")
+//! @yah:gotcha("COSIGN FLAG DIVERGENCE that will bite the QED-side signing work (R605-F1). release.yml pins cosign v2.6.5 and signs with '--tlog-upload=false'. cosign 3.x REMOVED that flag: 3.1.3 exits non-zero with 'not supported with --signing-config or --use-signing-config'. The 3.x equivalent is '--signing-config <file>' where the file has no rekorTlogUrls -- generate with 'cosign signing-config create --with-default-services' and delete the rekorTlogUrls/rekorTlogConfig keys, keeping tsaUrls. Verified working: the resulting bundle is sigstore bundle v0.3 with a publicKey hint plus one rfc3161 timestamp and no cert, byte-shape-identical to what was already published at mesofact/0.8.27.2, and install.sh's 'cosign verify-blob --key <pub> --insecure-ignore-tlog --bundle' accepts it.")
 
 mod artifact_store;
 mod events;
@@ -304,5 +308,80 @@ mod roundtrip_tests {
             }
             _ => unreachable!(),
         }
+    }
+
+    /// R785-B1 live-fixture check: extract the actual `mesofact-build` step
+    /// that reproduced the bug in `qed run 690455c1` (2026-08-19) — GHA's own
+    /// checkout puts it at `working-directory: oss/mesofact`, and before this
+    /// fix `run_bash_step` always used `executor.workspace` (the repo root),
+    /// where `cargo tree -p mesofact --features deploy` fails with "cannot
+    /// specify features for packages outside of workspace" (oss/mesofact is
+    /// excluded from the root workspace). Runs the real step body from a real
+    /// repo root, not a synthetic copy, so this can't drift from release.yml.
+    #[test]
+    fn mesofact_prod_closure_step_runs_from_its_declared_working_directory() {
+        let Some(wf) = parse_file("release.yml") else { eprintln!("skip: yah workflow fixtures not present"); return; };
+        let repo_root = workflows_dir()
+            .and_then(|d| d.parent().and_then(|d| d.parent().map(|d| d.to_path_buf())));
+        let Some(repo_root) = repo_root else { eprintln!("skip: yah workflow fixtures not present"); return; };
+
+        let mesofact_build = &wf.jobs["mesofact-build"];
+        let step = mesofact_build
+            .steps
+            .iter()
+            .find(|s| {
+                s.name
+                    .as_ref()
+                    .and_then(|n| n.as_pure_literal())
+                    .map(|n| n.contains("Assert prod closure"))
+                    .unwrap_or(false)
+            })
+            .expect("release.yml carries the Assert-prod-closure step")
+            .clone();
+        assert_eq!(
+            step.working_directory.as_ref().and_then(|w| w.as_pure_literal()).as_deref(),
+            Some("oss/mesofact"),
+            "step's own working-directory should still be oss/mesofact"
+        );
+
+        let mut jobs = indexmap::IndexMap::new();
+        jobs.insert(
+            "verify".to_string(),
+            Job {
+                name: None,
+                runs_on: RunsOn::Label(ExprString::literal("ubuntu-latest")),
+                needs: vec![],
+                if_cond: None,
+                permissions: None,
+                outputs: indexmap::IndexMap::new(),
+                env: indexmap::IndexMap::new(),
+                strategy: None,
+                timeout_minutes: None,
+                continue_on_error: None,
+                defaults: None,
+                concurrency: None,
+                steps: vec![step],
+            },
+        );
+        let synthetic = Workflow {
+            name: None,
+            triggers: Triggers::default(),
+            permissions: None,
+            env: indexmap::IndexMap::new(),
+            concurrency: None,
+            defaults: None,
+            jobs,
+        };
+
+        let mut e = Executor::new(repo_root);
+        e.env_passthrough = true;
+        let run = crate::execute_workflow(&synthetic, &e).unwrap_or_else(|err| panic!("execute: {err}"));
+        let inst = run.instance("verify").expect("verify instance");
+        assert_eq!(
+            inst.result,
+            crate::JobResult::Success,
+            "steps: {:#?}",
+            inst.steps
+        );
     }
 }

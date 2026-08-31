@@ -315,6 +315,15 @@ impl ForgeExecutor for LocalForgeDriver {
                  instead of asking for retrieval",
             ));
         }
+        if !ctx.secrets.is_empty() {
+            return Err(ForgeExecutorError::Unsupported(
+                "LocalForgeDriver received ExecContext::secrets. Vault credentials are \
+                 resolved by yubaba on the node that runs the workload; this box has no \
+                 cluster secret store, so the mount cannot be honored — and running the \
+                 step without it would fail later, inside the build, as a missing-auth \
+                 error nobody would trace back to placement (R555-F5)",
+            ));
+        }
         let runtime = spec.where_.runtime;
         match spec.command {
             ForgeCommand::Subprocess { argv, image } => match runtime {
@@ -325,6 +334,15 @@ impl ForgeExecutor for LocalForgeDriver {
                     ))?;
                     run_subprocess(build_container_command(&image, &argv, &ctx), sink).await
                 }
+                // R605-F8: microVM is remote-only by construction. The point of
+                // booting a guest is to protect *co-tenants* — a raft voter, a
+                // live site — and a dev box has none, so a local microVM would
+                // cost a kernel boot to isolate a build from its own author.
+                TaskRuntime::MicroVm => Err(ForgeExecutorError::Unsupported(
+                    "runtime = microvm is remote-only: it isolates a build from what else \
+                     is running on the node, and locally that is you. Use runtime = \
+                     container (or native) for a local run (R605-F8)",
+                )),
             },
             ForgeCommand::BuildImage { .. } => Err(ForgeExecutorError::Unsupported("BuildImage")),
             ForgeCommand::Workload { .. } => Err(ForgeExecutorError::Unsupported("Workload")),
@@ -1009,7 +1027,7 @@ mod tests {
             },
             TaskLocation::RemoteAny {
                 tier: workload_spec::TierTag("infra".into()),
-                mesh_tags: vec!["tier:x86".into()],
+                mesh_tags: vec!["arch:x86".into()],
             },
         ] {
             let mut spec = subprocess_spec(
@@ -1057,6 +1075,40 @@ mod tests {
             err.to_string().contains("remote-only"),
             "the refusal must say why, got: {err}"
         );
+    }
+
+    /// R555-F5: vault credentials are resolved by yubaba on the node that runs
+    /// the workload. Dropping the mount would run the build without the
+    /// credential it declared — a missing-auth failure deep inside a two-hour
+    /// build, traced back to placement by nobody.
+    #[tokio::test]
+    async fn a_secret_mount_is_refused_rather_than_ignored() {
+        let driver = LocalForgeDriver::new();
+        let spec = subprocess_spec(
+            vec!["/bin/sh".into(), "-c".into(), "exit 0".into()],
+            velveteen::TaskRuntime::Native,
+        );
+        let err = driver
+            .execute(
+                spec,
+                ExecContext::default().with_secrets(vec![workload_spec::SecretMount {
+                    source: workload_spec::SecretRef::Cluster {
+                        name: "r2-write".into(),
+                    },
+                    target: workload_spec::SecretTarget::File {
+                        path: PathBuf::from("/run/yah/r2.json"),
+                        mode: 0o400,
+                    },
+                }]),
+                None,
+            )
+            .await
+            .expect_err("secret mounts are remote-only");
+        assert!(
+            matches!(err, ForgeExecutorError::Unsupported(_)),
+            "{err:?}"
+        );
+        assert!(err.to_string().contains("cluster secret store"), "{err}");
     }
 
     #[tokio::test]

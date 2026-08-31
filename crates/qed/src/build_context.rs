@@ -1,4 +1,5 @@
-//! Cross-host build contexts for `StepKind::BuildImage` (R636-B1).
+//! Cross-host build contexts (R636-B1 for `StepKind::BuildImage`; R560-T8 for
+//! remote `StepKind::Subprocess` source trees).
 //!
 //! # The bug this exists for
 //!
@@ -32,8 +33,22 @@
 //! whoever owns the bytes-in-a-bucket relationship (the `yah` CLI, over R2).
 //! A camp with a different reachable store implements this instead; a camp
 //! with none gets [`NoBuildContextPublisher`] and a refusal that says so.
+//!
+//! # The same gap, one layer over: remote subprocess steps (R560-T8)
+//!
+//! `build_workload_spec` gives an offloaded subprocess exactly three things —
+//! the image, the argv, and the `/yah/produced` durable mount. No source. That
+//! is fine for `rusty-v8-musl`, whose baked script clones V8 from the internet
+//! inside the container, and fatal for any step that compiles the *camp tree*:
+//! the `mesofact-musl` legs need `oss/mesofact` plus the two sibling subtrees
+//! its path deps escape into. [`pack_source_context`] is the transport,
+//! deliberately reusing [`BuildContextPublisher`] rather than growing a second
+//! bytes-to-the-worker path — same trait, same single-use run-scoped key, same
+//! delete-on-both-legs. The only difference is what goes in the tar and who
+//! unpacks it: git-tracked files at their camp-root-relative paths, unpacked
+//! by the step's own argv out of `$YAH_SOURCE_CONTEXT_URL`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 
@@ -133,6 +148,193 @@ pub fn pack_context(
         .map_err(|e| pack_err(format!("compressing the context tar: {e}")))
 }
 
+/// Env var naming the URL a remote subprocess step fetches its source tree
+/// from (R560-T8).
+///
+/// Set by the runner on the offloaded-subprocess path whenever the step
+/// declares [`QedStep::source_context`](crate::types::QedStep::source_context);
+/// never set otherwise, so a step that does not declare one sees exactly the
+/// environment it saw before this existed.
+pub const SOURCE_CONTEXT_URL_ENV: &str = "YAH_SOURCE_CONTEXT_URL";
+
+/// Pack the **git-tracked** files under `paths` into one gzipped tar whose
+/// entries keep their `camp_root`-relative paths (R560-T8).
+///
+/// # Why `git ls-files` and not a directory walk
+///
+/// Because the numbers are not close. `oss/mesofact` is 28 GB on disk and 5 MB
+/// tracked — the difference is `target/` and seven `node_modules/`. A walk
+/// would trip [`MAX_CONTEXT_BYTES`] long before it reached a source file, and
+/// the fix would be to reinvent ignore rules that git already computes
+/// correctly for this tree. Reading from the *working tree* rather than from a
+/// git object means uncommitted edits travel, which is the behaviour a build
+/// dispatched from a live camp has to have.
+///
+/// # Why the paths stay camp-root-relative
+///
+/// Unlike a build-image context — where the tar root *is* the context — the
+/// consumer here unpacks into an empty directory and expects a repo-shaped
+/// tree. `oss/mesofact`'s path deps escape its own workspace into
+/// `oss/yah-base` and `oss/cheers` (that is why the image's `build-mesofact.sh`
+/// takes a repo root and refuses without both siblings). Flattening to a
+/// per-path tar root would break exactly that.
+///
+/// A tracked path that has been deleted in the working tree is skipped: the
+/// tree really does not have it, and the point is to ship the tree as
+/// positioned.
+pub fn pack_source_context(camp_root: &Path, paths: &[PathBuf]) -> Result<Vec<u8>, RunnerError> {
+    let rel = source_context_files(camp_root, paths)?;
+
+    let mut budget = MAX_CONTEXT_BYTES;
+    let gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    let mut tar = tar::Builder::new(gz);
+    tar.follow_symlinks(true);
+
+    for entry in &rel {
+        let abs = camp_root.join(entry);
+        let meta = match std::fs::metadata(&abs) {
+            Ok(meta) => meta,
+            // Tracked but deleted in the working tree, or a dangling symlink.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(source_err(format!("stat {}: {e}", abs.display()))),
+        };
+        if meta.is_dir() {
+            // A tracked gitlink (submodule) shows up as a path with no file
+            // behind it. Nothing to ship, and recursing would leave the
+            // camp-root-relative contract.
+            continue;
+        }
+        let len = meta.len();
+        budget = budget.checked_sub(len).ok_or_else(|| {
+            source_err(format!(
+                "source context exceeds the {} MiB cross-host limit (tripped at {}). \
+                 Narrow `source_context` to the subtrees the build actually compiles.",
+                MAX_CONTEXT_BYTES / (1024 * 1024),
+                entry.display(),
+            ))
+        })?;
+
+        let mut file = std::fs::File::open(&abs)
+            .map_err(|e| source_err(format!("opening {}: {e}", abs.display())))?;
+        tar.append_file(entry, &mut file).map_err(|e| {
+            source_err(format!("adding {} to the source tar: {e}", entry.display()))
+        })?;
+    }
+
+    let gz = tar
+        .into_inner()
+        .map_err(|e| source_err(format!("finishing the source tar: {e}")))?;
+    gz.finish()
+        .map_err(|e| source_err(format!("compressing the source tar: {e}")))
+}
+
+/// The git-tracked files under `paths`, camp-root-relative and sorted.
+///
+/// Shared by [`pack_source_context`] and [`source_context_fingerprint`] so the
+/// two cannot disagree about *which* files a step's source context is. A
+/// fingerprint that covered a different set than the pack ships would be a
+/// cache key that misses the change it exists to detect.
+fn source_context_files(camp_root: &Path, paths: &[PathBuf]) -> Result<Vec<PathBuf>, RunnerError> {
+    if paths.is_empty() {
+        return Err(source_err(
+            "source context requested with no paths".to_string(),
+        ));
+    }
+
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("-C").arg(camp_root).args(["ls-files", "-z", "--"]);
+    for path in paths {
+        cmd.arg(path);
+    }
+    let out = cmd.output().map_err(|e| {
+        source_err(format!(
+            "running git ls-files in {}: {e}",
+            camp_root.display()
+        ))
+    })?;
+    if !out.status.success() {
+        return Err(source_err(format!(
+            "git ls-files in {} failed: {}",
+            camp_root.display(),
+            String::from_utf8_lossy(&out.stderr).trim(),
+        )));
+    }
+
+    // Deterministic order, for the same reason `append_dir` sorts: two packs of
+    // an unchanged tree must produce the same bytes. `git ls-files` already
+    // sorts, but sorting here means that stays true if the source of the list
+    // ever changes.
+    let mut rel: Vec<PathBuf> = out
+        .stdout
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| PathBuf::from(String::from_utf8_lossy(s).into_owned()))
+        .collect();
+    rel.sort();
+
+    if rel.is_empty() {
+        return Err(source_err(format!(
+            "`source_context` matched no git-tracked files under {:?} — the step would \
+             fetch an empty source tree and fail at the build. Check the paths are \
+             camp-root-relative and tracked.",
+            paths,
+        )));
+    }
+
+    Ok(rel)
+}
+
+/// BLAKE3 over the *content* of everything [`pack_source_context`] would ship —
+/// the identity of a step's build inputs, as a cache key (R746-F2).
+///
+/// # Why not just hash the packed tar
+///
+/// Because the tar is not content-only. [`tar::Builder::append_file`] copies the
+/// file's mode, uid/gid and **mtime** into each header, so a `git checkout` that
+/// rewrites timestamps without changing a byte produces a different archive. As
+/// a transport that is fine; as a cache key it would dispatch an hour-long fleet
+/// build for a branch switch that changed nothing. This hashes `(relative path,
+/// BLAKE3 of bytes)` pairs instead, so it moves when and only when the source
+/// the build compiles moves.
+///
+/// Executable bit and symlink target are deliberately *not* covered: nothing in
+/// a Rust source tree builds differently for them, and including mode would
+/// reintroduce a filesystem-dependent key on a tree that gets checked out on
+/// both macOS and Linux.
+///
+/// A tracked path deleted in the working tree is skipped, exactly as the pack
+/// skips it — the key describes the tree as positioned.
+pub fn source_context_fingerprint(
+    camp_root: &Path,
+    paths: &[PathBuf],
+) -> Result<String, RunnerError> {
+    let rel = source_context_files(camp_root, paths)?;
+
+    let mut acc = blake3::Hasher::new();
+    for entry in &rel {
+        let abs = camp_root.join(entry);
+        let meta = match std::fs::metadata(&abs) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(source_err(format!("stat {}: {e}", abs.display()))),
+        };
+        // A tracked gitlink (submodule) has no file behind it — same skip the
+        // pack makes.
+        if meta.is_dir() {
+            continue;
+        }
+        let bytes = std::fs::read(&abs)
+            .map_err(|e| source_err(format!("reading {} for fingerprint: {e}", abs.display())))?;
+        // Length-delimited so no rename can collide with a content change:
+        // `a/bc` + `d` and `a/b` + `cd` hash differently.
+        let path_bytes = entry.to_string_lossy();
+        acc.update(&(path_bytes.len() as u64).to_le_bytes());
+        acc.update(path_bytes.as_bytes());
+        acc.update(blake3::hash(&bytes).as_bytes());
+    }
+    Ok(acc.finalize().to_hex().to_string())
+}
+
 /// Recursive walk. Written by hand rather than with `Builder::append_dir_all`
 /// so the byte budget can abort mid-walk — `append_dir_all` on a camp root
 /// would happily stream `target/` for minutes before anyone could object.
@@ -150,8 +352,7 @@ fn append_dir<W: std::io::Write>(
     // on directory-iteration order alone.
     let mut names: Vec<std::ffi::OsString> = Vec::new();
     for entry in entries {
-        let entry =
-            entry.map_err(|e| pack_err(format!("walking {}: {e}", dir.display())))?;
+        let entry = entry.map_err(|e| pack_err(format!("walking {}: {e}", dir.display())))?;
         names.push(entry.file_name());
     }
     names.sort();
@@ -168,8 +369,9 @@ fn append_dir<W: std::io::Write>(
         }
 
         let len = meta.len();
-        *budget = budget.checked_sub(len).ok_or_else(|| {
-            RunnerError::StepFailed {
+        *budget = budget
+            .checked_sub(len)
+            .ok_or_else(|| RunnerError::StepFailed {
                 step: "build-image".into(),
                 msg: format!(
                     "build context {} exceeds the {} MiB cross-host limit (tripped at {}). \
@@ -180,8 +382,7 @@ fn append_dir<W: std::io::Write>(
                     MAX_CONTEXT_BYTES / (1024 * 1024),
                     rel.display(),
                 ),
-            }
-        })?;
+            })?;
 
         let mut file = std::fs::File::open(&path)
             .map_err(|e| pack_err(format!("opening {}: {e}", path.display())))?;
@@ -194,6 +395,13 @@ fn append_dir<W: std::io::Write>(
 fn pack_err(msg: String) -> RunnerError {
     RunnerError::StepFailed {
         step: "build-image".into(),
+        msg,
+    }
+}
+
+fn source_err(msg: String) -> RunnerError {
+    RunnerError::StepFailed {
+        step: "source-context".into(),
         msg,
     }
 }
@@ -348,6 +556,190 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("big.bin"), "must name the file: {msg}");
         assert!(msg.contains("context ="), "must name the fix: {msg}");
+    }
+
+    // ── pack_source_context (R560-T8) ────────────────────────────────────────
+
+    /// A throwaway git repo with `tracked/` committed and `ignored/` matching
+    /// `.gitignore` — the miniature of the real shape (`oss/mesofact` at 5 MB
+    /// tracked inside 28 GB of `target/` + `node_modules/`).
+    fn source_repo() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .arg("-C")
+                .arg(root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "git {args:?}: {out:?}");
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "t"]);
+
+        std::fs::create_dir_all(root.join("pkg/src")).unwrap();
+        std::fs::create_dir_all(root.join("pkg/target/debug")).unwrap();
+        std::fs::create_dir_all(root.join("sibling/src")).unwrap();
+        std::fs::create_dir_all(root.join("elsewhere")).unwrap();
+        std::fs::write(root.join(".gitignore"), "target/\n").unwrap();
+        std::fs::write(root.join("pkg/src/lib.rs"), b"// lib\n").unwrap();
+        std::fs::write(root.join("pkg/Cargo.toml"), b"[package]\n").unwrap();
+        std::fs::write(root.join("pkg/target/debug/huge.bin"), vec![0u8; 4096]).unwrap();
+        std::fs::write(root.join("sibling/src/dep.rs"), b"// dep\n").unwrap();
+        std::fs::write(root.join("elsewhere/nope.rs"), b"// nope\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "init"]);
+        dir
+    }
+
+    /// The two properties the whole transport rests on: entries keep their
+    /// **camp-root-relative** paths (so an escaping path dep still resolves
+    /// after unpacking), and only **git-tracked** files travel (so `target/`
+    /// cannot blow the size ceiling before a single source file ships).
+    ///
+    /// The path shape is the one that differs from `pack_context`, where the
+    /// tar root *is* the context. Getting it wrong here produces a tar that
+    /// unpacks to `src/lib.rs` instead of `pkg/src/lib.rs`, and cargo then
+    /// fails on a missing workspace member rather than on anything that names
+    /// the real cause.
+    #[test]
+    fn source_context_ships_tracked_files_at_camp_relative_paths() {
+        let repo = source_repo();
+        let tarball = pack_source_context(
+            repo.path(),
+            &[PathBuf::from("pkg"), PathBuf::from("sibling")],
+        )
+        .unwrap();
+
+        let names: Vec<String> = entries_of(&tarball).into_iter().map(|(n, _)| n).collect();
+        assert_eq!(
+            names,
+            vec!["pkg/Cargo.toml", "pkg/src/lib.rs", "sibling/src/dep.rs"],
+            "camp-relative paths, sorted, tracked-only",
+        );
+        assert!(
+            !names.iter().any(|n| n.contains("target/")),
+            "an ignored build dir must not travel: {names:?}",
+        );
+        assert!(
+            !names.iter().any(|n| n.starts_with("elsewhere/")),
+            "only the named subtrees travel: {names:?}",
+        );
+    }
+
+    /// Two packs of an unchanged tree produce identical bytes. A future
+    /// content-addressed cache over this tar would otherwise miss on
+    /// directory-iteration order alone — the same property `pack_context`'s
+    /// sort exists for.
+    #[test]
+    fn source_context_packs_deterministically() {
+        let repo = source_repo();
+        let paths = [PathBuf::from("pkg"), PathBuf::from("sibling")];
+        assert_eq!(
+            pack_source_context(repo.path(), &paths).unwrap(),
+            pack_source_context(repo.path(), &paths).unwrap(),
+        );
+    }
+
+    /// A tracked file deleted in the working tree is skipped rather than
+    /// erroring: the tree really does not have it, and the point of reading the
+    /// working tree instead of a git object is to ship the tree as positioned.
+    #[test]
+    fn source_context_skips_files_deleted_in_the_working_tree() {
+        let repo = source_repo();
+        std::fs::remove_file(repo.path().join("pkg/src/lib.rs")).unwrap();
+        let names: Vec<String> =
+            entries_of(&pack_source_context(repo.path(), &[PathBuf::from("pkg")]).unwrap())
+                .into_iter()
+                .map(|(n, _)| n)
+                .collect();
+        assert_eq!(names, vec!["pkg/Cargo.toml"]);
+    }
+
+    /// A path that matches nothing tracked is refused at pack time, not
+    /// discovered on the worker. The failure mode it prevents is the expensive
+    /// one: dispatch, a ~2.5 GB image pull, a container start, and then cargo
+    /// failing on an empty directory with a message about a workspace root.
+    #[test]
+    fn source_context_matching_nothing_is_refused_with_an_actionable_message() {
+        let repo = source_repo();
+        let err = pack_source_context(repo.path(), &[PathBuf::from("oss/typo")]).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("no git-tracked files"), "{msg}");
+        assert!(msg.contains("camp-root-relative"), "{msg}");
+    }
+
+    /// The fingerprint is content-only: touching every file (what a `git
+    /// checkout` or a `cargo` pass does to mtimes) must not move it. This is the
+    /// whole reason it is not `blake3(pack_source_context(..))` — the tar
+    /// carries mtimes in its headers, so hashing it would rebuild on a branch
+    /// switch that changed nothing.
+    #[test]
+    fn fingerprint_ignores_mtime() {
+        let repo = source_repo();
+        let paths = [PathBuf::from("pkg"), PathBuf::from("sibling")];
+        let before = source_context_fingerprint(repo.path(), &paths).unwrap();
+
+        let file = repo.path().join("pkg/src/lib.rs");
+        let content = std::fs::read(&file).unwrap();
+        std::fs::remove_file(&file).unwrap();
+        std::fs::write(&file, &content).unwrap();
+
+        assert_eq!(
+            before,
+            source_context_fingerprint(repo.path(), &paths).unwrap()
+        );
+        // …and the packed tar really does move, which is the thing being
+        // guarded against rather than assumed.
+        assert_ne!(
+            before,
+            blake3::hash(&pack_source_context(repo.path(), &paths).unwrap())
+                .to_hex()
+                .to_string(),
+        );
+    }
+
+    /// One changed byte in one tracked file moves the fingerprint — the
+    /// "the Rust side actually changed" signal the build-dispatch arm keys on.
+    #[test]
+    fn fingerprint_moves_on_a_content_change() {
+        let repo = source_repo();
+        let paths = [PathBuf::from("pkg")];
+        let before = source_context_fingerprint(repo.path(), &paths).unwrap();
+        std::fs::write(repo.path().join("pkg/src/lib.rs"), b"pub fn f() {}\n").unwrap();
+        assert_ne!(
+            before,
+            source_context_fingerprint(repo.path(), &paths).unwrap()
+        );
+    }
+
+    /// An untracked file does not move it. Everything under `oss/mesofact`'s
+    /// 28 GB of `target/` and `node_modules/` is untracked; a fingerprint that
+    /// moved with them would never hit.
+    #[test]
+    fn fingerprint_ignores_untracked_files() {
+        let repo = source_repo();
+        let paths = [PathBuf::from("pkg")];
+        let before = source_context_fingerprint(repo.path(), &paths).unwrap();
+        std::fs::create_dir_all(repo.path().join("pkg/target")).unwrap();
+        std::fs::write(repo.path().join("pkg/target/junk.bin"), b"\x00\x01").unwrap();
+        assert_eq!(
+            before,
+            source_context_fingerprint(repo.path(), &paths).unwrap()
+        );
+    }
+
+    /// Same refusal as the pack, from the same enumeration — a typo'd subtree
+    /// must not silently fingerprint as "no inputs" and then reuse a stale
+    /// binary forever.
+    #[test]
+    fn fingerprint_matching_nothing_is_refused() {
+        let repo = source_repo();
+        let err =
+            source_context_fingerprint(repo.path(), &[PathBuf::from("oss/typo")]).unwrap_err();
+        assert!(err.to_string().contains("no git-tracked files"), "{err}");
     }
 
     /// The unwired default refuses rather than silently falling back to the

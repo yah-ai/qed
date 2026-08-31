@@ -273,15 +273,26 @@
 //! @yah:next("Deliverable is the W296 edit, done. Downstream consumers: R717-T5 writes the Q1 host= cwd rule as a module doc comment; R717-F4 defaults the synthesized Pipeline to workspace=live + concurrency_key=@doc:<doc>#<fp> per Q1/Q4; R717-T10 implements ParamDef::options_from per Q3; nobody adds ttl= per Q2.")
 //! @yah:verify("The four Open questions no longer exist in .yah/docs/working/W296-executable-docs-notebook-cells.md; the section is titled Settled questions (R717-S13, 2026-08-07) and each of Q1-Q4 states a decision plus the reason it beat its alternative.")
 //! @yah:handoff("Reconciliation audit: spike fully settled, no residual. W296 'Settled questions (R717-S13, 2026-08-07)' section confirmed landed verbatim in 871fde1c by content — doc-only ticket, no test suite applicable.")
+//!
+//! @yah:ticket(R577-B5, "desktop-release lost its two Linux matrix rows; the R577-F2 assertion still expects three")
+//! @yah:at(2026-08-12T03:16:57Z)
+//! @yah:status(open)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R577)
+//! @yah:severity(low)
+//! @yah:gotcha("Filed 2026-08-11 from R719-F7, from the outside - I did not touch either file. yah-qed tests::desktop_release_matrix_routes_each_row_to_its_own_platform fails: it asserts three matrix rows over the REAL checked-in recipe, and .yah/qed/desktop-release.toml now declares one. The row removal is UNCOMMITTED and carries a long in-file rationale (both Linux rows published nothing in two waves, publish-desktop.sh exits 0 off Darwin, and the matrix parents AND-of-rows status reported a good 0.8.22 release as failed). So the recipe change looks deliberate and the test is the stale half.")
+//! @yah:next("Decide, then make the two agree. Either the one-row matrix is the intended shape (drop the two Linux entries from the assertion at oss/qed/crates/qed/src/lib.rs, keeping the Windows-stays-absent rationale), or the rows come back WITH the publish leg that consumes them (a Linux branch in publish-desktop.sh writing appimage/deb into the manifest). It is a product call about what desktop-release ships, which is why R719-F7 did not just edit the assertion green.")
 
 pub mod artifact_local;
 pub mod artifact_retrieval;
 pub mod build_context;
 pub mod config;
+pub mod dag;
 pub mod doc_source;
 pub mod eject;
 pub mod events;
 pub mod export;
+pub mod globals;
 pub mod image_overlay;
 pub mod images;
 pub mod import;
@@ -305,6 +316,7 @@ pub mod types;
 pub mod waitfor;
 
 pub use config::{ConfigError, GhaWorkflowEntry, LoaderSubPipelineResolver, PipelineLoader};
+pub use dag::{DagError, DEFAULT_MAX_PARALLEL};
 pub use events::{OutputStream, QedEvent};
 pub use images::{CatalogEntry, CatalogError, CatalogManifest, ProduceTarget};
 pub use eject::{
@@ -312,6 +324,7 @@ pub use eject::{
     GeneratedHeader, ValidateError as EjectValidateError,
 };
 pub use export::{export_pipeline, Degradation, ExportReport};
+pub use globals::{CampGlobals, ReleaseGlobals, TagHygiene};
 pub use import::{content_hash, expand_import, ImportExpansion, ImportFreshness};
 pub use native::{
     native_tarball_output_path, pack_native_tarball, resolve_signer, tarball_stem, CosignSigner,
@@ -350,7 +363,9 @@ pub use publish::{
 pub use yah_qed_gha;
 pub use registries::{extract_registry_host, RegistryConfig, RegistryConfigError, RegistryEntry};
 pub use runner::{
-    pipeline_is_fully_offloaded, pipeline_needs_offload, sub_pipeline_admission_gap, AdmissionGap,
+    pipeline_is_fully_offloaded, pipeline_needs_offload, sub_pipeline_admission_gap,
+    AdmissionControl, AdmissionGap, AdmissionLane,
+    ChildEventFactory, ChildRunInfo,
     LoggingOutcomeDispatcher,
     ManualAnswer, ManualGate, ManualParkHandle, ManualParkRequest, OutcomeDispatcher,
     PipelineRunner, RunWhere, RunnerError,
@@ -365,7 +380,9 @@ pub use velveteen_exec::{
     RecipeError, RecipeLocation, RecipePlacement, RecipeStep, TransformRecipe,
     TransformRecipeLoader,
 };
-pub use doc_source::{parse_doc, DocCell, DocSource, DocSourceError, NotebookConfig};
+pub use doc_source::{
+    parse_doc, DocCell, DocSource, DocSourceError, ManualCell, NotebookConfig,
+};
 pub use staleness::{hash_declared_inputs, input_freshness, InputFreshness, ABSENT_INPUT};
 pub use toolchain::{
     detect_host_versions, effective_pins, resolve_pin, version_satisfies, PinResolution,
@@ -380,7 +397,9 @@ pub use types::{
     GhaWorkflowConfig,
     ImportConfig, JobRow, ManifestStitchConfig, ManualConfig, Outcome, OutputDecl, Pipeline,
     Placement,
-    ProducedArtifact, QedRunId, QedRunMeta, QedStep, RunStatus, StepActivation, StepKind,
+    PipelineClass,
+    ProducedArtifact, QedRunId, QedRunLaunch, QedRunMeta, QedStep, RunStatus, StepActivation,
+    StepKind,
     StepStatus, StepValidationError, SubPipelineCollect, SubPipelineConfig, SubPipelineError,
     SubPipelineRef, SubPipelineResolver, Trigger, WaitForConfig, WorkspaceMode,
     DEFAULT_CONCURRENCY_KEY, MAX_SUB_PIPELINE_DEPTH, PARALLEL_CONCURRENCY_KEY,
@@ -654,12 +673,15 @@ mod tests {
         rows.sort();
         assert_eq!(
             rows,
-            vec![
-                "aarch64-apple-darwin",
-                "aarch64-unknown-linux-gnu",
-                "x86_64-unknown-linux-gnu",
-            ],
-            "the W235 fan-out rows; Windows stays absent until the fleet has a node",
+            vec!["aarch64-apple-darwin"],
+            "the W235 fan-out rows. Both Linux rows were removed in 497a8a6b \
+             (2026-08-12) for the reason recorded in desktop-release.toml's own \
+             matrix comment: nothing downstream consumes them (publish-desktop.sh \
+             exits 0 off Darwin), so a green Linux row and a failed one produce \
+             the same empty artifact set — while the AND-of-rows parent status \
+             reported a good 0.8.22 release as failed. Windows likewise stays \
+             absent until the fleet has a node. Restoring a row means restoring \
+             the publish leg that consumes it, and updating this list with it.",
         );
     }
 

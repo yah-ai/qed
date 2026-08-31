@@ -12,9 +12,9 @@
 //! [`RuntimeError::UnknownAction`].
 //!
 //! @yah:ticket(R605-F2, "Docker/buildx-capable QED runner substrate for the image-yah-{base,rust,rust-bun} jobs (retire GitHub-hosted builders)")
-//! @yah:at(2026-07-16T01:32:20Z)
-//! @yah:status(open)
-//! @yah:assignee(agent:bundle-anthropic-glimmerstone)
+//! @yah:status(review)
+//! @yah:at(2026-08-16T20:09:12Z)
+//! @yah:assignee(agent:bundle-anthropic-miravel)
 //! @yah:parent(R605)
 //! @yah:next("The setup-buildx/qemu `uses:` verifiers are already overridden in qed-gha (toolkit_builtin), but the image jobs still need a live docker/buildx daemon to run the builds. Provision QED runners with docker on the remote-runner tier rather than re-implementing a builder here.")
 //! @yah:next("Route the image-yah-{base,rust,rust-bun} legs to a docker-capable node via the R555 remote-run placement + tier/quota grant, kamaji-admitted (signed recipes only, R555-F4).")
@@ -23,6 +23,64 @@
 //! @yah:depends_on(R555)
 //! @yah:depends_on(R546)
 //! @yah:depends_on(R563)
+//! @yah:handoff("Fleet dispatch wired for docker/build-push-action: QedImageBuilder gained with_remote(tokio_handle, remote_driver, build_context_publisher) (oss/qed/crates/qed/src/image_overlay.rs) and do_build_push_remote, which reuses the SAME substrate the native `build-image` step kind already uses successfully (runner::execute_step_build_image_remote) -- ForgeCommand::BuildImage + RemoteForgeDriver + BuildContextPublisher + TaskPlacement::RemoteAny{tier, mesh_tags} -- instead of re-implementing a builder, per this ticket's own next-step warning. Not a second builder: same request shape, same tier=infra default, same context-pack-and-publish path (crate::build_context::pack_context).")
+//! @yah:handoff("Opt-in, not default-on: a slug goes remote only when its W200 overlay entry sets config.remote = true (config.tier/config.arch override the infra/x86_64 defaults) -- remote_build_requested() in image_overlay.rs. Left off in the committed .yah/qed/gha-actions.toml (commented example added there explaining why: worker-side registry push creds aren't delivered yet -- R555-F5 -- and us-west-002 is documented ephemeral/often-offline). A camp/dev opts in via the per-machine overlay once a worker is confirmed reachable with push creds for the target registry.")
+//! @yah:handoff("Wiring: runner.rs's execute_step_gha_workflow now captures tokio::runtime::Handle::current() + clones self.remote_driver/self.build_context_publisher BEFORE the spawn_blocking crossing (Handle::current() must be called from the async context, not the sync closure) and passes all three into QedImageBuilder::with_remote at the construction site (runner.rs ~4213). Made runner::tag_to_filename pub(crate) so image_overlay.rs derives the same collision-free publish-key stem instead of duplicating the mapping.")
+//! @yah:handoff("Guard: a slug with config.remote=true but nothing wired (no with_remote call, e.g. a bare embedding) fails loudly with a named message rather than silently falling back to local docker -- matches NoBuildContextPublisher's existing refuse-loudly philosophy. Unit-tested.")
+//! @yah:handoff("Multi-arch and push/load pass straight through unchanged: platforms (GHA's with.platforms CSV, e.g. `linux/amd64,linux/arm64`) maps to buildctl's --opt platform=<csv> on ONE dispatched worker, same as a real ubuntu-latest runner's qemu-backed buildx -- no per-arch split needed for release.yml's three image jobs.")
+//! @yah:handoff("Explicitly NOT done (documented in code + the overlay comment, not silently dropped): outputs.digest/outputs.imageid come back empty on the remote leg -- no metadata-file readback exists for a remote build today (R555-F6's 'logs stream to QED/task pane' is still open, itself gated on R729's server-side GET /workloads/{id}/logs, currently a hard 501). This ticket's own verify criterion (build+push lands in the registry) does not need digest; a downstream cosign-sign step keyed on it does, and needs that separately-tracked work first -- same shape as F1's own next-step already flagged this coupling.")
+//! @yah:verify("cargo test -p yah-qed --lib (cd oss/qed) -- 879 pass, 0 fail, 1 ignored (was 876 before this change +3 new: remote_not_requested_by_default, remote_config_parses_defaults_and_overrides, remote_opt_in_without_wiring_fails_loudly_not_silently_local). VERIFIED.")
+//! @yah:verify("cargo check -p yah-qed (root workspace) -- clean. VERIFIED.")
+//! @yah:verify("cargo check -p yah (root CLI crate, sanity pass for downstream consumers) -- pre-existing, UNRELATED failure at app/yah/cli/src/cli.rs:5044 (missing field `tool_args` on ToolInvocationData) caused by a live in-flight peer edit to crates/yah/policy-dsl (5 files uncommitted, not touched by this ticket) -- not this change; yah-qed itself is green.")
+//! @yah:verify("STILL UNVERIFIABLE FROM THIS SANDBOX, and the ticket's own original criterion: a live `yah qed run release` image slice actually building+pushing image-yah-base from a real build-worker with no GitHub-hosted builder in the loop -- needs a live daemon with fleet config, a reachable build-worker, and confirmed registry push creds on that worker (R555-F5 gap noted above), none of which this sandbox has. Mirrors exactly how F1 (this same ticket's sibling) left its own cosign-verify criterion for a follow-up session with real infra access.")
+//! @yah:gotcha("Worker-side registry push credentials are NOT delivered by this change or by anything else today -- BuildKit-in-containerd on the remote worker pushes using whatever containerd/docker registry auth is already configured ON THAT BOX (manual docker login, per us-west-002's machine-file bootstrap notes), not anything qed ships over the wire. R555-F5 (per-run ephemeral vault grants) is the ticket that closes this gap generally; until then, flipping config.remote=true only works against a worker an operator has pre-authed for the target registry.")
+//! @yah:gotcha("R605-S6 (agent:bundle-anthropic-miravel, open spike on Firecracker-isolated x86 build capacity) flagged this ticket by name as adjacent-not-duplicate before I claimed it: S6 is about general build/job CAPACITY provisioning (a kamaji runtime backend), this ticket is about wiring the GHA-emulator's specific docker/build-push-action call site to existing capacity. No file overlap; no coordination collision found.")
+//!
+//! @yah:ticket(R605-T4, "Per-job shared-resource key so the qed-gha emulator can raise max_parallel_jobs above 1")
+//! @yah:status(review)
+//! @yah:at(2026-08-19T04:54:49Z)
+//! @yah:assignee(agent:bundle-anthropic-miravel)
+//! @yah:parent(R605)
+//! @yah:next("Shipped in R605-F3: run_wave in qed-gha runtime.rs runs a wave on scoped threads up to Executor.max_parallel_jobs, honouring strategy.max-parallel per job underneath. The cap DEFAULTS TO 1, so nothing fans out yet.")
+//! @yah:next("What is missing is a per-job shared-resource key: on GitHub each job gets a fresh runner, here every instance in a wave shares one Executor.workspace, one cargo target dir and one docker daemon. Two jobs that both write dist/ are independent in the DAG and destructive on the disk, and nothing in a workflow.yml says which pairs those are.")
+//! @yah:next("Two candidate sources for the key, pick one: (a) parse GHA job-level concurrency.group, which qed-ghas Job struct does not carry today (workflow.rs:124) -- real GHA semantics, authored in the file; (b) a qed-side Executor.job_resources map the runner populates from the wrapping QedStep. (a) is the honest one; (b) is the escape hatch when the workflow author never wrote a group.")
+//! @yah:gotcha("Do NOT raise the default cap without the key. The native-pipeline side got QedStep.resource for exactly this and defaults max_parallel to 4 only because an absent needs makes every legacy pipeline a serial chain -- the emulator has no such safety, since its waves are ALREADY wide and raising the cap fans out every wrapped workflow at once.")
+//! @yah:verify("A workflow whose two same-wave jobs both write the same path runs them serially at max_parallel_jobs=4 once they share a resource key, and concurrently once they do not.")
+//! @yah:handoff("Implemented option (a) from the ticket's own next-steps: job-level `concurrency:` (real GHA syntax) is now parsed into workflow.rs Job.concurrency (workflow.rs:124-136, parse.rs parse_job) reusing the existing Concurrency type/parse_concurrency helper that already served the workflow-level key.")
+//! @yah:handoff("runtime.rs run_wave (R605-T4): resource_key_for() evaluates each in-wave instance's job.concurrency.group ExprString against that instance's own matrix/needs context, precomputed once per wave before any worker thread spawns. WaveSchedule gained running_resources: HashSet<String>; claim_next now blocks head-of-line on a resource key already in flight, same head-of-line-blocking semantics as the existing per-job strategy.max-parallel gate. release() frees both.")
+//! @yah:handoff("No default-cap change: max_parallel_jobs still defaults to 1 per the ticket's own gotcha -- this only makes raising the cap safe for workflows that declare concurrency.group, it doesn't raise anything itself.")
+//! @yah:verify("cargo test -p yah-qed-gha --lib (oss/qed) -- 135 pass, 0 fail, 0 ignored (was 39/39 in runtime::tests alone, +2 new: same_wave_jobs_sharing_a_concurrency_group_serialize_under_a_raised_cap, same_wave_jobs_with_distinct_concurrency_groups_still_run_concurrently). New tests assert wall-clock: two jobs sharing group:dist at cap 3 take >=1.9s (serialized) not <1.5s (would-be-concurrent); two jobs with distinct groups at cap 2 take <1.9s (still concurrent). VERIFIED.")
+//! @yah:verify("cargo check -p yah-qed-gha (oss/qed) -- clean, no warnings. VERIFIED.")
+//! @yah:verify("cargo check -p yah-qed (oss/qed, the crate's sole in-repo consumer) -- clean, confirms no other Job{} construction site broke from the new required field. VERIFIED.")
+//!
+//! @yah:relay(R785, "qed-gha: run: steps ignore working-directory under local/in-process execution")
+//! @yah:at(2026-08-19T06:06:00Z)
+//! @yah:status(open)
+//! @yah:assignee(agent:bundle-anthropic-miravel)
+//!
+//! @yah:ticket(R785-B1, "run_bash_step ignores step-level working-directory — every `run:` step executes from repo root")
+//! @yah:status(review)
+//! @yah:at(2026-08-19T06:20:55Z)
+//! @yah:assignee(agent:bundle-anthropic-miravel)
+//! @yah:parent(R785)
+//! @yah:severity(high)
+//! @yah:verify("A `run:` step with working-directory: <subdir> set actually executes with that subdir as cwd under `yah qed run` local/in-process execution (new test in oss/qed/crates/qed-gha, e.g. asserting a `pwd`-equivalent step output matches the resolved workspace-joined path) — mirrors the existing runner.environment-parity precedent (R654-T1) of testing both GHA-hosted and local-execution behavior explicitly.")
+//! @yah:verify("Re-running the exact failing steps from qed run 690455c1 (mesofact-build's 'Assert prod closure' step, yubaba-build's 'Build yubaba (static musl)' step) succeeds after the fix.")
+//! @yah:verify("cargo test -p yah-qed-gha clean.")
+//! @yah:gotcha("Root-caused by direct code read, not inferred: run_bash_step (oss/qed/crates/qed-gha/src/runtime.rs:1100-1145) is the ONLY executor for `run:` steps and always does `cmd.current_dir(&executor.workspace)` (repo root) — `step.working_directory` (parsed fine in parse.rs/workflow.rs) is never referenced anywhere in runtime.rs (`grep -n working_directory runtime.rs` = zero hits). So `working-directory: oss/<subdir>` on any `run:` step is silently a no-op under qed-gha's local/in-process execution, even though it's honored correctly on real GitHub-hosted runners — a correctness gap between the two execution modes qed-gha exists to keep identical (W200/W201).")
+//! @yah:gotcha("Reproduced live in qed run 690455c1-78ef-4754-b6e5-1e6fa26afe73 (release.yml, 2026-08-19), TWO independent steps, same symptom: (1) `mesofact-build` job's 'Assert prod closure carries no dev affordances' step (working-directory: oss/mesofact) failed with `cargo tree -p mesofact --features deploy` -> 'error: cannot specify features for packages outside of workspace' — reproduces as CLEAN when the same command is run by hand from oss/mesofact, only fails when qed-gha resolves the cwd. (2) `yubaba-build` job's pre-existing 'Build yubaba (static musl)' step (working-directory: oss/yubaba, comment on that step already documents this exact failure mode and why working-directory is set) failed identically: `cross` warned 'unable to get metadata for package', fell back to host cargo, and host cargo hit the same 'cannot specify features for packages outside of workspace' from the wrong cwd. yubaba-build predates R746-F9 entirely, so this is not new/isolated to one job — it's a pre-existing, general qed-gha defect. A third, independent hit of the identical error string was found in an unrelated session's tool-result log (session:0feac5a8), confirming this recurs.")
+//! @yah:gotcha("Blast radius in that one run: the yubaba-build failure cascaded to skip image-yah-yubaba, cli-build (x5 matrix), camp-build (x2), smoke — and then the publish-image-* jobs for base/rust/rust-bun/rust-sccache/rusty-v8-musl-builder/miniflare all FAILED (not skipped) trying to alias a `:smoke-<sha>` image tag that was never pushed this run, surfacing as `ghcr.io/yah-ai/<image>@sha256:...: not found`. That 'not found' is downstream damage from THIS bug, not a registry problem or evidence ghcr.io itself is broken — worth flagging on the ticket explicitly so nobody chases a phantom registry issue.")
+//! @yah:gotcha("Flagged by R746-F9 (2026-08-19) as out of its blast radius rather than fixed inline; this ticket is that promised followup, filed with the actual root-caused location instead of a general pointer.")
+//! @yah:assumes("Tier: Warrior — one executor function needs to join `executor.workspace` with `step.working_directory` (relative-path resolution matching GHA's own semantics: relative to workspace, absolute paths used as-is) plus a regression test; small in code size but touches the shared step-execution path every workflow runs through, so warrants care over a one-line patch.")
+//! @yah:handoff("run_bash_step (runtime.rs) now resolves cwd via a new resolve_working_directory() helper implementing GHA's real precedence: step working-directory > job defaults.run.working-directory > workflow defaults.run.working-directory > executor.workspace. Relative values join onto executor.workspace (GHA semantics), absolute values pass through unchanged.")
+//! @yah:handoff("job_defaults/workflow_defaults are computed once per job (both were parsed already by parse.rs but never read anywhere in runtime.rs) and threaded through run_step -> run_bash_step as new trailing params. run_uses_step is untouched -- GHA's working-directory has no effect on uses: steps.")
+//! @yah:handoff("GITHUB_WORKSPACE stays pinned to executor.workspace (unchanged) -- only the shell's actual cwd moves; that matches GHA, where GITHUB_WORKSPACE is always the repo root regardless of a step's working-directory.")
+//! @yah:verify("cargo test -p yah-qed-gha --lib (cd oss/qed) -- 139 pass, 0 fail (was 135; +4 new: step_working_directory_moves_the_shell_cwd, job_defaults_working_directory_applies_without_a_step_override, step_working_directory_overrides_job_defaults, and a live-fixture test below). VERIFIED.")
+//! @yah:verify("cargo check -p yah-qed-gha -- clean, no warnings. VERIFIED.")
+//! @yah:verify("cargo check -p yah-qed (oss/qed's sole in-repo consumer) -- clean (4m build, one pre-existing unrelated warning in yah-object-store/r2.rs, not touched by this change). VERIFIED.")
+//! @yah:verify("New test roundtrip_tests::mesofact_prod_closure_step_runs_from_its_declared_working_directory extracts the ACTUAL 'Assert prod closure carries no dev affordances' step from the real .github/workflows/release.yml (not a copy), runs it through execute_workflow with executor.workspace = the real repo root, and asserts Success -- this is the exact mesofact-build step that failed in qed run 690455c1. Passes after the fix. VERIFIED live against the real oss/mesofact tree.")
+//! @yah:verify("Also manually reproduced by hand: `cd oss/mesofact && cargo tree -p mesofact --features deploy -e normal` succeeds (no dev-affordance hits) confirming the command itself is fine and the bug was purely the cwd. VERIFIED.")
+//! @yah:verify("yubaba-build's 'Build yubaba (static musl)' step (the ticket's other named repro) needs `cross` + a docker/musl cross toolchain + network -- STILL UNVERIFIABLE FROM THIS SANDBOX. Same class of fix applies (working-directory: oss/yubaba is now honored the same way as oss/mesofact's), but a live re-run of qed run needs real infra this sandbox doesn't have -- mirrors the precedent left by this ticket's own sibling (R605-F2's verify notes).")
 
 use std::io::Write;
 use std::path::PathBuf;
@@ -41,7 +99,7 @@ use crate::tier::{classify_uses, Disposition, NativeReplacement};
 use crate::toolkit::{Lookup, StepConclusion, ToolkitCall, ToolkitRegistry};
 #[cfg(test)]
 use crate::toolkit::ToolkitOutcome;
-use crate::workflow::{Job, Step, StepAction, Workflow};
+use crate::workflow::{Job, RunDefaults, Step, StepAction, Workflow};
 
 #[derive(Debug, Error)]
 pub enum RuntimeError {
@@ -150,6 +208,30 @@ pub struct Executor {
     /// `actions/download-artifact` (R594). Same injection gate as
     /// [`Self::image_builder`]: `None` (default) keeps the tier-3 error.
     pub artifact_store: Option<std::sync::Arc<dyn crate::artifact_store::ArtifactStore>>,
+    /// R605-F3 half (a): ceiling on job instances executing at once within one
+    /// wave. **Defaults to 1 — serial**, which is the behaviour this runtime
+    /// had from F4 up to the moment the cap existed.
+    ///
+    /// The waves themselves were always computed correctly by
+    /// [`crate::graph::build_plan`]; only the executor was serial, so turning
+    /// concurrency on is a scheduling change and not a correctness one *for the
+    /// graph*. It is a correctness question for the **workspace**, which is why
+    /// the default stays 1: on GitHub each job gets a fresh runner, and here
+    /// every instance in a wave shares one [`Self::workspace`], one cargo
+    /// `target/` and one docker daemon. Two jobs that both write `dist/` are
+    /// independent in the DAG and destructive on the disk, and nothing in a
+    /// `workflow.yml` says which pairs those are.
+    ///
+    /// What would let this default higher is a per-job shared-resource key —
+    /// the emulator-side analogue of
+    /// [`QedStep::resource`](../../yah_qed/types/struct.QedStep.html). Until
+    /// one exists, the global cap *is* the resource guard, at its most
+    /// conservative setting, and raising it is the caller asserting that this
+    /// particular workflow's parallel jobs don't share output paths.
+    ///
+    /// A job's own `strategy.max-parallel` is honoured underneath this cap: it
+    /// bounds concurrent rows *of that job*, exactly as on GitHub.
+    pub max_parallel_jobs: usize,
 }
 
 impl Executor {
@@ -183,7 +265,18 @@ impl Executor {
             secrets: Value::object(),
             image_builder: None,
             artifact_store: None,
+            // R605-F3: serial by default — see the field docs for why the
+            // emulator does not get to fan out on its own initiative.
+            max_parallel_jobs: 1,
         }
+    }
+
+    /// Raise the within-wave concurrency ceiling (R605-F3 half (a)). See
+    /// [`Self::max_parallel_jobs`] for what the caller is asserting by doing
+    /// so. `0` is clamped to `1`.
+    pub fn with_max_parallel_jobs(mut self, n: usize) -> Self {
+        self.max_parallel_jobs = n.max(1);
+        self
     }
 
     /// Configure an event sink. The returned executor emits one
@@ -360,28 +453,16 @@ pub fn execute_workflow(
     let mut runs: Vec<InstanceRun> = Vec::new();
 
     for wave in &plan.waves {
-        // Sequential within wave — F4 simplification. Real parallelism is a
-        // scheduling concern, not a correctness one, so we punt to F4+.
-        for instance in wave {
-            // R499-F3 phase 2: instance filter. Non-selected rows short-circuit
-            // to Skipped — same path as a GHA `if: false` — so needs aggregation
-            // (failure > cancelled > skipped > success) and downstream `if:`
-            // checks still see them.
-            let run = if let Some(reason) = instance_excluded(executor, instance) {
-                InstanceRun {
-                    job_id: instance.job_id.clone(),
-                    matrix_index: instance.matrix_index,
-                    result: JobResult::Skipped,
-                    steps: vec![],
-                    outputs: IndexMap::new(),
-                    skip_reason: Some(reason),
-                }
-            } else {
-                emit_job_started(executor, instance, workflow);
-                let r = run_instance(instance, workflow, executor, &completed)?;
-                emit_job_finished(executor, instance, &r);
-                r
-            };
+        // R605-F3 half (a): the instances of one wave are independent by
+        // construction, so they may run concurrently — bounded by
+        // `executor.max_parallel_jobs` (default 1, i.e. the F4 serial
+        // behaviour) and, per job, by its own `strategy.max-parallel`.
+        //
+        // Results are folded back in WAVE order, not completion order:
+        // `completed` feeds the next wave's `needs.*` aggregation and
+        // `runs` is the returned transcript, and neither should depend on
+        // which of two independent jobs happened to finish first.
+        for run in run_wave(wave, workflow, executor, &completed)? {
             completed.push(CompletedInstance {
                 job_id: run.job_id.clone(),
                 matrix_index: run.matrix_index,
@@ -393,6 +474,232 @@ pub fn execute_workflow(
     }
 
     Ok(WorkflowRun { instances: runs })
+}
+
+/// Execute one wave's instances, up to `executor.max_parallel_jobs` at a time,
+/// returning their runs in wave order (R605-F3).
+///
+/// Scoped OS threads rather than a runtime: [`run_instance`] is synchronous all
+/// the way down (it shells out with [`std::process::Command`]), so there is
+/// nothing to `await` and no executor to borrow into. `&Executor`, `&Workflow`
+/// and `&[CompletedInstance]` are shared immutably across the workers.
+///
+/// The serial path is preserved exactly — cap 1 or a single-instance wave takes
+/// the same in-line loop it always did, spawning no threads at all — so the
+/// default configuration cannot regress on a scheduler it never enters.
+fn run_wave(
+    wave: &[JobInstance],
+    workflow: &Workflow,
+    executor: &Executor,
+    completed: &[CompletedInstance],
+) -> Result<Vec<InstanceRun>, RuntimeError> {
+    let cap = executor.max_parallel_jobs.max(1).min(wave.len().max(1));
+    if cap == 1 {
+        return wave
+            .iter()
+            .map(|instance| run_one(instance, workflow, executor, completed))
+            .collect();
+    }
+
+    // R605-T4: resolve each instance's shared-resource key (its job's
+    // `concurrency.group`, evaluated against that instance's own matrix/needs
+    // context) up front, in the parent thread, before any worker exists to
+    // race the evaluation. `None` means the job declared no `concurrency:` —
+    // free to run alongside anything else the cap admits.
+    let resource_keys: Vec<Option<String>> = wave
+        .iter()
+        .map(|instance| resource_key_for(instance, workflow, executor, completed))
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // Slot per instance, filled in place so wave order survives.
+    let slots: Vec<std::sync::Mutex<Option<Result<InstanceRun, RuntimeError>>>> =
+        (0..wave.len()).map(|_| std::sync::Mutex::new(None)).collect();
+    let sched = std::sync::Mutex::new(WaveSchedule {
+        next: 0,
+        running_per_job: std::collections::HashMap::new(),
+        running_resources: std::collections::HashSet::new(),
+    });
+    let idle = std::sync::Condvar::new();
+
+    std::thread::scope(|scope| {
+        for _ in 0..cap {
+            scope.spawn(|| loop {
+                let Some(i) = claim_next(&sched, &idle, wave, workflow, &resource_keys) else {
+                    return;
+                };
+                let outcome = run_one(&wave[i], workflow, executor, completed);
+                *slots[i].lock().expect("wave slot") = Some(outcome);
+                sched
+                    .lock()
+                    .expect("wave schedule")
+                    .release(&wave[i].job_id, resource_keys[i].as_deref());
+                // A finished instance can unblock a row its job's own
+                // `max-parallel` was holding back, or another job waiting on
+                // the same resource key.
+                idle.notify_all();
+            });
+        }
+    });
+
+    // First error in wave order wins, for the same reason the runs are ordered:
+    // which of two concurrent failures landed first is not a fact about the
+    // workflow.
+    let mut out = Vec::with_capacity(wave.len());
+    for slot in slots {
+        match slot.into_inner().expect("wave slot") {
+            Some(Ok(run)) => out.push(run),
+            Some(Err(e)) => return Err(e),
+            // Unreachable: every index is claimed exactly once before the
+            // workers exit, and a panicking worker propagates out of `scope`.
+            None => unreachable!("wave slot never filled"),
+        }
+    }
+    Ok(out)
+}
+
+/// Who is next, and is anyone allowed to take them. Guarded by one mutex; the
+/// per-job counter is what makes a job's `strategy.max-parallel` mean the same
+/// thing here as it does on GitHub. `running_resources` (R605-T4) is the
+/// shared-resource-key guard: an instance whose key is already in this set
+/// blocks, the emulator-side analogue of GHA's per-job fresh runner meaning
+/// two instances never actually contend for the same disk.
+struct WaveSchedule {
+    /// Next unclaimed wave index. Instances are claimed strictly in order, so a
+    /// job blocked on its own `max-parallel` blocks the ones behind it too —
+    /// the simple reading, and the one that keeps a large matrix from
+    /// starving whatever follows it.
+    next: usize,
+    running_per_job: std::collections::HashMap<String, usize>,
+    running_resources: std::collections::HashSet<String>,
+}
+
+impl WaveSchedule {
+    fn release(&mut self, job_id: &str, resource_key: Option<&str>) {
+        if let Some(n) = self.running_per_job.get_mut(job_id) {
+            *n = n.saturating_sub(1);
+        }
+        if let Some(key) = resource_key {
+            self.running_resources.remove(key);
+        }
+    }
+}
+
+/// A job's `concurrency.group` (real GHA syntax, R605-T4 half (a)),
+/// evaluated against this instance's own matrix/needs context, as the
+/// scheduler's shared-resource key. `None` when the job carries no
+/// `concurrency:` block — the emulator asserts nothing about that job's disk
+/// footprint and lets the cap alone govern it.
+///
+/// Evaluated once per instance, in the parent thread, before any worker spawns
+/// — cheap (no I/O, no subprocess) and keeps the key stable for the whole wave
+/// rather than re-derived per claim attempt.
+fn resource_key_for(
+    instance: &JobInstance,
+    workflow: &Workflow,
+    executor: &Executor,
+    completed: &[CompletedInstance],
+) -> Result<Option<String>, RuntimeError> {
+    let Some(job) = workflow.jobs.get(&instance.job_id) else {
+        return Ok(None);
+    };
+    let Some(concurrency) = job.concurrency.as_ref() else {
+        return Ok(None);
+    };
+    let ctx = build_context_for_instance(
+        instance,
+        workflow,
+        completed,
+        executor.github.clone(),
+        executor.inputs.clone(),
+        crate::graph::RunnerInfo {
+            os: &executor.runner_os,
+            arch: &executor.runner_arch,
+            environment: &executor.runner_environment,
+        },
+        executor.secrets.clone(),
+    )?;
+    let group = crate::graph::eval_exprstring(&concurrency.group, &ctx).map_err(|source| {
+        RuntimeError::Expr {
+            site: format!("jobs.{}.concurrency.group", instance.job_id),
+            source,
+        }
+    })?;
+    Ok(Some(group.as_str_lossy()))
+}
+
+/// A job's own `strategy.max-parallel`, or `usize::MAX` when it declares none.
+fn job_row_cap(workflow: &Workflow, job_id: &str) -> usize {
+    workflow
+        .jobs
+        .get(job_id)
+        .and_then(|j| j.strategy.as_ref())
+        .and_then(|s| s.max_parallel)
+        .map(|n| (n as usize).max(1))
+        .unwrap_or(usize::MAX)
+}
+
+/// Take the next instance a worker is allowed to run, blocking while one is
+/// pending but capped, or while its resource key is already in flight
+/// (R605-T4). `None` once the wave is exhausted.
+fn claim_next(
+    sched: &std::sync::Mutex<WaveSchedule>,
+    idle: &std::sync::Condvar,
+    wave: &[JobInstance],
+    workflow: &Workflow,
+    resource_keys: &[Option<String>],
+) -> Option<usize> {
+    let mut guard = sched.lock().expect("wave schedule");
+    loop {
+        if guard.next >= wave.len() {
+            return None;
+        }
+        let i = guard.next;
+        let job_id = &wave[i].job_id;
+        let running = guard.running_per_job.get(job_id).copied().unwrap_or(0);
+        let resource_free = resource_keys[i]
+            .as_deref()
+            .map(|key| !guard.running_resources.contains(key))
+            .unwrap_or(true);
+        if running < job_row_cap(workflow, job_id) && resource_free {
+            guard.next += 1;
+            *guard.running_per_job.entry(job_id.clone()).or_insert(0) += 1;
+            if let Some(key) = resource_keys[i].as_deref() {
+                guard.running_resources.insert(key.to_string());
+            }
+            return Some(i);
+        }
+        // Head-of-line blocked by its own job's row cap or by a resource key
+        // another in-flight instance holds; wait for a release.
+        guard = idle.wait(guard).expect("wave schedule");
+    }
+}
+
+/// Run (or short-circuit) one instance — the body the serial loop used to hold
+/// inline, unchanged except for being callable from a worker thread.
+fn run_one(
+    instance: &JobInstance,
+    workflow: &Workflow,
+    executor: &Executor,
+    completed: &[CompletedInstance],
+) -> Result<InstanceRun, RuntimeError> {
+    // R499-F3 phase 2: instance filter. Non-selected rows short-circuit
+    // to Skipped — same path as a GHA `if: false` — so needs aggregation
+    // (failure > cancelled > skipped > success) and downstream `if:`
+    // checks still see them.
+    if let Some(reason) = instance_excluded(executor, instance) {
+        return Ok(InstanceRun {
+            job_id: instance.job_id.clone(),
+            matrix_index: instance.matrix_index,
+            result: JobResult::Skipped,
+            steps: vec![],
+            outputs: IndexMap::new(),
+            skip_reason: Some(reason),
+        });
+    }
+    emit_job_started(executor, instance, workflow);
+    let r = run_instance(instance, workflow, executor, completed)?;
+    emit_job_finished(executor, instance, &r);
+    Ok(r)
 }
 
 fn run_instance(
@@ -467,6 +774,11 @@ fn run_instance(
     let mut job_failed = false;
     let job_cancelled = false;
 
+    // R785-B1: `working-directory:` precedence source, resolved once per job
+    // (neither changes per step) and threaded down to each `run:` step.
+    let job_defaults = job.defaults.as_ref().and_then(|d| d.run.as_ref());
+    let workflow_defaults = workflow.defaults.as_ref().and_then(|d| d.run.as_ref());
+
     for (idx, step) in job.steps.iter().enumerate() {
         // Refresh ctx.steps from the accumulator before each step so the
         // current step can see outputs from prior steps in this job.
@@ -501,7 +813,16 @@ fn run_instance(
         }
 
         emit_step_started(executor, instance, idx, step);
-        let res = run_step(step, &ctx, executor, &env_overlay, instance, idx)?;
+        let res = run_step(
+            step,
+            &ctx,
+            executor,
+            &env_overlay,
+            instance,
+            idx,
+            job_defaults,
+            workflow_defaults,
+        )?;
         emit_step_finished(executor, instance, idx, &res);
         // Workflow commands setting env (`echo "K=V" >> $GITHUB_ENV`) bleed
         // into subsequent steps in the same job.
@@ -700,6 +1021,7 @@ fn eval_implicit_expr(s: &ExprString, ctx: &Context, site: &str) -> Result<Value
 
 // ─── step exec ─────────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn run_step(
     step: &Step,
     ctx: &Context,
@@ -707,17 +1029,71 @@ fn run_step(
     env_overlay: &IndexMap<String, String>,
     instance: &JobInstance,
     step_index: usize,
+    job_defaults: Option<&RunDefaults>,
+    workflow_defaults: Option<&RunDefaults>,
 ) -> Result<StepResult, RuntimeError> {
     let env = compose_step_env(step, ctx, env_overlay, executor)?;
     let res = match &step.action {
-        StepAction::Run { body, shell } => {
-            run_bash_step(step, body, shell.as_deref(), &env, ctx, executor, instance, step_index)?
-        }
+        StepAction::Run { body, shell } => run_bash_step(
+            step,
+            body,
+            shell.as_deref(),
+            &env,
+            ctx,
+            executor,
+            instance,
+            step_index,
+            job_defaults,
+            workflow_defaults,
+        )?,
         StepAction::Uses { slug, git_ref, with } => {
             run_uses_step(step, slug, git_ref.as_deref(), with, &env, ctx, executor)?
         }
     };
     Ok(res)
+}
+
+/// Resolve the cwd for a `run:` step, matching GHA's own precedence: step
+/// `working-directory:` wins, then the job's `defaults.run.working-directory`,
+/// then the workflow's, else the executor's workspace root. A relative value
+/// resolves against `executor.workspace` (GHA's own semantics — relative to
+/// `GITHUB_WORKSPACE`, not the process cwd); an absolute value is used as-is.
+///
+/// Only `run:` steps take this — GHA's `working-directory:` has no effect on
+/// `uses:` steps, so [`run_uses_step`] is untouched.
+fn resolve_working_directory(
+    step: &Step,
+    ctx: &Context,
+    executor: &Executor,
+    job_defaults: Option<&RunDefaults>,
+    workflow_defaults: Option<&RunDefaults>,
+) -> Result<PathBuf, RuntimeError> {
+    let raw: Option<String> = if let Some(wd) = step.working_directory.as_ref() {
+        Some(
+            crate::graph::eval_exprstring(wd, ctx)
+                .map_err(|source| RuntimeError::Expr {
+                    site: "step.working-directory".into(),
+                    source,
+                })?
+                .as_str_lossy(),
+        )
+    } else if let Some(d) = job_defaults.and_then(|d| d.working_directory.as_ref()) {
+        Some(d.clone())
+    } else {
+        workflow_defaults.and_then(|d| d.working_directory.clone())
+    };
+
+    Ok(match raw {
+        Some(rel) => {
+            let p = PathBuf::from(rel);
+            if p.is_absolute() {
+                p
+            } else {
+                executor.workspace.join(p)
+            }
+        }
+        None => executor.workspace.clone(),
+    })
 }
 
 /// The W224 tier-2 environment floor: the synthetic repo context every GHA
@@ -819,6 +1195,7 @@ fn compose_step_env(
     Ok(out)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_bash_step(
     step: &Step,
     body: &ExprString,
@@ -828,6 +1205,8 @@ fn run_bash_step(
     executor: &Executor,
     instance: &JobInstance,
     step_index: usize,
+    job_defaults: Option<&RunDefaults>,
+    workflow_defaults: Option<&RunDefaults>,
 ) -> Result<StepResult, RuntimeError> {
     let body_str = crate::graph::eval_exprstring(body, ctx)
         .map_err(|source| RuntimeError::Expr { site: "step.run".into(), source })?
@@ -862,9 +1241,11 @@ fn run_bash_step(
     std::fs::File::create(&env_path)?;
     std::fs::File::create(&step_summary_path)?;
 
+    let workdir = resolve_working_directory(step, ctx, executor, job_defaults, workflow_defaults)?;
+
     let mut cmd = Command::new(shell);
     cmd.arg(&script_path);
-    cmd.current_dir(&executor.workspace);
+    cmd.current_dir(&workdir);
     if !executor.env_passthrough {
         cmd.env_clear();
     }
@@ -1414,6 +1795,250 @@ mod tests {
         e.env_passthrough = true; // need PATH for bash/coreutils
         e.runner_os = "Linux".into();
         execute_workflow(wf, &e).unwrap_or_else(|err| panic!("execute: {err}"))
+    }
+
+    // ── R605-F3 half (a): within-wave concurrency ─────────────────────────
+
+    /// Wall-clock proof, from inside the workflow itself: each job records the
+    /// interval it occupied, and two jobs in one wave must overlap once the cap
+    /// allows it. Written with `date +%s%N`-free arithmetic — the steps just
+    /// sleep and the assertion is on the elapsed wall-clock of the whole run,
+    /// which is the only observable a workflow can't fake.
+    #[test]
+    fn a_wave_runs_concurrently_once_the_cap_is_raised() {
+        let yaml = r#"
+on: [push]
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - run: sleep 1
+  b:
+    runs-on: ubuntu-latest
+    steps:
+      - run: sleep 1
+  c:
+    runs-on: ubuntu-latest
+    steps:
+      - run: sleep 1
+"#;
+        let wf = workflow(yaml);
+        let mut e = Executor::new(workspace_path());
+        e.env_passthrough = true;
+        e.runner_os = "Linux".into();
+
+        let started = std::time::Instant::now();
+        let run = execute_workflow(&wf, &e).expect("serial execute");
+        let serial = started.elapsed();
+        assert_eq!(run.instances.len(), 3);
+        assert!(
+            serial >= std::time::Duration::from_millis(2_900),
+            "the default cap of 1 must still be serial (took {serial:?})",
+        );
+
+        let mut parallel_exec = Executor::new(workspace_path());
+        parallel_exec.env_passthrough = true;
+        parallel_exec.runner_os = "Linux".into();
+        let parallel_exec = parallel_exec.with_max_parallel_jobs(3);
+        let started = std::time::Instant::now();
+        let run = execute_workflow(&wf, &parallel_exec).expect("parallel execute");
+        let parallel = started.elapsed();
+        assert!(
+            parallel < std::time::Duration::from_millis(2_500),
+            "three independent jobs at cap 3 must overlap (took {parallel:?}, \
+             serial was {serial:?})",
+        );
+        // Order of the transcript is wave order, not completion order.
+        let ids: Vec<&str> = run.instances.iter().map(|i| i.job_id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "b", "c"]);
+        assert!(run.instances.iter().all(|i| i.result == JobResult::Success));
+    }
+
+    /// R605-T4: two same-wave jobs that declare the same `concurrency.group`
+    /// share a disk resource and must serialize even though the global cap
+    /// would otherwise let them overlap; a third job with no `concurrency:`
+    /// block is unconstrained and races ahead of both.
+    #[test]
+    fn same_wave_jobs_sharing_a_concurrency_group_serialize_under_a_raised_cap() {
+        let yaml = r#"
+on: [push]
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: dist
+    steps:
+      - run: sleep 1
+  b:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: dist
+    steps:
+      - run: sleep 1
+  c:
+    runs-on: ubuntu-latest
+    steps:
+      - run: sleep 1
+"#;
+        let wf = workflow(yaml);
+        let mut e = Executor::new(workspace_path());
+        e.env_passthrough = true;
+        e.runner_os = "Linux".into();
+        let e = e.with_max_parallel_jobs(3);
+
+        let started = std::time::Instant::now();
+        let run = execute_workflow(&wf, &e).expect("execute");
+        let elapsed = started.elapsed();
+        assert_eq!(run.instances.len(), 3);
+        assert!(run.instances.iter().all(|i| i.result == JobResult::Success));
+        // `a` and `b` share `group: dist` so they never overlap — one full
+        // second each, back to back — while `c` runs alongside whichever of
+        // them goes first. Serial a+b alone is ~2s; if the resource key were
+        // ignored all three would overlap and finish under 1.5s.
+        assert!(
+            elapsed >= std::time::Duration::from_millis(1_900),
+            "jobs sharing a concurrency.group must not run concurrently \
+             even under a raised cap (took {elapsed:?})",
+        );
+        assert!(
+            elapsed < std::time::Duration::from_millis(2_900),
+            "`c` (no concurrency group) should still overlap one of a/b \
+             rather than the whole wave going fully serial (took {elapsed:?})",
+        );
+    }
+
+    /// Same-wave jobs with *different* `concurrency.group` values (or no
+    /// group at all) are unconstrained by the resource key and overlap
+    /// exactly as before R605-T4 introduced it.
+    #[test]
+    fn same_wave_jobs_with_distinct_concurrency_groups_still_run_concurrently() {
+        let yaml = r#"
+on: [push]
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: group-a
+    steps:
+      - run: sleep 1
+  b:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: group-b
+    steps:
+      - run: sleep 1
+"#;
+        let wf = workflow(yaml);
+        let mut e = Executor::new(workspace_path());
+        e.env_passthrough = true;
+        e.runner_os = "Linux".into();
+        let e = e.with_max_parallel_jobs(2);
+
+        let started = std::time::Instant::now();
+        let run = execute_workflow(&wf, &e).expect("execute");
+        let elapsed = started.elapsed();
+        assert_eq!(run.instances.len(), 2);
+        assert!(run.instances.iter().all(|i| i.result == JobResult::Success));
+        assert!(
+            elapsed < std::time::Duration::from_millis(1_900),
+            "distinct concurrency groups must not serialize the wave \
+             (took {elapsed:?})",
+        );
+    }
+
+    /// A job's own `strategy.max-parallel` is honoured under the global cap —
+    /// the same thing it means on GitHub. Four rows, global cap 4, job cap 1 ⇒
+    /// serial anyway.
+    #[test]
+    fn a_jobs_own_max_parallel_bounds_its_rows_under_the_global_cap() {
+        let yaml = r#"
+on: [push]
+jobs:
+  fan:
+    runs-on: ubuntu-latest
+    strategy:
+      max-parallel: 1
+      matrix:
+        n: [1, 2, 3]
+    steps:
+      - run: sleep 1
+"#;
+        let wf = workflow(yaml);
+        let mut e = Executor::new(workspace_path());
+        e.env_passthrough = true;
+        e.runner_os = "Linux".into();
+        let e = e.with_max_parallel_jobs(4);
+
+        let started = std::time::Instant::now();
+        let run = execute_workflow(&wf, &e).expect("execute");
+        let elapsed = started.elapsed();
+        assert_eq!(run.instances.len(), 3);
+        assert!(
+            elapsed >= std::time::Duration::from_millis(2_900),
+            "max-parallel: 1 must keep the rows serial even at global cap 4 \
+             (took {elapsed:?})",
+        );
+    }
+
+    /// The wave boundary is still a barrier: a dependent job may not start
+    /// before its predecessors finished, whatever the cap says.
+    #[test]
+    fn a_raised_cap_does_not_cross_a_wave_boundary() {
+        let yaml = r#"
+on: [push]
+jobs:
+  first:
+    runs-on: ubuntu-latest
+    steps:
+      - id: emit
+        run: echo "v=1" >> "$GITHUB_OUTPUT"
+    outputs:
+      v: ${{ steps.emit.outputs.v }}
+  second:
+    needs: first
+    runs-on: ubuntu-latest
+    steps:
+      - run: test "${{ needs.first.outputs.v }}" = "1"
+"#;
+        let wf = workflow(yaml);
+        let mut e = Executor::new(workspace_path());
+        e.env_passthrough = true;
+        e.runner_os = "Linux".into();
+        let e = e.with_max_parallel_jobs(8);
+        let run = execute_workflow(&wf, &e).expect("execute");
+        // `second` could only pass its `test` if `first`'s output was already
+        // aggregated — i.e. the wave boundary held.
+        assert_eq!(run.instance("second").unwrap().result, JobResult::Success);
+    }
+
+    /// A failure inside a concurrent wave surfaces as the error, and picks the
+    /// first failure in WAVE order rather than whichever thread lost the race.
+    #[test]
+    fn a_concurrent_wave_reports_its_failure_deterministically() {
+        let yaml = r#"
+on: [push]
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: nope/one@v1
+  b:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: nope/two@v1
+"#;
+        let wf = workflow(yaml);
+        let mut e = Executor::bare(workspace_path());
+        e.env_passthrough = true;
+        e.runner_os = "Linux".into();
+        let e = e.with_max_parallel_jobs(2);
+        for _ in 0..5 {
+            let err = execute_workflow(&wf, &e).expect_err("unknown actions fail");
+            assert!(
+                err.to_string().contains("nope/one"),
+                "the wave-order-first failure must win every time, got: {err}",
+            );
+        }
     }
 
     #[test]
@@ -2360,6 +2985,103 @@ jobs:
             inst.steps[2].outputs.get("envvar"),
             Some(&Value::String("self-hosted".into()))
         );
+    }
+
+    // ── R785-B1: `working-directory:` actually moves the step's cwd ───────
+
+    /// A `run:` step's `working-directory:` must resolve relative to the
+    /// executor's workspace and actually become the shell's cwd — before the
+    /// fix `run_bash_step` always used `executor.workspace`, so `pwd` inside
+    /// the step reported the repo root regardless of what the step declared.
+    #[test]
+    fn step_working_directory_moves_the_shell_cwd() {
+        let sub = workspace_path().join("R785-B1-step-sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let expected = std::fs::canonicalize(&sub).unwrap();
+
+        let yaml = r#"
+on: [push]
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    steps:
+      - id: where
+        working-directory: R785-B1-step-sub
+        run: echo "cwd=$(pwd -P)" >> "$GITHUB_OUTPUT"
+"#;
+        let wf = workflow(yaml);
+        let run = run_with_path(&wf);
+        let inst = run.instance("a").unwrap();
+        assert_eq!(inst.result, JobResult::Success);
+        let cwd = inst.steps[0]
+            .outputs
+            .get("cwd")
+            .unwrap_or_else(|| panic!("no cwd output; steps: {:?}", inst.steps))
+            .as_str_lossy();
+        let got = std::fs::canonicalize(PathBuf::from(cwd)).unwrap();
+        assert_eq!(got, expected);
+    }
+
+    /// With no step-level override, `defaults.run.working-directory` on the
+    /// job applies — the GHA precedence `resolve_working_directory` (R785-B1)
+    /// implements: step > job defaults > workflow defaults > workspace root.
+    #[test]
+    fn job_defaults_working_directory_applies_without_a_step_override() {
+        let sub = workspace_path().join("R785-B1-job-sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let expected = std::fs::canonicalize(&sub).unwrap();
+
+        let yaml = r#"
+on: [push]
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: R785-B1-job-sub
+    steps:
+      - id: where
+        run: echo "cwd=$(pwd -P)" >> "$GITHUB_OUTPUT"
+"#;
+        let wf = workflow(yaml);
+        let run = run_with_path(&wf);
+        let inst = run.instance("a").unwrap();
+        assert_eq!(inst.result, JobResult::Success);
+        let cwd = inst.steps[0].outputs.get("cwd").unwrap().as_str_lossy();
+        let got = std::fs::canonicalize(PathBuf::from(cwd)).unwrap();
+        assert_eq!(got, expected);
+    }
+
+    /// A step-level `working-directory:` wins over the job's
+    /// `defaults.run.working-directory` — matches GHA's own precedence.
+    #[test]
+    fn step_working_directory_overrides_job_defaults() {
+        let job_sub = workspace_path().join("R785-B1-precedence-job");
+        let step_sub = workspace_path().join("R785-B1-precedence-step");
+        std::fs::create_dir_all(&job_sub).unwrap();
+        std::fs::create_dir_all(&step_sub).unwrap();
+        let expected = std::fs::canonicalize(&step_sub).unwrap();
+
+        let yaml = r#"
+on: [push]
+jobs:
+  a:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: R785-B1-precedence-job
+    steps:
+      - id: where
+        working-directory: R785-B1-precedence-step
+        run: echo "cwd=$(pwd -P)" >> "$GITHUB_OUTPUT"
+"#;
+        let wf = workflow(yaml);
+        let run = run_with_path(&wf);
+        let inst = run.instance("a").unwrap();
+        assert_eq!(inst.result, JobResult::Success);
+        let cwd = inst.steps[0].outputs.get("cwd").unwrap().as_str_lossy();
+        let got = std::fs::canonicalize(PathBuf::from(cwd)).unwrap();
+        assert_eq!(got, expected);
     }
 
     #[test]

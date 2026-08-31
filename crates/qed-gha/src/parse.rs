@@ -426,6 +426,7 @@ fn parse_job(_id: &str, v: &Value) -> Result<Job, ParseError> {
     let timeout_minutes = lookup(map, "timeout-minutes").and_then(|v| v.as_u64()).map(|n| n as u32);
     let continue_on_error = lookup(map, "continue-on-error").and_then(|v| v.as_bool());
     let defaults = lookup(map, "defaults").map(parse_defaults).transpose()?;
+    let concurrency = lookup(map, "concurrency").map(parse_concurrency).transpose()?;
 
     let steps = match lookup(map, "steps") {
         Some(Value::Sequence(seq)) => seq.iter().map(parse_step).collect::<Result<Vec<_>, _>>()?,
@@ -451,6 +452,7 @@ fn parse_job(_id: &str, v: &Value) -> Result<Job, ParseError> {
         timeout_minutes,
         continue_on_error,
         defaults,
+        concurrency,
         steps,
     })
 }

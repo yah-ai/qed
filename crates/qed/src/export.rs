@@ -472,6 +472,7 @@ mod tests {
 
     fn pipeline(name: &str, steps: Vec<QedStep>) -> Pipeline {
         Pipeline {
+            max_parallel: None,
             description: None,
             tags: Vec::new(),
             name: name.into(),
@@ -489,6 +490,8 @@ mod tests {
             toolchain: None,
             binds: Vec::new(),
             on_change: Vec::new(),
+            alias_of: None,
+            pins: Default::default(),
             finally: Vec::new(),
         }
     }

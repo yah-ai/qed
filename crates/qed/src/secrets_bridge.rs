@@ -233,7 +233,15 @@ fn quote_toml_str(s: &str) -> String {
 /// Resolve a single source URI to its current string value, using `vault`
 /// for `vault:<slot>` lookups. Returns `None` when nothing resolved (the
 /// caller folds that to `""` so undefined secrets read empty, matching GHA).
-fn resolve_source(source: &str, vault: Option<&fob::KeysStore>) -> Option<String> {
+///
+/// Public because the source-URI grammar outgrew this file: `yah cloud apply`
+/// resolves a bundle slot's `[providers.bundle.env]` through it (R556-T12) so
+/// a mirror and `~/.yah/qed/secrets.toml` speak one vocabulary instead of two
+/// that drift. Callers outside the GHA bridge decide their own miss policy —
+/// the deploy path treats `None` as fatal rather than folding it to `""`,
+/// because a credential-less serve process is exactly the failure that
+/// motivated the field.
+pub fn resolve_source(source: &str, vault: Option<&fob::KeysStore>) -> Option<String> {
     // Pipe-joined fallback chain: try each alternative in order until one
     // yields a Some. Same precedence as shell `${VAR:-${OTHER:-…}}` — the
     // first non-empty wins.

@@ -470,11 +470,17 @@ impl TaskDriver {
             &opts.beholder_select
         };
         let attach = registry.attach(cmd, select, opts.tty_attached);
-        // Use the (possibly rewritten) argv to reconstruct the effective command.
-        let effective_cmd = if attach.argv.is_empty() {
-            cmd.to_string()
-        } else {
-            attach.argv.join(" ")
+        // Reconstruct the command from argv ONLY when a beholder actually
+        // rewrote it. `AttachResult.argv` is always populated — it is
+        // `resolve_argv(cmd)` even when nothing attached — so joining it
+        // unconditionally ran every run's command through a whitespace
+        // normalization nobody asked for: runs of spaces collapse and embedded
+        // newlines become spaces, which is silent corruption for a heredoc or
+        // any multi-line line. The caller's bytes go to the shell untouched
+        // unless a rewrite is the whole point.
+        let effective_cmd = match &attach.status.rewrite_added {
+            Some(added) if !added.is_empty() && !attach.argv.is_empty() => attach.argv.join(" "),
+            _ => cmd.to_string(),
         };
 
         self.store.insert_run(&TaskRunMeta {
@@ -1422,6 +1428,78 @@ mod tests {
         let chunks = store.get_chunks(id, &ChunkFilter::default()).await.unwrap();
         let bytes: Vec<u8> = chunks.into_iter().flat_map(|c| c.bytes).collect();
         String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    // ── The caller's bytes reach the shell unchanged (R739-S2) ───────────────
+
+    /// `AttachResult.argv` is populated on every run, rewrite or not, so
+    /// `spawn_run` used to join it back into the command line unconditionally.
+    /// That put every `task.run` command through a whitespace normalization
+    /// nobody asked for. A multi-line command is the case where that is not
+    /// cosmetic: the newline the caller wrote becomes a space, and two
+    /// commands become one nonsense command.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_multi_line_command_is_not_flattened_into_one_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(&dir).await;
+        let driver = Arc::new(TaskDriver::new(Arc::clone(&store)).await.unwrap());
+
+        // Flattened to one line this is `echo one echo two`, which prints
+        // "one echo two" — a different answer, not a failure, which is what
+        // makes the old behaviour dangerous rather than merely wrong.
+        let id = driver
+            .spawn_run(
+                "echo one\necho two",
+                SpawnOpts { cwd: "/tmp".into(), ..Default::default() },
+            )
+            .await
+            .unwrap();
+        await_done(&store, &id).await;
+
+        let out = output_of(&store, &id).await;
+        assert!(out.contains("one"), "got: {out:?}");
+        assert!(
+            out.contains("two"),
+            "the second line must have run as its own command; got: {out:?}"
+        );
+        assert!(
+            !out.contains("one echo two"),
+            "the newline was flattened into a space; got: {out:?}"
+        );
+    }
+
+    /// `resolve_argv` strips `bunx`/`npx`/`pnpm` so a beholder's `matches` sees
+    /// the bare tool. That is a *matching* concern; it must never reach the
+    /// spawn, or the wrapper the caller needed is gone from the command.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_wrapper_the_caller_wrote_is_not_stripped_from_the_spawned_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(&dir).await;
+        let driver = Arc::new(TaskDriver::new(Arc::clone(&store)).await.unwrap());
+
+        // `npx` is almost certainly absent in test environments, and that is
+        // the point: if the wrapper survived, the shell reports it missing. If
+        // it were stripped we would be running bare `--version`.
+        let id = driver
+            .spawn_run(
+                "npx r739s2-nonexistent-tool --version",
+                SpawnOpts { cwd: "/tmp".into(), ..Default::default() },
+            )
+            .await
+            .unwrap();
+        let meta = await_done(&store, &id).await;
+        let out = output_of(&store, &id).await;
+        assert!(
+            !matches!(meta.status, RunStatus::Done { exit_code: 0, .. }),
+            "expected a failure, got {:?} with output {out:?}",
+            meta.status
+        );
+        assert!(
+            !out.contains("--version: "),
+            "the wrapper was stripped and the shell tried to run the flag; got: {out:?}"
+        );
     }
 
     // ── Direct argv (R652-T6) ────────────────────────────────────────────────

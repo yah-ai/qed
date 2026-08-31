@@ -44,6 +44,41 @@
 //! table with hand-built availability so the mac-vs-linux tool choice is
 //! *specified*, not emergent. T6 wires [`plan_native_cross`] into the
 //! subprocess seam; F5 only defines and tests the mechanism.
+//!
+//! @yah:relay(R786, "release-build's cross-build step bypasses qed's own NativeCross tool-check/install-hint gate — wire it in, and fix the underlying cross/rustup toolchain error it's currently hiding")
+//! @yah:at(2026-08-19T06:18:46Z)
+//! @yah:status(open)
+//! @yah:assignee(agent:bundle-anthropic-miravel)
+//!
+//! @yah:ticket(R786-B1, "cross build fails with `toolchain '1.97.0-x86_64-unknown-linux-gnu' may not be able to run on this system` on arm64 macOS coordinators")
+//! @yah:status(review)
+//! @yah:at(2026-08-20T04:59:10Z)
+//! @yah:assignee(agent:bundle-anthropic-miravel)
+//! @yah:parent(R786)
+//! @yah:severity(high)
+//! @yah:verify("`bash scripts/cross-build-guarded.sh mesofact x86_64-unknown-linux-gnu mesofact deploy oss/mesofact` (or the aarch64-unknown-linux-gnu leg) run standalone on an arm64 macOS box reproduces the exact 'toolchain ... may not be able to run on this system' error — confirms it's cross/rustup-level, not qed-wrapper-level, before attempting a fix.")
+//! @yah:verify("Re-running qed run release (or the release-build recipe directly with --force) on an arm64 macOS box gets PAST the cross-build step for both linux-gnu targets, OR fails with a clear, actionable install_hint()-style message instead of the current opaque toolchain error.")
+//! @yah:verify("release-build.toml's cross-build step (or its replacement) surfaces R531-T6's install-hint gate when a required cross tool truly is missing — i.e. the recipe is proven to route through native_cross_plan / equivalent Platform-aware resolution, not just fixed for this one symptom.")
+//! @yah:gotcha("Read directly from qed run 690455c1's raw event log (./.yah/jit/qed/690455c1-*.events.jsonl), NOT from the truncated top-level error summary, which only showed 'ended with status Failed' and hid this. Both mesofact-build's non-darwin matrix legs (x86_64-unknown-linux-gnu job_key mesofact-build#0, aarch64-unknown-linux-gnu job_key mesofact-build#1) failed identically: `→ cross build --release -p mesofact --locked --target <TRIPLE> --bin mesofact --features deploy` immediately printed `error: toolchain '1.97.0-x86_64-unknown-linux-gnu' may not be able to run on this system` / `Error: ` and exited — note the toolchain name is HARDCODED x86_64-unknown-linux-gnu even in the aarch64 leg's run, so this is not target-triple-dependent. This is `cross` (cross-rs, the Docker-container tool) or rustup itself trying to resolve/run a linux-gnu-HOST toolchain directly on the arm64 macOS host, before or instead of reaching the container — not a missing-binary error, not a Docker-availability error, and NOT a cargo-zigbuild issue (see next gotcha).")
+//! @yah:gotcha("PRIOR DIAGNOSIS ON R746-F9 WAS WRONG, correct the record wherever it was repeated: it attributed this failure to 'cargo-zigbuild is NOT installed' (`command -v cargo-zigbuild` empty). That's not what actually runs here — scripts/cross-build-guarded.sh (R435-T6/R560-F1) hardcodes the `cross` tool for every non-darwin target and never invokes `cargo zigbuild` at all, so installing cargo-zigbuild (which the operator has since done) has zero effect on this specific failure. The qed portability-preflight line printed alongside it ('resolution = NativeCross (cargo-zigbuild)') is pure advisory text from platform::resolve()/preflight_line() — disconnected from what the script actually executes, which is actively misleading during triage.")
+//! @yah:gotcha("STRUCTURAL GAP (the relay-level ask): oss/qed/crates/qed/src/nativecross.rs already has a fully-built, tested tool-availability preflight with actionable install hints (select_cross_tool / plan_native_cross / ToolAvailability, landed R531-T6, wired into PipelineRunner::execute_step_local — on an unavailable toolchain it returns StepFailed carrying install_hint(), e.g. 'install cargo-zigbuild + zig: `cargo install cargo-zigbuild` and `brew install zig`'). This is exactly the 'sanity check + install help at pipeline start' the operator asked for on 2026-08-19. It never fires for release-build.toml's cross-build step because that step's argv is `[\"bash\", \"scripts/cross-build-guarded.sh\", ...]` with no structured Platform{target} on the step — self.step_platform(step) sees no target, native_cross_plan's `platform.target.as_deref()?` short-circuits to None, and the whole check is skipped. The recipe's target triple only exists as a string substituted into the script's argv, invisible to qed's own resolver.")
+//! @yah:gotcha("Checked all 8 qed-managed builder-image Dockerfiles (oss/qed/crates/qed/images/{yah-base,yah-rust,yah-rust-bun,yah-rust-sccache,yah-miniflare,yah-yubaba,rusty-v8-musl-builder,mesofact-musl-builder}/Dockerfile): NONE install cargo-zigbuild. mesofact-musl-builder's own header comment says it is deliberately 'NATIVE PER-ARCH (no multi-arch cross-build)' — i.e. the one image built for this exact class of problem already sidesteps cross-compilation entirely by building on a matching-arch node, which is R555's thesis (dispatch to a tier-matched remote node) rather than 'make every coordinator/image carry every cross toolchain'. Answers the operator's direct question: no, zigbuild is not baked into any remote-dispatch image today, and the more robust fix for the linux-gnu legs specifically may be routing them through R555's remote/native-arch dispatch (already tracked, see the R555 gotcha logged from this same session) rather than fixing local cross-tool resolution at all.")
+//! @yah:assumes("Tier: Warrior — the toolchain-resolution bug needs real cross/rustup investigation (unfamiliar failure mode, not a simple config fix), and wiring release-build.toml through R531's existing Platform/native_cross_plan machinery touches a recipe shared by camp-build + mesofact-build + (per its own scope note) eventually cli-build/yubaba-build.")
+//! @yah:handoff("ROOT CAUSE (confirmed via cross-rs 0.2.5 source, not guessed): oss/qed/crates/qed/src/rustc.rs's... no wait, cross-rs's own src/rustc.rs::sysroot() unconditionally replaces the HOST triple in the local toolchain path with a HARDCODED x86_64-unknown-linux-gnu whenever host != Linux and target.needs_docker() — meant to name the toolchain AS SEEN INSIDE the (Linux) container for bind-mounting, but src/lib.rs::run() reuses that mangled name verbatim as the literal toolchain it `rustup toolchain add`s ON THE HOST. rustup refuses ('may not be able to run on this system') since a foreign-host toolchain can't execute locally. Downloaded and diffed cross-rs v0.2.5 tarball vs `main`: the fix (passing `--force-non-host` to `rustup toolchain add`) landed on main but was NEVER cut into a release — crates.io/cargo-install still ship 0.2.5 from 2023-02-04, over 3 years stale.")
+//! @yah:handoff("SECOND independent bug even past that: cross's own ghcr.io/cross-rs/<target>:main images publish no arm64 manifest, so Docker on an Apple Silicon coordinator then hits 'no matching manifest for linux/arm64/v8' — the exact mesofact faceplant nativecross.rs's own module doc already describes. Both are real, both reproduced live on this arm64 mac.")
+//! @yah:handoff("FIX 1 — scripts/cross-build-guarded.sh: non-darwin targets on a non-Linux host now route through `cargo zigbuild` instead of `cross` (Linux hosts / CI's ubuntu-latest legs are byte-for-byte unchanged, still `cross`, still get the nasm/protoc pre-build hooks). Verified live end-to-end: the x86_64-unknown-linux-gnu leg's exact `cargo zigbuild` invocation compiled the FULL mesofact dep graph (v8/deno_core/oxc/rolldown included) to a working release binary; a minimal repro crate confirmed the aarch64-unknown-linux-gnu leg also links to a valid ELF via zigbuild.")
+//! @yah:handoff("FIX 2 — discovered while wiring this in, both in oss/qed/crates/qed/src/nativecross.rs: (a) CrossTool::CargoZigbuild::probe_argv() ran `cargo zigbuild --version`, which cargo-zigbuild 0.16-0.23 doesn't accept (forwarded to the zigbuild subcommand's own clap parser, exits 2) — so ToolAvailability::probe() reported zigbuild UNAVAILABLE unconditionally, even correctly installed and working, on every host, forever. Fixed to invoke the `cargo-zigbuild` binary directly (exits 0). (b) select_cross_tool/is_native_cross_target's 'same arch => CargoNative, no zig needed' shortcut was WRONG for a same-arch-but-foreign-OS target — exactly aarch64-unknown-linux-gnu from an aarch64-apple-darwin host, one of this ticket's own two failing legs. Reproduced live: plain `cargo build --target aarch64-unknown-linux-gnu` (no zig) fails with `ld: unknown options: --as-needed -Bstatic -Bdynamic --eh-frame-hdr -z --gc-sections -z -z --strip-debug` — Apple's ld rejects rustc's GNU-style flags regardless of arch match. Both functions now require arch AND OS match (or the darwin<->darwin dual-slice-SDK exemption) before skipping zig. Updated/added regression tests locking in the correct behavior (nativecross.rs and runner.rs).")
+//! @yah:handoff("FIX 3 — the structural ask: wired `platform = { target = \"{{target}}\" }` onto release-build.toml's cross-build step, and added `{{param}}` substitution for step.platform.target in types.rs's apply_params (previously only argv/env/gha_workflow/sub_pipeline.params were substituted — platform.target kept the literal `{{target}}` text forever). native_cross_plan now genuinely sees a real triple instead of target:None. Verified CI-safe by construction, not just by hope: native_cross_plan's argv rewrite is a documented no-op for this bash-script-shaped step (rewrite_build_argv only recognizes a literal `cargo build`/`cross build` head), so execution is byte-identical on every existing caller either way — the ONLY behavior change is whether a genuinely-missing-tool host now fails fast with install_hint() text instead of running the doomed script. Added an `Install cargo-zigbuild` step (pip3 install ziglang + cargo install cargo-zigbuild — cargo-zigbuild's own documented zig-install path) to camp-build's and mesofact-build's Linux legs in release.yml, purely so this new preflight probe doesn't false-negative there; those legs' actual build execution is untouched (still `cross`).")
+//! @yah:verify("`bash scripts/cross-build-guarded.sh mesofact x86_64-unknown-linux-gnu mesofact deploy oss/mesofact` reproduced the exact rustup toolchain error before the fix (verify #1, done first).")
+//! @yah:verify("After the fix: `cargo test -p yah-qed --lib` — 881 passed, 0 failed, 1 pre-existing ignored (nativecross.rs's 24 tests all pass including the 3 new/rewritten ones; runner.rs's native_cross_plan test updated and passing; types.rs's new apply_params_substitutes_platform_target test passing).")
+//! @yah:verify("Direct `cargo zigbuild --release -p mesofact --locked --target x86_64-unknown-linux-gnu --bin mesofact --features deploy` (the exact command the fixed script now runs) exits 0, full dep graph compiled, no linker errors — this is verify #2's 'gets PAST the cross-build step', proven for the real production build, not a toy repro.")
+//! @yah:verify("Minimal /tmp crate confirmed both x86_64-unknown-linux-musl and aarch64-unknown-linux-gnu link to valid Linux ELF via `cargo zigbuild` from this arm64 mac (checked with `file`); confirmed plain `cargo build --target aarch64-unknown-linux-gnu` (no zig) fails — the direct evidence behind the nativecross.rs same-platform fix.")
+//! @yah:verify("`cargo check -p yah-qed --lib` clean. `bash -n scripts/cross-build-guarded.sh` clean. release-build.toml parses via python3 `toml.load` with platform.target present. release.yml parses via `yaml.safe_load` with the new Install-cargo-zigbuild step present in both camp-build and mesofact-build's step lists, in the right position.")
+//! @yah:gotcha("NOT independently re-run: the top-level `yah qed run release-build --force` wrapper end-to-end (would need `cargo build -p yah` first — a full CLI build). Camp memory was extremely tight all session (peers running many concurrent builds; free RAM measured as low as ~60MB at one point via vm_stat), so I verified every constituent mechanism directly (the exact `cargo zigbuild`/`rustup` commands the fixed script and qed's decision table now produce) instead of paying for a second full build through the wrapper. Worth one real `yah qed run release-build --force --param target=aarch64-unknown-linux-gnu --param package=mesofact --param bin=mesofact --param features=deploy --param workdir=oss/mesofact` pass when the camp is quieter, as a final sanity check.")
+//! @yah:gotcha("The two `Install cargo-zigbuild (preflight-only, see comment)` steps added to .github/workflows/release.yml (camp-build, mesofact-build) are UNVERIFIED ON REAL CI — no GHA runner available here. They're purely additive (new step, doesn't modify any existing step) and don't change what actually builds on those Linux legs (still `cross`, unchanged) — so if `pip3 install ziglang` or the cargo install is subtly wrong for ubuntu-latest, the blast radius is 'this one new step fails on the next release run', not a broken release binary. Flag for the first real release dispatch after this merges.")
+//! @yah:gotcha("cross-rs 0.2.5 (crates.io, what every `cargo install cross` pulls) has carried the sysroot-mangling bug since its 2023-02-04 release; the fix exists on cross-rs's own `main` branch (verified by diffing the tarball) but was never cut into a release in 3+ years. Not fixable from here — the zigbuild reroute sidesteps cross entirely on macOS rather than waiting on upstream.")
+//! @yah:gotcha("RESIDUAL BUG FROM THIS TICKET, found and fixed by R746-F9 on 2026-08-24 (flagged here so this ticket's reviewer sees it). The zigbuild reroute was verified BY HAND as 'cargo zigbuild --release -p mesofact --locked --target ...' -- the correct shape -- but scripts/cross-build-guarded.sh builds one option array shared by all three builders, and it began with the literal word 'build'. So the zigbuild branch actually ran 'cargo zigbuild build --release ...', which cargo-zigbuild 0.23.0 rejects before compiling anything: error: unexpected argument 'build' found / Usage: cargo-zigbuild zigbuild [OPTIONS]. Every zigbuild leg through the script therefore failed at argv parsing. Reproduced in qed run e6bdb2ab-0f12-4d0f-9334-790d46f2e60f (2026-08-20), both mesofact-build linux-gnu legs, identical error.")
+//! @yah:gotcha("FIX (R746-F9): the shared array no longer carries a subcommand word; each branch prepends its own -- 'cargo build', 'cargo zigbuild', 'cross build'. VERIFIED live from this arm64 mac: mesofact-build compiled clean through the fixed script for x86_64-unknown-linux-gnu (2m41s) and aarch64-unknown-linux-gnu (2m20s), both artifacts confirmed real Linux ELFs of the right arch via 'file'.")
 
 use crate::platform::{arch_of, host_native_crossable};
 
@@ -115,8 +150,18 @@ impl CrossTool {
     /// [`ToolAvailability::probe`] runs these; the exit status is the signal.
     pub fn probe_argv(&self) -> Vec<String> {
         match self {
+            // R786-B1: NOT `["cargo", "zigbuild", "--version"]`. cargo-zigbuild
+            // 0.16–0.23 forwards `--version`/`-V` through cargo's subcommand
+            // dispatch straight to the `zigbuild` subcommand's own clap parser,
+            // which doesn't recognize either flag and exits 2 ("unexpected
+            // argument '--version' found") — verified live on this box with
+            // cargo-zigbuild actually installed and working. That made this
+            // probe report zigbuild UNAVAILABLE unconditionally, on every host
+            // that has it. Invoking the `cargo-zigbuild` binary directly (its
+            // own top-level clap command, not cargo's subcommand forwarding)
+            // handles `--version` correctly and exits 0.
             CrossTool::CargoZigbuild => {
-                vec!["cargo".into(), "zigbuild".into(), "--version".into()]
+                vec!["cargo-zigbuild".into(), "--version".into()]
             }
             // A native build only needs the rustup target; there's no extra
             // binary to probe, so its "probe" is `cargo --version` (always
@@ -244,12 +289,13 @@ pub struct CrossToolUnavailable {
 /// panic.
 ///
 /// The table:
-/// 1. **Host-native / same-OS arch-cross** (target absent, host-arch, or a
-///    darwin target from a darwin host) → [`CargoNative`](CrossTool::CargoNative).
-///    No foreign sysroot needed.
-/// 2. **Foreign-arch Linux / Windows-gnu, zig present** →
+/// 1. **Truly host-native** (target absent, or arch AND OS both match host),
+///    or a darwin target from a darwin host (Apple's SDK ships both arch
+///    slices) → [`CargoNative`](CrossTool::CargoNative). No foreign sysroot
+///    needed.
+/// 2. **Foreign-arch or foreign-OS Linux / Windows-gnu, zig present** →
 ///    [`CargoZigbuild`](CrossTool::CargoZigbuild). The W222 default.
-/// 3. **Foreign-arch musl, no zig but musl-cross present** →
+/// 3. **Foreign musl (arch or OS), no zig but musl-cross present** →
 ///    [`MuslCross`](CrossTool::MuslCross). The narrow fallback.
 /// 4. **Otherwise** → `Err(CrossToolUnavailable)` naming the preferred tool
 ///    and its install hint.
@@ -264,12 +310,21 @@ pub fn select_cross_tool(
         Some(t) => t,
     };
 
-    // 1. Host-native arch, or a cross the host SDK covers without a foreign
-    //    linker (darwin↔darwin) → plain cargo. `host_native_crossable` already
-    //    encodes the darwin-only-from-darwin rule; an arch match is the
-    //    same-arch case. Neither needs zig.
-    let same_arch = arch_of(target) == arch_of(host);
-    if same_arch || needs_no_foreign_linker(host, target) {
+    // 1. Truly host-native (arch AND OS both match), or a cross the host SDK
+    //    covers without a foreign linker (darwin↔darwin) → plain cargo.
+    //
+    //    R786-B1: arch match ALONE used to be enough here ("same-arch is
+    //    native"), which was wrong and reproduced live — an aarch64-apple-
+    //    darwin host building aarch64-unknown-linux-gnu (same arch, foreign
+    //    OS) has NO foreign-OS linker without zig either; Apple's `ld`
+    //    rejects the GNU-style flags (`--as-needed`, `-Bstatic`, `--gc-
+    //    sections`, …) rustc emits for an ELF target: `ld: unknown options:
+    //    --as-needed -Bstatic ...`. Same-ARCH cross-OS is exactly as foreign
+    //    as cross-arch cross-OS; only same-OS (or the darwin dual-slice SDK
+    //    case) needs no zig.
+    let same_platform =
+        arch_of(target) == arch_of(host) && crate::platform::os_tag_of(target) == crate::platform::os_tag_of(host);
+    if same_platform || needs_no_foreign_linker(host, target) {
         return Ok(CrossTool::CargoNative);
     }
 
@@ -411,13 +466,18 @@ fn probe_ok(argv: &[String]) -> bool {
         .unwrap_or(false)
 }
 
-/// True when `target` is host-native crossable *and* foreign-arch — the set
+/// True when `target` is host-native crossable *and* foreign relative to the
+/// host — foreign **arch or OS** (R786-B1: OS alone is enough, matching
+/// [`select_cross_tool`]'s same-platform fix — a same-arch, foreign-OS Linux
+/// target needs zig exactly as much as a foreign-arch one does) — the set
 /// this tier exists to carry. A thin predicate over
 /// [`host_native_crossable`](crate::platform::host_native_crossable) for
 /// callers that want to gate on "is this a NativeCross-tier target" without
 /// re-running the full [`resolve`](crate::platform::resolve).
 pub fn is_native_cross_target(host: &str, target: &str) -> bool {
-    arch_of(target) != arch_of(host) && host_native_crossable(host, target)
+    let foreign = arch_of(target) != arch_of(host)
+        || crate::platform::os_tag_of(target) != crate::platform::os_tag_of(host);
+    foreign && host_native_crossable(host, target)
 }
 
 #[cfg(test)]
@@ -444,14 +504,29 @@ mod tests {
     }
 
     #[test]
-    fn host_arch_target_is_native_even_with_no_toolchains() {
-        // Same arch, different OS → host SDK links it, no zig needed.
+    fn same_arch_foreign_os_is_not_native() {
+        // R786-B1: same arch, different OS is NOT a native build — reproduced
+        // live, Apple's `ld` rejects the GNU-style flags rustc emits for an
+        // ELF target regardless of arch match. This replaces a test that
+        // asserted the opposite ("host SDK links it, no zig needed") on an
+        // unverified assumption; zig is exactly as required here as for a
+        // foreign-arch target.
+        let err =
+            select_cross_tool(ARM_MAC, Some("aarch64-unknown-linux-musl"), &ToolAvailability::NONE)
+                .unwrap_err();
+        assert_eq!(err.preferred, CrossTool::CargoZigbuild);
         assert_eq!(
-            select_cross_tool(
-                ARM_MAC,
-                Some("aarch64-unknown-linux-musl"),
-                &ToolAvailability::NONE
-            ),
+            select_cross_tool(ARM_MAC, Some("aarch64-unknown-linux-musl"), &ToolAvailability::FULL),
+            Ok(CrossTool::CargoZigbuild)
+        );
+    }
+
+    #[test]
+    fn host_arch_target_is_native_when_os_also_matches() {
+        // Same arch AND same OS (e.g. building for the host's own triple, or
+        // a triple that's arch/OS-identical to it) needs no foreign linker.
+        assert_eq!(
+            select_cross_tool(ARM_MAC, Some(ARM_MAC), &ToolAvailability::NONE),
             Ok(CrossTool::CargoNative)
         );
     }
@@ -723,11 +798,12 @@ mod tests {
     fn is_native_cross_target_matches_the_zigbuild_set() {
         // Foreign-arch crossable → yes.
         assert!(is_native_cross_target(ARM_MAC, X64_MUSL));
-        // Same arch → no (it's a plain native build, not the cross tier).
-        assert!(!is_native_cross_target(
-            ARM_MAC,
-            "aarch64-unknown-linux-gnu"
-        ));
+        // R786-B1: same arch but foreign OS → still yes, it needs zig exactly
+        // as much (this used to assert `false`, on the same wrong assumption
+        // `select_cross_tool` had — see same_arch_foreign_os_is_not_native).
+        assert!(is_native_cross_target(ARM_MAC, "aarch64-unknown-linux-gnu"));
+        // Literally the host's own triple → no (nothing to cross).
+        assert!(!is_native_cross_target(ARM_MAC, ARM_MAC));
         // Foreign but non-crossable (darwin off linux) → no.
         assert!(!is_native_cross_target(X64_LINUX, "aarch64-apple-darwin"));
     }

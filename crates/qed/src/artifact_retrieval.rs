@@ -91,6 +91,56 @@ impl ContentAddressedStore {
             size: bytes.len() as u64,
         })
     }
+
+    /// Give a landed blob a second, **named** path at
+    /// `<root>/named/<blake3>/<filename>`, and return it (R560-T9).
+    ///
+    /// # Why a content-addressed store needs a name at all
+    ///
+    /// Because the next consumer downstream keys off the filename, and the CAS
+    /// address destroys it. [`crate::publish::stage_release`] derives a release
+    /// object key as `<binary>/<version>/<triple>/<basename-of-the-path>` — so
+    /// publishing a retrieved artifact straight out of the CAS uploads it as
+    /// `mesofact/0.8.22/x86_64-unknown-linux-musl/9f3c…64-hex…`, a URL no
+    /// install script would ever construct. Nobody had hit it because
+    /// `rusty-v8-musl`, the only pipeline retrieving remote artifacts so far,
+    /// feeds the W164 derived-asset path (which keys off bytes) rather than a
+    /// release channel (which keys off names).
+    ///
+    /// # Why a link beside the blob rather than a rename of it
+    ///
+    /// The CAS entry is load-bearing on its own — it is R546-T3's
+    /// bootstrap-publish input and the BLAKE3-preservation check — so it stays
+    /// exactly where it is. The named path is a hard link into the same inode,
+    /// so the name costs no bytes and cannot drift from the content it claims
+    /// to be. On a filesystem that refuses the link (a cross-device store, or
+    /// one without hard links) this falls back to a copy: the point is a usable
+    /// name, and failing a retrieved multi-hundred-MB build over a link
+    /// restriction would be a poor trade.
+    ///
+    /// `named/` cannot collide with a blob: every CAS entry is 64 hex chars.
+    pub fn link_named(
+        &self,
+        landed: &RetrievedArtifact,
+        filename: &str,
+    ) -> std::io::Result<PathBuf> {
+        let dir = self.root.join("named").join(&landed.blake3);
+        std::fs::create_dir_all(&dir)?;
+        let named = dir.join(filename);
+
+        // Idempotent for the same reason `land` is: the address is the content,
+        // so an existing link under it already points at these bytes.
+        if named.exists() {
+            return Ok(named);
+        }
+        match std::fs::hard_link(&landed.path, &named) {
+            Ok(()) => Ok(named),
+            Err(_) => {
+                std::fs::copy(&landed.path, &named)?;
+                Ok(named)
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -135,6 +185,66 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         assert_eq!(entries, vec![a.blake3], "one content-addressed blob, no temp debris");
+    }
+
+    /// R560-T9: the named view carries the build's own filename and the SAME
+    /// bytes, and the CAS entry it links from is untouched.
+    ///
+    /// The bug this pins: `stage_release` keys a release object as
+    /// `<binary>/<version>/<triple>/<basename>`, so publishing straight out of
+    /// the CAS would upload `mesofact-x86_64-unknown-linux-musl.tar.gz` as a
+    /// 64-hex BLAKE3 filename — a URL install.sh never constructs, and a
+    /// failure that only shows up after a successful multi-hour fleet build.
+    #[test]
+    fn named_view_keeps_the_filename_and_the_bytes() {
+        let dir = TempDir::new().unwrap();
+        let store = ContentAddressedStore::new(dir.path().join("artifacts"));
+        let bytes = b"mesofact tarball bytes \x00\xff";
+        let landed = store.land(bytes).unwrap();
+
+        let named = store
+            .link_named(&landed, "mesofact-x86_64-unknown-linux-musl.tar.gz")
+            .unwrap();
+
+        assert_eq!(
+            named.file_name().unwrap(),
+            "mesofact-x86_64-unknown-linux-musl.tar.gz",
+            "the publish leg keys off this basename",
+        );
+        assert_eq!(std::fs::read(&named).unwrap(), bytes);
+        assert!(
+            landed.path.exists(),
+            "the CAS entry is R546-T3's input and must survive the linking",
+        );
+        assert_eq!(std::fs::read(&landed.path).unwrap(), bytes);
+
+        // Idempotent, like `land` — re-linking returns the same path.
+        assert_eq!(
+            store
+                .link_named(&landed, "mesofact-x86_64-unknown-linux-musl.tar.gz")
+                .unwrap(),
+            named,
+        );
+    }
+
+    /// Two DIFFERENT builds may legitimately share a filename (the two musl
+    /// legs do not, but a re-run of one leg with changed bytes does). Nesting
+    /// the name under the address rather than beside it keeps them apart —
+    /// a flat `named/<filename>` would have the second run silently serve the
+    /// first run's bytes.
+    #[test]
+    fn named_views_of_distinct_bytes_do_not_collide() {
+        let dir = TempDir::new().unwrap();
+        let store = ContentAddressedStore::new(dir.path().join("artifacts"));
+        let a = store.land(b"build one").unwrap();
+        let b = store.land(b"build two").unwrap();
+
+        let pa = store.link_named(&a, "mesofact.tar.gz").unwrap();
+        let pb = store.link_named(&b, "mesofact.tar.gz").unwrap();
+
+        assert_ne!(pa, pb);
+        assert_eq!(std::fs::read(&pa).unwrap(), b"build one");
+        assert_eq!(std::fs::read(&pb).unwrap(), b"build two");
     }
 
     #[test]

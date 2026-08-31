@@ -244,6 +244,21 @@ pub struct IndexTriple {
 ///    again), so restamping on a re-publish would not merely edit a field — it
 ///    would move an old release to the top of /releases and present it as the
 ///    newest. Publication dates are historical facts.
+/// 3. **Replace-or-append applies PER TRIPLE, not to the map wholesale.** A
+///    release matrix lands in slices: each platform leg stages only the
+///    artifacts it built, so its [`IndexUpdate`] carries only its own triples.
+///    Taking the update's map as the version's whole map means the last leg to
+///    finish wins and every earlier platform disappears — which is why the live
+///    index carried exactly one triple and /releases showed "Not published yet"
+///    for Linux and Windows. Worse, the CAS in the caller *guarantees* that
+///    outcome rather than racing for it: a loser re-reads the winner's bytes and
+///    then discards the very triples the re-read fetched. Unioning here is what
+///    makes that conditional write actually converge.
+///
+///    The cost is that a triple can only be updated, never dropped, by
+///    publishing. That is the right trade for a permanent record — a stale entry
+///    is a visible wrong URL, a vanished one is a download that silently stops
+///    existing — and removing one is a deliberate hand-edit of the object.
 pub fn merge_index(
     existing: Option<&str>,
     binary: &str,
@@ -258,16 +273,27 @@ pub fn merge_index(
         None => Vec::new(),
     };
 
-    let first_published = prior
-        .iter()
-        .find(|v| v.version == version)
-        .map(|v| v.pub_date.clone());
+    let previous = prior.iter().find(|v| v.version == version).cloned();
+    // Prior triples first, this update's on top: a leg re-publishing a triple it
+    // already wrote replaces that entry, and every triple it did not build
+    // survives untouched.
+    let mut merged_triples = previous
+        .as_ref()
+        .map(|v| v.triples.clone())
+        .unwrap_or_default();
+    merged_triples.extend(triples);
+
     prior.retain(|v| v.version != version);
     prior.push(IndexVersion {
         version,
-        pub_date: first_published.unwrap_or_else(|| pub_date.to_string()),
-        manifest_url,
-        triples,
+        pub_date: previous
+            .as_ref()
+            .map(|v| v.pub_date.clone())
+            .unwrap_or_else(|| pub_date.to_string()),
+        // Same rule one field over: a leg that cannot derive the URL (no
+        // `base_url` configured) must not erase one an earlier leg did.
+        manifest_url: manifest_url.or_else(|| previous.and_then(|v| v.manifest_url)),
+        triples: merged_triples,
     });
 
     // Newest first, and deterministic: two entries sharing a `pub_date` must
@@ -852,18 +878,34 @@ mod tests {
     }
 
     fn triple_entry(url: &str) -> BTreeMap<String, IndexTriple> {
+        one_triple("darwin-aarch64", url)
+    }
+
+    /// One platform leg's contribution — what a matrix job actually stages.
+    fn one_triple(triple: &str, url: &str) -> BTreeMap<String, IndexTriple> {
         let mut m = BTreeMap::new();
         m.insert(
-            "darwin-aarch64".to_string(),
+            triple.to_string(),
             IndexTriple {
                 url: url.to_string(),
-                platform: Some("darwin-aarch64".into()),
+                platform: Some(triple.to_string()),
                 filename: Some("yah.tar.gz".into()),
                 size_bytes: Some(42),
                 hash: Some("blake3:aa".into()),
             },
         );
         m
+    }
+
+    fn triples_of(json: &str, version: &str) -> Vec<String> {
+        let idx: ReleaseIndex = serde_json::from_str(json).unwrap();
+        idx.versions
+            .into_iter()
+            .find(|v| v.version == version)
+            .unwrap_or_else(|| panic!("version {version} missing from index"))
+            .triples
+            .into_keys()
+            .collect()
     }
 
     fn versions_of(json: &str) -> Vec<(String, String)> {
@@ -937,6 +979,149 @@ mod tests {
 
         let got: Vec<String> = versions_of(&c).into_iter().map(|(v, _)| v).collect();
         assert_eq!(got, vec!["0.8.22", "0.8.21", "0.8.20"]);
+    }
+
+    /// The regression pin for R330-T35's sliced-release case: a release matrix
+    /// publishes one platform per leg, and each leg's update carries only its
+    /// own triples. Before this, the last leg to finish took the version's whole
+    /// triples map and every earlier platform vanished.
+    #[test]
+    fn a_release_published_one_platform_at_a_time_accumulates_every_triple() {
+        let mac = merge_index(
+            None,
+            "yah",
+            "0.8.22",
+            "2026-08-12T00:00:00Z",
+            None,
+            one_triple("aarch64-apple-darwin", "https://cdn.yah.dev/mac"),
+        )
+        .unwrap();
+        let linux = merge_index(
+            Some(&mac),
+            "yah",
+            "0.8.22",
+            "2026-08-12T00:00:01Z",
+            None,
+            one_triple("x86_64-unknown-linux-musl", "https://cdn.yah.dev/linux"),
+        )
+        .unwrap();
+        let win = merge_index(
+            Some(&linux),
+            "yah",
+            "0.8.22",
+            "2026-08-12T00:00:02Z",
+            None,
+            one_triple("x86_64-pc-windows-msvc", "https://cdn.yah.dev/win"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            triples_of(&win, "0.8.22"),
+            vec![
+                "aarch64-apple-darwin".to_string(),
+                "x86_64-pc-windows-msvc".to_string(),
+                "x86_64-unknown-linux-musl".to_string(),
+            ],
+            "a later platform leg must not drop the triples earlier legs published"
+        );
+        assert_eq!(
+            versions_of(&win).len(),
+            1,
+            "the slices are one version, not three"
+        );
+    }
+
+    /// Slicing must not weaken invariant 1: a leg re-publishing a triple it
+    /// already wrote still updates that entry in place.
+    #[test]
+    fn re_publishing_one_slice_updates_that_triple_and_leaves_its_siblings() {
+        let mac = merge_index(
+            None,
+            "yah",
+            "0.8.22",
+            "2026-08-12T00:00:00Z",
+            None,
+            one_triple("aarch64-apple-darwin", "https://cdn.yah.dev/mac-v1"),
+        )
+        .unwrap();
+        let linux = merge_index(
+            Some(&mac),
+            "yah",
+            "0.8.22",
+            "2026-08-12T00:00:01Z",
+            None,
+            one_triple("x86_64-unknown-linux-musl", "https://cdn.yah.dev/linux"),
+        )
+        .unwrap();
+        // The mac leg failed its upload and retried.
+        let retried = merge_index(
+            Some(&linux),
+            "yah",
+            "0.8.22",
+            "2026-08-12T00:00:02Z",
+            None,
+            one_triple("aarch64-apple-darwin", "https://cdn.yah.dev/mac-v2"),
+        )
+        .unwrap();
+
+        let idx: ReleaseIndex = serde_json::from_str(&retried).unwrap();
+        let v = &idx.versions[0];
+        assert_eq!(v.triples["aarch64-apple-darwin"].url, "https://cdn.yah.dev/mac-v2");
+        assert_eq!(v.triples["x86_64-unknown-linux-musl"].url, "https://cdn.yah.dev/linux");
+        assert_eq!(
+            v.pub_date, "2026-08-12T00:00:00Z",
+            "a retried slice must not restamp the version"
+        );
+    }
+
+    /// Two versions releasing in the same window, their legs interleaved — the
+    /// shape `cas_merge_index`'s retry loop produces when concurrent publishers
+    /// serialise onto one object. Each merge sees the previous winner's bytes.
+    #[test]
+    fn interleaved_legs_of_two_versions_all_survive() {
+        let a1 = merge_index(None, "yah", "0.8.21", "2026-08-01T00:00:00Z", None,
+            one_triple("aarch64-apple-darwin", "https://cdn.yah.dev/21-mac")).unwrap();
+        let b1 = merge_index(Some(&a1), "yah", "0.8.22", "2026-08-12T00:00:00Z", None,
+            one_triple("aarch64-apple-darwin", "https://cdn.yah.dev/22-mac")).unwrap();
+        let a2 = merge_index(Some(&b1), "yah", "0.8.21", "2026-08-01T00:00:05Z", None,
+            one_triple("x86_64-unknown-linux-musl", "https://cdn.yah.dev/21-linux")).unwrap();
+        let b2 = merge_index(Some(&a2), "yah", "0.8.22", "2026-08-12T00:00:05Z", None,
+            one_triple("x86_64-unknown-linux-musl", "https://cdn.yah.dev/22-linux")).unwrap();
+
+        let got: Vec<String> = versions_of(&b2).into_iter().map(|(v, _)| v).collect();
+        assert_eq!(got, vec!["0.8.22", "0.8.21"]);
+        assert_eq!(triples_of(&b2, "0.8.21").len(), 2);
+        assert_eq!(triples_of(&b2, "0.8.22").len(), 2);
+    }
+
+    /// A leg with no `base_url` derives no `manifest_url`; it must not erase the
+    /// one a sibling leg derived. Same replace-or-append rule, one field over.
+    #[test]
+    fn a_slice_without_a_manifest_url_keeps_the_one_already_recorded() {
+        let with_url = merge_index(
+            None,
+            "yah",
+            "0.8.22",
+            "2026-08-12T00:00:00Z",
+            Some("https://cdn.yah.dev/yah/0.8.22/manifest.json".into()),
+            one_triple("aarch64-apple-darwin", "https://cdn.yah.dev/mac"),
+        )
+        .unwrap();
+        let without = merge_index(
+            Some(&with_url),
+            "yah",
+            "0.8.22",
+            "2026-08-12T00:00:01Z",
+            None,
+            one_triple("x86_64-unknown-linux-musl", "https://cdn.yah.dev/linux"),
+        )
+        .unwrap();
+
+        let idx: ReleaseIndex = serde_json::from_str(&without).unwrap();
+        assert_eq!(
+            idx.versions[0].manifest_url.as_deref(),
+            Some("https://cdn.yah.dev/yah/0.8.22/manifest.json")
+        );
     }
 
     #[test]

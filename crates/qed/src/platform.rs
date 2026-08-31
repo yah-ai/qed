@@ -528,11 +528,11 @@ pub fn arch_of(triple: &str) -> &str {
 /// requirement* — a candidate node must carry all of them.
 ///
 /// The fleet nodes are tagged in `.yah/infra/machines/*.toml` with
-/// `mesh_tags = ["tag:build-worker", "tag:qed", "tier:x86" | "tier:arm",
+/// `mesh_tags = ["tag:build-worker", "tag:qed", "arch:x86" | "arch:arm",
 /// "os:linux" | "os:darwin"]`, so an amd64 image build routes to
 /// `us-west-002` (x86) and an arm64 *Linux* build to the Pi5s — not to
 /// `us-west-015`, the fleet's only arm64 *Darwin* node, even though it also
-/// carries `tier:arm`. Before R631 this function derived the tag set from
+/// carries `arch:arm`. Before R631 this function derived the tag set from
 /// arch alone, so an `aarch64-apple-darwin` offload requested exactly the tag
 /// set the Pi5s already carry and a Linux node silently won a job it could
 /// never satisfy — the OS dimension is what tells the Pi5s and the Mac apart.
@@ -541,8 +541,8 @@ pub fn arch_of(triple: &str) -> &str {
 pub fn build_worker_mesh_tags(arch: &str, os: &str) -> Vec<String> {
     let os_tag = format!("os:{os}");
     let arch_tag = match arch {
-        "x86_64" | "x86" | "i686" | "amd64" => "tier:x86",
-        "aarch64" | "arm64" | "arm" => "tier:arm",
+        "x86_64" | "x86" | "i686" | "amd64" => "arch:x86",
+        "aarch64" | "arm64" | "arm" => "arch:arm",
         // Unknown arch: fall back to the build-worker pool without an arch pin
         // (still OS-pinned — a foreign OS can't be emulated the way an
         // unrecognized arch tier can); yubaba admission picks any build-worker
@@ -562,7 +562,7 @@ mod build_worker_tag_tests {
             build_worker_mesh_tags("x86_64", "linux"),
             vec![
                 "tag:build-worker".to_string(),
-                "tier:x86".to_string(),
+                "arch:x86".to_string(),
                 "os:linux".to_string()
             ]
         );
@@ -574,7 +574,7 @@ mod build_worker_tag_tests {
             build_worker_mesh_tags("aarch64", "linux"),
             vec![
                 "tag:build-worker".to_string(),
-                "tier:arm".to_string(),
+                "arch:arm".to_string(),
                 "os:linux".to_string()
             ]
         );

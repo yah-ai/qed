@@ -17,12 +17,12 @@
 //!
 //! ## Cells live in the fence info string
 //!
-//! ```text
+//! ````text
 //! ```bash cell=probe-identity assert host={{node}}
 //! test "$(whoami)@$(hostname)" = "yah@{{node}}"
 //! sudo -n true
 //! ```
-//! ```
+//! ````
 //!
 //! **`cell=<id>` is what makes a fence a cell at all.** A fence without it is an
 //! ordinary code block and renders exactly as it does today — which is most of
@@ -44,7 +44,49 @@
 //! | `if=<expr>` | The existing [`QedStep::if_cond`]. |
 //! | `secret` | R717-T2 capture opt-out. |
 //! | `host=<param\|name>` | R717-T5 — resolve `[connect].ssh` from `.yah/infra/machines/<name>.toml` and wrap the body in `ssh`. |
-//! | `manual` | R717-T11, blocked on R622. Parsed and **rejected** rather than silently ignored. |
+//! | `manual` | R717-T11 — lowers to [`StepKind::Manual`] (R622/W282). The cell is a **human's** gate; see below. |
+//!
+//! ## A manual cell is a human's gate
+//!
+//! `manual` turns the cell into W282's [`StepKind::Manual`]: the run parks, a
+//! form lands in the AnswerQueue, and the step advances only when a person says
+//! so (or when its `advance` condition starts passing on its own). The cell body
+//! carries the human's half in a **leading comment block**:
+//!
+//! ````text
+//! ```bash cell=kek-mint manual needs=kek-camp-exists if=!cells.kek-camp-exists.ok
+//! # Mint the camp KEK. Once, ever — a second mint orphans every secret
+//! # sealed under the first.
+//! #
+//! # advance: yah cloud secret kek fingerprint
+//! # checklist: Confirmed no camp KEK exists
+//! yah cloud secret kek init
+//! ```
+//! ````
+//!
+//! Everything above the first non-comment line is the human's brief: bare `#`
+//! prose becomes [`ManualConfig::prompt`], `# advance:` becomes
+//! [`ManualConfig::advance`], and each `# checklist:` an advisory checkbox.
+//! What is left below is [`ManualConfig::terminal`] — commands the form
+//! **prefills but never runs**. A cell that is all comment (W257's BIOS block:
+//! Secure Boot, USB-first boot order, restore-on-AC-loss) is the honest case
+//! where there is nothing to prefill and nothing to verify; `advance` is
+//! optional precisely for it, and a checklist that remembers whether you did it
+//! is the whole contribution there.
+//!
+//! **The rule that makes this worth having:** a manual cell declares a *human*
+//! actor, and an agent-initiated run parks on it rather than answering it.
+//! Agents can otherwise resolve forms — that is the standing approval path
+//! (`subagent.answer_ask`) — so without this an agent driving W257 sails
+//! straight through "go set restore-on-AC-power-loss in the BIOS". The
+//! enforcement is structural, not conventional: choosing [`StepKind::Manual`]
+//! here means the daemon's gate mints the form with `prefer = "human"`, and the
+//! daemon refuses an agent's submission of such a form outright.
+//!
+//! `assert`, `capture=` and `host=` are rejected on a manual cell — a step with
+//! no argv has no exit code to make a verdict of, no `$YAH_OUTPUTS` to read, and
+//! nothing to wrap in `ssh` (put the ssh in `advance:`, which is where the
+//! router-reservation cell wants it anyway).
 //!
 //! ## `needs=` is a constraint, not a scheduler
 //!
@@ -64,7 +106,7 @@
 //! One leading TOML fence tagged `notebook=<name>` carries params, binds, and
 //! the pipeline knobs. It must come before any cell.
 //!
-//! ```text
+//! ````text
 //! ```toml notebook=node-onboard
 //! [params]
 //! node = { required = true, description = "machine name, e.g. us-west-003" }
@@ -74,7 +116,7 @@
 //! path = "registration.hostkey_fingerprint"
 //! from = "identity-probe.outputs.fingerprint"
 //! ```
-//! ```
+//! ````
 //!
 //! Two defaults differ from a hand-written `.yah/qed/*.toml`, both settled in
 //! R717-S13 and both overridable from this fence:
@@ -97,7 +139,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::types::{
-    OnFail, OutputDecl, ParamDef, Pipeline, QedStep, StepKind, WorkspaceMode,
+    ManualConfig, OnFail, OutputDecl, ParamDef, Pipeline, QedStep, StepKind, WorkspaceMode,
 };
 
 /// Why a `.md` could not be read as a QED source. Every variant names the cell
@@ -143,11 +185,33 @@ pub enum DocSourceError {
     #[error("cell `{0}`: attribute `{1}` is a flag and takes no value")]
     AttributeTakesNoValue(String, String),
     #[error(
-        "cell `{0}`: `manual` cells are not lowered yet — R717-T11, blocked on R622 \
-         (StepKind::Manual). Rejected rather than ignored: silently running a cell whose whole \
-         point is to stop for a human is the one failure this must not have"
+        "cell `{0}`: a `manual` cell needs a prompt — the leading `# ` comment block of the body \
+         says what the human must accomplish. Without it the form is a bare Continue button, \
+         which asserts nothing"
     )]
-    ManualNotYetSupported(String),
+    ManualNeedsPrompt(String),
+    #[error("cell `{0}`: `# advance:` is empty — give it a command that proves the work was done, or drop the line (a manual cell may have no advance at all)")]
+    ManualBlankAdvance(String),
+    #[error("cell `{0}`: more than one `# advance:` line — a manual cell has exactly one condition (`{1}` then `{2}`)")]
+    ManualDuplicateAdvance(String, String, String),
+    #[error(
+        "cell `{0}`: `manual` and `assert` contradict each other — a manual step runs no argv, so \
+         there is no exit code to make a verdict of. What proves a manual cell was done is its \
+         `# advance:` line"
+    )]
+    ManualWithAssert(String),
+    #[error(
+        "cell `{0}`: `manual` and `capture={1}` contradict each other — a manual step runs no \
+         argv, so nothing ever writes $YAH_OUTPUTS. Capture the value in a following non-manual \
+         cell instead"
+    )]
+    ManualWithCapture(String, String),
+    #[error(
+        "cell `{0}`: `manual` and `host={1}` contradict each other — a manual step is a person at \
+         a keyboard on the qed host, not a remote command. Put the ssh in the cell's `# advance:` \
+         line, which is where a remote proof belongs"
+    )]
+    ManualWithHost(String, String),
     #[error("cell `{0}`: `host={1}` resolved to `{2}`, but there is no machine file at `{3}`")]
     UnknownHost(String, String, String, String),
     #[error("cell `{0}`: machine file `{1}` is not valid TOML: {2}")]
@@ -195,6 +259,32 @@ pub struct DocCell {
     /// `host=<param|name>`, **unsubstituted** — it may be `{{node}}`, which only
     /// the run's params can resolve.
     pub host: Option<String>,
+    /// `manual` — the human's half, lifted out of the body's leading comment
+    /// block (R717-T11). `Some` ⇒ this cell lowers to [`StepKind::Manual`] and
+    /// **no agent may answer it**; see the module docs.
+    pub manual: Option<ManualCell>,
+}
+
+/// A `manual` cell's brief, parsed out of the body's leading comment block and
+/// still **unsubstituted** (params are applied at lowering, in one pass with
+/// the rest of the cell).
+///
+/// Field-for-field a [`ManualConfig`] minus `advance_poll_secs`, which a doc
+/// has no reason to override — a park spans human time, so the 5s default is
+/// as good as any number an author would pick.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ManualCell {
+    /// The bare `# ` prose: what the human must accomplish.
+    pub prompt: String,
+    /// Everything below the comment block — commands the form prefills into
+    /// terminal tiles and **never runs**.
+    pub terminal: Vec<String>,
+    /// `# advance: <cmd>`, the condition that proves they did it. `None` for
+    /// the irreducible cases (a person at a box with no out-of-band access);
+    /// then the human's word is the only door.
+    pub advance: Option<String>,
+    /// `# checklist: <item>` lines. Advisory — they gate nothing.
+    pub checklist: Vec<String>,
 }
 
 /// A markdown document read as a QED source: doc-level config plus its cells,
@@ -405,6 +495,7 @@ impl DocSource {
                     .clone()
                     .unwrap_or_else(|| self.default_concurrency_key(params)),
             ),
+            max_parallel: None,
             placement: Default::default(),
             // R717-S13 Q1 — `live`, not the `Checkout` default. See the module docs.
             workspace: self.config.workspace.unwrap_or(WorkspaceMode::Live),
@@ -413,6 +504,8 @@ impl DocSource {
             toolchain: None,
             binds: self.config.binds.clone(),
             on_change: self.config.on_change.clone(),
+            alias_of: None,
+            pins: Default::default(),
             finally: Vec::new(),
         })
     }
@@ -432,6 +525,45 @@ impl DocSource {
         camp_root: &Path,
         params: &HashMap<String, String>,
     ) -> Result<QedStep, DocSourceError> {
+        // R717-T11: a `manual` cell is not a command at all — it lowers to
+        // W282's human gate, whose whole contract is that the runner parks
+        // instead of executing. `argv` MUST stay empty (`validate()` rejects a
+        // manual step that carries one), so this returns before the `bash -c`
+        // wrapping below rather than sharing it.
+        if let Some(m) = &cell.manual {
+            return Ok(QedStep {
+                name: cell.id.clone(),
+                argv: Vec::new(),
+                kind: StepKind::Manual,
+                manual: Some(ManualConfig {
+                    prompt: substitute_params(&m.prompt, params),
+                    terminal: m
+                        .terminal
+                        .iter()
+                        .map(|c| substitute_params(c, params))
+                        .collect(),
+                    advance: m.advance.as_ref().map(|a| substitute_params(a, params)),
+                    checklist: m
+                        .checklist
+                        .iter()
+                        .map(|c| substitute_params(c, params))
+                        .collect(),
+                    advance_poll_secs: crate::types::default_manual_advance_poll_secs(),
+                }),
+                // Always `Abort`, and deliberately not the `assert`/`show`
+                // choice the other cells make: a manual step only "fails" when
+                // the human declined it or its `advance` could not be
+                // satisfied, and continuing past a gate a person just refused
+                // is not a thing a runbook should be able to express. (`assert`
+                // is rejected on a manual cell for the same reason.)
+                on_fail: OnFail::Abort,
+                inputs: cell.inputs.clone(),
+                secret: cell.secret,
+                if_cond: cell.if_cond.clone(),
+                ..Default::default()
+            });
+        }
+
         // `set -eo pipefail` so a multi-line assert cell fails on the line that
         // actually failed rather than on whatever the last line happened to
         // return — the same prologue `crate::transform` gives an imported GHA
@@ -697,7 +829,9 @@ fn build_cell(
         if_cond: None,
         secret: false,
         host: None,
+        manual: None,
     };
+    let mut is_manual = false;
 
     let need_value = |a: &Attr| -> Result<String, DocSourceError> {
         a.value
@@ -730,10 +864,10 @@ fn build_cell(
             "needs" => cell.needs = split_list(&need_value(attr)?),
             "if" => cell.if_cond = Some(need_value(attr)?),
             "host" => cell.host = Some(need_value(attr)?),
-            // Parsed and REJECTED, not ignored. A manual cell's whole purpose is
-            // to stop for a human; running it because the lowering isn't built
-            // yet is the one failure mode this feature must not have.
-            "manual" => return Err(DocSourceError::ManualNotYetSupported(id)),
+            "manual" => {
+                no_value(attr)?;
+                is_manual = true;
+            }
             other => {
                 return Err(DocSourceError::UnknownAttribute(
                     id,
@@ -742,7 +876,85 @@ fn build_cell(
             }
         }
     }
+
+    if is_manual {
+        // Checked here rather than in `validate_cells` so the contradiction is
+        // reported before the body parse, which would otherwise complain about
+        // whatever the author wrote under a `host=` they thought was running.
+        if cell.assert {
+            return Err(DocSourceError::ManualWithAssert(id));
+        }
+        if !cell.capture.is_empty() {
+            return Err(DocSourceError::ManualWithCapture(id, cell.capture.join(",")));
+        }
+        if let Some(host) = &cell.host {
+            return Err(DocSourceError::ManualWithHost(id.clone(), host.clone()));
+        }
+        cell.manual = Some(parse_manual_body(&id, &cell.body)?);
+    }
     Ok(cell)
+}
+
+/// Lift a `manual` cell's brief out of its body (R717-T11).
+///
+/// The **leading** run of blank and `#` lines is the human's half; the first
+/// line that is neither ends it, and everything from there down is
+/// [`ManualCell::terminal`]. Anchoring on the leading block rather than
+/// scanning the whole body is what lets an ordinary shell comment stay an
+/// ordinary shell comment once the commands start.
+fn parse_manual_body(id: &str, body: &str) -> Result<ManualCell, DocSourceError> {
+    let mut out = ManualCell::default();
+    let mut prompt_lines: Vec<&str> = Vec::new();
+    let mut in_header = true;
+
+    for line in body.lines() {
+        let trimmed = line.trim();
+        if in_header {
+            if trimmed.is_empty() {
+                // A blank line inside the block is a paragraph break — but a
+                // leading one is just the fence's own newline.
+                if !prompt_lines.is_empty() {
+                    prompt_lines.push("");
+                }
+                continue;
+            }
+            if let Some(rest) = trimmed.strip_prefix('#') {
+                let rest = rest.trim();
+                if let Some(cond) = rest.strip_prefix("advance:") {
+                    let cond = cond.trim();
+                    if cond.is_empty() {
+                        return Err(DocSourceError::ManualBlankAdvance(id.to_string()));
+                    }
+                    if let Some(first) = &out.advance {
+                        return Err(DocSourceError::ManualDuplicateAdvance(
+                            id.to_string(),
+                            first.clone(),
+                            cond.to_string(),
+                        ));
+                    }
+                    out.advance = Some(cond.to_string());
+                } else if let Some(item) = rest.strip_prefix("checklist:") {
+                    let item = item.trim();
+                    if !item.is_empty() {
+                        out.checklist.push(item.to_string());
+                    }
+                } else {
+                    prompt_lines.push(rest);
+                }
+                continue;
+            }
+            in_header = false;
+        }
+        if !trimmed.is_empty() {
+            out.terminal.push(trimmed.to_string());
+        }
+    }
+
+    out.prompt = prompt_lines.join("\n").trim().to_string();
+    if out.prompt.is_empty() {
+        return Err(DocSourceError::ManualNeedsPrompt(id.to_string()));
+    }
+    Ok(out)
 }
 
 fn split_list(value: &str) -> Vec<String> {
@@ -1197,13 +1409,162 @@ yah cloud secret kek export --out "$RUNDIR/cluster.kek"
         );
     }
 
+    // ── R717-T11 (W296): manual cells ────────────────────────────────────────
+
+    /// W296's kek-mint cell, verbatim in shape: prose, an `advance:`, a
+    /// checklist, and one command that is *prefill*, never run.
+    const MANUAL_DOC: &str = r#"
+```toml notebook=node-onboard
+[params]
+node = { required = true }
+```
+
+```bash cell=kek-mint manual if=!cells.kek-camp-exists.ok
+# Mint the camp KEK for {{node}}. Once, ever — a second mint orphans
+# every secret sealed under the first.
+#
+# advance: yah cloud secret kek fingerprint
+# checklist: Confirmed no camp KEK exists
+# checklist: Backup location decided
+yah cloud secret kek init
+```
+
+### 0x·1–4 — BIOS
+
+```bash cell=bios manual
+# At the box, with a keyboard and a monitor, in BIOS setup:
+# checklist: Secure Boot disabled
+# checklist: USB first in the boot order
+# checklist: Restore-on-AC-power-loss = On
+```
+"#;
+
     #[test]
-    fn a_manual_cell_is_rejected_rather_than_run() {
-        let md = "```toml notebook=n\n```\n\n```bash cell=bios manual\ntrue\n```\n";
+    fn a_manual_cell_lifts_its_brief_out_of_the_leading_comment_block() {
+        let doc = parse_doc("W257.md", MANUAL_DOC).unwrap();
+        let m = doc.cell("kek-mint").unwrap().manual.as_ref().unwrap();
+
+        assert_eq!(
+            m.prompt,
+            "Mint the camp KEK for {{node}}. Once, ever — a second mint orphans\n\
+             every secret sealed under the first.",
+            "bare `# ` prose is the prompt, and it is NOT substituted at parse time"
+        );
+        assert_eq!(m.advance.as_deref(), Some("yah cloud secret kek fingerprint"));
+        assert_eq!(
+            m.checklist,
+            vec!["Confirmed no camp KEK exists", "Backup location decided"]
+        );
+        assert_eq!(
+            m.terminal,
+            vec!["yah cloud secret kek init"],
+            "what is left below the comment block is PREFILL, not something the runner executes"
+        );
+    }
+
+    /// W257's BIOS block is the case `advance` exists to be optional for: a
+    /// person at the box, no out-of-band access, nothing to verify.
+    #[test]
+    fn a_manual_cell_may_have_no_advance_and_no_commands() {
+        let doc = parse_doc("W257.md", MANUAL_DOC).unwrap();
+        let m = doc.cell("bios").unwrap().manual.as_ref().unwrap();
+        assert!(m.advance.is_none(), "advance must be optional");
+        assert!(m.terminal.is_empty());
+        assert_eq!(m.checklist.len(), 3, "the checklist is the whole contribution here");
+        assert!(m.prompt.starts_with("At the box"));
+    }
+
+    /// The T11 verify, first half: a manual cell lowers to W282's human gate —
+    /// no argv, `kind = manual`, and it validates through the normal step rules.
+    #[test]
+    fn a_manual_cell_lowers_to_a_step_kind_manual_gate() {
+        let camp = machine_camp();
+        let doc = parse_doc("W257.md", MANUAL_DOC).unwrap();
+        let p = doc
+            .lower(camp.path(), &params(&[("node", "us-west-003")]), None)
+            .unwrap();
+
+        let kek = &p.steps[0];
+        assert_eq!(kek.kind, StepKind::Manual);
+        assert!(
+            kek.argv.is_empty(),
+            "a manual step MUST carry no argv — the runner parks, it does not execute"
+        );
+        assert!(matches!(kek.on_fail, OnFail::Abort), "you cannot continue past a refused gate");
+        assert_eq!(kek.if_cond.as_deref(), Some("!cells.kek-camp-exists.ok"));
+
+        let cfg = kek.manual.as_ref().unwrap();
+        assert!(
+            cfg.prompt.starts_with("Mint the camp KEK for us-west-003."),
+            "params reach the prompt at lowering, one pass with the rest of the cell: {}",
+            cfg.prompt
+        );
+        assert_eq!(cfg.terminal, vec!["yah cloud secret kek init"]);
+        assert_eq!(cfg.advance.as_deref(), Some("yah cloud secret kek fingerprint"));
+        assert_eq!(cfg.advance_poll_secs, 5);
+
+        assert!(p.steps[1].manual.as_ref().unwrap().advance.is_none());
+        assert!(
+            p.steps.iter().all(|s| s.validate().is_ok()),
+            "and both validate through R622's own step rules"
+        );
+    }
+
+    #[test]
+    fn a_manual_cell_with_no_prompt_is_rejected() {
+        let md = "```toml notebook=n\n```\n\n```bash cell=bios manual\n# advance: true\n```\n";
         assert!(matches!(
             parse_doc("d.md", md),
-            Err(DocSourceError::ManualNotYetSupported(_))
+            Err(DocSourceError::ManualNeedsPrompt(_))
         ));
+    }
+
+    #[test]
+    fn manual_contradictions_are_rejected_at_parse() {
+        let cases: Vec<(&str, fn(&DocSourceError) -> bool)> = vec![
+            (
+                "```bash cell=a manual assert\n# do it\n```",
+                |e| matches!(e, DocSourceError::ManualWithAssert(_)),
+            ),
+            (
+                "```bash cell=a manual capture=fp\n# do it\n```",
+                |e| matches!(e, DocSourceError::ManualWithCapture(_, _)),
+            ),
+            (
+                "```bash cell=a manual host=us-west-003\n# do it\n```",
+                |e| matches!(e, DocSourceError::ManualWithHost(_, _)),
+            ),
+            (
+                "```bash cell=a manual\n# do it\n# advance:\n```",
+                |e| matches!(e, DocSourceError::ManualBlankAdvance(_)),
+            ),
+            (
+                "```bash cell=a manual\n# do it\n# advance: x\n# advance: y\n```",
+                |e| matches!(e, DocSourceError::ManualDuplicateAdvance(_, _, _)),
+            ),
+        ];
+        for (fence, want) in cases {
+            let md = format!("```toml notebook=n\n```\n\n{fence}\n");
+            let err = parse_doc("d.md", &md).unwrap_err();
+            assert!(want(&err), "wrong error for `{fence}`: {err}");
+        }
+    }
+
+    /// A `#` line *below* the commands is an ordinary shell comment and stays
+    /// one — the brief is the LEADING block, not every comment in the body.
+    #[test]
+    fn only_the_leading_comment_block_is_the_brief() {
+        let md = "```toml notebook=n\n```\n\n\
+                  ```bash cell=a manual\n# Do the thing.\nfirst --cmd\n\
+                  # advance: not-a-directive\nsecond --cmd\n```\n";
+        let doc = parse_doc("d.md", md).unwrap();
+        let m = doc.cell("a").unwrap().manual.as_ref().unwrap();
+        assert_eq!(m.prompt, "Do the thing.");
+        assert!(m.advance.is_none(), "a directive below the block is just shell prose");
+        assert_eq!(
+            m.terminal,
+            vec!["first --cmd", "# advance: not-a-directive", "second --cmd"]
+        );
     }
 
     #[test]

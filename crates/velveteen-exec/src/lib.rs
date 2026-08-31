@@ -20,6 +20,7 @@
 //! - **integration-forge**: N-workload stand-up scoped to a test or flow
 //!   (R094-F4).
 
+pub mod admission;
 pub mod default_image;
 pub mod executor;
 pub mod integration;
@@ -39,6 +40,7 @@ pub use integration::{
     ClusterClient, IntegrationForgeDriver, IntegrationForgeError, IntegrationRunHandle,
 };
 pub use list::{ForgeListFilter, forge_list};
+pub use admission::{RecipeAdmission, envelope_for_recipe_step, grant_for_recipe_step};
 pub use local::LocalForgeDriver;
 pub use meta::ForgeMeta;
 pub use remote::{ForgeRunHandle, RemoteForgeDriver, RemoteForgeError, WardenClient};

@@ -25,12 +25,29 @@
 //! @arch:see(.yah/docs/working/W235-remote-qed.md)
 //! @yah:depends_on(R555)
 //! @yah:depends_on(R572)
+//!
+//! R605-F2: [`QedImageBuilder::with_remote`] adds the fleet-dispatch half this
+//! module's own doc used to call "phase C" — a slug opts in per-camp via the
+//! W200 overlay (`config.remote = true` under `.yah/qed/gha-actions.toml` or
+//! the per-machine override), and `do_build_push` then routes through the
+//! SAME [`velveteen::ForgeCommand::BuildImage`] + [`RemoteForgeDriver`] +
+//! [`BuildContextPublisher`] substrate the native `build-image` step kind
+//! (`runner::execute_step_build_image_remote`) already uses successfully —
+//! not a second builder. Left unset, behavior is byte-identical to before:
+//! local `docker buildx build` on the qed host.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
 use indexmap::IndexMap;
+use task_runs::Initiator;
+use velveteen::{ForgeCommand, ForgeSpec, ForgeStatus, MeshAccess, TaskLocation, TaskPlacement, TaskRuntime};
+use velveteen_exec::RemoteForgeDriver;
+use workload_spec::TierTag;
 use yah_qed_gha::{ImageBuildCall, ImageBuilder, StepConclusion, ToolkitOutcome, Value};
+
+use crate::build_context::BuildContextPublisher;
 
 /// Injected image builder for the docker push family. Holds the per-slug
 /// overlay config (registry route + auth) and the resolved secrets context.
@@ -47,19 +64,97 @@ pub struct QedImageBuilder {
     /// `${{ secrets.X }}` against) — used to resolve `registry_auth`'s
     /// `password_secret` for a redirected push target.
     secrets: Value,
+    /// R605-F2 fleet-dispatch handles, wired via [`Self::with_remote`]. All
+    /// three are `None` (the default from [`Self::new`]) until a caller opts
+    /// in; `do_build_push` falls back to local `docker buildx` whenever any
+    /// is missing, even if a slug's overlay `config.remote = true` — a
+    /// dangling opt-in with nothing wired to serve it fails loudly instead of
+    /// silently building local, matching [`crate::build_context::NoBuildContextPublisher`]'s
+    /// philosophy.
+    tokio_handle: Option<tokio::runtime::Handle>,
+    remote_driver: Option<Arc<RemoteForgeDriver>>,
+    build_context_publisher: Option<Arc<dyn BuildContextPublisher>>,
 }
 
 impl QedImageBuilder {
     /// Build from the camp workspace: loads the W200 overlay(s) and captures the
-    /// resolved secrets context.
+    /// resolved secrets context. Local-only until [`Self::with_remote`] is
+    /// also applied.
     pub fn new(workspace: &Path, secrets: Value) -> Self {
         let configs = load_overlay_configs(workspace);
-        Self { configs, secrets }
+        Self {
+            configs,
+            secrets,
+            tokio_handle: None,
+            remote_driver: None,
+            build_context_publisher: None,
+        }
+    }
+
+    /// Wire the fleet-dispatch substrate (R605-F2). `tokio_handle` must be
+    /// captured with [`tokio::runtime::Handle::current`] *before* crossing
+    /// into the `spawn_blocking` closure the qed-gha runtime executes in —
+    /// `do_build_push` is a synchronous [`ImageBuilder::handle`] call, so it
+    /// bridges into the async `driver.start(..).await` / `publisher.publish(..).await`
+    /// calls via `tokio_handle.block_on(..)`, the standard sync-from-blocking-pool
+    /// pattern. `remote_driver` / `build_context_publisher` are typically the
+    /// same `Option<Arc<_>>` fields a [`crate::runner::PipelineRunner`] already
+    /// carries for the native build-image path — pass them through unchanged
+    /// rather than standing up a second copy.
+    pub fn with_remote(
+        mut self,
+        tokio_handle: tokio::runtime::Handle,
+        remote_driver: Option<Arc<RemoteForgeDriver>>,
+        build_context_publisher: Option<Arc<dyn BuildContextPublisher>>,
+    ) -> Self {
+        self.tokio_handle = Some(tokio_handle);
+        self.remote_driver = remote_driver;
+        self.build_context_publisher = build_context_publisher;
+        self
     }
 
     fn config_for(&self, slug: &str) -> &Value {
         self.configs.get(slug).unwrap_or(&NULL_CONFIG_SENTINEL)
     }
+}
+
+/// Which fleet tier/arch a `config.remote = true` slug wants (R605-F2). Parsed
+/// out of the same per-slug overlay `config` blob `apply_registry_route` and
+/// friends already read — `registry_route` says where the bytes land,
+/// `remote` + `tier` + `arch` say where the build itself runs.
+struct RemoteBuildTarget {
+    /// `TaskLocation::RemoteAny.tier` — defaults to `"infra"`, the tier
+    /// `execute_step_build_image_remote` already routes catalog builds to.
+    tier: String,
+    /// Feeds [`crate::platform::build_worker_mesh_tags`] — defaults to
+    /// `"x86_64"`, the only arch the current build-worker pool
+    /// (us-west-002/003, `.yah/infra/machines/`) actually carries.
+    arch: String,
+}
+
+/// `config.remote = true` under a slug's overlay entry opts that slug into
+/// fleet dispatch. `false`/absent (the default) keeps today's local-only
+/// behavior — a build-worker's presence and, more to the point, its registry
+/// push credentials are not guaranteed on every host running `yah qed run`,
+/// so this is an explicit per-camp/per-machine choice, not an autodetect.
+fn remote_build_requested(config: &Value) -> Option<RemoteBuildTarget> {
+    let Value::Object(cfg) = config else {
+        return None;
+    };
+    if !cfg.get("remote").map(|v| v.is_truthy()).unwrap_or(false) {
+        return None;
+    }
+    let tier = cfg
+        .get("tier")
+        .map(|v| v.as_str_lossy())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "infra".to_string());
+    let arch = cfg
+        .get("arch")
+        .map(|v| v.as_str_lossy())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "x86_64".to_string());
+    Some(RemoteBuildTarget { tier, arch })
 }
 
 // A shared empty config for slugs with no overlay entry. `Value` isn't `const`-
@@ -158,6 +253,12 @@ impl QedImageBuilder {
         }
         let build_args = collect_build_args(with, config);
 
+        if let Some(target) = remote_build_requested(config) {
+            return self.do_build_push_remote(
+                call, &context, file.as_deref(), push, load, &platforms, &tags, &build_args, target,
+            );
+        }
+
         let metadata_dir =
             tempfile::tempdir().map_err(|e| format!("docker/build-push-action: tempdir: {e}"))?;
         let metadata_path = metadata_dir.path().join("metadata.json");
@@ -230,6 +331,176 @@ impl QedImageBuilder {
                 "docker/build-push-action: tags=[{}] push={push} platforms={}\n{stdout}\n{stderr}",
                 tags.join(", "),
                 platforms.unwrap_or_else(|| "(host)".into()),
+            ),
+            conclusion,
+        })
+    }
+
+    /// `docker/build-push-action`, fleet leg (R605-F2): pack the context,
+    /// publish it, and dispatch a `ForgeCommand::BuildImage` to an
+    /// arch-matched build-worker instead of shelling `docker buildx` on this
+    /// host — the same request shape `runner::execute_step_build_image_remote`
+    /// sends for a native `build-image` pipeline step.
+    ///
+    /// `push`/`load` and `platforms` (buildkit's `--opt platform=<csv>`, which
+    /// — like a real GHA `ubuntu-latest` runner's qemu-backed buildx — builds
+    /// every requested arch in one dispatch to one worker) pass straight
+    /// through, so a multi-arch `linux/amd64,linux/arm64` build-push-action
+    /// step needs no change on the workflow side to go remote.
+    ///
+    /// Does NOT resolve `outputs.digest`/`outputs.imageid`: unlike local
+    /// `docker buildx --metadata-file`, nothing today streams a remote
+    /// workload's files back to the qed daemon (R555-F6's "logs stream to
+    /// QED/task pane" is still open, gated on R729's server-side log
+    /// streaming) — so those two evaluate empty for a remote build, same as
+    /// any other unset GHA step output. A cosign-sign step keyed on the
+    /// digest needs that wired first; this ticket's own verify criterion
+    /// (build + push lands in the registry) does not depend on it.
+    #[allow(clippy::too_many_arguments)]
+    fn do_build_push_remote(
+        &self,
+        call: &ImageBuildCall<'_>,
+        context_rel: &str,
+        file: Option<&str>,
+        push: bool,
+        load: bool,
+        platforms_raw: &Option<String>,
+        tags: &[String],
+        build_args: &IndexMap<String, String>,
+        target: RemoteBuildTarget,
+    ) -> Result<ToolkitOutcome, String> {
+        let (Some(tokio_handle), Some(driver), Some(publisher)) = (
+            self.tokio_handle.clone(),
+            self.remote_driver.clone(),
+            self.build_context_publisher.clone(),
+        ) else {
+            return Err(format!(
+                "docker/build-push-action: overlay sets config.remote = true for `{}` but this \
+                 runner has no fleet dispatch wired (RemoteForgeDriver / BuildContextPublisher) — \
+                 the `yah` CLI wires both when the camp has fleet config; a bare qed-runner \
+                 embedding needs QedImageBuilder::with_remote",
+                call.slug
+            ));
+        };
+
+        let context_dir = call.workspace.join(context_rel);
+        let dockerfile_path = match file {
+            Some(f) => call.workspace.join(f),
+            None => context_dir.join("Dockerfile"),
+        };
+        let (dockerfile_basename, extra) = match dockerfile_path.strip_prefix(&context_dir) {
+            // The common case (release.yml's three image jobs): the Dockerfile
+            // already lives inside the context, so it travels in the packed
+            // tar for free — no extra entry needed.
+            Ok(rel) => (rel.to_string_lossy().to_string(), Vec::new()),
+            // A Dockerfile outside the context (the catalog build-image path's
+            // shape, `.yah/cache/buildkit/<name>.Dockerfile`) has to be
+            // injected as an extra tar entry at the root, same as
+            // `runner::publish_build_context`.
+            Err(_) => {
+                let name = dockerfile_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_else(|| "Dockerfile".to_string());
+                let bytes = std::fs::read(&dockerfile_path).map_err(|e| {
+                    format!(
+                        "docker/build-push-action: reading {}: {e}",
+                        dockerfile_path.display()
+                    )
+                })?;
+                (name.clone(), vec![(name, bytes)])
+            }
+        };
+
+        let tarball = crate::build_context::pack_context(&context_dir, &extra).map_err(|e| e.to_string())?;
+        let context_kib = tarball.len() / 1024;
+
+        let platforms: Vec<String> = platforms_raw
+            .as_deref()
+            .map(|p| p.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+            .unwrap_or_default();
+        let mesh_tags = crate::platform::build_worker_mesh_tags(&target.arch, "linux");
+        let tier_for_log = target.tier.clone();
+        let arch_for_log = target.arch.clone();
+        let forge_key = crate::runner::tag_to_filename(&format!(
+            "gha-{}-{}",
+            tags.first().map(String::as_str).unwrap_or(call.slug),
+            uuid::Uuid::new_v4(),
+        ));
+        let spec_build_args: Vec<(String, String)> =
+            build_args.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        let tags_owned = tags.to_vec();
+        let label = format!("gha:{}", call.slug);
+        let forge_key_for_dispatch = forge_key.clone();
+
+        let outcome: Result<(), String> = tokio_handle.block_on(async move {
+            let context_url = publisher
+                .publish(&forge_key_for_dispatch, tarball)
+                .await
+                .map_err(|e| e.to_string())?;
+            let spec = ForgeSpec {
+                command: ForgeCommand::BuildImage {
+                    dockerfile: PathBuf::from(&dockerfile_basename),
+                    context: context_dir,
+                    context_url: Some(context_url),
+                    tags: tags_owned,
+                    platforms,
+                    build_args: spec_build_args,
+                    push,
+                    load,
+                },
+                where_: TaskPlacement::new(
+                    TaskLocation::RemoteAny {
+                        tier: TierTag(target.tier),
+                        mesh_tags,
+                    },
+                    TaskRuntime::Container,
+                ),
+                timeout: None,
+                label: Some(label),
+                initiator: Initiator::Human { camp: "qed".into() },
+                mesh_access: MeshAccess::None,
+            };
+
+            let result = match driver.start(spec).await {
+                Err(e) => Err(e.to_string()),
+                Ok(handle) => match handle.wait().await {
+                    ForgeStatus::Done { exit_code: 0, .. } => Ok(()),
+                    ForgeStatus::Done { exit_code, .. } => {
+                        Err(format!("buildkit exited with code {exit_code}"))
+                    }
+                    ForgeStatus::TimedOut { .. } => Err("remote build-image timed out".to_string()),
+                    ForgeStatus::Killed { signal, .. } => {
+                        Err(format!("buildkit killed by signal {signal}"))
+                    }
+                    ForgeStatus::Lost { reason } => Err(format!("buildkit lost: {reason}")),
+                    ForgeStatus::Pending | ForgeStatus::Running => {
+                        unreachable!("ForgeRunHandle::wait returns a terminal status")
+                    }
+                },
+            };
+            // Drop the uploaded context on BOTH legs, same reasoning as
+            // runner::execute_step_build_image_remote: a failed build is
+            // exactly when an operator re-runs, and every re-run uploads a
+            // fresh key, so skipping cleanup on failure just accumulates
+            // copies nobody will ever look at again.
+            publisher.discard(&forge_key_for_dispatch).await;
+            result
+        });
+
+        let conclusion = if outcome.is_ok() {
+            StepConclusion::Success
+        } else {
+            StepConclusion::Failure
+        };
+        let detail = outcome.err().unwrap_or_else(|| "ok".to_string());
+        Ok(ToolkitOutcome {
+            outputs: IndexMap::new(),
+            log: format!(
+                "docker/build-push-action (remote build-worker tier={tier_for_log} arch={arch_for_log}): \
+                 tags=[{}] push={push} platforms={} context={context_kib}KiB forge_key={forge_key}\n{detail}",
+                tags.join(", "),
+                platforms_raw.as_deref().unwrap_or("(worker default)"),
             ),
             conclusion,
         })
@@ -537,6 +808,66 @@ mod tests {
         assert_eq!(
             args.get("RUST_BASE").map(String::as_str),
             Some("ghcr.io/yah-ai/yah-rust:smoke-abc")
+        );
+    }
+
+    #[test]
+    fn remote_not_requested_by_default() {
+        assert!(remote_build_requested(&Value::object()).is_none());
+        let cfg = obj(&[("remote", Value::Bool(false))]);
+        assert!(remote_build_requested(&cfg).is_none());
+    }
+
+    #[test]
+    fn remote_config_parses_defaults_and_overrides() {
+        let cfg = obj(&[("remote", Value::Bool(true))]);
+        let t = remote_build_requested(&cfg).expect("remote requested");
+        assert_eq!(t.tier, "infra");
+        assert_eq!(t.arch, "x86_64");
+
+        let cfg2 = obj(&[
+            ("remote", Value::Bool(true)),
+            ("tier", Value::String("build".into())),
+            ("arch", Value::String("aarch64".into())),
+        ]);
+        let t2 = remote_build_requested(&cfg2).expect("remote requested");
+        assert_eq!(t2.tier, "build");
+        assert_eq!(t2.arch, "aarch64");
+    }
+
+    // R605-F2: a slug opted into `config.remote = true` with nothing wired to
+    // serve it must fail loudly, not silently fall back to local docker
+    // buildx — a dev who set the overlay flag and forgot `with_remote` should
+    // see why nothing built remotely, not a build that quietly ran local.
+    #[test]
+    fn remote_opt_in_without_wiring_fails_loudly_not_silently_local() {
+        let mut configs = IndexMap::new();
+        configs.insert(
+            "docker/build-push-action".to_string(),
+            obj(&[("remote", Value::Bool(true))]),
+        );
+        let builder = QedImageBuilder {
+            configs,
+            secrets: Value::object(),
+            tokio_handle: None,
+            remote_driver: None,
+            build_context_publisher: None,
+        };
+        let mut with = IndexMap::new();
+        with.insert("tags".to_string(), Value::String("ghcr.io/yah-ai/x:1".into()));
+        with.insert("context".to_string(), Value::String(".".into()));
+        with.insert("push".to_string(), Value::Bool(false));
+        let env = IndexMap::new();
+        let call = ImageBuildCall {
+            slug: "docker/build-push-action",
+            with: &with,
+            env: &env,
+            workspace: Path::new("."),
+        };
+        let err = builder.handle(&call).expect_err("no fleet dispatch wired");
+        assert!(
+            err.contains("with_remote"),
+            "expected the no-wiring guard message, got: {err}"
         );
     }
 

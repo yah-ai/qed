@@ -60,6 +60,104 @@ pub struct TransformRecipe {
     pub image: ImageRef,
     #[serde(default)]
     pub steps: Vec<RecipeStep>,
+    /// `[admission]` — the signature a signed recipe carries to kamaji's
+    /// admission gate (R555-F4 / W235 §(c)). Absent on an unsigned recipe,
+    /// which stays legal: a node running the default `permissive` policy admits
+    /// it, and one running `required` refuses it. See
+    /// [`crate::admission`] for what the signature covers and why the grant
+    /// document is derived rather than stored here.
+    #[serde(default)]
+    pub admission: Option<crate::admission::RecipeAdmission>,
+    /// `[[secrets]]` — the vault credentials this recipe needs on the worker
+    /// (R555-F5 / W235 §(c)). Empty on every recipe in the tree today, and
+    /// empty means the run can read nothing: the derived admission grant
+    /// enumerates exactly these, and a node refuses a dispatched spec that
+    /// mounts anything else.
+    #[serde(default)]
+    pub secrets: Vec<RecipeSecret>,
+}
+
+/// One vault credential a recipe declares.
+///
+/// ```toml
+/// [[secrets]]
+/// cluster = "r2-write"          # cluster secret name
+/// path    = "/run/yah/r2.json"  # absolute path inside the container
+/// mode    = "0400"              # optional, octal, defaults to 0400
+/// ```
+///
+/// # Why cluster-only, and why file-only
+///
+/// [`SecretRef::LocalFile`](workload_spec::SecretRef::LocalFile) names a file in
+/// the per-machine store, which carries no access rule at all — naming it is the
+/// whole authorization. That is the ambient grant W235 §(c) exists to replace,
+/// so a recipe cannot ask for one. A cluster secret carries a
+/// [`SecretAccess`](workload_spec::secrets::SecretAccess) rule evaluated on the
+/// node at mount time, which is what makes the grant *two-sided*: the recipe
+/// author signs for what the build may read, and the secret's owner
+/// independently names which recipe may read it.
+///
+/// File-only for the reason
+/// [`SecretTarget`](workload_spec::SecretTarget) already gives: an env var leaks
+/// through the subprocess environment and every log dump of it. Admission
+/// refuses an env-target secret outright.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RecipeSecret {
+    /// Cluster secret name, as `yah cloud secret put` stored it.
+    pub cluster: String,
+    /// Absolute path the value is mounted at inside the container.
+    pub path: PathBuf,
+    /// Octal file mode, as a string (TOML has no octal literal, and `0400`
+    /// written bare is not a valid TOML integer).
+    #[serde(default = "default_secret_mode", deserialize_with = "deserialize_octal_mode")]
+    pub mode: u32,
+}
+
+/// Owner-read-only. A build that needs a credential does not need to hand it to
+/// every uid in the container.
+fn default_secret_mode() -> u32 {
+    0o400
+}
+
+fn deserialize_octal_mode<'de, D>(de: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = String::deserialize(de)?;
+    u32::from_str_radix(raw.trim_start_matches("0o"), 8).map_err(|_| {
+        serde::de::Error::custom(format!(
+            "mode {raw:?} is not an octal file mode — write it as a string, e.g. \"0400\""
+        ))
+    })
+}
+
+impl RecipeSecret {
+    /// The admission-grant entry this declaration authorizes.
+    pub fn to_grant(&self) -> workload_spec::admission::GrantSecret {
+        workload_spec::admission::GrantSecret {
+            source: workload_spec::SecretRef::Cluster {
+                name: self.cluster.clone(),
+            },
+            path: self.path.clone(),
+            mode: self.mode,
+        }
+    }
+
+    /// The mount the dispatcher puts on the workload spec. Exactly the thing
+    /// [`RecipeSecret::to_grant`] describes — one constructor each way, so the
+    /// pair cannot drift into a grant that does not cover its own mount.
+    pub fn to_mount(&self) -> workload_spec::SecretMount {
+        workload_spec::SecretMount {
+            source: workload_spec::SecretRef::Cluster {
+                name: self.cluster.clone(),
+            },
+            target: workload_spec::SecretTarget::File {
+                path: self.path.clone(),
+                mode: self.mode,
+            },
+        }
+    }
 }
 
 /// Where + how a recipe step runs.
@@ -78,7 +176,7 @@ pub struct TransformRecipe {
 /// **`platform` is a LOCAL-only knob.** It asks the host's container runtime to
 /// emulate a foreign architecture; a remote run has no such host and selects
 /// architecture by scheduling instead — `location = { kind = "remote_any", …,
-/// mesh_tags = ["tier:x86"] }`. `RemoteForgeDriver` refuses a spec that carries
+/// mesh_tags = ["arch:x86"] }`. `RemoteForgeDriver` refuses a spec that carries
 /// a platform request rather than dropping it, because a silently-ignored
 /// `--platform` yields a wrong-arch artifact that only fails at link time.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
@@ -104,7 +202,7 @@ pub struct RecipePlacement {
 /// ```toml
 /// location = "local"
 /// location = { kind = "remote", node = "us-west-002" }
-/// location = { kind = "remote_any", tier = "infra", mesh_tags = ["tier:x86"] }
+/// location = { kind = "remote_any", tier = "infra", mesh_tags = ["arch:x86"] }
 /// ```
 ///
 /// The bare-string form is the pre-W235 spelling and stays valid for `local`
@@ -145,7 +243,7 @@ where
                      `location = \"local\"`, \
                      `location = {{ kind = \"remote\", node = \"<mesh-ident>\" }}`, \
                      `location = {{ kind = \"remote_any\", tier = \"<tier>\", \
-                     mesh_tags = [\"tier:x86\"] }}`. The remote variants carry a \
+                     mesh_tags = [\"arch:x86\"] }}`. The remote variants carry a \
                      payload, so the bare-string spelling can't express them."
                 ))),
             }
@@ -454,7 +552,7 @@ argv = ["true"]
     #[test]
     fn tagged_table_remote_any_carries_tier_and_mesh_tags() {
         let placement = load_placement(
-            "location = { kind = \"remote_any\", tier = \"infra\", mesh_tags = [\"tier:x86\"] }\n\
+            "location = { kind = \"remote_any\", tier = \"infra\", mesh_tags = [\"arch:x86\"] }\n\
              runtime = \"container\"",
         )
         .unwrap();
@@ -462,7 +560,7 @@ argv = ["true"]
             placement.location,
             RecipeLocation::RemoteAny {
                 tier: workload_spec::TierTag("infra".into()),
-                mesh_tags: vec!["tier:x86".to_string()],
+                mesh_tags: vec!["arch:x86".to_string()],
             }
         );
     }
@@ -657,5 +755,115 @@ argv = ["true"]
         params.insert("key".into(), "value".into());
         let resolved = substitute_argv(&template, &params);
         assert_eq!(resolved, vec!["value".to_string()]);
+    }
+
+    // ── [[secrets]] (R555-F5) ────────────────────────────────────────────────
+
+    fn recipe_with_secrets(block: &str) -> Result<TransformRecipe, toml::de::Error> {
+        toml::from_str(&format!(
+            r#"
+name  = "rusty-v8-musl"
+label = "Build rusty_v8 from source"
+image = "ghcr.io/yah-ai/b:v1@sha256:{HASH_64}"
+
+[placement]
+location = {{ kind = "remote_any", tier = "infra", mesh_tags = ["tier:x86"] }}
+runtime  = "container"
+
+[[steps]]
+name    = "build"
+argv    = ["build-v8.sh"]
+timeout = 9000
+{block}
+"#
+        ))
+    }
+
+    #[test]
+    fn a_recipe_declares_cluster_secrets_with_a_default_owner_only_mode() {
+        let r = recipe_with_secrets(
+            r#"
+[[secrets]]
+cluster = "r2-write"
+path    = "/run/yah/r2.json"
+"#,
+        )
+        .expect("secrets block parses");
+        assert_eq!(
+            r.secrets,
+            vec![RecipeSecret {
+                cluster: "r2-write".into(),
+                path: PathBuf::from("/run/yah/r2.json"),
+                mode: 0o400,
+            }]
+        );
+    }
+
+    #[test]
+    fn an_explicit_mode_is_read_as_octal() {
+        let r = recipe_with_secrets(
+            r#"
+[[secrets]]
+cluster = "r2-write"
+path    = "/run/yah/r2.json"
+mode    = "0440"
+"#,
+        )
+        .unwrap();
+        // The whole reason mode is a string: `0440` written bare is not a valid
+        // TOML integer, and `440` read as decimal would be mode 0o670.
+        assert_eq!(r.secrets[0].mode, 0o440);
+    }
+
+    #[test]
+    fn a_decimal_looking_mode_is_still_octal_and_a_bad_one_is_an_error() {
+        let err = recipe_with_secrets(
+            r#"
+[[secrets]]
+cluster = "r2-write"
+path    = "/run/yah/r2.json"
+mode    = "0480"
+"#,
+        )
+        .expect_err("8 is not an octal digit");
+        assert!(err.to_string().contains("octal"), "{err}");
+    }
+
+    /// A per-machine `local_file` secret carries no access rule — naming it is
+    /// the whole authorization — so the recipe surface does not offer one, and
+    /// a typo reaching for it must not be silently dropped.
+    #[test]
+    fn a_recipe_cannot_reach_for_a_per_machine_file_secret() {
+        let err = recipe_with_secrets(
+            r#"
+[[secrets]]
+local_file = "/var/lib/yah/yubaba/secrets/r2"
+path       = "/run/yah/r2.json"
+"#,
+        )
+        .expect_err("local_file is not a recipe-declarable source");
+        assert!(err.to_string().contains("local_file"), "{err}");
+    }
+
+    #[test]
+    fn a_recipe_with_no_secrets_block_declares_none() {
+        let r: TransformRecipe = toml::from_str(&whisper_quantize_toml()).unwrap();
+        assert!(r.secrets.is_empty());
+    }
+
+    /// The paired constructors that keep the grant and the mount from drifting.
+    #[test]
+    fn the_grant_entry_and_the_mount_describe_the_same_credential() {
+        let s = RecipeSecret {
+            cluster: "r2-write".into(),
+            path: PathBuf::from("/run/yah/r2.json"),
+            mode: 0o400,
+        };
+        let grant = s.to_grant();
+        let mount = s.to_mount();
+        assert_eq!(
+            workload_spec::admission::GrantSecret::of_mount(&mount),
+            Some(grant)
+        );
     }
 }

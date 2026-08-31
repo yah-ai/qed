@@ -514,15 +514,15 @@ fn exec_error(e: RemoteForgeError) -> ForgeExecutorError {
 /// - `platform` → **refused**. It exists to ask a *host* container runtime for
 ///   foreign-arch emulation (Rosetta / qemu). A yubaba node has no such knob;
 ///   remote runs pick architecture by *scheduling* — `location.mesh_tags =
-///   ["tier:x86"]`. Honoring it silently would hand back an artifact built for
+///   ["arch:x86"]`. Honoring it silently would hand back an artifact built for
 ///   the wrong architecture, which is precisely the R546 failure this seam
 ///   exists to retire.
-fn apply_exec_context(ws: &mut WorkloadSpec, ctx: &ExecContext) -> Result<(), RemoteForgeError> {
+pub(crate) fn apply_exec_context(ws: &mut WorkloadSpec, ctx: &ExecContext) -> Result<(), RemoteForgeError> {
     if let Some(platform) = &ctx.platform {
         return Err(RemoteForgeError::InvalidSpec(format!(
             "placement.platform = {platform:?} is a local-only emulation knob and has no \
              remote equivalent. A remote run selects architecture by scheduling: set \
-             location = {{ kind = \"remote_any\", tier = \"…\", mesh_tags = [\"tier:x86\"] }} \
+             location = {{ kind = \"remote_any\", tier = \"…\", mesh_tags = [\"arch:x86\"] }} \
              and drop `platform` (W235 / R546)."
         )));
     }
@@ -562,6 +562,26 @@ fn apply_exec_context(ws: &mut WorkloadSpec, ctx: &ExecContext) -> Result<(), Re
                 value: value.clone(),
             },
         });
+    }
+    // R555-F5: declared vault credentials. Appended rather than assigned so a
+    // `ForgeCommand::Workload`'s own mounts survive — but note the grant covers
+    // the FULL resulting list, so a workload spec that arrives carrying secrets
+    // the recipe did not declare is refused on the node rather than merged in
+    // quietly.
+    ws.secrets.extend(ctx.secrets.iter().cloned());
+    // R555-F4: the admission envelope goes on LAST, after every field the grant
+    // is checked against has settled. Attaching it earlier would still work
+    // today — `attach` only writes annotations — but the grant covers `workdir`
+    // and `env`, which the two loops above are still moving, and "the signature
+    // is attached to the finished spec" is the property worth being able to
+    // read off the order rather than reason about.
+    if let Some(envelope) = &ctx.admission {
+        workload_spec::admission::attach(
+            ws,
+            &envelope.grant,
+            &envelope.signature,
+            &envelope.public_key,
+        );
     }
     Ok(())
 }
@@ -637,12 +657,14 @@ fn now_ms() -> u64 {
 /// container). Those still refuse, before any state is allocated or any
 /// yubaba RPC is issued — no forge id published, no scryer events, no
 /// `deploy` call.
-fn build_workload_spec(
+pub(crate) fn build_workload_spec(
     forge_id: &ForgeId,
     spec: &ForgeSpec,
 ) -> Result<WorkloadSpec, RemoteForgeError> {
-    let native_exec = match spec.where_.runtime {
-        TaskRuntime::Container => false,
+    let mut native_exec = false;
+    let mut microvm = false;
+    match spec.where_.runtime {
+        TaskRuntime::Container => {}
         TaskRuntime::Native => {
             if !matches!(spec.command, ForgeCommand::Subprocess { .. }) {
                 return Err(RemoteForgeError::InvalidSpec(
@@ -653,14 +675,42 @@ fn build_workload_spec(
                         .into(),
                 ));
             }
-            true
+            native_exec = true;
         }
-    };
+        TaskRuntime::MicroVm => {
+            // R605-F8. Same restriction as native, reached from the opposite
+            // direction. Native refuses the image-backed commands because they
+            // have no *host* shape; microVM refuses them because a guest boots
+            // the node's rootfs, not the step's image — a `BuildImage` forge
+            // running BuildKit and a `Workload` forge carrying its own
+            // container spec would both have their image silently ignored, and
+            // the run would report success having built the wrong thing.
+            if !matches!(spec.command, ForgeCommand::Subprocess { .. }) {
+                return Err(RemoteForgeError::InvalidSpec(
+                    "remote + microvm is supported only for a subprocess forge command — a \
+                     guest boots the node's own rootfs, so a workload forge's container spec \
+                     and a build-image forge's BuildKit image have nowhere to be honored. \
+                     Set placement.runtime = container (R605-F8 / W325)."
+                        .into(),
+                ));
+            }
+            microvm = true;
+        }
+    }
 
-    let (tier, mesh_tags) = match &spec.where_.location {
-        TaskLocation::RemoteAny { tier, mesh_tags } => (tier.clone(), mesh_tags.clone()),
+    let (tier, mesh_tags, pinned_node) = match &spec.where_.location {
+        TaskLocation::RemoteAny { tier, mesh_tags } => (tier.clone(), mesh_tags.clone(), None),
         // Pin to a specific node: tier defaults to infra (conventional for forge).
-        TaskLocation::Remote { .. } => (TierTag("infra".into()), vec![]),
+        //
+        // R833-F8: the node name used to be DROPPED here — a `Remote { node }`
+        // spec was admitted exactly like an unconstrained `RemoteAny`, so
+        // "run it on us-west-003" landed on whichever machine won the
+        // declaration-order tie-break. It now travels as an annotation (below)
+        // and narrows admission by name. No mesh tags are requested alongside
+        // it: naming the box IS the constraint, and adding an inferred
+        // capability filter on top could only make an explicit target
+        // unschedulable.
+        TaskLocation::Remote { node } => (TierTag("infra".into()), vec![], Some(node.0.clone())),
         TaskLocation::Local => {
             return Err(RemoteForgeError::InvalidSpec(
                 "RemoteForgeDriver received a local ForgeSpec".into(),
@@ -718,6 +768,15 @@ fn build_workload_spec(
             .insert(NODE_SELECTOR_MESH_TAGS_ANNOTATION.into(), mesh_tags.join(","));
     }
 
+    // R833-F8: the imperative half of the same seam. Same mechanism (an
+    // annotation yubaba admission reads off the spec), one candidate instead of
+    // a filtered set. Mutually exclusive with the tags by construction — the
+    // match above yields one or the other, never both.
+    if let Some(node) = pinned_node {
+        ws.annotations
+            .insert(NODE_SELECTOR_NODE_ANNOTATION.into(), node);
+    }
+
     // R590-B7: remote forge workloads are ephemeral tier=infra build tasks that
     // must reach the network to fetch sources (git clone of v8/chromium, cargo
     // registry, image layers). kamaji gives every container an isolated,
@@ -726,13 +785,27 @@ fn build_workload_spec(
     // Request host networking so the build shares the node's network stack; the
     // pairing bind-mount of /etc/resolv.conf lives in kamaji's build_oci_spec.
     // kamaji guards this annotation to tier=infra, which forge always satisfies.
-    ws.annotations.insert(
-        workload_spec::HOST_NETWORK_ANNOTATION.into(),
-        workload_spec::HOST_NETWORK_VALUE.into(),
-    );
+    //
+    // R605-F8: NOT for a microVM. The annotation asks kamaji to put a container
+    // in the host's network namespace, and a guest has no namespace to place —
+    // it has a virtual NIC on a TAP the microVM backend sets up, and it reaches
+    // the registry through that. Setting it anyway would be inert at the
+    // backend but not harmless upstream: `AdmissionGrant::from_spec` records
+    // `host_network` from this very annotation, so the signed grant would
+    // assert a host-network privilege that was never taken. A grant that
+    // overstates is a grant that stops meaning anything.
+    if !microvm {
+        ws.annotations.insert(
+            workload_spec::HOST_NETWORK_ANNOTATION.into(),
+            workload_spec::HOST_NETWORK_VALUE.into(),
+        );
+    }
 
     if native_exec {
         mark_native_exec(&mut ws, forge_id);
+    }
+    if microvm {
+        mark_microvm(&mut ws);
     }
 
     Ok(ws)
@@ -791,9 +864,45 @@ fn mark_native_exec(ws: &mut WorkloadSpec, forge_id: &ForgeId) {
     ws.workdir = Some(produced);
 }
 
+/// Turn a container-shaped forge spec into a microVM one (R605-F8 / W325 §5).
+///
+/// **One edit**, and the brevity next to [`mark_native_exec`]'s three is the
+/// point rather than an omission. The native path has to rewrite `workdir` and
+/// publish [`PRODUCED_DIR_ENV`] because a fork+exec'd process has no mount
+/// namespace, so the container-side `/yah/produced` simply does not exist for
+/// it and the step has to be told the real host path instead.
+///
+/// A guest does have a mount namespace — it has a whole kernel — so the
+/// declared volume targets are honoured as declared. kamaji's microVM backend
+/// copies each bind source onto the guest's scratch disk and the guest's init
+/// bind-mounts it back at `target`, which means a step writing to
+/// `/yah/produced` works unchanged, and `forge_produced::host_path` reads the
+/// artifacts back from the same host directory it always did. The durable-mount
+/// volume that `build_workload_spec` pushed is doing real work here, not
+/// surviving as inert bookkeeping the way it does on the native path.
+fn mark_microvm(ws: &mut WorkloadSpec) {
+    ws.annotations.insert(
+        workload_spec::NATIVE_EXEC_ANNOTATION.into(),
+        workload_spec::MICROVM_EXEC_VALUE.into(),
+    );
+}
+
 /// Annotation key carrying the R594 mesh-tag node-selector (comma-joined) from
 /// [`TaskLocation::RemoteAny::mesh_tags`] to yubaba admission.
 pub const NODE_SELECTOR_MESH_TAGS_ANNOTATION: &str = "yah.node-selector.mesh-tags";
+
+/// Annotation key carrying the R833-F8 **imperative** node selector — the
+/// machine name from [`TaskLocation::Remote::node`] — to yubaba admission.
+///
+/// The sibling of [`NODE_SELECTOR_MESH_TAGS_ANNOTATION`] and deliberately a
+/// second key rather than a `node:<name>` mesh tag: mesh tags are *inferred*
+/// capability constraints matched as a superset, while this is the operator
+/// naming one box. Folding the name into the tag set would make the two
+/// indistinguishable at admission, and would silently pass for any node that
+/// happened to declare such a tag (none do).
+///
+/// Consumed by `cloud::config::node_selector_node` / `RequiredSpec::nodes`.
+pub const NODE_SELECTOR_NODE_ANNOTATION: &str = "yah.node-selector.node";
 
 // ─── BuildKit workload synthesis (R381-T5) ────────────────────────────────────
 
@@ -891,8 +1000,13 @@ fn build_image_workload_spec(
     let mut ws = WorkloadSpec::for_forge(&forge_id.to_string(), image, tier, vec![]);
 
     // Image builds routinely peak at several hundred MiB; the for_forge
-    // defaults (256MiB / 512m) are too tight for buildkit.
-    ws.resources.memory_mb = 2048;
+    // defaults were too tight for buildkit. `memory_mb` is deliberately NOT
+    // overridden any more: this line used to read `= 2048` against a 256 MiB
+    // default, which R590-B10 then raised to 32 GiB — so the override quietly
+    // inverted from raising buildkit's cgroup ceiling to *lowering* it by 16x,
+    // still narrating the old direction. Inheriting for_forge's ceiling is what
+    // the comment always meant. The placement floor is unaffected either way;
+    // it comes from the MEMORY_REQUEST_ANNOTATION for_forge sets.
     ws.resources.cpu_millis = 2000;
     ws.resources.ephemeral_storage_mb = 4096;
 
@@ -1510,6 +1624,137 @@ mod remote {
         assert!(!container.env.iter().any(|e| e.name == PRODUCED_DIR_ENV));
     }
 
+    /// R605-F8: a remote + microVM subprocess forge synthesizes an ordinary
+    /// container-shaped workload carrying the microVM marker kamaji routes on.
+    #[test]
+    fn remote_microvm_subprocess_is_marked_for_kamajis_microvm_backend() {
+        let forge_id = ForgeId::new();
+        let placement = TaskPlacement::new(
+            TaskLocation::RemoteAny {
+                tier: TierTag("infra".into()),
+                mesh_tags: vec!["tag:build-worker".into(), "arch:x86".into()],
+            },
+            TaskRuntime::MicroVm,
+        );
+        let ws = build_workload_spec(&forge_id, &subprocess_spec(placement, None))
+            .expect("remote + microvm subprocess must synthesize");
+
+        assert!(
+            ws.wants_microvm(),
+            "kamaji routes on this marker; without it the build shares the node's kernel"
+        );
+        assert!(
+            !ws.wants_native_exec(),
+            "one `yah.exec` key holds one value — the two substrates cannot both be selected"
+        );
+
+        // Unlike the native path, the produced dir needs no env-var indirection:
+        // the guest has a mount namespace, so kamaji surfaces the durable volume
+        // at the target the spec declared and the step writes to `/yah/produced`
+        // exactly as it would in a container.
+        assert!(
+            !ws.env.iter().any(|e| e.name == PRODUCED_DIR_ENV),
+            "a microVM step resolves produced files through the declared mount, not an env var"
+        );
+        assert!(ws.workdir.is_none());
+
+        let produced = workload_spec::forge_produced::host_dir(&forge_id.to_string());
+        assert!(
+            ws.volumes.iter().any(|v| matches!(
+                &v.source,
+                workload_spec::VolumeSource::Bind { host_path } if host_path == &produced
+            )),
+            "the durable produced mount is how artifacts leave the guest: {:?}",
+            ws.volumes
+        );
+    }
+
+    /// R605-F8: a microVM workload must NOT carry the host-network annotation.
+    ///
+    /// Inert at the backend — a guest has no namespace to place in the host's —
+    /// but `AdmissionGrant::from_spec` reads `host_network` off exactly this
+    /// annotation, so leaving it on would make every microVM grant assert a
+    /// privilege the run never took.
+    #[test]
+    fn a_microvm_workload_does_not_claim_host_networking() {
+        let forge_id = ForgeId::new();
+        let vm = build_workload_spec(
+            &forge_id,
+            &subprocess_spec(
+                TaskPlacement::new(
+                    TaskLocation::RemoteAny {
+                        tier: TierTag("infra".into()),
+                        mesh_tags: vec![],
+                    },
+                    TaskRuntime::MicroVm,
+                ),
+                None,
+            ),
+        )
+        .expect("synthesis");
+        assert!(!vm.wants_host_network());
+
+        // The container leg is untouched: it still needs host networking to
+        // reach crates.io, and R590-B7 proved that the hard way.
+        let container = build_workload_spec(
+            &forge_id,
+            &subprocess_spec(
+                TaskPlacement::new(
+                    TaskLocation::RemoteAny {
+                        tier: TierTag("infra".into()),
+                        mesh_tags: vec![],
+                    },
+                    TaskRuntime::Container,
+                ),
+                None,
+            ),
+        )
+        .expect("synthesis");
+        assert!(container.wants_host_network());
+        assert!(!container.wants_microvm());
+    }
+
+    /// R605-F8: the image-backed forge commands refuse a microVM placement
+    /// before any state is allocated, exactly as they refuse a native one.
+    #[test]
+    fn remote_microvm_refuses_an_image_backed_forge_command() {
+        let forge_id = ForgeId::new();
+        let spec = ForgeSpec {
+            command: ForgeCommand::BuildImage {
+                dockerfile: "Dockerfile".into(),
+                context: PathBuf::from("."),
+                context_url: None,
+                tags: vec!["example:latest".into()],
+                platforms: vec![],
+                build_args: Default::default(),
+                push: false,
+                load: false,
+            },
+            where_: TaskPlacement::new(
+                TaskLocation::RemoteAny {
+                    tier: TierTag("infra".into()),
+                    mesh_tags: vec![],
+                },
+                TaskRuntime::MicroVm,
+            ),
+            ..subprocess_spec(
+                TaskPlacement::new(
+                    TaskLocation::RemoteAny {
+                        tier: TierTag("infra".into()),
+                        mesh_tags: vec![],
+                    },
+                    TaskRuntime::MicroVm,
+                ),
+                None,
+            )
+        };
+        let err = build_workload_spec(&forge_id, &spec).unwrap_err();
+        assert!(
+            format!("{err}").contains("microvm"),
+            "the refusal must name the placement that caused it: {err}"
+        );
+    }
+
     /// R577-T1 × R555-T2: `ExecContext` folding is correct for a native forge
     /// on two of its three fields and refuses the third.
     ///
@@ -1743,6 +1988,60 @@ mod remote {
         .expect("synthesis ok")
     }
 
+    /// R833-F8: a `TaskLocation::Remote { node }` spec carries the node name to
+    /// admission as the imperative node-selector annotation.
+    ///
+    /// It used to be DROPPED here — the match arm read `Remote { .. }` and
+    /// produced the same (tier=infra, no tags) pair as an unconstrained
+    /// `RemoteAny`, so "run it on us-west-003" was indistinguishable from "run
+    /// it anywhere" by the time yubaba saw it.
+    #[test]
+    fn a_pinned_node_reaches_admission_as_an_annotation() {
+        let forge_id = ForgeId::new();
+        let placement = TaskPlacement::new(
+            TaskLocation::Remote {
+                node: workload_spec::MeshIdent("us-west-003".into()),
+            },
+            TaskRuntime::Container,
+        );
+        let ws = build_workload_spec(&forge_id, &subprocess_spec(placement, None))
+            .expect("synthesis ok");
+        assert_eq!(
+            ws.annotations
+                .get(NODE_SELECTOR_NODE_ANNOTATION)
+                .map(String::as_str),
+            Some("us-west-003"),
+        );
+        assert!(
+            !ws.annotations.contains_key(NODE_SELECTOR_MESH_TAGS_ANNOTATION),
+            "a named node is the constraint; no inferred tag filter on top",
+        );
+        assert_eq!(ws.tier.0, "infra");
+    }
+
+    /// The dual: a tag-selected `RemoteAny` is unchanged by R833-F8 — mesh tags
+    /// travel, no node annotation appears.
+    #[test]
+    fn an_unpinned_remote_any_carries_no_node_annotation() {
+        let forge_id = ForgeId::new();
+        let placement = TaskPlacement::new(
+            TaskLocation::RemoteAny {
+                tier: TierTag("infra".into()),
+                mesh_tags: vec!["tag:build-worker".into(), "arch:x86".into()],
+            },
+            TaskRuntime::Container,
+        );
+        let ws = build_workload_spec(&forge_id, &subprocess_spec(placement, None))
+            .expect("synthesis ok");
+        assert_eq!(
+            ws.annotations
+                .get(NODE_SELECTOR_MESH_TAGS_ANNOTATION)
+                .map(String::as_str),
+            Some("tag:build-worker,arch:x86"),
+        );
+        assert!(!ws.annotations.contains_key(NODE_SELECTOR_NODE_ANNOTATION));
+    }
+
     /// R636-B2: the buildkit workload — and *only* it — asks for the
     /// nested-sandbox grant. Without the annotation kamaji's baseline sandbox
     /// (CAP_NET_BIND_SERVICE only, `no_new_privs` on) stops `rootlesskit`
@@ -1797,11 +2096,26 @@ mod remote {
             ws.image.tag
         );
 
-        // Resources upsized vs the for_forge default (256MiB / 512m).
+        // CPU upsized vs the for_forge default (512m); the memory ceiling is
+        // inherited rather than overridden, so assert it is at least the
+        // buildkit floor the old `= 2048` override was reaching for.
         assert!(ws.resources.memory_mb >= 1024, "memory should be ≥1GiB");
         assert!(
             ws.resources.cpu_millis >= 1000,
             "cpu_millis should be ≥ one full core"
+        );
+        // The placement request is the small number, and it must not track the
+        // ceiling — this is the regression that made 8 GiB build-workers
+        // unschedulable for every offloaded step.
+        assert_eq!(
+            ws.memory_request_mb(),
+            workload_spec::FORGE_MEMORY_REQUEST_MB
+        );
+        assert!(
+            ws.memory_request_mb() < ws.resources.memory_mb,
+            "request must stay below the ceiling: {} vs {}",
+            ws.memory_request_mb(),
+            ws.resources.memory_mb
         );
 
         // Bind mounts: context (ro), dockerfile dir (ro), out dir (rw).

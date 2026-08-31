@@ -3,6 +3,39 @@
 //! @yah:status(review)
 //! @yah:parent(R299)
 //! @yah:handoff(".yah/qed/ directory created at workspace root. PipelineLoader.list_all() now dedupes built-ins + custom files. Camp TOML overrides built-ins by name.")
+//!
+//! @yah:relay(R751, "QED templates + specializations: alias_of/pin, template classification, smell-your-way-to-it discovery")
+//! @yah:at(2026-08-12T02:22:52Z)
+//! @yah:status(open)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:handoff("GOAL (operator, 2026-08-11): every build job should be a QED run or a VARIANT of one. The vocabulary the operator asked for is C++/Rust templates: a pipeline with unbound required params is a TEMPLATE - it cannot run without specialization - and a semantic name bound to a template plus pinned params is a SPECIALIZATION. Specializations carry their own title and tags so an operator can smell their way to them in the roster instead of knowing the base pipeline's name.")
+//! @yah:handoff("WHAT ALREADY EXISTS, verified in source, so nobody rebuilds it: ParamDef with required/default/options/options_from (oss/qed/crates/qed/src/types.rs:2174); {{key}} substitution into argv, env and a wrapped GHA workflow's inputs+matrix (types.rs:677 apply_params); params-as-VARIANTS via step gating - R653-F1 put resolved params into the if-context, so if = \"params.variant == 'full'\" is live today (types.rs:929, wired at app/yah/cli/src/qed.rs:757); SubPipelineConfig{target, params, propagate, opaque} forwards pinned params to a child (types.rs:1158); tags: Vec<String> and label already on PipelineConfig (config.rs:141-152) and already on the FE PipelineDef. The template CONCEPT also already exists in the UI as a derived runnable-vs-template cut (QedPanel.tsx:1702-1708). None of that needs inventing.")
+//! @yah:next("THE SEAM IS ONE FUNCTION: PipelineLoader::load (oss/qed/crates/qed/src/config.rs:234). Every consumer - CLI, QED_PIPELINES RPC, desktop Run tab, LoaderSubPipelineResolver - goes through it, so resolving a specialization there makes it indistinguishable from a hand-written pipeline everywhere with no downstream change: base steps, alias's own name/label/tags/description, base param schema MINUS the pinned keys.")
+//! @yah:handoff("THE GAP IS THE NAME, NOT THE CONFIGURATION. rg alias over config.rs/types.rs/runner.rs returns nothing, so a semantic name costs a whole pipeline file whose only content is a one-step SubPipeline wrapper - and that file then LIES in the catalog, because qed_pipelines_handler (app/yah/cli/src/camp.rs:8971) reads steps and params off whatever loader.load(name) returned, so the wrapper reports 1 step and no params. .yah/qed/desktop-local.toml is exactly that shape today.")
+//! @yah:assumes("TWO DESIGN DEFAULTS the operator accepted by saying 'sure file it' rather than by picking. (1) A specialization lives in ITS OWN FILE (alias_of in [pipeline]), not as [[alias]] blocks inside the base - so a camp can specialize a builtin or an oss/-shipped pipeline without editing it. (2) A PINNED param is NOT overridable from --param: a pin a flag can undo is not a variant, it is a default, and ParamDef.default already covers that. Reverse either only on purpose.")
+//! @yah:gotcha("oss/qed is an independent Cargo workspace exported to a public mirror (github.com/yah-ai/qed) - edit in place, never the mirror, and do not use workspace=true inheritance from the yah root. PipelineToml/PipelineConfig are ALSO the schema source of truth: cargo run -p xtask -- emit-schemas derives .yah/schema/qed-pipeline.toml.schema.json from them and xtask/tests/schema_drift.rs asserts it matches. Any new [pipeline] key here means regenerating that schema in the same commit - the pre-commit hook does it if core.hooksPath is set to scripts/git-hooks.")
+//!
+//! @yah:ticket(R751-F2, "alias_of + pin: specializations resolved in PipelineLoader::load, with their own label/tags")
+//! @yah:status(review)
+//! @yah:at(2026-08-12T22:09:21Z)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R751)
+//! @yah:next("Resolve in PipelineLoader::load (config.rs:234), NOT in each caller. Everything downstream - the CLI, QED_PIPELINES, the desktop Run tab, LoaderSubPipelineResolver - already funnels through it, so a specialization then needs zero downstream code to appear as a first-class entry.")
+//! @yah:next("Reject at load time, loudly, with a typed ConfigError: alias_of naming an unknown base; a pin key the base does not declare (the whole point is that a pin is checked against a real param); an alias that also declares steps; and an alias chain that cycles or exceeds a small depth cap. MAX_SUB_PIPELINE_DEPTH (types.rs:1148) is the precedent for the cap, and validate_sub_pipeline_graph is the precedent for the cycle walk.")
+//! @yah:next("Do NOT build this as a SubPipeline wrapper under the hood. That is exactly the shape being replaced, it doubles the run tree for no reason, and it would put the alias's steps behind an extra node in the graph tab.")
+//! @yah:handoff("THE PRIMITIVE. A specialization is a steps-less pipeline file: [pipeline] name/label/tags/description of its own, alias_of = \"<base>\", and a [pipeline.pin] table fixing some of the base's params. The loader resolves it into a real Pipeline - base steps, alias's identity, base params minus the pinned keys - so desktop-local / all-local / another-local-variant become ~6-line files over one real pipeline.")
+//! @yah:verify("A specialization appears in qed.pipelines with its OWN name/label/tags and the base's step list - not as a 1-step wrapper. Compare against .yah/qed/desktop-local.toml's current wire shape (1 step, no params) to see the difference the ticket is buying.")
+//! @yah:verify("A pinned param is absent from the alias's advertised params and cannot be overridden by --param (see the relay's assumes - reverse only on purpose).")
+//! @yah:verify("Round-trip: a specialization TOML survives load -> export -> load unchanged. oss/qed/crates/qed/src/export.rs is the serializer that has to learn the new keys.")
+//! @yah:gotcha("PipelineConfig is the schemars source for .yah/schema/qed-pipeline.toml.schema.json - adding alias_of/pin means running cargo run -p xtask -- emit-schemas and committing the regenerated schema, or xtask/tests/schema_drift.rs goes red for everyone on the shared tree. It is a generated artifact, so regenerating it is nobody's permission to ask for.")
+//! @yah:handoff("SHIPPED. A specialization is a steps-less TOML: [pipeline] name/label/tags/description of its own, alias_of = <base>, and a [pipeline.pin] table. PipelineLoader::load (oss/qed/crates/qed/src/config.rs:361) resolves it, so the CLI, qed.pipelines, the desktop Run tab and LoaderSubPipelineResolver all see a first-class pipeline with ZERO downstream change: base steps, alias identity, base params MINUS the pinned keys.")
+//! @yah:handoff("Pipeline grew two provenance fields (types.rs:449 alias_of, types.rs:472 pins); PipelineConfig grew alias_of + pin (config.rs). Pins are moved OUT of params at load and re-inserted by resolve_params (types.rs:657), so {{key}} substitution and R653-F1 if= step gating see a pinned value exactly like any other resolved param.")
+//! @yah:handoff("Five typed load-time rejections, all with repair hints: AliasBaseNotFound, AliasHasBody (every offending body key at once), AliasPinUnknownParam (lists what the base does declare), AliasPinNotInOptions, AliasChain (cycle + MAX_ALIAS_DEPTH=4, mirroring MAX_SUB_PIPELINE_DEPTH). A pinned param is not overridable: ParamError::PinnedParamOverride fires on a CONFLICTING --param, while the same value is a no-op so re-running a recorded param set still works.")
+//! @yah:verify("12 new tests in config::alias_tests (cargo test -p yah-qed --lib alias, run from oss/qed): 12 passed. Cover identity/body split, pin reaching the run + refusing override, all five rejections, alias-of-an-alias pin accumulation, tag + description fallback, and serde round-trip (an ordinary pipeline serializes with NO alias_of/pins keys, so qed eject output is unchanged).")
+//! @yah:verify("E2E through the real binary, not only unit tests: a 7-line desktop-local.toml over a 2-step local-install planned as 'desktop-local - 1 expanded job(s)' with steps Build + Install (oss/qed/target/debug/yah-qed plan). The 1-step SubPipeline wrapper shape this replaces reports 1 step and no params. A bad pin failed with: base pipeline local-install declares no such param; it declares: profile, target.")
+//! @yah:verify("Regression sweep: every .yah/qed/*.toml in this camp still loads through the changed loader (only baseline/gha-actions/peers fail, and those are not pipeline files). cargo check --workspace --all-targets clean. cargo test -p yah --test camp_qed_image_pins 3 passed.")
+//! @yah:verify("Generated artifacts regenerated and green: cargo run -p xtask -- emit-schemas added alias_of + pin to .yah/schema/qed-pipeline.toml.schema.json; cargo test -p xtask --test schema_drift 3 passed; scripts/check-workload-spec-ts.sh in sync.")
+//! @yah:gotcha("Pre-existing, NOT from this ticket: cargo test -p yah-qed --lib has one failure, tests::desktop_release_matrix_routes_each_row_to_its_own_platform, which asserts 3 matrix rows while .yah/qed/desktop-release.toml declares 1. The narrowing landed in commit 497a8a6b (a peer sync). Already filed as R577-B5 and explicitly deferred there as a product call. 815 of 816 pass.")
 
 use crate::peers::PeerConfig;
 use crate::registries::{extract_registry_host, RegistryConfig, RegistryConfigError};
@@ -112,7 +145,88 @@ pub enum ConfigError {
     InvalidBind(String),
     #[error("Invalid param: {0}")]
     InvalidParam(String),
+    /// R605-F3: the pipeline's `needs` edges don't form a runnable DAG — an
+    /// unknown/self/ambiguous reference, or a cycle. Rejected at load time
+    /// because the alternative is a run that reports Success having silently
+    /// dropped an edge, or one that hangs with nothing ready.
+    #[error("Invalid step graph: {0}")]
+    InvalidDag(#[from] crate::dag::DagError),
+    /// R751-F2: a specialization whose `alias_of` names a pipeline that doesn't
+    /// exist. Separate from [`Self::NotFound`] because the name the operator
+    /// asked for *did* resolve — it's the file's own reference that dangles,
+    /// and saying "pipeline not found: local-instal" when they ran
+    /// `desktop-local` sends them looking in the wrong place.
+    #[error(
+        "pipeline '{alias}': alias_of = {base:?} names a pipeline that does not exist ({source})"
+    )]
+    AliasBaseNotFound {
+        alias: String,
+        base: String,
+        source: Box<ConfigError>,
+    },
+    /// R751-F2: `alias_of` alongside keys that define a pipeline BODY. A
+    /// specialization binds a base; it does not get to also be one, because
+    /// there would be no answer to which set of steps runs.
+    #[error(
+        "pipeline '{alias}': alias_of = {base:?} cannot be combined with {keys} — a specialization \
+         binds the base's body, it does not declare one of its own"
+    )]
+    AliasHasBody {
+        alias: String,
+        base: String,
+        keys: String,
+    },
+    /// R751-F2: a `[pipeline.pin]` key the base doesn't declare as a param.
+    /// The whole value of a pin over a hand-copied pipeline is that it is
+    /// checked against a real declaration, so a stale pin (base renamed the
+    /// param) has to fail loudly rather than sit inert in the file.
+    #[error(
+        "pipeline '{alias}': [pipeline.pin] {name} = {value:?} — base pipeline '{base}' declares no \
+         such param{}",
+        if known.is_empty() {
+            " (it declares none at all)".to_string()
+        } else {
+            format!("; it declares: {}", known.join(", "))
+        }
+    )]
+    AliasPinUnknownParam {
+        alias: String,
+        base: String,
+        name: String,
+        value: String,
+        known: Vec<String>,
+    },
+    /// R751-F2: a pin whose value is outside the base param's declared
+    /// `options`. Same reasoning as [`Self::InvalidParam`] for a bad default —
+    /// caught at load time, because a specialization pinning an illegal value
+    /// would otherwise only fail on the runs that actually reached it.
+    #[error(
+        "pipeline '{alias}': [pipeline.pin] {name} = {value:?} is not one of base pipeline \
+         '{base}' param's options ({})",
+        options.join(", ")
+    )]
+    AliasPinNotInOptions {
+        alias: String,
+        base: String,
+        name: String,
+        value: String,
+        options: Vec<String>,
+    },
+    /// R751-F2: `alias_of` chains that cycle, or nest deeper than
+    /// [`MAX_ALIAS_DEPTH`].
+    #[error("pipeline alias chain {}: {reason}", chain.join(" -> "))]
+    AliasChain { chain: Vec<String>, reason: String },
 }
+
+/// How deep an `alias_of` chain may nest before the loader refuses it
+/// (R751-F2). A specialization of a specialization is legitimate —
+/// `all-local` → `desktop-local` → `local-install` pins one more key at each
+/// hop — but a chain long enough to hit this is a modelling mistake, not a
+/// recipe. Same posture (and same number) as
+/// [`MAX_SUB_PIPELINE_DEPTH`](crate::types::MAX_SUB_PIPELINE_DEPTH): a small
+/// cap that turns runaway indirection into an error at load rather than a
+/// stack overflow at run.
+pub const MAX_ALIAS_DEPTH: usize = 4;
 
 /// On-disk shape of a `.yah/qed/*.toml` pipeline file. This is the JSON-Schema
 /// source of truth (R533-T10): `cargo run -p xtask -- emit-schemas` derives
@@ -150,6 +264,34 @@ pub struct PipelineConfig {
     /// Catalog classification tags — see [`crate::types::Pipeline::tags`].
     #[serde(default)]
     tags: Vec<String>,
+    /// R751-F2 — declare this file a SPECIALIZATION of the named pipeline.
+    ///
+    /// ```toml
+    /// [pipeline]
+    /// name = "desktop-local"
+    /// label = "Install the desktop app locally"
+    /// tags = ["build", "desktop", "local"]
+    /// alias_of = "local-install"
+    ///
+    /// [pipeline.pin]
+    /// target = "desktop"
+    /// ```
+    ///
+    /// The alias lives in its OWN file rather than as `[[alias]]` blocks inside
+    /// the base, so a camp can specialize a pipeline shipped by `oss/` (or by
+    /// another camp) without editing it — the same reason a C++ template
+    /// specialization doesn't live inside the primary template's header.
+    ///
+    /// Resolution happens in [`PipelineLoader::load`], so no consumer needs to
+    /// know: see [`crate::types::Pipeline::alias_of`].
+    #[serde(default)]
+    alias_of: Option<String>,
+    /// R751-F2 — `[pipeline.pin]`: param values this specialization FIXES.
+    /// Only meaningful with [`Self::alias_of`]; every key must name a param the
+    /// base declares. See [`crate::types::Pipeline::pins`] for why a pin is not
+    /// spelled as a `default`.
+    #[serde(default)]
+    pin: HashMap<String, String>,
     #[serde(default)]
     steps: Vec<QedStep>,
     #[serde(default)]
@@ -162,6 +304,10 @@ pub struct PipelineConfig {
     triggers: Vec<crate::types::Trigger>,
     #[serde(default)]
     concurrency_key: Option<String>,
+    /// R605-F3 — ceiling on concurrent steps within one run. See
+    /// [`crate::types::Pipeline::max_parallel`].
+    #[serde(default)]
+    max_parallel: Option<usize>,
     #[serde(default)]
     placement: Placement,
     #[serde(default)]
@@ -231,9 +377,25 @@ impl PipelineLoader {
     ///   1. `<qed_dir>/P{n}-<name>.toml` (or legacy `<name>.toml`)
     ///   2. `<workspace>/.github/workflows/<name>.yml` (or `.yaml`),
     ///      synthesised into a one-step `StepKind::GhaWorkflow` pipeline.
+    ///
+    /// R751-F2: a file declaring `alias_of` is a SPECIALIZATION and is resolved
+    /// here — the returned `Pipeline` carries the base's body under the alias's
+    /// own identity, with `[pipeline.pin]` moved from `params` to `pins`. This
+    /// is deliberately the *only* place that happens: the CLI, the daemon's
+    /// `qed.pipelines` / `qed.run`, the desktop Run tab and
+    /// [`LoaderSubPipelineResolver`] all funnel through `load`, so a
+    /// specialization is indistinguishable from a hand-written pipeline
+    /// everywhere without a line of downstream change.
     pub fn load(&self, name: &str) -> Result<Pipeline, ConfigError> {
+        self.load_chain(name, &mut Vec::new())
+    }
+
+    /// [`Self::load`] carrying the `alias_of` chain walked so far, for cycle
+    /// and depth detection. `chain` holds pipeline *names* in resolution order.
+    fn load_chain(&self, name: &str, chain: &mut Vec<String>) -> Result<Pipeline, ConfigError> {
         if let Some(path) = find_pipeline_file(&self.qed_dir, name) {
-            return self.load_from_file(&path);
+            let content = fs::read_to_string(&path)?;
+            return self.pipeline_from_str(&content, chain);
         }
         if let Some(entry) = self.find_gha_workflow(name) {
             return Ok(synthesise_gha_pipeline(&entry));
@@ -379,8 +541,18 @@ impl PipelineLoader {
     /// test-only `load_from_str` both route through here so a new field can't
     /// be wired into one path and forgotten in the other (R703-F3: which is
     /// exactly what two copies of this hoist invited).
-    fn pipeline_from_str(&self, content: &str) -> Result<Pipeline, ConfigError> {
+    fn pipeline_from_str(
+        &self,
+        content: &str,
+        chain: &mut Vec<String>,
+    ) -> Result<Pipeline, ConfigError> {
         let parsed: PipelineToml = toml::from_str(content)?;
+        // R751-F2: a specialization has no body of its own — it takes the
+        // base's and rebrands it. Everything below this point would be
+        // operating on an empty `steps`, so branch before building it.
+        if parsed.pipeline.alias_of.is_some() {
+            return self.resolve_specialization(parsed, content, chain);
+        }
         let pipeline = Pipeline {
             name: parsed.pipeline.name,
             label: parsed.pipeline.label,
@@ -391,12 +563,15 @@ impl PipelineLoader {
                 .description
                 .or_else(|| leading_comment_block(content)),
             tags: parsed.pipeline.tags,
+            alias_of: None,
+            pins: HashMap::new(),
             steps: parsed.pipeline.steps,
             params: parsed.pipeline.params.unwrap_or_default(),
             on_success: parsed.pipeline.on_success,
             on_fail: parsed.pipeline.on_fail,
             triggers: parsed.pipeline.triggers,
             concurrency_key: parsed.pipeline.concurrency_key,
+            max_parallel: parsed.pipeline.max_parallel,
             placement: parsed.pipeline.placement,
             workspace: parsed.pipeline.workspace,
             wraps: parsed.pipeline.wraps,
@@ -407,14 +582,201 @@ impl PipelineLoader {
             finally: parsed.pipeline.finally,
         };
         self.validate_steps(&pipeline)?;
+        self.validate_dag(&pipeline)?;
         self.validate_binds(&pipeline)?;
         self.validate_params(&pipeline)?;
         Ok(pipeline)
     }
 
+    /// R751-F2 — turn a parsed specialization file into a real [`Pipeline`].
+    ///
+    /// What comes from where:
+    /// - **body** (steps, params, finally, matrix, toolchain, triggers,
+    ///   placement, workspace, outcomes, binds, …) — entirely the base's. The
+    ///   alias is forbidden from declaring any of it, so a key that would
+    ///   silently do nothing is an error instead.
+    /// - **identity** (name, label, description, tags) — the alias's own. This
+    ///   is the point of the feature: `desktop-local` is a row in the catalog
+    ///   an operator can smell their way to, not a footnote on `local-install`.
+    ///   `tags` fall back to the base's when the alias declares none, because a
+    ///   specialization of a `build` pipeline is still a build.
+    /// - **params** — the base's, MINUS every pinned key, which moves to
+    ///   [`Pipeline::pins`]. A pinned param is no longer a question to ask, so
+    ///   it must not appear in the run form.
+    fn resolve_specialization(
+        &self,
+        parsed: PipelineToml,
+        content: &str,
+        chain: &mut Vec<String>,
+    ) -> Result<Pipeline, ConfigError> {
+        let cfg = parsed.pipeline;
+        let alias = cfg.name;
+        let base_name = cfg.alias_of.expect("caller checked alias_of is Some");
+
+        // Body keys are the base's, so declaring one here is an authoring
+        // error, not an override. Reported together: an author who wrote a
+        // whole pipeline body under an `alias_of` should see that in one pass.
+        let mut body_keys: Vec<&str> = Vec::new();
+        if !cfg.steps.is_empty() {
+            body_keys.push("steps");
+        }
+        if !cfg.finally.is_empty() {
+            body_keys.push("finally");
+        }
+        if cfg.params.as_ref().is_some_and(|p| !p.is_empty()) {
+            body_keys.push("params (pin the base's instead)");
+        }
+        if !cfg.on_success.is_empty() {
+            body_keys.push("on_success");
+        }
+        if !cfg.on_fail.is_empty() {
+            body_keys.push("on_fail");
+        }
+        if !cfg.triggers.is_empty() {
+            body_keys.push("triggers");
+        }
+        if cfg.concurrency_key.is_some() {
+            body_keys.push("concurrency_key");
+        }
+        if cfg.max_parallel.is_some() {
+            body_keys.push("max_parallel");
+        }
+        if cfg.placement != Placement::default() {
+            body_keys.push("placement");
+        }
+        if cfg.workspace != crate::types::WorkspaceMode::default() {
+            body_keys.push("workspace");
+        }
+        if cfg.wraps.is_some() {
+            body_keys.push("wraps");
+        }
+        if cfg.matrix.is_some() {
+            body_keys.push("matrix");
+        }
+        if cfg.toolchain.is_some() {
+            body_keys.push("toolchain");
+        }
+        if !parsed.binds.is_empty() {
+            body_keys.push("[[bind]]");
+        }
+        if !parsed.on_change.is_empty() {
+            body_keys.push("[[on_change]]");
+        }
+        if !body_keys.is_empty() {
+            return Err(ConfigError::AliasHasBody {
+                alias,
+                base: base_name,
+                keys: body_keys.join(", "),
+            });
+        }
+
+        // Cycle + depth, walked over the chain of names rather than of files:
+        // `alias_of` is a name reference, so a cycle can only close on one.
+        if chain.iter().any(|n| n == &base_name) {
+            let mut cycled = chain.clone();
+            cycled.push(alias.clone());
+            cycled.push(base_name.clone());
+            return Err(ConfigError::AliasChain {
+                chain: cycled,
+                reason: format!("alias_of cycles back to '{base_name}'"),
+            });
+        }
+        chain.push(alias.clone());
+        if chain.len() > MAX_ALIAS_DEPTH {
+            let mut too_deep = chain.clone();
+            too_deep.push(base_name.clone());
+            return Err(ConfigError::AliasChain {
+                chain: too_deep,
+                reason: format!(
+                    "alias_of nests deeper than MAX_ALIAS_DEPTH ({MAX_ALIAS_DEPTH})"
+                ),
+            });
+        }
+
+        let mut base =
+            self.load_chain(&base_name, chain)
+                .map_err(|source| match source {
+                    // A chain error from further down is already the more
+                    // specific diagnosis; wrapping it in "base not found"
+                    // would bury it.
+                    e @ (ConfigError::AliasChain { .. }
+                    | ConfigError::AliasHasBody { .. }
+                    | ConfigError::AliasPinUnknownParam { .. }
+                    | ConfigError::AliasPinNotInOptions { .. }
+                    | ConfigError::AliasBaseNotFound { .. }) => e,
+                    source => ConfigError::AliasBaseNotFound {
+                        alias: alias.clone(),
+                        base: base_name.clone(),
+                        source: Box::new(source),
+                    },
+                })?;
+
+        // Every pin must name a param the base actually declares. Sorted so a
+        // file with two bad pins names the same one on every run.
+        let mut pin_names: Vec<&String> = cfg.pin.keys().collect();
+        pin_names.sort();
+        for name in pin_names {
+            let value = &cfg.pin[name];
+            let Some(def) = base.params.get(name) else {
+                let mut known: Vec<String> = base.params.keys().cloned().collect();
+                known.sort();
+                return Err(ConfigError::AliasPinUnknownParam {
+                    alias: alias.clone(),
+                    base: base.name.clone(),
+                    name: name.clone(),
+                    value: value.clone(),
+                    known,
+                });
+            };
+            // `options_from` resolves at READ time (see `ParamDef::options_from`),
+            // so a pin against one of those can only be checked when the run
+            // resolves it — the same limit the `default` check has.
+            if !def.options.is_empty() && !def.options.iter().any(|o| o == value) {
+                return Err(ConfigError::AliasPinNotInOptions {
+                    alias: alias.clone(),
+                    base: base.name.clone(),
+                    name: name.clone(),
+                    value: value.clone(),
+                    options: def.options.clone(),
+                });
+            }
+        }
+
+        // A pinned param stops being a question. Removing it from `params` is
+        // what makes the run form, `yah qed pipelines`, and the required-param
+        // check all agree that the specialization takes fewer inputs than its
+        // base — the visible difference between this and a wrapper pipeline.
+        for name in cfg.pin.keys() {
+            base.params.remove(name);
+        }
+
+        // A specialization OF a specialization inherits the inner pins: the
+        // base already moved them out of `params`, so the unknown-param check
+        // above guarantees the two sets are disjoint and neither can clobber
+        // the other.
+        base.pins.extend(cfg.pin);
+
+        // Rebrand in place rather than rebuilding the struct: the whole
+        // contract is "the base's body, unchanged", and a field-by-field copy
+        // is exactly the thing that silently drops a field somebody adds later.
+        base.alias_of = Some(std::mem::replace(&mut base.name, alias));
+        base.label = cfg.label;
+        // Same precedence as a normal file (explicit key, then the file's own
+        // `#` header) with one extra rung: a specialization that says nothing
+        // about itself describes the thing it specializes.
+        base.description = cfg
+            .description
+            .or_else(|| leading_comment_block(content))
+            .or(base.description);
+        if !cfg.tags.is_empty() {
+            base.tags = cfg.tags;
+        }
+        Ok(base)
+    }
+
     #[cfg(test)]
     fn load_from_str(&self, content: &str) -> Result<Pipeline, ConfigError> {
-        self.pipeline_from_str(content)
+        self.pipeline_from_str(content, &mut Vec::new())
     }
 
     /// Public helper: parse a pipeline directly from a file path, bypassing
@@ -427,7 +789,7 @@ impl PipelineLoader {
 
     pub(crate) fn load_from_file(&self, path: &Path) -> Result<Pipeline, ConfigError> {
         let content = fs::read_to_string(path)?;
-        self.pipeline_from_str(&content)
+        self.pipeline_from_str(&content, &mut Vec::new())
     }
 
     /// Run [`QedStep::validate`] across every step, then enforce the
@@ -458,6 +820,24 @@ impl PipelineLoader {
             step.validate_finally()
                 .map_err(ConfigError::InvalidStep)?;
         }
+        Ok(())
+    }
+
+    /// R605-F3 parse-time step-graph validation: resolve every `needs` edge
+    /// against the whole pipeline and group the result into waves, so an
+    /// unknown reference, a self-edge, an ambiguous duplicate name or a cycle
+    /// fails the *load* rather than the run.
+    ///
+    /// Strict about unknown names on purpose — the runner resolves the same
+    /// graph with [`crate::dag::Missing::Satisfied`] because a
+    /// resume-from-step run hands it a drained prefix, and that leniency is
+    /// only safe because this check already proved the full pipeline resolves.
+    ///
+    /// `[[finally]]` teardown is always-run and unconditional, so a `needs` on
+    /// one would be inert config; [`crate::types::QedStep::validate_finally`]
+    /// rejects it.
+    fn validate_dag(&self, pipeline: &Pipeline) -> Result<(), ConfigError> {
+        crate::dag::waves(&pipeline.steps, crate::dag::Missing::Reject)?;
         Ok(())
     }
 
@@ -611,6 +991,7 @@ fn synthesise_gha_pipeline(entry: &GhaWorkflowEntry) -> Pipeline {
         on_fail: Vec::new(),
         triggers: Vec::new(),
         concurrency_key: None,
+        max_parallel: None,
         placement: Placement::default(),
         workspace: crate::types::WorkspaceMode::default(),
         wraps: None,
@@ -618,6 +999,8 @@ fn synthesise_gha_pipeline(entry: &GhaWorkflowEntry) -> Pipeline {
         toolchain: None,
         binds: Vec::new(),
         on_change: Vec::new(),
+        alias_of: None,
+        pins: Default::default(),
         finally: Vec::new(),
     }
 }
@@ -711,6 +1094,7 @@ impl SubPipelineResolver for LoaderSubPipelineResolver {
                     label: String::new(),
                     tags: Vec::new(),
                     concurrency_key: None,
+                    max_parallel: None,
                     steps: vec![step],
                     triggers: Vec::new(),
                     on_success: Vec::new(),
@@ -723,6 +1107,8 @@ impl SubPipelineResolver for LoaderSubPipelineResolver {
                     toolchain: None,
                     binds: Vec::new(),
                     on_change: Vec::new(),
+                    alias_of: None,
+                    pins: Default::default(),
                     finally: Vec::new(),
                 })
             }
@@ -793,6 +1179,570 @@ impl SubPipelineResolver for LoaderSubPipelineResolver {
             SubPipelineRef::Peer { camp, .. } => self.local_peer_camp_root(camp),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod alias_tests {
+    use super::*;
+    use crate::types::ParamError;
+
+    /// The base every specialization test below binds: two steps, three params,
+    /// one of them enumerated. Written as real TOML rather than a `Pipeline`
+    /// literal because the thing under test is what the *loader* does with a
+    /// file, and a literal would skip the parse half of it.
+    const LOCAL_INSTALL: &str = r#"
+# local-install — build a yah surface and install it into this machine.
+
+[pipeline]
+name = "local-install"
+label = "Local install"
+tags = ["build", "local"]
+
+[pipeline.params]
+target = { required = true, options = ["desktop", "cli", "all"] }
+profile = { required = false, default = "release" }
+notify = { required = false, default = "" }
+
+[[pipeline.steps]]
+name = "Build"
+argv = ["cargo", "build", "--profile", "{{profile}}", "-p", "yah-{{target}}"]
+
+[[pipeline.steps]]
+name = "Install"
+argv = ["./scripts/install.sh", "{{target}}"]
+"#;
+
+    /// A loader over a temp `.yah/qed` holding `local-install` plus whatever
+    /// alias files the test writes.
+    fn camp(files: &[(&str, &str)]) -> (tempfile::TempDir, PipelineLoader) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("local-install.toml"), LOCAL_INSTALL).unwrap();
+        for (name, body) in files {
+            std::fs::write(dir.path().join(format!("{name}.toml")), body).unwrap();
+        }
+        let loader = PipelineLoader::new(dir.path());
+        (dir, loader)
+    }
+
+    // ── R605-F3: step-graph validation ────────────────────────────────────
+
+    /// A `needs` typo is caught at LOAD, not at run. The runner resolves the
+    /// same graph leniently (a resume-from-step run is handed a drained
+    /// prefix), so this is the only place a dangling name is an error — and it
+    /// has to be, or a mistyped edge silently becomes no edge.
+    #[test]
+    fn a_needs_naming_no_step_fails_the_load() {
+        let (_d, loader) = camp(&[(
+            "typo",
+            r#"
+[pipeline]
+name = "typo"
+label = "l"
+
+[[pipeline.steps]]
+name = "build"
+argv = ["true"]
+
+[[pipeline.steps]]
+name = "ship"
+argv = ["true"]
+needs = ["biuld"]
+"#,
+        )]);
+        let err = loader.load("typo").expect_err("dangling needs");
+        assert!(
+            matches!(&err, ConfigError::InvalidDag(crate::dag::DagError::UnknownNeed { missing, .. })
+                     if missing == "biuld"),
+            "got {err:?}",
+        );
+    }
+
+    /// A cycle can never drain, so it is a load error rather than a run that
+    /// finishes instantly having executed nothing.
+    #[test]
+    fn a_cyclic_needs_graph_fails_the_load() {
+        let (_d, loader) = camp(&[(
+            "cyc",
+            r#"
+[pipeline]
+name = "cyc"
+label = "l"
+
+[[pipeline.steps]]
+name = "a"
+argv = ["true"]
+needs = ["b"]
+
+[[pipeline.steps]]
+name = "b"
+argv = ["true"]
+needs = ["a"]
+"#,
+        )]);
+        assert!(
+            matches!(
+                loader.load("cyc").expect_err("cycle"),
+                ConfigError::InvalidDag(crate::dag::DagError::Cycle(_))
+            ),
+        );
+    }
+
+    /// `[[finally]]` is unconditional always-run teardown; a `needs` there
+    /// would be inert config that reads as if it scheduled something.
+    #[test]
+    fn a_needs_on_a_finally_step_is_rejected() {
+        let (_d, loader) = camp(&[(
+            "teardown",
+            r#"
+[pipeline]
+name = "teardown"
+label = "l"
+
+[[pipeline.steps]]
+name = "test"
+argv = ["true"]
+
+[[pipeline.finally]]
+name = "cleanup"
+argv = ["true"]
+needs = ["test"]
+"#,
+        )]);
+        let err = loader.load("teardown").expect_err("needs on finally");
+        assert!(
+            matches!(
+                &err,
+                ConfigError::InvalidStep(StepValidationError::FinallyCannotDeclareNeeds(n))
+                    if n == "cleanup"
+            ),
+            "got {err:?}",
+        );
+    }
+
+    /// `max_parallel` is a pipeline body key and parses onto the type — pinned
+    /// because the loader has a separate hand-written struct that a new field
+    /// is easy to add to `Pipeline` without.
+    #[test]
+    fn max_parallel_parses_off_the_pipeline_table() {
+        let (_d, loader) = camp(&[(
+            "capped",
+            r#"
+[pipeline]
+name = "capped"
+label = "l"
+max_parallel = 2
+
+[[pipeline.steps]]
+name = "a"
+argv = ["true"]
+needs = []
+
+[[pipeline.steps]]
+name = "b"
+argv = ["true"]
+needs = []
+"#,
+        )]);
+        let p = loader.load("capped").expect("loads");
+        assert_eq!(p.max_parallel, Some(2));
+        assert_eq!(
+            crate::dag::waves(&p.steps, crate::dag::Missing::Reject).unwrap(),
+            vec![vec![0, 1]],
+        );
+    }
+
+    /// The whole ticket in one assertion set: a six-line file becomes a
+    /// first-class catalog entry carrying the BASE's steps under its OWN
+    /// identity. Contrast the shape this replaces — a one-step SubPipeline
+    /// wrapper, which reports 1 step and no params to every consumer that
+    /// reads what `load` returned.
+    #[test]
+    fn specialization_carries_the_base_body_under_its_own_identity() {
+        let (_d, loader) = camp(&[(
+            "desktop-local",
+            r#"
+[pipeline]
+name = "desktop-local"
+label = "Install the desktop app locally"
+tags = ["build", "desktop", "local"]
+alias_of = "local-install"
+
+[pipeline.pin]
+target = "desktop"
+"#,
+        )]);
+
+        let p = loader.load("desktop-local").unwrap();
+        assert_eq!(p.name, "desktop-local");
+        assert_eq!(p.label, "Install the desktop app locally");
+        assert_eq!(p.tags, vec!["build", "desktop", "local"]);
+        assert_eq!(p.alias_of.as_deref(), Some("local-install"));
+
+        // The base's body, verbatim — not a wrapper around it.
+        let steps: Vec<&str> = p.steps.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(steps, vec!["Build", "Install"]);
+
+        // A pinned param is no longer a question to ask the operator...
+        let mut advertised: Vec<&str> = p.params.keys().map(String::as_str).collect();
+        advertised.sort();
+        assert_eq!(advertised, vec!["notify", "profile"]);
+        // ...but it is still a param at run time.
+        assert_eq!(p.pins.get("target").map(String::as_str), Some("desktop"));
+    }
+
+    /// A pin is the specialization's identity, not a default: substitution and
+    /// `if =` gating both see it, and a run cannot talk it out of it.
+    #[test]
+    fn a_pin_reaches_the_run_and_refuses_to_be_overridden() {
+        let (_d, loader) = camp(&[(
+            "desktop-local",
+            "[pipeline]\nname = \"desktop-local\"\nlabel = \"l\"\n\
+             alias_of = \"local-install\"\n\n[pipeline.pin]\ntarget = \"desktop\"\n",
+        )]);
+        let mut p = loader.load("desktop-local").unwrap();
+
+        // Nothing supplied: the pin lands alongside the base's declared
+        // defaults, and `{{target}}` substitutes.
+        let resolved = p.resolve_params(&HashMap::new()).unwrap();
+        assert_eq!(resolved.get("target").map(String::as_str), Some("desktop"));
+        assert_eq!(resolved.get("profile").map(String::as_str), Some("release"));
+        p.apply_params(&resolved);
+        assert_eq!(
+            p.steps[1].argv,
+            vec!["./scripts/install.sh".to_string(), "desktop".to_string()]
+        );
+
+        // The same value is a no-op — which is what re-running a recorded
+        // param set does, and it must not become an error.
+        let same: HashMap<String, String> =
+            [("target".to_string(), "desktop".to_string())].into_iter().collect();
+        assert!(loader.load("desktop-local").unwrap().resolve_params(&same).is_ok());
+
+        // A different one is refused, loudly. Silently ignoring it would hand
+        // back a run that looks like it honoured the flag and didn't.
+        let other: HashMap<String, String> =
+            [("target".to_string(), "cli".to_string())].into_iter().collect();
+        let err = loader
+            .load("desktop-local")
+            .unwrap()
+            .resolve_params(&other)
+            .expect_err("pinned params are not overridable");
+        match &err {
+            ParamError::PinnedParamOverride { name, pinned, value, base, .. } => {
+                assert_eq!((name.as_str(), pinned.as_str(), value.as_str()), ("target", "desktop", "cli"));
+                assert_eq!(base, "local-install");
+            }
+            other => panic!("expected PinnedParamOverride, got {other:?}"),
+        }
+        // The message has to point at the escape hatch: run the base.
+        assert!(err.to_string().contains("local-install"), "got: {err}");
+    }
+
+    /// The pin is checked against a REAL declaration — that is the whole
+    /// advantage over hand-copying a pipeline. A base that renames a param
+    /// must break its specializations at load, not leave a dead pin in a file.
+    #[test]
+    fn a_pin_naming_no_declared_param_is_rejected() {
+        let (_d, loader) = camp(&[(
+            "typo-local",
+            "[pipeline]\nname = \"typo-local\"\nlabel = \"l\"\n\
+             alias_of = \"local-install\"\n\n[pipeline.pin]\ntarrget = \"desktop\"\n",
+        )]);
+        let err = loader.load("typo-local").expect_err("tarrget is not a param");
+        match &err {
+            ConfigError::AliasPinUnknownParam { name, known, .. } => {
+                assert_eq!(name, "tarrget");
+                assert_eq!(known, &["notify", "profile", "target"]);
+            }
+            other => panic!("expected AliasPinUnknownParam, got {other:?}"),
+        }
+        // Naming the legal set is the repair hint.
+        assert!(err.to_string().contains("target"), "got: {err}");
+    }
+
+    /// Same reasoning as a `default` outside `options` (see `validate_params`):
+    /// caught at load, because otherwise it only fails on the runs that reach it.
+    #[test]
+    fn a_pin_outside_the_base_options_is_rejected() {
+        let (_d, loader) = camp(&[(
+            "web-local",
+            "[pipeline]\nname = \"web-local\"\nlabel = \"l\"\n\
+             alias_of = \"local-install\"\n\n[pipeline.pin]\ntarget = \"web\"\n",
+        )]);
+        let err = loader.load("web-local").expect_err("web is not a declared target");
+        assert!(
+            matches!(&err, ConfigError::AliasPinNotInOptions { value, .. } if value == "web"),
+            "got {err:?}",
+        );
+        assert!(err.to_string().contains("desktop, cli, all"), "got: {err}");
+    }
+
+    /// A specialization binds a body; it does not get to also declare one,
+    /// because nothing could say which set of steps runs. Every body key is
+    /// reported at once — an author who wrote a whole pipeline under an
+    /// `alias_of` should learn that in one pass.
+    #[test]
+    fn an_alias_that_also_declares_a_body_is_rejected() {
+        let (_d, loader) = camp(&[(
+            "hybrid",
+            r#"
+[pipeline]
+name = "hybrid"
+label = "l"
+alias_of = "local-install"
+concurrency_key = "cargo-target"
+
+[[pipeline.steps]]
+name = "Extra"
+argv = ["true"]
+"#,
+        )]);
+        let err = loader.load("hybrid").expect_err("alias + body");
+        match &err {
+            ConfigError::AliasHasBody { keys, .. } => {
+                assert!(keys.contains("steps"), "got: {keys}");
+                assert!(keys.contains("concurrency_key"), "got: {keys}");
+            }
+            other => panic!("expected AliasHasBody, got {other:?}"),
+        }
+    }
+
+    /// The base name is a reference like any other and can dangle. Reported as
+    /// its own error rather than a bare `NotFound`: the name the operator asked
+    /// for did resolve, so "pipeline not found: local-instal" would send them
+    /// looking in entirely the wrong place.
+    #[test]
+    fn an_alias_of_an_unknown_base_names_both() {
+        let (_d, loader) = camp(&[(
+            "orphan",
+            "[pipeline]\nname = \"orphan\"\nlabel = \"l\"\nalias_of = \"local-instal\"\n",
+        )]);
+        let err = loader.load("orphan").expect_err("no such base");
+        assert!(
+            matches!(&err, ConfigError::AliasBaseNotFound { alias, base, .. }
+                     if alias == "orphan" && base == "local-instal"),
+            "got {err:?}",
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("orphan") && msg.contains("local-instal"), "got: {msg}");
+    }
+
+    /// Specializing a specialization is legitimate — each hop pins one more
+    /// key — and the pins accumulate rather than shadow. The inner pin is
+    /// already out of `params`, so the unknown-param check makes re-pinning it
+    /// impossible by construction.
+    #[test]
+    fn a_specialization_of_a_specialization_accumulates_pins() {
+        let (_d, loader) = camp(&[
+            (
+                "desktop-local",
+                "[pipeline]\nname = \"desktop-local\"\nlabel = \"desktop\"\n\
+                 tags = [\"build\", \"desktop\"]\nalias_of = \"local-install\"\n\n\
+                 [pipeline.pin]\ntarget = \"desktop\"\n",
+            ),
+            (
+                "desktop-local-debug",
+                "[pipeline]\nname = \"desktop-local-debug\"\nlabel = \"desktop (debug)\"\n\
+                 alias_of = \"desktop-local\"\n\n[pipeline.pin]\nprofile = \"dev\"\n",
+            ),
+        ]);
+
+        let p = loader.load("desktop-local-debug").unwrap();
+        assert_eq!(p.name, "desktop-local-debug");
+        assert_eq!(p.alias_of.as_deref(), Some("desktop-local"));
+        assert_eq!(p.pins.get("target").map(String::as_str), Some("desktop"));
+        assert_eq!(p.pins.get("profile").map(String::as_str), Some("dev"));
+        assert_eq!(
+            p.params.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["notify"],
+            "both pinned keys are out of the advertised schema",
+        );
+        // Tags fall back through the chain: a specialization of a `build`
+        // pipeline is still a build, and re-declaring that in every file is
+        // how tag vocabularies rot.
+        assert_eq!(p.tags, vec!["build", "desktop"]);
+        // Re-pinning an already-pinned key can't even be spelled.
+        let resolved = p.resolve_params(&HashMap::new()).unwrap();
+        assert_eq!(resolved.get("profile").map(String::as_str), Some("dev"));
+    }
+
+    /// `alias_of` is a name reference, so a chain can close on itself. Caught
+    /// at load with the chain in the message rather than by blowing the stack.
+    #[test]
+    fn an_alias_cycle_is_rejected_with_its_chain() {
+        let (_d, loader) = camp(&[
+            (
+                "ping",
+                "[pipeline]\nname = \"ping\"\nlabel = \"l\"\nalias_of = \"pong\"\n",
+            ),
+            (
+                "pong",
+                "[pipeline]\nname = \"pong\"\nlabel = \"l\"\nalias_of = \"ping\"\n",
+            ),
+        ]);
+        let err = loader.load("ping").expect_err("ping -> pong -> ping");
+        match &err {
+            ConfigError::AliasChain { chain, .. } => {
+                assert_eq!(chain, &["ping", "pong", "ping"]);
+            }
+            other => panic!("expected AliasChain, got {other:?}"),
+        }
+        assert!(err.to_string().contains("ping -> pong -> ping"), "got: {err}");
+    }
+
+    /// A chain longer than `MAX_ALIAS_DEPTH` is a modelling mistake, not a
+    /// recipe. Same posture as `MAX_SUB_PIPELINE_DEPTH`.
+    #[test]
+    fn an_alias_chain_deeper_than_the_cap_is_rejected() {
+        let mut files: Vec<(String, String)> = Vec::new();
+        // a0 -> a1 -> … -> a{N} -> local-install; N chosen to exceed the cap.
+        let depth = MAX_ALIAS_DEPTH + 1;
+        for i in 0..depth {
+            let base = if i + 1 == depth {
+                "local-install".to_string()
+            } else {
+                format!("a{}", i + 1)
+            };
+            files.push((
+                format!("a{i}"),
+                format!("[pipeline]\nname = \"a{i}\"\nlabel = \"l\"\nalias_of = \"{base}\"\n"),
+            ));
+        }
+        let refs: Vec<(&str, &str)> = files
+            .iter()
+            .map(|(n, b)| (n.as_str(), b.as_str()))
+            .collect();
+        let (_d, loader) = camp(&refs);
+
+        let err = loader.load("a0").expect_err("chain exceeds the cap");
+        assert!(
+            matches!(&err, ConfigError::AliasChain { reason, .. } if reason.contains("MAX_ALIAS_DEPTH")),
+            "got {err:?}",
+        );
+        // Entering the same chain ONE hop later resolves: the cap is a cap on
+        // nesting, not a ban on it, and this is the boundary it sits at.
+        assert!(loader.load("a1").is_ok(), "a1 -> … -> local-install is exactly at the cap");
+    }
+
+    /// A specialization with nothing to say about itself describes the thing it
+    /// specializes, rather than showing an empty readme in the catalog. Its own
+    /// header block still wins when it has one.
+    #[test]
+    fn description_falls_back_through_the_alias_to_the_base() {
+        let (_d, loader) = camp(&[
+            (
+                "quiet",
+                "[pipeline]\nname = \"quiet\"\nlabel = \"l\"\nalias_of = \"local-install\"\n\n\
+                 [pipeline.pin]\ntarget = \"cli\"\n",
+            ),
+            (
+                "loud",
+                "# loud — the cli, installed, with feeling.\n\n\
+                 [pipeline]\nname = \"loud\"\nlabel = \"l\"\nalias_of = \"local-install\"\n\n\
+                 [pipeline.pin]\ntarget = \"cli\"\n",
+            ),
+        ]);
+        assert_eq!(
+            loader.load("quiet").unwrap().description.as_deref(),
+            Some("local-install — build a yah surface and install it into this machine."),
+        );
+        assert_eq!(
+            loader.load("loud").unwrap().description.as_deref(),
+            Some("loud — the cli, installed, with feeling."),
+        );
+    }
+
+    /// R751-F3: the template ↔ concrete cut, over real files rather than over
+    /// hand-built `Pipeline` literals — the FE's own copy of this derivation
+    /// passed its unit tests and was still wrong on the wire path (R751-B1),
+    /// so the one that replaces it is tested through the loader.
+    #[test]
+    fn classification_follows_what_a_run_still_has_to_be_told() {
+        let (_d, loader) = camp(&[
+            (
+                // Fully binds the base's only unbound required param.
+                "desktop-local",
+                "[pipeline]\nname = \"desktop-local\"\nlabel = \"l\"\n\
+                 alias_of = \"local-install\"\n\n[pipeline.pin]\ntarget = \"desktop\"\n",
+            ),
+            (
+                // Pins something, but leaves `target` open. A PARTIAL
+                // specialization is still a template — you cannot instantiate
+                // it — which is the whole reason template wins the precedence.
+                "debug-local",
+                "[pipeline]\nname = \"debug-local\"\nlabel = \"l\"\n\
+                 alias_of = \"local-install\"\n\n[pipeline.pin]\nprofile = \"dev\"\n",
+            ),
+        ]);
+
+        let base = loader.load("local-install").unwrap();
+        assert_eq!(base.classification(), crate::types::PipelineClass::Template);
+        assert_eq!(base.unbound_params(), vec!["target"]);
+
+        let full = loader.load("desktop-local").unwrap();
+        assert_eq!(full.classification(), crate::types::PipelineClass::Specialization);
+        assert!(full.unbound_params().is_empty(), "the pin bound the last one");
+
+        let partial = loader.load("debug-local").unwrap();
+        assert_eq!(
+            partial.classification(),
+            crate::types::PipelineClass::Template,
+            "a partial specialization still cannot be run with no input",
+        );
+        assert_eq!(partial.unbound_params(), vec!["target"]);
+        assert_eq!(
+            partial.alias_of.as_deref(),
+            Some("local-install"),
+            "and it still says where it came from, so nothing is lost by the precedence",
+        );
+    }
+
+    /// A `required` param carrying a `default` is BOUND — that is the whole
+    /// point of `default = ""` (see `ParamDef::default`), and reading `required`
+    /// alone would file half the catalog under templates.
+    #[test]
+    fn a_required_param_with_a_default_is_not_unbound() {
+        let (_d, loader) = camp(&[]);
+        let p = loader.load("local-install").unwrap();
+        // `profile` is required=false with a default; `notify` defaults to "".
+        assert_eq!(p.unbound_params(), vec!["target"]);
+        assert_eq!(
+            loader
+                .load_from_str(
+                    "[pipeline]\nname = \"n\"\nlabel = \"l\"\n\n\
+                     [pipeline.params]\nfeatures = { required = true, default = \"\" }\n"
+                )
+                .unwrap()
+                .classification(),
+            crate::types::PipelineClass::Concrete,
+        );
+    }
+
+    /// R751-F2 verify: a specialization survives load → serialize → load. The
+    /// serialized form is what `qed eject` writes and what the wire carries, so
+    /// `alias_of` / `pins` dropping out of it would silently un-specialize a
+    /// pipeline somewhere downstream.
+    #[test]
+    fn a_specialization_round_trips_through_serde() {
+        let (_d, loader) = camp(&[(
+            "desktop-local",
+            "[pipeline]\nname = \"desktop-local\"\nlabel = \"l\"\ntags = [\"desktop\"]\n\
+             alias_of = \"local-install\"\n\n[pipeline.pin]\ntarget = \"desktop\"\n",
+        )]);
+        let p = loader.load("desktop-local").unwrap();
+        let json = serde_json::to_string(&p).unwrap();
+        let back: Pipeline = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.alias_of, p.alias_of);
+        assert_eq!(back.pins, p.pins);
+        assert_eq!(back.params.len(), p.params.len());
+        assert_eq!(back.steps.len(), p.steps.len());
+
+        // An ordinary pipeline must not grow the keys: `skip_serializing_if`
+        // keeps `qed eject`'s output free of `alias_of = null` / `pins = {}`.
+        let plain = serde_json::to_string(&loader.load("local-install").unwrap()).unwrap();
+        assert!(!plain.contains("alias_of"), "got: {plain}");
+        assert!(!plain.contains("pins"), "got: {plain}");
     }
 }
 

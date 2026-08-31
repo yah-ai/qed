@@ -24,45 +24,110 @@
 //! | `uses: actions/checkout`, `cache`, `upload-artifact`, `gh-release`, `build-push`, … | 3 service | [`FlagKind::ReplaceWithNative`] carrying the native stanza |
 //! | `uses:` unrecognized | unknown | [`FlagKind::Unknown`] — surfaced for review |
 //!
-//! ## Job DAG → flat pipeline
+//! ## Job DAG → step DAG
 //!
-//! A native [`Pipeline`](crate::types::Pipeline) is a flat `Vec<QedStep>` run in
-//! declaration order; GHA workflows are a job DAG. The transform flattens jobs
-//! into a **topological linearization** ([`yah_qed_gha::topo_sort`]) — every job's
-//! `needs:` predecessors emit before it — so execution order is honest even
-//! though the job grouping is lost.
+//! GHA workflows are a job DAG. A native [`Pipeline`](crate::types::Pipeline) is
+//! a `Vec<QedStep>` — but since R605-F3 that Vec carries edges
+//! ([`QedStep::needs`](crate::types::QedStep::needs), scheduled by
+//! [`crate::dag`]), so the job graph survives the import instead of being
+//! flattened out of it.
 //!
-//! Read that as "the DAG is not *represented*", NOT as "the port gives up
-//! parallelism you had". QED has no inter-job parallelism to give up at either
-//! end: `QedStep` carries no dependency edges and the runner walks
-//! `pipeline.steps` in order, and the qed-gha emulator likewise computes waves
-//! and then executes every instance one at a time (`runtime.rs`, "Sequential
-//! within wave"). A flattened port therefore runs in the same wall-clock as the
-//! same workflow under the emulator; both are slower than GitHub, which schedules
-//! jobs across runners. Making QED honour the DAG is a *runner* feature (a
-//! dependency model on the step/job layer plus a concurrent scheduler), not
-//! something this transform can recover on its own — so do not "fix" it here by
-//! synthesising ordering the executor cannot act on.
+//! The mapping is one edge per **job boundary**, not per step:
+//!
+//! - steps are emitted job by job in [`topo_sort`] order, so the file still
+//!   reads top-to-bottom the way the workflow does;
+//! - the **first** emitted step of each job gets an explicit `needs` naming the
+//!   **last** emitted step of each of its `needs:` predecessors — or
+//!   `needs = []` when it is a root;
+//! - every other step of a job says nothing, which is the implicit chain edge
+//!   to its predecessor *within the same job* — exactly GHA's within-job
+//!   sequencing.
+//!
+//! A predecessor job that emitted **no** native steps (every step tier-3, so
+//! all of them flagged) is transparent: its dependents inherit *its*
+//! predecessors' tails. Otherwise a job whose only content was
+//! `actions/checkout` would sever the branch it sits on.
+//!
+//! This is what makes an ejected multi-job workflow run its independent
+//! branches concurrently rather than in a topological line. Note what it is
+//! *not* a claim about: the [`yah_qed_gha`] emulator that runs a **wrapped**
+//! workflow (`kind = gha-workflow`) still executes one instance at a time
+//! unless its own concurrency cap is raised — see `runtime.rs`. Porting and
+//! wrapping are different paths, and only the ported one goes through this
+//! module.
 //!
 //! Matrix expansion and the `workflow_call` port contract are *not* handled
 //! here: target lifting out of `strategy.matrix` is R533-F9 (it layers onto the
 //! steps emitted here) and the down/up-port mapping is R533-F5.
 //!
 //! @yah:ticket(R605-F3, "QED executes a job DAG: dependency edges on the step/job layer + a concurrent scheduler")
-//! @yah:at(2026-08-03T06:12:20Z)
-//! @yah:status(open)
+//! @yah:status(review)
+//! @yah:at(2026-08-16T05:46:37Z)
 //! @yah:assignee(agent:bundle-anthropic-ashguard)
 //! @yah:parent(R605)
-//! @yah:next("Half (a) - qed-gha emulator: runtime.rs `for wave in &plan.waves { for instance in wave {` runs every instance serially ('Sequential within wave - F4 simplification'). The waves are ALREADY computed correctly by graph::plan; only the executor is serial. Needs a concurrency cap + shared-resource keys before turning on: unlike GHA these instances share one host, one cargo target dir and one docker daemon, so naive fan-out contends where GHA does not.")
-//! @yah:next("Half (b) - native pipelines: QedStep carries no dependency edges at all and PipelineRunner walks `for step in &self.pipeline.steps` in order, so an ejected pipeline cannot REPRESENT the DAG regardless of scheduling. This is the half that gates porting release.yml as anything but a flat list. Needs a dependency model (a `needs` on QedStep, or a job-grouping layer above steps) before the transform has anywhere to put the edges.")
-//! @yah:next("Only after (b): change transform.rs's topo_sort(...).map(|waves| waves.into_iter().flatten().collect()) to emit the wave structure instead of flattening. Do NOT do this first - synthesising ordering the executor cannot act on is worse than the honest flat list.")
-//! @yah:next("Blast radius on (b), scope before starting: PipelineRunner's sequential loop; remote-resume, which indexes by pipeline-local step index (runner.rs ~2659); background_until, whose contract is 'the named step must appear AFTER this one' - a partial order breaks 'after'; concurrency_key lock acquisition; and the per-step event/index stream the desktop QED tab renders.")
 //! @yah:verify("A pipeline with two independent branches and one join records overlapping start/end timestamps for the branches, and the join starts only after both finish")
 //! @yah:verify("yah qed eject on a multi-job workflow emits the job structure rather than a flat list, and `yah qed validate` still round-trips it")
 //! @yah:gotcha("The reporting layer already models this and is NOT the gap: the run-status wire struct carries `needs: Vec<String>` per job (W223 R532-F2) so the graph viewer can draw dependency edges for a WRAPPED workflow. That is display-only, fed from yah_qed_gha::plan - it does not mean native pipelines have dependencies.")
 //! @yah:gotcha("Do not file this as a release.yml blocker on parallelism grounds. Porting release.yml flat costs NOTHING against QED-today, because the emulator is serial too. The parallelism gap is against GitHub, and you already pay it the moment you run release.yml through QED at all. The real reasons to hold release.yml are its 52 tier-3 flags (several with no native replacement built yet) and it being a one-way move off the thing that currently ships releases.")
 //! @arch:see(oss/qed/crates/qed-gha/src/runtime.rs)
 //! @arch:see(oss/qed/crates/qed/src/transform.rs)
+//! @yah:gotcha("LIVE DEFECT found from R776-T2 (read-from-call-graph, NOT executed -- confirm with a test first). Step-level matrices never expand on either run path. expand_step has one production caller, matrix::plan (oss/qed/crates/qed/src/matrix.rs:311), and both paths gate it on a PIPELINE-level matrix: app/yah/cli/src/camp.rs:8831-8836 (None arm hands the raw pipeline to PipelineRunner at :8882-8885) and app/yah/cli/src/qed.rs:1446-1454. PipelineRunner never reads QedStep::matrix. The camp.rs:8828-8830 comment claiming step matrices keep runner-side handling is false. Effect: the step runs once with the matrix expression literal in argv.")
+//! @yah:gotcha("Sequencing that follows from the above: make step matrices expand BEFORE resolving needs, then resolve needs against the EXPANDED list. background_until already shows the failure -- it resolves by name against the expanded list (runner.rs:2461-2490), so background_until = 'build' against a matrixed 'build' errors 'names unknown step' because the post-expansion name is 'build [k=v]' (matrix.rs:326-350) and no author writes that by hand. A name-keyed needs inherits this exactly. Separately: background_until is POSITIONAL -- runner.rs:2496-2504 rejects a target at or before the declaring step, and a partial order has no 'later'. See .yah/docs/working/W322-plugin-nodes-in-the-build-dag.md section 2.")
+//! @yah:gotcha("R776-T3: matrix::apply_matrix_to_step (matrix.rs:366-391) substitutes argv/env/cwd/platform.target/platform.container_platform and nothing else -- notably NOT the new `resource` field. A per-row resource key stays one shared literal across every fanned row, so every instance of a matrixed cargo step serializes against every other, including rows building into genuinely separate target dirs. Conservative rather than racy, but it caps a fan-out at the pessimal answer. Adding `resource` to that substitution list is a one-liner.")
+//! @yah:gotcha("R776-T3: `if_cond` is not substituted by apply_matrix_to_step either, and the runner builds ctx.matrix from self.matrix_coord -- the PIPELINE-level coord (runner.rs:1805-1815). So a step-level matrix instance cannot gate on its own coord: an if= naming matrix.<key> resolves to Null and EVERY instance skips. Worth knowing before anyone reaches for if= as the per-instance selection mechanism; W322 section 3 rejects that route for exactly this reason and uses a goal closure over needs instead.")
+//! @yah:handoff("BOTH HALVES SHIPPED (uncommitted; parts of it were swept into a peer sync commit mid-session). Half (b), the one that gated everything: QedStep.needs is a three-state Option<Vec<String>> -- absent = implicit chain edge to the previous step, needs = [] = root, needs = [..] = exactly those. The absent case is the whole backwards-compat story: every pipeline TOML in every camp omits the key, so every one of them resolves to the chain 0-1-2-.. and runs byte-identically, same event stream, same rows. Reading absent as no-dependencies would have fanned out the entire corpus overnight.")
+//! @yah:handoff("New module oss/qed/crates/qed/src/dag.rs: predecessors() / waves() / dependents() / is_explicit(), Kahn over the step slice, with a Missing policy (Reject for the loader, Satisfied for the runner because resume-from-step hands it a drained prefix). A needs entry matches a step by name OR by the \"<name> [k=v]\" shape matrix::plan gives a fanned-out row, so needs = [\"build\"] joins on every matrix row the way GHA needs: does. 14 unit tests.")
+//! @yah:handoff("run_inner()s sequential for-loop is now a ready-queue scheduler (runner.rs ~2605). A step is admitted when every predecessor is done; up to Pipeline.max_parallel (default dag::DEFAULT_MAX_PARALLEL = 4) run at once, minus any whose QedStep.resource key is held. The 400-line loop body moved out to run_one_step(), which takes the step by value and returns a StepOutcome the scheduler folds BY STEP INDEX -- so produced artifacts and status rows stay in declaration order even when the steps overlapped.")
+//! @yah:handoff("Every item on the blast-radius list was preserved, not worked around. Event indices unchanged (index + index_offset), so the desktop QED tab and remote-resume both still index by pipeline-local step index. background_until keeps its declaration-order check AND gains a stricter one under a declared DAG: the gate must be a transitive dependent, because \"later in the file\" stops meaning \"after\" the moment two branches exist and a gate on the wrong branch would kill the sidecar mid-use. A background step counts as satisfied at SPAWN (it has no exit to wait for), which makes needs = [\"server\"] a runnable edge rather than a deadlock. Admission-lane handling downgrades Fleet to the runs own lane while any local step is in flight, and the enter_lane await moved INTO the step future so a queued run cannot stall the steps already running.")
+//! @yah:handoff("transform.rs now carries the job graph instead of flattening it: one edge per JOB boundary (first native step of a job needs the last native step of each predecessor job; roots get needs = []), with a job that emitted no native steps made transparent so an all-tier-3 job does not sever its branch. Duplicate emitted step names are disambiguated with \" (2)\" -- GHA allows two steps to share a name and QED cannot, since the name is the key a needs edge resolves against. An unresolvable job graph still imports flat with no edges rather than failing.")
+//! @yah:handoff("Half (a), the qed-gha emulator: runtime.rs \"Sequential within wave - F4 simplification\" is gone. run_wave() runs a waves instances on std::thread::scope workers up to Executor.max_parallel_jobs, honouring each jobs own strategy.max-parallel underneath (which was already parsed and previously ignored). Results fold back in WAVE order, not completion order, so needs.* aggregation and the returned transcript stay deterministic; the first failure in wave order wins. THE CAP DEFAULTS TO 1 -- unchanged serial behaviour -- and raising it needs a per-job resource key, filed as R605-T4.")
+//! @yah:handoff("DISCOVERED WORK fixed in this pass, all outside the ticket title. (1) lib.rs:673 desktop_release_matrix_routes_each_row_to_its_own_platform asserted three matrix rows against a recipe that has had one since 497a8a6b (2026-08-12, which removed both Linux rows deliberately and documented why in the TOML) -- red at HEAD before I started; assertion updated to the real row set with the rationale and the commit. (2) doc_source.rs module docs had three broken doctests from nested ``` fences inside ```text blocks -- outer fences widened to four backticks; cargo test --workspace in oss/qed was red on this before. (3) Regenerated .yah/schema/qed-pipeline.toml.schema.json AND .yah/schema/workload.toml.schema.json plus packages/yah/workload-spec/index.ts. The latter two are NOT mine -- they are R556-T12s MesofactStaticSlot.env, the drift the R625-F3 note in xtask/src/main.rs parked on \"belongs to whoever changed the types\". xtask/tests/schema_drift.rs is green now.")
+//! @yah:verify("Verify criterion 1, mechanized as runner::tests::two_branches_overlap_and_the_join_waits_for_both: a root plus two sleep-1 branches plus a join. Asserts the branch rows overlap in recorded start/end timestamps, that the join starts at or after both completed_at, AND that the reported rows are still in declaration order.")
+//! @yah:verify("Verify criterion 2, mechanized as eject::tests::a_multi_job_workflow_ejects_the_job_structure_not_a_flat_list: a four-job diamond ejects, the body re-parses as Pipeline TOML, and dag::waves over it is 3 waves with 2 steps in the middle one -- not 4 sequential. eject::tests::needs_survives_the_toml_round_trip pins the serializer. transform::tests::release_yml_transforms_end_to_end now additionally asserts the REAL release.yml ports to a graph with strictly fewer waves than steps.")
+//! @yah:verify("The compatibility property has its own test: runner::tests::a_pipeline_without_needs_stays_strictly_serial. If that ever goes green with overlap, every pipeline TOML in every camp just became parallel.")
+//! @yah:verify("Suites: cargo test --workspace in oss/qed = 1482 pass / 0 fail across all 8 crates including doctests (869 yah-qed, 133 yah-qed-gha). cargo check --workspace at the camp root = clean. cargo test -p xtask --test schema_drift = 3/3. cargo test -p yah --lib qed = 41/41 (covers the qed_eject round-trip).")
+//! @yah:gotcha("No pipeline in .yah/qed/ declares needs yet, deliberately. Porting a real recipe to a DAG is a per-recipe judgement about which of its steps actually contend on target/ or docker, and that is an operator call, not a mechanical edit. The mechanism ships inert: every existing recipe still runs exactly as before.")
+//! @yah:gotcha("runner::tests::wait_for_times_out_when_endpoint_never_healthy failed once in ~8 full-suite runs and passed in isolation and in the other 7. It binds an ephemeral port, drops it, and assumes nothing re-binds it -- a pre-existing port-reuse race that the extra load from the new sleep-based concurrency tests makes marginally likelier to lose. Not a scheduler bug: that pipeline is a single step, so it is a one-step wave.")
+//! @yah:gotcha("The step-matrix-never-expands finding recorded in the two gotchas above now has its own durable ticket: R605-B5. It was filed separately so the finding survives this ticket archiving. Nothing here is blocked on it -- R605-F3's own mechanism is sound; B5 is the pre-existing gate that keeps dag::name_matches's fan-out branch unreachable on the daemon path.")
+//! @yah:handoff("FOLLOW-UP PASS: confirmed and fixed three of the four findings @Ashguard:eclipse appended from R776-T2/T3 while this was in flight. All three were real; the fourth is half-fixed with the remainder recorded as a gotcha. (1) Step-level matrices genuinely never expanded on either run path -- both gated matrix::plan on pipeline.matrix alone and PipelineRunner never reads QedStep::matrix. Latent for the camp (no .yah/qed/*.toml declares a step matrix) but LIVE for this ticket: R533-F9 lift_target emits exactly that shape, so every ported multi-target workflow would have run one step with the expression literal in argv. Added matrix::needs_expansion (pipeline matrix OR any step matrix) and repointed both gates at it -- camp.rs:8846 and qed.rs:1450. A step matrix still yields one PlannedJob, so the multi-row fan-out branch is unreachable from it and that path is unchanged.")
+//! @yah:handoff("(2) matrix::apply_matrix_to_step did not substitute the new QedStep.resource, so a per-row key stayed one literal and every fanned row serialized against every other -- the fan-out capped at its pessimal answer. One line, plus matrix::tests::a_matrix_row_gets_its_own_resource_key. (3) background_until matched by exact name, so a gate naming a matrix step failed preflight with \"unknown step\" (post-expansion the name is `client [n=1]`) -- and had it resolved it would have reaped on the FIRST row. Now resolved with dag::name_matches at preflight into a set of step indices carried on BackgroundTask.gate; the reap fires when the last of them is done. BackgroundTask.until is gone, superseded.")
+//! @yah:handoff("(4) if_cond: substituted the `${{ matrix.x }}` spelling per row (same one-liner, matrix::tests::a_matrix_row_substitutes_its_own_if_gate) because making step matrices actually expand turned a dead path live and a silent skip-everything is the worst shape to leave it in. The BARE spelling (if = \"matrix.arch == ..\") still resolves through ctx.matrix, which the runner builds from the PIPELINE coord -- see the gotcha. No recipe uses either spelling today.")
+//! @yah:gotcha("STILL OPEN from R776-T3, narrowed: a step-level matrix instance cannot gate on its own coord with the BARE spelling. runner.rs:1805-1815 builds ctx.matrix from self.matrix_coord, the PIPELINE-level coord, so `if = \"matrix.arch == 0x86\"` is Null for a step-only matrix and every instance skips. The `${{ matrix.x }}` spelling now works (substituted at expansion). Closing the bare half means threading a per-step coord into the expression context -- a runner change, not a substitution one. W322 section 3 rejects if= as the per-instance selection mechanism for exactly this reason, so nothing depends on it today.")
+//! @yah:verify("After the follow-up pass: oss/qed cargo test --workspace = 1487 pass / 0 fail. cargo test -p yah --lib = 1136 pass / 0 fail (covers camp.rs r325_f1 matrix fan-out and the qed_eject round-trip, the two suites the CLI-side gate change could have moved).")
+//! @yah:verify("The step-matrix defect has a regression test that would have caught it: matrix::tests::a_step_matrix_alone_needs_expansion_and_gets_it asserts needs_expansion is true for a step matrix under a matrix-less pipeline and that plan() fans the step. background_until over a matrix gate: runner::tests::background_until_gates_on_the_last_row_of_a_matrix_step asserts the sidecar completed_at is at or after BOTH rows.")
+//! @yah:handoff("(5) Closed the last inconsistency @Ashguard:eclipse named: `needs` was the only edge-bearing field left out of apply_matrix_to_step once resource and if_cond joined, so a CORRELATED per-row edge (needs = [\"build [arch=${{ matrix.arch }}]\"]) carried the literal into the graph and resolved to nothing -- rejected at load, silently dropped by the runners lenient resolver. Substituted now, with matrix::tests::a_matrix_row_can_declare_a_correlated_per_row_edge asserting the resulting graph is two independent chains rather than a join. The un-correlated needs = [\"build\"] still fans in on every row via dag::name_matches. Final: oss/qed cargo test --workspace = 1488 pass / 0 fail.")
+//!
+//! @yah:relay(R776, "Design: plugins/sidecars as first-class nodes in QED's build DAG")
+//! @yah:at(2026-08-16T02:18:58Z)
+//! @yah:kind(spike)
+//! @yah:status(open)
+//! @yah:assignee(agent:bundle-anthropic-miravel)
+//! @yah:next("Break into sub-tickets: node granularity, edge expression, composition with the desktop app build, and where R552-F6 blob-resolution plugs into a node's 'already satisfied' check. Land the design as a W### doc before touching transform.rs or config.rs -- this is a modeling question first.")
+//! @yah:next("R605-F3's own next-steps already name the blast radius any new edge mechanism has to survive (remote-resume step indexing, background_until's 'after' contract, concurrency_key locking, the desktop QED tab's per-step event stream) -- read those before proposing a shape.")
+//! @yah:gotcha("R605-F3 is the prerequisite mechanism, not a duplicate of this: QedStep carries no dependency edges today and PipelineRunner walks steps in strict declared order, so nothing can represent a DAG yet at any granularity. This spike should design the plugin-node shape assuming R605-F3's `needs`-on-step (or job-grouping-above-steps) model lands, not invent a second edge mechanism.")
+//! @yah:gotcha("Orthogonal to, not a substitute for, R552-F6 (bundled: -> blake3: blob acquisition). A plugin DAG node can resolve two ways -- build locally, or fetch a published blob -- and the design needs to model both branches, not just the build one, or it re-privileges local build over the R552-F6 direction this was raised alongside.")
+//! @yah:gotcha("Today's sidecar build is a single opaque xtask step (`cargo run -p xtask -- build-sidecars`) that loops yah_bundled::BUNDLED with no inter-sidecar edges -- a plugin-depends-on-plugin case is not expressible at all right now, not just inefficiently expressed.")
+//! @arch:see(crates/yah/bundled/src/lib.rs)
+//! @arch:see(.yah/qed/local-install.toml)
+//! @arch:see(.yah/qed/desktop-local.toml)
+//! @arch:see(app/yah/desktop/before-build.sh)
+//!
+//! @yah:ticket(R776-T2, "Edge expression: reuse R605-F3's step-level `needs`, or does plugin-to-plugin dependency need its own layer?")
+//! @yah:status(review)
+//! @yah:at(2026-08-16T03:01:23Z)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R776)
+//! @yah:depends_on(R605-F3)
+//! @yah:notify_on(R605-F3, "Read the SHIPPED needs shape before answering T2. The one thing T2 turns on: can a needs edge name a coord-suffixed matrix INSTANCE (matrix.rs:347 names them `<step> [triple=aarch64-apple-darwin]`), or only the declared step name? Instance-level => plugin-to-plugin edges stay triple-correlated. Step-name-only => every plugin fan-out collapses to all-of-A-needs-all-of-B, and T2 must answer 'own layer' instead of 'reuse'.")
+//! @yah:handoff("ANSWER: reuse R605-F3's step-level needs. Plugin-to-plugin dependency does NOT need its own layer. Landed as W322 section 2 (.yah/docs/working/W322-plugin-nodes-in-the-build-dag.md).")
+//! @yah:handoff("WHY no second layer: the plugin-to-plugin case has no instance in the tree. The four registry entries each build as cargo build -p NAME from their own workspace_subdir with no edges between them (xtask/src/main.rs:150-154, :384-411). The real edges are plugin->app (desktop bundle needs every sidecar staged) and artifact->install (mcp-sidecar after desktop-bundle), both ordinary step-to-step. A dedicated layer would be speculative generality; when a plugin-to-plugin case appears it is a build-order edge between two steps, which is what needs already is.")
+//! @yah:handoff("THE REAL REQUIREMENT on R605-F3: needs must resolve against the EXPANDED step list, and an edge must be able to name either the declared step (meaning all instances) or one instance. Declared-name-only degrades a triple-correlated edge into all-of-A-needs-all-of-B and serializes the fan-out section 1 exists to parallelize. Handed to @Ashguard:griffin (session:3b42fa19) in-session, plus two durable gotchas appended to R605-F3.")
+//! @yah:handoff("Found a live defect while answering this: step-level matrices never expand on either run path. Not fixed here -- it lives in camp.rs/qed.rs/runner.rs, which R605-F3 is actively rewriting, so editing them would be a shared-tree hand-fight. Handed over both channels (party.chat + two @yah:gotcha entries on R605-F3), and @yah:notify_on(R605-F3) is registered on this ticket.")
+//! @yah:verify("Call graph verified by tree-wide grep: expand_step has exactly one production caller (matrix.rs:311); the other two hits are its definition (:326) and a unit test (:839). Both gate sites read directly (camp.rs:8831-8836, qed.rs:1446-1454). runner.rs .matrix reads are only matrix_coord and the GHA cfg.matrix filter.")
+//! @yah:verify("Every cited line was opened and read; four citations that drifted while writing were corrected against grep before filing.")
+//! @yah:verify("NOT executed: the never-expands finding is read from the call graph, not observed at runtime. Said so explicitly in the doc and in the handover to @Ashguard:griffin, who should confirm with a test before acting.")
+//! @yah:verify("Design-only: no qed source touched. Only edits this session are W322 and one @arch:see line in crates/yah/bundled/src/lib.rs.")
+//! @yah:notify_on(R605-F3, "The needs mechanism landed. Read crate::dag in oss/qed/crates/qed/src/dag.rs and QedStep::needs/resource in types.rs before designing the plugin-node edge: needs is a three-state Option (absent = implicit chain, [] = root, [..] = explicit), and QedStep::resource is the shared-resource gate. Both are step-level, so the question this ticket asks is now answerable against real code rather than a proposal.")
 
 use crate::matrix::MatrixSpec;
 use crate::platform::PlatformSpec;
@@ -252,10 +317,15 @@ impl FlagKind {
 
 /// Transform a parsed workflow into native QED steps + assisted flags.
 ///
-/// Jobs are flattened in [`topo_sort`] order so `needs:` predecessors precede
-/// their dependents; an unresolvable graph (cycle / unknown `needs`) falls back
-/// to declaration order rather than failing the import — the operator still gets
-/// the per-step transform to work from.
+/// Jobs are emitted in [`topo_sort`] order so `needs:` predecessors precede
+/// their dependents in the file, and the job graph is carried onto the steps as
+/// [`QedStep::needs`](crate::types::QedStep::needs) edges (R605-F3) so the
+/// runner schedules independent branches concurrently rather than in that
+/// line. An unresolvable graph (cycle / unknown `needs`) falls back to
+/// declaration order with the edges dropped, rather than failing the import —
+/// the operator still gets the per-step transform to work from, and a cycle
+/// that reached QED's own `needs` would only fail the load later, further from
+/// the workflow that caused it.
 pub fn transform_workflow(wf: &Workflow) -> TransformReport {
     let label = wf
         .name
@@ -265,19 +335,115 @@ pub fn transform_workflow(wf: &Workflow) -> TransformReport {
 
     // Topo-linearize the job DAG; on an unresolvable graph, keep declaration
     // order so the import still produces something to edit.
-    let order: Vec<String> = topo_sort(wf)
-        .map(|waves| waves.into_iter().flatten().collect())
-        .unwrap_or_else(|_| wf.jobs.keys().cloned().collect());
+    let sorted = topo_sort(wf).ok();
+    let order: Vec<String> = match &sorted {
+        Some(waves) => waves.iter().flatten().cloned().collect(),
+        None => wf.jobs.keys().cloned().collect(),
+    };
 
-    let mut steps = Vec::new();
+    let mut steps: Vec<TransformedStep> = Vec::new();
+    // Where each job's emitted native steps sit in `steps`, so the edge pass
+    // below can name a job's first and last one.
+    let mut spans: Vec<(String, Vec<usize>)> = Vec::new();
     for job_id in &order {
         let Some(job) = wf.jobs.get(job_id) else { continue };
+        let mut native_at: Vec<usize> = Vec::new();
         for (step_index, step) in job.steps.iter().enumerate() {
-            steps.push(transform_step(job_id, job, step_index, step));
+            let t = transform_step(job_id, job, step_index, step);
+            if t.native.is_some() {
+                native_at.push(steps.len());
+            }
+            steps.push(t);
         }
+        spans.push((job_id.clone(), native_at));
+    }
+
+    // Two steps with the same emitted name would make a `needs` edge to that
+    // name ambiguous (and `${{ steps.X.outputs }}` / `background_until` too), so
+    // disambiguate before anything references them.
+    dedupe_native_names(&mut steps);
+    if sorted.is_some() {
+        apply_job_edges(wf, &mut steps, &spans);
     }
 
     TransformReport { name, label, steps }
+}
+
+/// Suffix repeated native step names with ` (2)`, ` (3)`, … .
+///
+/// GHA tolerates two steps in one job sharing a `name:`; QED's step namespace
+/// does not — the emitted name is the key for a `needs` edge, for
+/// `${{ steps.<name>.outputs.* }}`, and for `background_until`. Emitting a
+/// duplicate would make the ejected pipeline fail its own load validation
+/// (`DagError::AmbiguousName`) the moment anything referenced it, which is a
+/// worse outcome than a slightly-renamed step.
+fn dedupe_native_names(steps: &mut [TransformedStep]) {
+    let mut seen: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for t in steps.iter_mut() {
+        let Some(native) = t.native.as_mut() else { continue };
+        let count = seen.entry(native.name.clone()).or_insert(0);
+        *count += 1;
+        if *count > 1 {
+            native.name = format!("{} ({})", native.name, count);
+        }
+    }
+}
+
+/// Carry the workflow's job edges onto the emitted steps (R605-F3).
+///
+/// One edge per job boundary: the first native step of a job `needs` the last
+/// native step of each predecessor job. A predecessor that emitted nothing (all
+/// its steps were tier-3, so all flagged) is transparent — its own
+/// predecessors' tails are inherited through it, so a job whose only content
+/// was `actions/checkout` doesn't sever the branch it sits on.
+///
+/// Roots get `needs = []`, which is *not* the same as leaving the key off:
+/// absent means "chain to the previous step in the file", and the previous step
+/// in the file belongs to some unrelated job that merely sorted earlier. Saying
+/// nothing here is precisely the flattening this pass exists to undo.
+fn apply_job_edges(wf: &Workflow, steps: &mut [TransformedStep], spans: &[(String, Vec<usize>)]) {
+    // job id → the step names a dependent should wait on. A job with native
+    // steps answers with its last one; an empty job passes the question up.
+    let mut tails: IndexMap<&str, Vec<String>> = IndexMap::new();
+    for (job_id, native_at) in spans {
+        let tail = match native_at.last() {
+            Some(&last) => vec![steps[last]
+                .native
+                .as_ref()
+                .expect("index recorded only for native steps")
+                .name
+                .clone()],
+            None => predecessor_tails(wf, job_id, &tails),
+        };
+        tails.insert(job_id.as_str(), tail);
+    }
+
+    for (job_id, native_at) in spans {
+        let Some(&first) = native_at.first() else { continue };
+        let deps = predecessor_tails(wf, job_id, &tails);
+        steps[first]
+            .native
+            .as_mut()
+            .expect("index recorded only for native steps")
+            .needs = Some(deps);
+    }
+}
+
+/// The step names a job must wait on: the resolved tails of every job in its
+/// `needs:`, deduped, in declaration order. Empty for a root.
+fn predecessor_tails(wf: &Workflow, job_id: &str, tails: &IndexMap<&str, Vec<String>>) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let Some(job) = wf.jobs.get(job_id) else {
+        return out;
+    };
+    for need in &job.needs {
+        for name in tails.get(need.as_str()).into_iter().flatten() {
+            if !out.contains(name) {
+                out.push(name.clone());
+            }
+        }
+    }
+    out
 }
 
 /// Convenience: parse raw workflow YAML and transform it in one call. Still
@@ -917,6 +1083,193 @@ jobs:
     // (Native step-matrix expansion concretizing platform.target end-to-end is
     // covered by matrix::tests::step_matrix_substitutes_lifted_platform_target.)
 
+    // ── R605-F3: the job DAG survives the import ──────────────────────────
+
+    /// The emitted `needs` on the named step, or `None` when it declares none.
+    fn needs_of<'a>(r: &'a TransformReport, step_name: &str) -> Option<&'a Vec<String>> {
+        r.native_steps()
+            .find(|s| s.name == step_name)
+            .unwrap_or_else(|| panic!("no native step named `{step_name}`"))
+            .needs
+            .as_ref()
+    }
+
+    /// Two independent jobs joining into a third. Before R605-F3 this ejected
+    /// as a flat six-step line; now the join's first step names both branch
+    /// tails and the branch heads are roots, so the runner fans them out.
+    #[test]
+    fn a_job_diamond_becomes_a_step_dag() {
+        let src = r#"
+on: push
+jobs:
+  setup:
+    runs-on: x
+    steps:
+      - name: prep
+        run: echo prep
+  left:
+    needs: setup
+    runs-on: x
+    steps:
+      - name: one
+        run: echo l1
+      - name: two
+        run: echo l2
+  right:
+    needs: setup
+    runs-on: x
+    steps:
+      - name: one
+        run: echo r1
+  join:
+    needs: [left, right]
+    runs-on: x
+    steps:
+      - name: fin
+        run: echo done
+"#;
+        let r = xf(src);
+        // The root job's head depends on nothing — and says so, rather than
+        // leaving the key off (which would mean "chain to the previous step").
+        assert_eq!(needs_of(&r, "setup: prep"), Some(&vec![]));
+        // Both branch heads hang off the root's tail.
+        assert_eq!(needs_of(&r, "left: one"), Some(&vec!["setup: prep".to_string()]));
+        assert_eq!(needs_of(&r, "right: one"), Some(&vec!["setup: prep".to_string()]));
+        // A step that is not its job's head says nothing — the implicit chain
+        // edge to the step before it, which is its own job's previous step.
+        assert_eq!(needs_of(&r, "left: two"), None);
+        // The join waits on the LAST step of each branch.
+        assert_eq!(
+            needs_of(&r, "join: fin"),
+            Some(&vec!["left: two".to_string(), "right: one".to_string()])
+        );
+    }
+
+    /// A predecessor job that emits nothing (every step tier-3) must not sever
+    /// the branch: its dependents inherit its own predecessors' tails.
+    #[test]
+    fn a_job_with_no_native_steps_is_transparent_in_the_graph() {
+        let src = r#"
+on: push
+jobs:
+  build:
+    runs-on: x
+    steps:
+      - name: compile
+        run: cargo build
+  stage:
+    needs: build
+    runs-on: x
+    steps:
+      - uses: actions/upload-artifact@v4
+  ship:
+    needs: stage
+    runs-on: x
+    steps:
+      - name: publish
+        run: echo ship
+"#;
+        let r = xf(src);
+        assert_eq!(
+            needs_of(&r, "ship: publish"),
+            Some(&vec!["build: compile".to_string()]),
+            "the all-tier-3 `stage` job emits nothing, so `ship` hangs off `build`",
+        );
+    }
+
+    /// The ejected step DAG has to be one QED itself accepts — same resolver
+    /// the loader runs, over the transform's own output.
+    #[test]
+    fn the_emitted_graph_resolves_and_fans_out() {
+        let src = r#"
+on: push
+jobs:
+  a:
+    runs-on: x
+    steps:
+      - name: s
+        run: echo a
+  b:
+    runs-on: x
+    steps:
+      - name: s
+        run: echo b
+  c:
+    needs: [a, b]
+    runs-on: x
+    steps:
+      - name: s
+        run: echo c
+"#;
+        let r = xf(src);
+        let steps = r.collect_native();
+        let waves = crate::dag::waves(&steps, crate::dag::Missing::Reject)
+            .expect("the emitted graph resolves");
+        assert_eq!(
+            waves,
+            vec![vec![0, 1], vec![2]],
+            "two independent jobs share a wave; their dependent follows",
+        );
+    }
+
+    /// Two steps sharing a `name:` are legal in GHA and ambiguous in QED — the
+    /// emitted name is the key a `needs` edge resolves against. Disambiguated
+    /// at emit, so the ejected file loads.
+    #[test]
+    fn duplicate_step_names_within_a_job_are_disambiguated() {
+        let src = r#"
+on: push
+jobs:
+  a:
+    runs-on: x
+    steps:
+      - name: build
+        run: echo one
+      - name: build
+        run: echo two
+  b:
+    needs: a
+    runs-on: x
+    steps:
+      - name: ship
+        run: echo three
+"#;
+        let r = xf(src);
+        let names: Vec<&str> = r.native_steps().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["a: build", "a: build (2)", "b: ship"]);
+        assert_eq!(needs_of(&r, "b: ship"), Some(&vec!["a: build (2)".to_string()]));
+        assert!(crate::dag::waves(&r.collect_native(), crate::dag::Missing::Reject).is_ok());
+    }
+
+    /// An unresolvable job graph still imports — flat, with no edges — rather
+    /// than failing. A cycle carried into QED's own `needs` would only fail the
+    /// load later, further from the workflow that caused it.
+    #[test]
+    fn a_cyclic_job_graph_imports_flat_with_no_edges() {
+        let src = r#"
+on: push
+jobs:
+  a:
+    needs: b
+    runs-on: x
+    steps:
+      - name: s
+        run: echo a
+  b:
+    needs: a
+    runs-on: x
+    steps:
+      - name: s
+        run: echo b
+"#;
+        let r = xf(src);
+        assert!(
+            r.native_steps().all(|s| s.needs.is_none()),
+            "no synthesized edges off a graph that doesn't resolve",
+        );
+        assert!(crate::dag::waves(&r.collect_native(), crate::dag::Missing::Reject).is_ok());
+    }
+
     /// Locate yah's live `release.yml` by ascending to the `.github/workflows`
     /// marker. Absent in the standalone export mirror → the fixture test skips.
     ///
@@ -1080,5 +1433,20 @@ jobs:
             assert!(b < s, "cli-build before smoke");
             assert!(s < p, "smoke before publish-cli");
         }
+
+        // R605-F3: the emitted step graph has to be one QED will actually
+        // load — the whole corpus of real-workflow shapes in one assertion.
+        // Its wave count must be *lower* than its step count, or the "job DAG"
+        // claim is just a flat list with extra keys on it.
+        let native = r.collect_native();
+        let waves = crate::dag::waves(&native, crate::dag::Missing::Reject)
+            .expect("release.yml's emitted graph resolves");
+        assert!(
+            waves.len() < native.len(),
+            "release.yml has independent jobs, so the ported graph must have at \
+             least one wave with more than one step in it ({} waves over {} steps)",
+            waves.len(),
+            native.len(),
+        );
     }
 }

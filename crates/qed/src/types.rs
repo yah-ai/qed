@@ -288,14 +288,66 @@
 //! @yah:verify("Re-swept .yah/qed/*.toml at 5e86d6d9: every pipeline file carries an explicit concurrency_key; the only keyless files are baseline.toml / gha-actions.toml / peers.toml, which are not pipelines. The @camp lane is empty, so no live recipe changed lanes.")
 //!
 //! @yah:ticket(R719-T6, "Collapse cargo-target into the default concurrency key (or decide not to)")
-//! @yah:at(2026-08-08T23:16:27Z)
-//! @yah:status(open)
+//! @yah:status(review)
+//! @yah:at(2026-08-11T00:08:23Z)
 //! @yah:assignee(agent:bundle-anthropic-ashguard)
 //! @yah:parent(R719)
 //! @yah:next("Decide whether DEFAULT_CONCURRENCY_KEY should become cargo-target instead of @camp. If yes: one line in types.rs plus deleting the ~19 now-redundant cargo-target stamps under .yah/qed/.")
 //! @yah:next("The judgement is the operators: should a non-cargo recipe that forgets a key inherit the cargo lane? Collapsing says yes and closes the hole; keeping them separate says no and leaves it. Deferred out of R719-F1 by explicit operator call, not oversight.")
 //! @yah:verify("cargo test -p yah --lib r325_f1")
 //! @yah:gotcha("Not a live bug today — R719-F1 swept every .yah/qed pipeline onto an explicit key, so the @camp lane is EMPTY. The hole is latent: a FUTURE recipe that cargo-builds and forgets a key lands in @camp and races the ~19 cargo-target recipes.")
+//! @yah:handoff("DECIDED: do NOT collapse. DEFAULT_CONCURRENCY_KEY stays \"@camp\". Three reasons, in order of weight: (1) qed is a general pipeline engine that ships standalone from oss/qed — naming its default after a Rust toolchain's build directory is a lie for every non-cargo recipe; (2) the collapse would delete ~18 self-documenting `concurrency_key = \"cargo-target\"` stamps, putting admission back to implicit, which is the exact property that let desktop-release ship unkeyed; (3) it closes only a third of the hole — a recipe that forgets `cloud-apply` or `pi-image` would be misfiled under cargo rather than unfiled. A default cannot infer which resource a recipe contends on.")
+//! @yah:handoff("INSTEAD, the hole is closed at its actual cause — forgetting. New app/yah/cli/tests/camp_qed_admission_lanes.rs, 3 tests. (a) every_camp_pipeline_declares_an_explicit_concurrency_key: no .yah/qed pipeline may fall through to the default at all, so @camp stays empty by construction rather than by a hand sweep. (b) camp_pipelines_running_cargo_locally_hold_the_cargo_target_key: any step with argv[0]==\"cargo\" and no image/runtime must be in the cargo lane — catches the second mistake (chose a lane, chose the wrong one) that the explicit-key guard alone does not. (c) the_guards_catch_the_mistakes_they_are_for: tempdir fixtures proving both predicates bite, including a containerized-cargo control that must NOT be flagged (rusty-v8-musl's shape).")
+//! @yah:handoff("The relay's own R435-T3 gotcha is that the stamps were audited once, by hand, with no guard, and desktop-release was authored after the audit and missed it. This is that audit as a test.")
+//! @yah:handoff("DOC: DEFAULT_CONCURRENCY_KEY's doc in oss/qed/crates/qed/src/types.rs now records the declined collapse and why, so the next agent does not re-litigate. W170 §3 rewritten — it still documented the PRE-R719-F1 default (\"omitted serializes per-pipeline\"), which has been false since F1 landed; it now states the three legal answers and that omitting is not a fourth.")
+//! @yah:handoff("DISCOVERED WORK, beyond the ticket. camp.rs r325_f1_tests::release_wizard_composes_and_gates_on_advance asserted release-wizard's EXACT four-step list, so the wizard legitimately growing four stages in 877914c2 (2026-08-09) turned it red. Replaced with the invariant the test's own doc comment claims: version-bump and oss-publish are present, are SubPipeline (not inlined forks), and are ordered. That un-masked a REAL defect one assertion further down — the new roll-the-fleet manual gate has no `advance`, so it takes the operator's word that the fleet rolled, while its own comment claims an advance proves convergence. Filed as R741-B1 under new relay R741 rather than fixed here: choosing what counts as proof of fleet convergence is an ops call, and `yah cloud rollout status` has no plan-id-free machine-checkable form.")
+//! @yah:verify("cargo test -p yah --test camp_qed_admission_lanes — 3 passed / 0 failed.")
+//! @yah:verify("cargo test -p yah --lib r325_f1 — 35 passed / 1 failed. The one failure is release_wizard_composes_and_gates_on_advance, now failing on the roll-the-fleet advance gap (R741-B1), NOT on anything in this ticket; it was already red before this session at commit 877914c2.")
+//! @yah:verify("cd oss/qed && cargo test -p yah-qed --lib — 783 passed / 0 failed / 1 ignored. (yah-qed is not a root-workspace member; -p yah-qed from the repo root errors with \"requires dev-dependencies and is not a member\".)")
+//! @yah:verify("cargo test -p xtask --test schema_drift — 3 passed. The types.rs edit is a const doc comment, not a PipelineToml field, so no schema regeneration was needed.")
+//! @yah:gotcha("PATHSPEC for a scoped commit (shared tree — camp.rs carries a live peer's uncommitted R740 work around lines 14k and 25k; my only camp.rs hunk is at ~18272 and does not overlap): app/yah/cli/tests/camp_qed_admission_lanes.rs oss/qed/crates/qed/src/types.rs .yah/docs/working/W170-qed-recipe-discipline.md app/yah/cli/src/camp.rs .yah/qed/release-wizard.toml")
+//!
+//! @yah:relay(R827, "QED trigger coverage — pipelines can only fire on tag, cron, chain or manual")
+//! @yah:at(2026-08-21T01:18:53Z)
+//! @yah:status(open)
+//! @yah:assignee(agent:bundle-anthropic-glimmerstone)
+//! @arch:see(oss/qed/crates/qed/src/export.rs)
+//! @arch:see(oss/qed/crates/qed/src/config.rs)
+//!
+//! @yah:ticket(R827-F1, "Trigger::Path { globs } — fire a pipeline when specific files change")
+//! @yah:at(2026-08-21T01:19:24Z)
+//! @yah:status(open)
+//! @yah:assignee(agent:bundle-anthropic-glimmerstone)
+//! @yah:parent(R827)
+//! @arch:see(oss/qed/crates/qed/src/export.rs)
+//! @arch:see(oss/qed/crates/qed/src/config.rs)
+//! @yah:next("Tier: Cleric — three small sites plus tests; the judgment is in who dispatches, not in what the exporter renders.")
+//! @yah:next("Trigger is Manual | Tag { pattern } | Schedule { cron } | Pipeline { id, status } (types.rs:346). Add Path { globs: Vec<String> }: 'run this pipeline when these files change'.")
+//! @yah:next("DEFINE IT IN QED'S OWN TERMS. types.rs:365 already states the model: qed has no polling daemon — a Trigger is a declaration of WHEN, and some host fires it. Tag is fired by a git-mirror hook, Schedule by almanac, Manual by the CLI/desktop. Path is a git-diff-aware dispatch and belongs with Tag, i.e. the yubaba git-mirror hook. THAT is the substance of this ticket.")
+//! @yah:next("Site 1 — types.rs: the variant. Trigger is a plain serde enum and config.rs takes `triggers: Vec<Trigger>` with #[serde(default)] (config.rs:304), so TOML parsing comes free.")
+//! @yah:next("Site 2 — the dispatcher: whichever hook fires Tag today needs to compare the push's changed paths against the globs. This is the real work; the enum variant is not.")
+//! @yah:next("Site 3 — export.rs::render_on, LAST and least. Accumulate globs into a Vec inside the match loop as tags and crons already are, render after the loop.")
+//! @yah:next("Tests: a config.rs parse test and an export.rs rendered-YAML test, mirroring the Tag/Schedule pairs at config.rs:2442 and config.rs:3196.")
+//! @yah:next("MOTIVATING CONSUMER (noisetable camp, R660-T1): a third-party licence manifest generated from Cargo.lock plus an npm tree, with a drift guard. Tag-only means the first time you learn a new copyleft transitive arrived is at release. The interim there is a Schedule{cron} nightly — it works, and it is not the right answer.")
+//! @yah:gotcha("CORRECTION TO THIS TICKET'S FIRST DRAFT: it specified Path around what an Actions `on: push: paths:` block can express. That is backwards. crates/qed-gha is an IMPORT front-end — its own header says 'QED imports a workflow, it does not faithfully emulate GitHub', and its tier-3 service overrides were retired rather than extended. R605 is actively taking GitHub off the release critical path, with the engine already done. Do not let a lossy export target define a QED vocabulary word.")
+//! @yah:gotcha("Exporter bug, not a design constraint: render_on emits its `push:` block for Tag triggers after the match loop. A Path arm that emits its own `  push:\\n    paths:\\n` produces TWO `push:` keys in one `on:` mapping — invalid YAML that reads as correct in review. The accumulate-then-render shape already used for tags and crons is the fix.")
+//! @yah:gotcha("When a card carries BOTH a Tag and a Path trigger, the exporter cannot render it faithfully: inside one Actions `push:` block, ref filters and `paths` are ANDed, so 'on release OR when these files change' is not expressible there. Push a Degradation, exactly as the Pipeline arm does for workflow_run. Do NOT reject the combination at config time — QED's own dispatchers can express it fine, and refusing a valid pipeline because one export target is lossy would be the tail wagging the dog.")
+//! @yah:assumes("That the git-mirror hook which fires Tag can see the changed-path list for a push. If it cannot, the dispatch half of this ticket is bigger than the enum half and should be split — confirm before estimating.")
+//! @yah:assumes("Trigger::Tag is matched only in export.rs and config.rs tests across external/yah (grepped 2026-08-20), so the hook that types.rs:365 describes was not located in this pass. Find it before writing the dispatch code.")
+//!
+//! @yah:ticket(R833-F10, "DEFERRED: trigger dispatch — nothing fires Trigger::Tag, and a dispatcher needs a build-storm guard designed in before it ships")
+//! @yah:at(2026-08-29T20:54:08Z)
+//! @yah:status(open)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:phase(P4)
+//! @yah:parent(R833)
+//! @arch:see(.yah/docs/working/W330-distributing-camp-compute.md)
+//! @yah:depends_on(R833-F8)
+//! @yah:depends_on(R833-F9)
+//! @yah:next("DELIBERATELY DEFERRED -- filed so it is visible and so the reasoning survives, not so it gets picked up next. It is blocked behind R833-F8 and R833-F9 on purpose. W330's argument: the imperative path is nearly done and needs no new service, while a dispatcher is a NEW ALWAYS-ON SERVICE to operate, and qed has deliberately never had a polling daemon.")
+//! @yah:next("Tier: Wizard -- the storm guard and the decision to add a durable watcher at all are design judgement about what this camp is willing to operate.")
+//! @yah:gotcha("THE STORM GUARD IS THE DESIGN, not a detail. GHA's model assumes human-paced pushes. This camp has ten agents wip-committing constantly, so a branch-triggered dispatcher would produce a build storm. The shape W330 specifies: TAGS ONLY by default -- rare and deliberately cut -- with branch triggers opt-in per branch. Whoever picks this up must design that guard in before shipping, not bolt it on after the first storm.")
+//! @yah:gotcha("STATE OF THE CODE, verified in W330's inventory: Trigger::{Manual, Tag, Schedule, Pipeline} are all DECLARED (oss/qed/crates/qed/src/types.rs). Cron and pipeline-chaining fire. NOTHING fires Tag -- the variant exists and its doc comment names a GHA shim or yubaba hook that does not dispatch it. So this is a missing dispatcher, not a missing type.")
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -436,9 +488,44 @@ pub struct Pipeline {
     /// TOML — an untagged pipeline should eject to a file with no tags line.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tags: Vec<String>,
+    /// R751-F2 — the base pipeline this one SPECIALIZES, when it is a
+    /// specialization rather than a hand-written recipe.
+    ///
+    /// A specialization is a steps-less `.yah/qed/*.toml` carrying
+    /// `alias_of = "<base>"` and a `[pipeline.pin]` table; the loader
+    /// ([`PipelineLoader::load`](crate::config::PipelineLoader::load))
+    /// resolves it into a real `Pipeline` — the base's steps under the alias's
+    /// own name/label/tags/description, with the pinned keys moved out of
+    /// [`Self::params`] and into [`Self::pins`]. By the time anything
+    /// downstream sees the value, it is indistinguishable from a hand-written
+    /// pipeline, so this field is **provenance only**: nothing in the runner
+    /// reads it. It exists so the catalog can say "specialization of `<base>`"
+    /// and so a specialization round-trips back to the file it came from.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias_of: Option<String>,
     pub steps: Vec<QedStep>,
     #[serde(default)]
     pub params: HashMap<String, ParamDef>,
+    /// R751-F2 — param values FIXED by a specialization (`[pipeline.pin]`).
+    ///
+    /// The difference between a pin and a [`ParamDef::default`] is who may
+    /// change it: a default is a suggestion the run can override, a pin is
+    /// part of the specialization's identity. `desktop-local` isn't
+    /// "`local-install` where `target` happens to start at `desktop`", it *is*
+    /// `local-install` with `target = "desktop"` — a pin a `--param` could undo
+    /// would just be a default wearing a different name.
+    ///
+    /// Pinned keys are removed from [`Self::params`] at load time (they are no
+    /// longer a question to ask the operator) but are re-inserted by
+    /// [`Self::resolve_params`], so `{{key}}` substitution and `if =
+    /// "params.k == …"` step gating see them exactly as they see any other
+    /// resolved param. Supplying a *conflicting* value fails the run with
+    /// [`ParamError::PinnedParamOverride`]; supplying the same value is a
+    /// no-op, which is what makes re-running a recorded param set work.
+    ///
+    /// Empty for every pipeline that isn't a specialization.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub pins: HashMap<String, String>,
     #[serde(default)]
     pub on_success: Vec<Outcome>,
     #[serde(default)]
@@ -472,6 +559,20 @@ pub struct Pipeline {
     ///   read-only fan-outs, fetch-and-compare drift checks.
     #[serde(default)]
     pub concurrency_key: Option<String>,
+    /// Ceiling on how many of THIS run's steps execute at once (R605-F3).
+    ///
+    /// The sibling of [`Self::concurrency_key`] one scope in:
+    /// `concurrency_key` bounds how many *runs* overlap, this bounds how many
+    /// *steps within one run* overlap once [`QedStep::needs`] says they may.
+    /// `None` ⇒ [`crate::dag::DEFAULT_MAX_PARALLEL`]; `Some(1)` pins the run
+    /// strictly serial regardless of what the DAG allows, which is the setting
+    /// to reach for when a pipeline turns out to contend in a way its
+    /// [`QedStep::resource`] keys don't capture yet.
+    ///
+    /// Raising it does nothing to a pipeline that declares no `needs`: those
+    /// resolve to a chain, and a chain never has two ready steps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_parallel: Option<usize>,
     /// Where this recipe is allowed to run (W170). Defaults to
     /// [`Placement::Anywhere`]. The runner enforces this at kick time
     /// (R435-F2) — the recipe body itself remains environment-agnostic.
@@ -551,6 +652,22 @@ pub struct Pipeline {
 /// matching [`PARALLEL_CONCURRENCY_KEY`]. Unlike `@parallel` it needs no
 /// special handling anywhere — it is an ordinary map key that happens to be
 /// spelled so nobody types it by accident.
+///
+/// R719-T6 considered and declined making this `"cargo-target"` — i.e. having
+/// an unkeyed pipeline join the lane that cargo work already shares. The point
+/// was real: `@camp` and `cargo-target` are different mutexes, so a recipe that
+/// cargo-builds and forgets its key does *not* serialize against the ones that
+/// remembered. But the fix is wrong at this altitude. qed is a general pipeline
+/// engine (it ships standalone); naming its default after a Rust toolchain's
+/// build directory would be a lie for every other kind of recipe, and it only
+/// covers recipes whose shared resource happens to be cargo's — one that forgets
+/// `cloud-apply` or an image-build lane would just be misfiled instead of
+/// unfiled. A default cannot infer which resource a recipe contends on, so the
+/// answer is to stop letting recipes decline to say: yah's camp pins it with
+/// `app/yah/cli/tests/camp_qed_admission_lanes.rs`, which fails the build when a
+/// `.yah/qed/*.toml` omits the key or puts local cargo work in another lane.
+/// Downstream users without that guard still get the conservative default,
+/// which is what this constant is for.
 pub const DEFAULT_CONCURRENCY_KEY: &str = "@camp";
 
 /// Sentinel that opts a pipeline out of serialization entirely.
@@ -575,6 +692,76 @@ impl Pipeline {
     pub fn is_parallel(&self) -> bool {
         self.effective_concurrency_key() == PARALLEL_CONCURRENCY_KEY
     }
+
+    /// R751-F3 — the params a run MUST be told, sorted: `required` with no
+    /// `default` to fall back on and no pin fixing them.
+    ///
+    /// Pinned keys are already out of [`Self::params`] by the time a
+    /// specialization reaches any consumer, so this needs no special case for
+    /// them — which is the point of resolving pins in the loader.
+    pub fn unbound_params(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .params
+            .iter()
+            .filter(|(_, def)| def.required && def.default.is_none())
+            .map(|(name, _)| name.clone())
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// R751-F3 — how this pipeline sits on the template ↔ concrete axis.
+    ///
+    /// Derived here rather than in each consumer: it is a property of the
+    /// pipeline, and the desktop roster deriving its own copy is what let
+    /// R751-B1 (a null-vs-undefined seam) empty the Templates group for five
+    /// pipelines without anything noticing.
+    pub fn classification(&self) -> PipelineClass {
+        if !self.unbound_params().is_empty() {
+            PipelineClass::Template
+        } else if self.alias_of.is_some() {
+            PipelineClass::Specialization
+        } else {
+            PipelineClass::Concrete
+        }
+    }
+}
+
+/// Where a pipeline sits on the template ↔ concrete axis (R751-F3).
+///
+/// The operator's framing is C++/Rust templates, and the analogy carries all
+/// the way down — including the case that decides the precedence below. A
+/// *partial* specialization is still a template: it binds some parameters and
+/// leaves others open, so it is not a thing you can instantiate. So a
+/// specialization that pins one of its base's two required params is reported
+/// as [`Self::Template`], not [`Self::Specialization`] — because the question
+/// the roster's primary cut asks is "can the operator kick this with no
+/// input?", and the honest answer there is no. Its
+/// [`Pipeline::alias_of`] still says where it came from, so nothing is lost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub enum PipelineClass {
+    /// Has at least one unbound required param, so it cannot be run as-is —
+    /// it is a building block something else specializes or supplies args to.
+    Template,
+    /// Fully bound AND `alias_of` a base: a named binding of a template,
+    /// runnable with no input.
+    Specialization,
+    /// Fully bound and not an alias — an ordinary hand-written recipe.
+    Concrete,
+}
+
+impl PipelineClass {
+    /// The wire spelling, matching the serde rename. Kept as a method so the
+    /// daemon's wire mapping and any log line agree by construction.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Template => "template",
+            Self::Specialization => "specialization",
+            Self::Concrete => "concrete",
+        }
+    }
 }
 
 impl Pipeline {
@@ -598,6 +785,30 @@ impl Pipeline {
         supplied: &HashMap<String, String>,
     ) -> Result<HashMap<String, String>, ParamError> {
         let mut resolved = supplied.clone();
+        // R751-F2: pins first. A pinned key is not in `self.params` (the loader
+        // moved it out), so the default/required/options loops below don't see
+        // it — but every downstream reader of the resolved map does, which is
+        // what makes `{{key}}` substitution and `if = "params.k == …"` gating
+        // work identically for a pinned and an operator-supplied value.
+        // Sorted so a file pinning several conflicting keys reports the same
+        // one every time rather than whichever the hash order surfaced.
+        let mut pinned: Vec<(&String, &String)> = self.pins.iter().collect();
+        pinned.sort_by(|a, b| a.0.cmp(b.0));
+        for (name, value) in pinned {
+            if let Some(supplied) = resolved.get(name.as_str()) {
+                if supplied != value {
+                    return Err(ParamError::PinnedParamOverride {
+                        pipeline: self.name.clone(),
+                        base: self.alias_of.clone().unwrap_or_else(|| self.name.clone()),
+                        name: name.clone(),
+                        pinned: value.clone(),
+                        value: supplied.clone(),
+                    });
+                }
+                continue;
+            }
+            resolved.insert(name.clone(), value.clone());
+        }
         let mut missing: Vec<String> = Vec::new();
         for (name, def) in &self.params {
             if resolved.contains_key(name.as_str()) {
@@ -670,6 +881,28 @@ impl Pipeline {
                 }
                 for value in cfg.matrix.values_mut() {
                     *value = substitute(value, params);
+                }
+            }
+            // A `sub-pipeline` step's `params` table is how a parent forwards
+            // its own params down (e.g. release-wizard's `spec = "{{spec}}"`
+            // to version-bump). Without this, `{{spec}}` survived into the
+            // child's `resolve_params` call literally, then into its argv —
+            // the child never saw the parent's own resolved params, only the
+            // raw placeholder text (R755, found exercising a real run).
+            if let Some(cfg) = step.sub_pipeline.as_mut() {
+                for value in cfg.params.values_mut() {
+                    *value = substitute(value, params);
+                }
+            }
+            // R786-B1: a step's `[platform]` block can name its target with a
+            // `{{target}}` placeholder (release-build.toml's cross-build step
+            // does, since the same recipe serves every matrix leg) — without
+            // this, `platform.target` keeps the literal `{{target}}` text
+            // forever, so `step_platform`/`native_cross_plan` never see a real
+            // triple and the whole NativeCross preflight silently no-ops.
+            if let Some(spec) = step.platform.as_mut() {
+                if let Some(target) = spec.target.as_mut() {
+                    *target = substitute(target, params);
                 }
             }
         }
@@ -776,6 +1009,50 @@ pub struct QedStep {
     /// step (e.g. `context = "target/yah-yubaba-ctx"`).
     #[serde(default)]
     pub context: Option<std::path::PathBuf>,
+    /// Camp-root-relative subtrees to ship to the worker when this *subprocess*
+    /// step is dispatched remotely (R560-T8) — the missing analogue of
+    /// [`Self::context`] + `context_url` on the build-image path.
+    ///
+    /// # The gap this closes
+    ///
+    /// `build_workload_spec` hands a remote subprocess exactly three things:
+    /// the image, the argv, and the `/yah/produced` durable mount. **No
+    /// source.** `rusty-v8-musl` gets away with that because its baked
+    /// `build-v8.sh` clones V8 from the internet inside the container; a step
+    /// that compiles the *camp tree* has nothing to compile. Meanwhile
+    /// `kind = build-image` has had a cross-host transport since R636-B1: pack
+    /// the context, PUT it somewhere the worker can GET, pass the URL. This
+    /// field is that same transport, re-pointed at subprocess steps — same
+    /// [`crate::build_context::BuildContextPublisher`] seam, same single-use
+    /// run-scoped key, same delete-on-both-legs.
+    ///
+    /// # What the step sees
+    ///
+    /// The runner sets **`YAH_SOURCE_CONTEXT_URL`** in the remote step's
+    /// environment; the argv fetches and unpacks it. The fetch is deliberately
+    /// *in the argv* rather than injected as a shell prelude: a prelude would
+    /// assume an entrypoint shape qed does not own, and it would make the TOML
+    /// stop describing what actually runs. If the var is set and the argv
+    /// ignores it, the build fails on a missing source tree — loudly, in
+    /// seconds.
+    ///
+    /// # What travels
+    ///
+    /// Only **git-tracked** files under the named paths, read from the working
+    /// tree (so uncommitted edits DO travel — this ships the tree as
+    /// positioned, which is the point). Tracked-only is not a tidiness
+    /// preference: `oss/mesofact` is 28 GB on disk and 5 MB tracked, so a
+    /// naive directory walk ships `target/` and `node_modules/` and trips
+    /// [`crate::build_context::MAX_CONTEXT_BYTES`] before it ships a single
+    /// source file. Entries keep their camp-root-relative paths, so unpacking
+    /// the tar into an empty dir reproduces a repo-root-shaped tree and path
+    /// deps that escape a workspace still resolve.
+    ///
+    /// Empty (the default) on every step that predates this field, and the
+    /// runner publishes nothing for such a step — no behaviour change, no
+    /// upload, for the whole existing corpus.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_context: Vec<std::path::PathBuf>,
     /// For `kind = build-image`: load the finished image into the local
     /// docker daemon with `--load` instead of writing an OCI archive.
     /// Use in dev pipelines where the image must be immediately runnable.
@@ -981,6 +1258,51 @@ pub struct QedStep {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[cfg_attr(feature = "json-schema", schemars(schema_with = "crate::types::permissive_schema"))]
     pub toolchain: Option<crate::toolchain::ToolchainSpec>,
+    /// Steps that must finish before this one may start (R605-F3). The edge
+    /// set that turns `steps` from a list into a DAG — see [`crate::dag`] for
+    /// the full model and [`crate::dag::waves`] for how it is grouped.
+    ///
+    /// Three states, and the distinction between the first two is the whole
+    /// backwards-compatibility story:
+    ///
+    /// - **absent** (`None`) — implicit chain: depends on the immediately
+    ///   preceding step. Every pipeline TOML written before this field existed
+    ///   omits it on every step, so every such pipeline is the same strict
+    ///   serial chain it always was, with the same event stream. Reading an
+    ///   absent `needs` as "no dependencies" would have made the entire
+    ///   existing corpus fan out at once.
+    /// - **`needs = []`** — a root: no dependencies, ready immediately. Not the
+    ///   same statement as saying nothing, which is why the field is an
+    ///   `Option` rather than a plain `Vec`. An imported workflow has one root
+    ///   per independent branch.
+    /// - **`needs = ["a", "b"]`** — exactly `a` and `b`, and nothing implicit.
+    ///
+    /// An entry matches a step by `name`, or by the `"<name> [k=v …]"` shape
+    /// [`crate::matrix::plan`] gives a fanned-out matrix step — so
+    /// `needs = ["build"]` joins on every row, as `needs:` does in GHA.
+    ///
+    /// A [`background`](Self::background) step counts as satisfied the moment
+    /// it is *spawned*, not when it exits: a sidecar has no exit to wait for,
+    /// so `needs = ["server"]` means "after the server is up-ish" and is
+    /// normally paired with a `kind = "wait-for"` gate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub needs: Option<Vec<String>>,
+    /// A shared resource this step monopolizes while it runs (R605-F3). Two
+    /// steps declaring the same key never execute concurrently, even when the
+    /// [`needs`](Self::needs) graph says they are independent and the run's
+    /// [`max_parallel`](Pipeline::max_parallel) budget would allow it.
+    ///
+    /// This is [`Pipeline::concurrency_key`] one level down, and it exists for
+    /// the same reason: the steps of one run share a host, a cargo `target/`
+    /// and a docker daemon, so "independent in the DAG" does not imply
+    /// "independent on the disk". Two branches that both run `cargo build` are
+    /// genuinely parallel in the graph and would spend the whole time in
+    /// cargo's file lock; `resource = "cargo-target"` on both says so.
+    ///
+    /// `None` (the default, and every pre-existing step) means the step is
+    /// bounded only by `max_parallel`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource: Option<String>,
 }
 
 fn default_enabled() -> bool {
@@ -1149,6 +1471,31 @@ pub struct SubPipelineConfig {
     /// workflow whose internals are noise. Default `false` (transparent).
     #[serde(default)]
     pub opaque: bool,
+    /// Opt out of W224/R533-F11 inheritance: reposition this child's OWN
+    /// workspace per its OWN pipeline's declared [`WorkspaceMode`], instead
+    /// of skipping positioning and building from the parent's already-
+    /// positioned tree. Default `false` (inherit — the original, and still
+    /// correct, behaviour for a child meant to share the parent's exact
+    /// tree, e.g. `desktop-release` composed under an `Isolated` `release`
+    /// run).
+    ///
+    /// Exists for the opposite case: a parent pipeline that is `Live` (it
+    /// mutates the tree for human review — see `version-bump`) composing a
+    /// child that must publish from clean committed state regardless (see
+    /// `oss-publish`, declared `Isolated`). Without this, the child's own
+    /// `workspace` declaration is silently discarded and it builds from
+    /// the parent's live, possibly-uncommitted tree — the gap R755 closed:
+    /// `release-wizard` forced `oss-publish` to run `Live` because it
+    /// shares the wizard's `workspace = "live"`, so `cargo publish` saw
+    /// whatever was on disk rather than the tagged commit.
+    ///
+    /// Set `true`, the child calls its own `prepare_workspace` against the
+    /// PARENT's positioned tree as the git base (so `git worktree add`
+    /// resolves the child's target ref — normally HEAD, i.e. whatever the
+    /// parent just committed/tagged — from the same repository the parent
+    /// is standing in, not a second clone).
+    #[serde(default)]
+    pub own_workspace: bool,
 }
 
 /// How a [`StepKind::SubPipeline`] step resolves to a runnable child. The
@@ -1429,7 +1776,9 @@ pub struct ManualConfig {
     pub advance_poll_secs: u64,
 }
 
-fn default_manual_advance_poll_secs() -> u64 {
+/// `pub(crate)` so [`crate::doc_source`] can lower a `manual` cell without
+/// hardcoding the same number in a second place (R717-T11).
+pub(crate) fn default_manual_advance_poll_secs() -> u64 {
     5
 }
 
@@ -1718,6 +2067,19 @@ pub enum StepValidationError {
          the flag would silently do nothing (R717-T2)"
     )]
     SecretRequiresSubprocess(String),
+    /// R560-T8: `source_context` is the subprocess analogue of build-image's
+    /// `context` + `context_url`. On a build-image step the pair already
+    /// exists and this key would be a second, silently-ignored spelling of it;
+    /// on every other kind there is no argv to consume the published URL, so
+    /// the upload would be pure cost. Reject at parse time rather than
+    /// uploading a tarball nothing fetches.
+    #[error(
+        "step `{0}`: `source_context` is a subprocess-only knob — a build-image \
+         step ships its context via `context` + the R636-B1 `context_url` \
+         transport, and no other step kind has an argv to fetch the published \
+         tarball with"
+    )]
+    SourceContextRequiresSubprocess(String),
     #[error(
         "step `{0}`: `secret = true` cannot be combined with declared `outputs` — a secret step's \
          $YAH_OUTPUTS is dropped unread, so the output would always be empty and any [[bind]] \
@@ -1784,6 +2146,15 @@ pub enum StepValidationError {
          (and never `background`) — composite / image / sidecar teardown is a follow-up"
     )]
     FinallyRequiresSubprocess(String),
+    /// R605-F3: `[[finally]]` steps are unconditional always-run teardown, run
+    /// in declaration order after the main graph has drained. There is no
+    /// readiness question for a `needs` to answer there, so the key would be
+    /// inert config that reads as if it did something.
+    #[error(
+        "finally step `{0}`: `needs` has no meaning on always-run teardown — \
+         `[[finally]]` steps run in declaration order after the step graph drains"
+    )]
+    FinallyCannotDeclareNeeds(String),
 }
 
 /// Deliberately **not** `#[derive(Default)]`.
@@ -1847,6 +2218,14 @@ impl QedStep {
         // the step, not to weaken the flag.
         if self.secret && !self.outputs.is_empty() {
             return Err(StepValidationError::SecretCannotDeclareOutputs(
+                self.name.clone(),
+            ));
+        }
+        // R560-T8: same closed-set discipline as `background` / `secret` above.
+        // The runner only publishes a source context on the remote SUBPROCESS
+        // path, because that is the only kind whose argv can fetch the URL.
+        if !self.source_context.is_empty() && self.kind != StepKind::Subprocess {
+            return Err(StepValidationError::SourceContextRequiresSubprocess(
                 self.name.clone(),
             ));
         }
@@ -2063,6 +2442,11 @@ impl QedStep {
                 self.name.clone(),
             ));
         }
+        if self.needs.is_some() {
+            return Err(StepValidationError::FinallyCannotDeclareNeeds(
+                self.name.clone(),
+            ));
+        }
         Ok(())
     }
 }
@@ -2140,6 +2524,25 @@ pub enum ParamError {
         name: String,
         value: String,
         options: Vec<String>,
+    },
+    /// R751-F2: a run tried to override a param a specialization PINNED.
+    ///
+    /// Refused rather than silently ignored, because silently ignoring a
+    /// `--param` is the worst of the three options: the operator gets a run
+    /// that looks like it honoured them and didn't. Passing the *same* value
+    /// is fine (that's what re-running a recorded param set does), so this
+    /// only fires on a genuine disagreement.
+    #[error(
+        "pipeline '{pipeline}': parameter '{name}' is pinned to {pinned:?} by this specialization \
+         and cannot be overridden (got {value:?})\n\
+         run the base pipeline '{base}' directly to choose a different value"
+    )]
+    PinnedParamOverride {
+        pipeline: String,
+        base: String,
+        name: String,
+        pinned: String,
+        value: String,
     },
 }
 
@@ -2302,6 +2705,93 @@ pub struct QedRunMeta {
     /// child's registered meta at fan-out time. `None` on a top-level run.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
+    /// The run's **resolved** params — the same map `Pipeline::resolve_params`
+    /// produced and `apply_params` consumed, defaults already filled in.
+    ///
+    /// Every other kind of inter-step state a resume needs already survived the
+    /// run: named step outputs are in [`StepStatus::outputs`], stdout/stderr is
+    /// in the task-runs store under [`StepStatus::task_run_id`], and the
+    /// filesystem persists by construction for `workspace = "live"`. Params
+    /// were the one thing the runner held only in memory, which is why
+    /// "resume from step" could not replay a run of a pipeline with a required
+    /// param — it re-entered `resolve_params` with nothing supplied and failed
+    /// the run before the first step (`release-wizard` needs `spec`).
+    ///
+    /// Written even on the `Queued` meta the daemon registers before spawning,
+    /// so a run that dies *before* any step still hands its params back.
+    ///
+    /// Empty on every run meta already on disk; an empty map and an unset field
+    /// mean the same thing (a run with no params), so `default` is honest here
+    /// in a way it would not be for a value-carrying field.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub params: HashMap<String, String>,
+    /// The rest of the invocation that produced this run — everything the
+    /// caller narrowed or steered with beyond [`Self::params`].
+    ///
+    /// `params` alone was enough for "resume from step" because that button
+    /// already re-supplies the one thing it changes. It is not enough for
+    /// "rerun this", which has to reproduce a run the operator *configured*:
+    /// a rerun of a step-subset run that quietly executes all forty steps, or
+    /// of a `--ref v0.8.29` run that builds `HEAD`, is a different pipeline
+    /// wearing the same name — and the operator finds out from the duration.
+    ///
+    /// `None` on every run meta recorded before this field existed and on runs
+    /// launched with nothing but params, which are the same thing to a caller:
+    /// rerun the pipeline as declared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch: Option<QedRunLaunch>,
+}
+
+/// How a run was launched, beyond its resolved params (which live on
+/// [`QedRunMeta::params`], where they predate this struct and where
+/// "resume from step" already reads them — a second copy here would be two
+/// spellings of one key).
+///
+/// Every field mirrors the like-named `qed.run` parameter, and an unset field
+/// means the caller did not send one. That correspondence is the whole
+/// contract: a rerun rebuilds the original request by copying this back out
+/// field-for-field, so a launch knob added to `qed.run` without a field here
+/// is a knob that silently resets on rerun.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QedRunLaunch {
+    /// Camp-relative markdown doc the pipeline was sourced from (R717-F4).
+    ///
+    /// Recorded here rather than read back off [`QedRunMeta::cell`], which
+    /// looks like it would serve: a whole-doc run stores the doc's *pipeline
+    /// name* in `CellRef::cell_id` (there was no cell to name), so replaying
+    /// that pair would ask for a cell the doc does not declare and be refused.
+    /// `CellRef` answers "what was this run about"; this answers "what was
+    /// asked for", and they are only sometimes the same string.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub doc: Option<String>,
+    /// The single doc cell the run was narrowed to; `None` ran the whole doc.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cell: Option<String>,
+    /// 0-based index the run started from, dropping the steps before it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_step: Option<u32>,
+    /// Step-name subset the run was restricted to; `None` ran the full set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_steps: Option<Vec<String>>,
+    /// Per-step gha-workflow matrix-instance subset; `None` ran full matrices.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_matrix_instances: Option<HashMap<String, Vec<String>>>,
+    /// Whether `status = "stubbed"` steps were included.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_stubbed: Option<bool>,
+    /// Target git ref the workspace was positioned at; `None` ⇒ `HEAD`.
+    ///
+    /// Named `git_ref` rather than `ref` because `ref` is a Rust keyword and a
+    /// raw identifier in a serialized struct is a trap for the next reader;
+    /// the wire name stays `ref` via `#[serde(rename)]`.
+    #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
+    pub git_ref: Option<String>,
+    /// Placement override — `"auto"` / `"local"` / `"remote"`.
+    #[serde(default, rename = "where", skip_serializing_if = "Option::is_none")]
+    pub placement: Option<String>,
+    /// Whether the placement gate was bypassed with `force`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub force: Option<bool>,
 }
 
 /// What a run was about: the doc cell it came from and the subject it was
@@ -2559,11 +3049,14 @@ mod tests {
 
     fn one_step(argv: Vec<&str>, env: &[(&str, &str)]) -> Pipeline {
         Pipeline {
+            max_parallel: None,
             description: None,
             tags: Vec::new(),
             name: "p".into(),
             label: "p".into(),
             steps: vec![QedStep {
+                needs: None,
+                resource: None,
                 inputs: Vec::new(),
                 secret: false,
                 background: false,
@@ -2591,6 +3084,7 @@ mod tests {
                 triple: None,
                 package: None,
                 context: None,
+                source_context: Vec::new(),
                 load: false,
                 sub_pipeline: None,
                 gha_workflow: None,
@@ -2615,6 +3109,8 @@ mod tests {
             toolchain: None,
             binds: Vec::new(),
             on_change: Vec::new(),
+            alias_of: None,
+            pins: Default::default(),
             finally: Vec::new(),
         }
     }
@@ -2690,6 +3186,69 @@ mod tests {
         p.apply_params(&params);
         assert_eq!(p.steps[0].argv, vec!["run", "--", "groq"]);
         assert_eq!(p.steps[0].env.get("KEY").unwrap(), "groq-x");
+    }
+
+    #[test]
+    fn apply_params_substitutes_platform_target() {
+        // R786-B1: release-build.toml's cross-build step declares
+        // `platform = { target = "{{target}}" }` so qed's native_cross_plan
+        // preflight sees a real triple. Without substitution here the field
+        // keeps the literal `{{target}}` text forever — step_platform would
+        // hand `native_cross_plan` a nonsense "target" that never matches a
+        // real arch/OS, silently defeating the whole point of declaring it.
+        let mut p = one_step(vec!["bash", "build.sh"], &[]);
+        p.steps[0].platform = Some(crate::platform::PlatformSpec {
+            target: Some("{{target}}".into()),
+            container_platform: None,
+            native: false,
+        });
+        let mut params = HashMap::new();
+        params.insert(
+            "target".to_string(),
+            "x86_64-unknown-linux-gnu".to_string(),
+        );
+        p.apply_params(&params);
+        assert_eq!(
+            p.steps[0].platform.as_ref().unwrap().target.as_deref(),
+            Some("x86_64-unknown-linux-gnu")
+        );
+    }
+
+    /// A pinned param must reach the RESOLVED map, not just `{{key}}`
+    /// substitution — `if = "params.k == …"` step gating reads the same map,
+    /// and `.yah/qed/local-install.toml` depends on it: its `mcp-sidecar` step
+    /// is skipped when `params.sidecars_flag == '--sidecars'`, which is a value
+    /// only `all-local`'s PIN ever supplies. If a pin stopped being visible
+    /// here, that gate would silently stop firing and the step would come back
+    /// — failing on a macOS App Management grant for a copy that changes
+    /// nothing. Nothing else in the tree pins this behaviour.
+    #[test]
+    fn resolve_params_surfaces_a_pinned_value_for_if_gating() {
+        let mut p = one_step(vec!["install", "{{sidecars_flag}}"], &[]);
+        p.params.insert(
+            "sidecars_flag".to_string(),
+            ParamDef {
+                required: false,
+                description: None,
+                default: Some("--no-sidecars".to_string()),
+                options: Vec::new(),
+                options_from: None,
+            },
+        );
+        // The loader moves a pinned key OUT of `params` and into `pins`.
+        p.params.remove("sidecars_flag");
+        p.pins.insert("sidecars_flag".to_string(), "--sidecars".to_string());
+
+        let resolved = p.resolve_params(&HashMap::new()).expect("a pin needs nothing supplied");
+        assert_eq!(
+            resolved.get("sidecars_flag").map(String::as_str),
+            Some("--sidecars"),
+            "a pinned param must be readable as params.<key>, or if-gating on it is dead"
+        );
+
+        // And it must still substitute, so the two readers cannot diverge.
+        p.apply_params(&resolved);
+        assert_eq!(p.steps[0].argv, vec!["install", "--sidecars"]);
     }
 
     #[test]
@@ -3112,6 +3671,8 @@ checklist = ["Diff reviewed"]
 
     fn build_image_step(name: &str) -> QedStep {
         QedStep {
+            needs: None,
+            resource: None,
             inputs: Vec::new(),
             secret: false,
             background: false,
@@ -3136,6 +3697,7 @@ checklist = ["Diff reviewed"]
             triple: None,
             package: None,
             context: None,
+            source_context: Vec::new(),
             load: false,
             sub_pipeline: None,
             gha_workflow: None,
@@ -3152,6 +3714,8 @@ checklist = ["Diff reviewed"]
 
     fn package_native_tarball_step(name: &str) -> QedStep {
         QedStep {
+            needs: None,
+            resource: None,
             inputs: Vec::new(),
             secret: false,
             background: false,
@@ -3176,6 +3740,7 @@ checklist = ["Diff reviewed"]
             triple: Some("x86_64-unknown-linux-musl".into()),
             package: None,
             context: None,
+            source_context: Vec::new(),
             load: false,
             sub_pipeline: None,
             gha_workflow: None,
@@ -3192,6 +3757,8 @@ checklist = ["Diff reviewed"]
 
     fn musl_static_preflight_step(name: &str) -> QedStep {
         QedStep {
+            needs: None,
+            resource: None,
             inputs: Vec::new(),
             secret: false,
             background: false,
@@ -3216,6 +3783,7 @@ checklist = ["Diff reviewed"]
             triple: None,
             package: Some("yubaba".into()),
             context: None,
+            source_context: Vec::new(),
             load: false,
             sub_pipeline: None,
             gha_workflow: None,
@@ -3386,6 +3954,8 @@ checklist = ["Diff reviewed"]
 
     fn sign_native_tarball_step(name: &str) -> QedStep {
         QedStep {
+            needs: None,
+            resource: None,
             inputs: Vec::new(),
             secret: false,
             background: false,
@@ -3410,6 +3980,7 @@ checklist = ["Diff reviewed"]
             triple: Some("x86_64-unknown-linux-musl".into()),
             package: None,
             context: None,
+            source_context: Vec::new(),
             load: false,
             sub_pipeline: None,
             gha_workflow: None,
@@ -3651,6 +4222,34 @@ checklist = ["Diff reviewed"]
         assert!(ok.validate().is_ok(), "secret IS valid on a subprocess step");
     }
 
+    /// R560-T8: `source_context` publishes a tarball and sets
+    /// `$YAH_SOURCE_CONTEXT_URL` for an argv to fetch. A build-image step
+    /// already ships its context through `context` + the R636-B1 `context_url`
+    /// transport, and no other kind has an argv at all — so accepting the key
+    /// there would upload bytes nothing ever GETs, then delete them. Same
+    /// closed-set discipline as `background` and `secret`.
+    #[test]
+    fn source_context_on_non_subprocess_is_rejected() {
+        let mut s = QedStep::default();
+        s.name = "image".into();
+        s.kind = StepKind::BuildImage;
+        s.image = Some("yah-yubaba".into());
+        s.source_context = vec![std::path::PathBuf::from("oss/mesofact")];
+        assert!(matches!(
+            s.validate(),
+            Err(StepValidationError::SourceContextRequiresSubprocess(_))
+        ));
+
+        let mut ok = QedStep::default();
+        ok.name = "build-mesofact".into();
+        ok.argv = vec!["build-mesofact.sh …".into()];
+        ok.source_context = vec![std::path::PathBuf::from("oss/mesofact")];
+        assert!(
+            ok.validate().is_ok(),
+            "source_context IS valid on a subprocess step",
+        );
+    }
+
     /// A secret step's `$YAH_OUTPUTS` is dropped unread, so a *declared* output
     /// would be permanently empty and a `[[bind]]` reading it would bind
     /// nothing — silently. Reject the pair where the author can still see it.
@@ -3795,6 +4394,8 @@ checklist = ["Diff reviewed"]
 
     fn sub_pipeline_step(name: &str, target: SubPipelineRef) -> QedStep {
         QedStep {
+            needs: None,
+            resource: None,
             inputs: Vec::new(),
             secret: false,
             background: false,
@@ -3819,12 +4420,14 @@ checklist = ["Diff reviewed"]
             triple: None,
             package: None,
             context: None,
+            source_context: Vec::new(),
             load: false,
             sub_pipeline: Some(SubPipelineConfig {
                 target,
                 params: HashMap::new(),
                 propagate: SubPipelineCollect::default(),
                 opaque: false,
+                own_workspace: false,
             }),
             outputs: Vec::new(),
             gha_workflow: None,
@@ -3840,6 +4443,7 @@ checklist = ["Diff reviewed"]
 
     fn pipeline_with(name: &str, steps: Vec<QedStep>) -> Pipeline {
         Pipeline {
+            max_parallel: None,
             description: None,
             tags: Vec::new(),
             name: name.into(),
@@ -3857,6 +4461,8 @@ checklist = ["Diff reviewed"]
             toolchain: None,
             binds: Vec::new(),
             on_change: Vec::new(),
+            alias_of: None,
+            pins: Default::default(),
             finally: Vec::new(),
         }
     }
