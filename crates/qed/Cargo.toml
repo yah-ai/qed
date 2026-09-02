@@ -16,12 +16,12 @@ name = "yah-qed"
 path = "src/bin/qed.rs"
 
 [dependencies]
-velveteen = { path = "../velveteen", version = "0.8.29" }
-velveteen-exec = { path = "../velveteen-exec", version = "0.8.29" }
-task-runs = { path = "../task-runs", version = "0.8.29" }
-workload-spec = { package = "yah-workload-spec", version = "0.8.29" }
-yah-scryer = { path = "../scryer", version = "0.8.29" }
-observation = { path = "../observation", version = "0.8.29" }
+velveteen = { path = "../velveteen", version = "0.8.30" }
+velveteen-exec = { path = "../velveteen-exec", version = "0.8.30" }
+task-runs = { path = "../task-runs", version = "0.8.30" }
+workload-spec = { package = "yah-workload-spec", version = "0.8.30" }
+yah-scryer = { path = "../scryer", version = "0.8.30" }
+observation = { path = "../observation", version = "0.8.30" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = { version = "0.8", features = ["preserve_order"] }
@@ -53,20 +53,27 @@ flate2 = "1"
 # transitive dep tree to flag glibc-only crates before the cross build.
 cargo_metadata = "0.18"
 # W200-F9: dispatch StepKind::GhaWorkflow into the native GHA runtime.
-yah-qed-gha = { path = "../qed-gha", version = "0.8.29" }
+yah-qed-gha = { path = "../qed-gha", version = "0.8.30" }
 # R533-F1 (W224): blake3 content-hash pin for an imported `workflow.yml`
 # source. Same content-addressing primitive the rest of yah uses (kept at the
 # workspace-wide `1.x` line).
 blake3 = "1"
+# R330-T32 follow-up: the install pointer's `bootstrap_hash`. blake3 cannot
+# serve that role — verifying it would mean fetching an unverified `b3sum` to
+# verify with — so the channel carries a sha256 alongside it, hashed over the
+# STAGED bytes by `publish::sha256_file`. Same pair `publish-yubaba-release.sh`
+# emits with sha256sum/b3sum.
+sha2 = "0.10"
+hex = "0.4"
 indexmap = { version = "2", features = ["serde"] }
 # R487 follow-up: vault-backed `~/.yah/qed/secrets.toml` resolver — maps GHA
 # secret names to vault slot names so workflows that reference
 # ${{ secrets.X }} get the same value GHA's secret store would.
-fob = { version = "0.8.29" }
+fob = { version = "0.8.30" }
 # W209: pipeline outputs → manifest bind. Parse-time schema (BindSpec,
 # OutputDecl, OutputRef, ValueType, Intent) consumed by the pipeline TOML
 # loader; the applier itself runs at step boundaries inside the runner.
-manifest-bind = { path = "../manifest-bind", version = "0.8.29" }
+manifest-bind = { path = "../manifest-bind", version = "0.8.30" }
 # R533-T10 (W224): JSON Schema derivation for the .yah/qed/*.toml pipeline
 # format. Optional + default-off so the runtime binary deps don't carry
 # schemars; xtask turns it on to generate qed-pipeline.toml.schema.json (same

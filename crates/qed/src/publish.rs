@@ -136,6 +136,34 @@ pub struct ChannelBundle {
     /// would be untagged forever.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
+    // The three fields below are what make a published channel INSTALLABLE
+    // rather than merely listed, and their absence is why `<binary>/latest.json`
+    // had no producer. (The recipe comment used to blame cosign keyless-OIDC and
+    // GHA for that; it was wrong on every clause — see .yah/qed/cli-release.toml.)
+    // `install.sh` verifies in two stages and needs all three:
+    //
+    //   1. sha256, because verifying blake3 first would mean downloading an
+    //      unverified `b3sum` to verify with, which is circular. Hence the name:
+    //      it is the hash that BOOTSTRAPS the check, with a tool every OS ships.
+    //   2. the cosign sigstore bundle at `bundle_url` — ONE file carrying
+    //      signature and rfc3161 timestamp, verified with `--key <ref>
+    //      --insecure-ignore-tlog` under `ReleaseTrust::Key`. No Fulcio
+    //      certificate, no `.cert` sidecar, no OIDC, no GitHub.
+    //
+    // All three are `Option` because a manifest staged before they existed is
+    // still valid input, and because a publisher with no signing key configured
+    // must still be able to stage — it just cannot write an install pointer.
+    /// Tagged `sha256:<hex>` — the bootstrap digest, per the note above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap_hash: Option<String>,
+    /// The same digest, bare. The deprecated spelling, kept because live
+    /// manifests carry it and `install.sh` still falls back to it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    /// URL of this artifact's cosign sigstore bundle, `<url>.sigstore.json`.
+    /// `None` until a signing pass has run over the staged tree.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_url: Option<String>,
 }
 
 /// Bucket key for the per-binary mutable pointer almanac re-fetches on push.
@@ -215,7 +243,10 @@ pub struct IndexVersion {
 }
 
 /// One (version, triple) download inside [`IndexVersion`].
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// `PartialEq`/`Eq` so [`TriplesManifest`] — which reuses this shape for the
+/// install pointer — can be compared in tests without hand-written asserts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IndexTriple {
     pub url: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -227,6 +258,18 @@ pub struct IndexTriple {
     /// Tagged `blake3:<hex>`. See [`ChannelBundle::hash`] for why never bare.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hash: Option<String>,
+    /// Tagged `sha256:<hex>` — the digest an installer can check with tools it
+    /// is guaranteed to have. See [`ChannelBundle::bootstrap_hash`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bootstrap_hash: Option<String>,
+    /// The same digest, bare. Deprecated spelling kept because live manifests
+    /// carry it; readers prefer `bootstrap_hash`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    /// URL of the cosign sigstore bundle for this artifact. See
+    /// [`ChannelBundle::bundle_url`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle_url: Option<String>,
 }
 
 /// Fold one release into the index, returning the bytes to publish.
@@ -424,10 +467,92 @@ pub fn index_triples_from_manifest(manifest: &ChannelManifest) -> BTreeMap<Strin
                         .map(str::to_string),
                     size_bytes: bundle.size,
                     hash: bundle.hash.clone(),
+                    bootstrap_hash: bundle.bootstrap_hash.clone(),
+                    sha256: bundle.sha256.clone(),
+                    bundle_url: bundle.bundle_url.clone(),
                 },
             )
         })
         .collect()
+}
+
+/// The install-pointer object — `<binary>/latest.json`, what `install.sh`
+/// resolves and the single answer to "what does `curl … | sh` fetch right now".
+///
+/// A DISTINCT shape from [`ChannelManifest`], and the difference is not
+/// cosmetic. The channel manifest nests under `host.bundle[triple]` and is what
+/// almanac's `R2Channel` reader and the Tauri updater consume. This one is flat
+/// — `triples[<triple>]` — because `install.sh` reads `.triples[$t][$f]` with
+/// `jq`, and that layout has live consumers on machines we do not control. The
+/// producer adapts to the installer, never the other way round; almanac already
+/// carries a matching `r2-triples` reader for exactly this object.
+///
+/// The same shape `scripts/publish-{yubaba,mesofact}-release.sh` write by hand,
+/// so all three products' pointers stay one format rather than three.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TriplesManifest {
+    /// Package name as `install.sh` knows it — the `<pkg>` in `<pkg>/latest.json`.
+    pub name: String,
+    /// Release version, without a leading `v`.
+    pub version: String,
+    /// ISO-8601 UTC publish timestamp.
+    pub pub_date: String,
+    pub triples: BTreeMap<String, IndexTriple>,
+}
+
+/// Project a staged [`ChannelManifest`] onto the install-pointer shape.
+///
+/// Returns `None` unless EVERY triple carries both a bootstrap digest and a
+/// signature bundle, which is the one refusal that matters here: a pointer is
+/// the object an installer trusts, and one written with a triple missing its
+/// `bundle_url` produces a `cosign is installed but the manifest carries no
+/// signature bundle for <triple>` die() on the user's machine — a broken
+/// install advertised as a release. Staging without signing is legal; pointing
+/// the world at it is not.
+pub fn triples_manifest(binary: &str, manifest: &ChannelManifest) -> Option<TriplesManifest> {
+    let triples = index_triples_from_manifest(manifest);
+    if triples.is_empty() {
+        return None;
+    }
+    if triples
+        .values()
+        .any(|t| t.bundle_url.is_none() || t.bootstrap_hash.is_none())
+    {
+        return None;
+    }
+    Some(TriplesManifest {
+        name: binary.to_string(),
+        version: manifest.version.clone(),
+        pub_date: manifest.pub_date.clone(),
+        triples,
+    })
+}
+
+/// Bucket key for a binary's install pointer.
+pub fn latest_key(prefix: Option<&str>, binary: &str) -> String {
+    join_key(prefix, &[binary, "latest.json"])
+}
+
+/// Streaming SHA-256 of a staged artifact, returned as a BARE hex digest.
+///
+/// Bare, unlike [`blake3_file`], because both spellings are needed downstream
+/// and tagging is the caller's job: `bootstrap_hash` wants `sha256:<hex>` and
+/// the deprecated `sha256` field wants the digest alone. Streamed for the same
+/// reason blake3 is — these are hundred-megabyte tarballs.
+fn sha256_file(path: &Path) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 /// Streaming BLAKE3 of a staged artifact, returned already tagged.
@@ -511,6 +636,8 @@ pub fn stage_release(
         // what was uploaded, so the digest has to describe the bytes that
         // actually landed in the channel.
         let hash = blake3_file(&dest)?;
+        // Same reasoning as the blake3 above — hash what LANDED, not the source.
+        let sha256 = sha256_file(&dest)?;
 
         let url = match base_url.map(str::trim).filter(|b| !b.is_empty()) {
             Some(base) => format!("{}/{}", base.trim_end_matches('/'), key),
@@ -519,6 +646,13 @@ pub fn stage_release(
         bundles.entry(artifact.binary.clone()).or_default().insert(
             triple,
             ChannelBundle {
+                // `bundle_url` stays None here on purpose: staging is a pure
+                // filesystem operation and signing is not. A signing pass over
+                // the staged tree fills it in, and a publisher that cannot sign
+                // leaves it None rather than advertising a bundle that 404s.
+                bundle_url: None,
+                bootstrap_hash: Some(format!("sha256:{sha256}")),
+                sha256: Some(sha256),
                 url,
                 size: Some(bytes),
                 hash: Some(hash),
@@ -892,6 +1026,11 @@ mod tests {
                 filename: Some("yah.tar.gz".into()),
                 size_bytes: Some(42),
                 hash: Some("blake3:aa".into()),
+                // Unset: these fixtures cover index MERGE semantics, which are
+                // indifferent to which optional fields an entry carries.
+                bootstrap_hash: None,
+                sha256: None,
+                bundle_url: None,
             },
         );
         m
@@ -1236,6 +1375,9 @@ mod tests {
                             .into(),
                         size: Some(4),
                         hash: Some("blake3:ff".into()),
+                        bootstrap_hash: None,
+                        sha256: None,
+                        bundle_url: None,
                     },
                 )]),
             },
@@ -1252,6 +1394,124 @@ mod tests {
             triples["aarch64-apple-darwin"].filename.as_deref(),
             Some("yah.tar.gz")
         );
+    }
+
+    /// One triple, with whichever install-pointer fields the caller wants set.
+    fn signed_manifest(bundle_url: Option<&str>, bootstrap: Option<&str>) -> ChannelManifest {
+        ChannelManifest {
+            version: "0.8.29".into(),
+            pub_date: "2026-09-01T00:00:00Z".into(),
+            notes: None,
+            host: ChannelHost {
+                bundle: BTreeMap::from([(
+                    "aarch64-apple-darwin".to_string(),
+                    ChannelBundle {
+                        url: "https://cdn.yah.dev/yah/0.8.29/aarch64-apple-darwin/yah.tar.gz"
+                            .into(),
+                        size: Some(4),
+                        hash: Some("blake3:ff".into()),
+                        bootstrap_hash: bootstrap.map(str::to_string),
+                        sha256: bootstrap.map(|b| b.trim_start_matches("sha256:").to_string()),
+                        bundle_url: bundle_url.map(str::to_string),
+                    },
+                )]),
+            },
+        }
+    }
+
+    #[test]
+    fn an_unsigned_manifest_yields_no_install_pointer() {
+        // The refusal that matters. Staging without signing is legal — a
+        // publisher with no key still produces a channel tree and an index
+        // entry — but `latest.json` is the object `curl … | sh` trusts, and one
+        // written without a `bundle_url` makes install.sh die with "cosign is
+        // installed but the manifest carries no signature bundle". Refusing to
+        // emit the pointer leaves the PREVIOUS release installable, which is
+        // strictly better than pointing at bytes nobody can verify.
+        assert!(triples_manifest("yah", &signed_manifest(None, Some("sha256:ab"))).is_none());
+    }
+
+    #[test]
+    fn a_manifest_without_a_bootstrap_digest_yields_no_install_pointer() {
+        // blake3 alone is not enough: install.sh cannot verify it without first
+        // downloading an unverified b3sum, so a pointer carrying only `hash`
+        // silently degrades every install to no integrity check at all.
+        assert!(triples_manifest("yah", &signed_manifest(Some("https://x/y.sigstore.json"), None))
+            .is_none());
+    }
+
+    #[test]
+    fn a_signed_manifest_projects_onto_the_install_pointer_shape() {
+        let m = signed_manifest(
+            Some("https://cdn.yah.dev/yah/0.8.29/aarch64-apple-darwin/yah.tar.gz.sigstore.json"),
+            Some("sha256:ab"),
+        );
+        let pointer = triples_manifest("yah", &m).expect("fully signed manifest yields a pointer");
+        // `name` is the install.sh `<pkg>` arg, not the triple or the binary path.
+        assert_eq!(pointer.name, "yah");
+        assert_eq!(pointer.version, "0.8.29");
+        // FLAT `triples[<triple>]`, never `host.bundle[...]` — install.sh reads
+        // `.triples[$t][$f]` and that layout is a published contract.
+        let entry = &pointer.triples["aarch64-apple-darwin"];
+        assert_eq!(entry.bootstrap_hash.as_deref(), Some("sha256:ab"));
+        assert_eq!(entry.sha256.as_deref(), Some("ab"));
+        assert!(entry.bundle_url.as_deref().unwrap().ends_with(".sigstore.json"));
+        // Serialized shape: the pointer must not grow a `host` key, or almanac's
+        // r2-triples reader and install.sh both stop finding the triples.
+        let json = serde_json::to_value(&pointer).unwrap();
+        assert!(json.get("host").is_none());
+        assert!(json["triples"]["aarch64-apple-darwin"]["bundle_url"].is_string());
+    }
+
+    #[test]
+    fn an_empty_manifest_yields_no_install_pointer() {
+        let mut m = signed_manifest(Some("https://x/y.sigstore.json"), Some("sha256:ab"));
+        m.host.bundle.clear();
+        assert!(triples_manifest("yah", &m).is_none());
+    }
+
+    #[test]
+    fn staging_computes_both_digests_over_the_staged_bytes() {
+        let src = TempDir::new().unwrap();
+        let bin = write_dummy(src.path(), "target/release/yah", b"YAH-BINARY");
+        let staging = TempDir::new().unwrap();
+        let report = stage_release(
+            staging.path(),
+            &[ProducedArtifact {
+                binary: "yah".into(),
+                path: bin,
+                triple: Some("aarch64-apple-darwin".into()),
+            }],
+            "0.8.29",
+            None,
+            Some("https://cdn.yah.dev"),
+        )
+        .unwrap();
+        let bundle = &report.manifests["yah"].host.bundle["aarch64-apple-darwin"];
+        // Literal digests of b"YAH-BINARY", from `sha256sum` / `b3sum` — NOT
+        // recomputed here with the same code under test, which would only prove
+        // the function agrees with itself. These are the exact tools
+        // publish-yubaba-release.sh uses, so agreeing with them is the property
+        // that matters: the two producers must hash a release identically.
+        assert_eq!(
+            bundle.sha256.as_deref(),
+            Some("1c47e2c01f3a57fcb22b5cfe8bb6cfa586f27ced4085fd4a0524d43076f278de")
+        );
+        assert_eq!(
+            bundle.hash.as_deref(),
+            Some("blake3:69ec0019d64fea0158bdb120a417e72f15b9823f355aa1521b9e55f39d5dc497")
+        );
+        // Tagged and bare are the SAME digest — two spellings for two readers,
+        // not two values.
+        assert_eq!(
+            bundle.bootstrap_hash.as_deref(),
+            Some("sha256:1c47e2c01f3a57fcb22b5cfe8bb6cfa586f27ced4085fd4a0524d43076f278de")
+        );
+        // Staging never signs, so a freshly staged manifest cannot become a
+        // pointer. This pairing is what keeps the refusal honest rather than
+        // theoretical.
+        assert!(bundle.bundle_url.is_none());
+        assert!(triples_manifest("yah", &report.manifests["yah"]).is_none());
     }
 
     #[test]

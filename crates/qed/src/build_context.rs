@@ -95,11 +95,12 @@ pub struct NoBuildContextPublisher;
 impl BuildContextPublisher for NoBuildContextPublisher {
     async fn publish(&self, _key: &str, _tarball: Vec<u8>) -> Result<String, RunnerError> {
         Err(RunnerError::InvalidConfig(
-            "this build-image step must run on a different host than qed, so its build \
-             context has to be fetched by the worker rather than bind-mounted — but no \
-             build-context publisher is wired into this runner. The `yah` CLI wires an \
-             R2-backed one; a bare `yah-qed` embedding must supply its own via \
-             `PipelineRunner::with_build_context_publisher`."
+            "this step runs on a different host than qed, so the bytes it needs (a \
+             build-image context, or an offloaded subprocess's `source_context` \
+             subtrees) have to be fetched by the worker rather than bind-mounted — but \
+             no build-context publisher is wired into this runner. The `yah` CLI wires \
+             an R2-backed one on every fleet-capable runner; a bare `yah-qed` embedding \
+             must supply its own via `PipelineRunner::with_build_context_publisher`."
                 .into(),
         ))
     }

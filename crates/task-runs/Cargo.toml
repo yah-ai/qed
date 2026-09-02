@@ -12,13 +12,23 @@ name = "task_runs"
 path = "src/lib.rs"
 
 [dependencies]
-observation = { path = "../observation", version = "0.8.29" }
+observation = { path = "../observation", version = "0.8.30" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "1.0"
 uuid = { version = "1", features = ["v4", "serde"] }
 turso = { workspace = true }
-portable-pty = "0.8"
+# Must stay >= 0.9 (R726-B12). 0.8.1 has a NON-optional `serial 0.4` dep, which
+# pulls serial-unix -> termios 0.2.2 — a 2015-era crate whose src/os/mod.rs has
+# linux/macos/freebsd/openbsd arms and NO android arm. Because cargo-hakari puts
+# yah-qed (this crate's dependent) in workspace-hack's unconditional
+# [dependencies], every workspace member inherits it, so that one edge made the
+# whole yah workspace impossible to cross-compile to Android (E0432, 28 errors in
+# termios). 0.9.0 swapped `serial` for `serial2 0.2`, which has explicit
+# target_os = "android" arms. Downgrading, or adding any dep that reintroduces
+# `serial`, silently re-breaks all four android targets — and the failure appears
+# three levels away in a crate nobody here depends on directly.
+portable-pty = "0.9"
 tokio = { version = "1", features = ["sync", "rt", "time", "macros"] }
 toml = "0.8"
 regex = "1"

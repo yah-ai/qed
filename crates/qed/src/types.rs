@@ -348,6 +348,20 @@
 //! @yah:next("Tier: Wizard -- the storm guard and the decision to add a durable watcher at all are design judgement about what this camp is willing to operate.")
 //! @yah:gotcha("THE STORM GUARD IS THE DESIGN, not a detail. GHA's model assumes human-paced pushes. This camp has ten agents wip-committing constantly, so a branch-triggered dispatcher would produce a build storm. The shape W330 specifies: TAGS ONLY by default -- rare and deliberately cut -- with branch triggers opt-in per branch. Whoever picks this up must design that guard in before shipping, not bolt it on after the first storm.")
 //! @yah:gotcha("STATE OF THE CODE, verified in W330's inventory: Trigger::{Manual, Tag, Schedule, Pipeline} are all DECLARED (oss/qed/crates/qed/src/types.rs). Cron and pipeline-chaining fire. NOTHING fires Tag -- the variant exists and its doc comment names a GHA shim or yubaba hook that does not dispatch it. So this is a missing dispatcher, not a missing type.")
+//!
+//! @yah:ticket(R823-F2, "QED multi-participant jobs: N hosts in one run, addressable to each other, one verdict")
+//! @yah:at(2026-09-01T22:32:39Z)
+//! @yah:status(open)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R823)
+//! @arch:see(.yah/docs/working/W235-remote-qed.md)
+//! @arch:see(.yah/docs/working/W258-fleet-compute-modes-and-tenant-isolation.md)
+//! @yah:next("THE MISSING CONCEPT IS A PARTICIPANT SET, NOT REMOTE EXECUTION. QED already offloads a step to an arch-matched remote worker: PlatformSpec.native routes through resolve_placement to Offload (R590-F4), and R590-F2/R636-B1 carry the build context across the host boundary. What has no expression is N hosts running CONCURRENTLY inside one run, each knowing the others' addresses, producing one verdict. Placement (oss/qed/crates/qed/src/types.rs:410) is a coarse local-only | ci-only | anywhere contract about WHERE a run may happen, and [pipeline.matrix] fans out into INDEPENDENT jobs that never learn of each other.")
+//! @yah:next("FIRST CONSUMER, AND THE REASON THIS IS FILED: noisetable R675-T4 (multi-node time etudes over real LAN). The operator answered W160 Call 2 on 2026-09-01 as both simulated and real, with REAL as the intended gate and simulated as a degraded fallback. That inversion is blocked on this feature. See noisetable .yah/docs/working/W160-time-transport-and-seek.md, the 'What B best practice, A fallback requires' subsection.")
+//! @yah:next("THREE THINGS THE SHAPE HAS TO ANSWER, in the order they bite: (1) RENDEZVOUS - a participant needs the others' addresses before its first step runs, so the plan has to allocate the set and inject the addressing before dispatch, not discover it mid-run. (2) VERDICT - one participant failing must fail the run, and a participant that never starts must be distinguishable from one that started and failed, because those are different diagnoses for a fleet. (3) TEARDOWN - a participant left running after a peer dies holds a machine; that is the failure mode that makes hardware CI feel flaky when it is actually leaking.")
+//! @yah:gotcha("THIS SITS UNDER R823 BECAUSE R823 IS THE LIVE HOME, not because vending is the same problem. The cross-host lineage (R590, R636) is where the mechanism lives, and both those relays are in review - filing under either would land the work on a closed relay. If R823 lands and this is still open, re-parent it rather than stretching R823's scope to cover it.")
+//! @yah:gotcha("DO NOT BUILD THIS AS CHAINED SINGLE-HOST PIPELINES WITH LOG CORRELATION AFTER THE FACT. That is the obvious workaround and it reintroduces exactly the flakiness that makes people distrust hardware CI - a rendezvous that only exists in the log reader cannot fail loudly.")
+//! @yah:assumes("Assumes matrix rows are genuinely independent jobs with no inter-row addressing. Read from .yah/qed/headless.aarch64.toml's own comment (qed::matrix::plan fans into one job per row) and from the absence of any peer-addressing field on QedStep - not from reading matrix::plan itself.")
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
