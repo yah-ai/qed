@@ -233,6 +233,7 @@ fn report_to_pipeline(header: &GeneratedHeader, report: &TransformReport) -> Pip
         alias_of: None,
         pins: Default::default(),
         finally: Vec::new(),
+        participants: None,
     }
 }
 

@@ -38,9 +38,13 @@
 //!
 //! Mode-2 analytics snapshots (R556-F6) — off unless `--snapshot-interval-secs`
 //! is given (and the long tier is enabled). When on, a background producer
-//! aggregates this node's Parquet corpus into an at-rest JSON snapshot published
-//! to R2 (`analytics/current.json` → content-addressed blob), which the managed
-//! mesofact analytics server renders behind cheers auth (W234 §Mode-2).
+//! aggregates the FULL Parquet corpus — every machine's shards discovered
+//! under the bucket's `events/` prefix, not just this node's — into an
+//! at-rest JSON snapshot published to R2 (`analytics/current.json` →
+//! content-addressed blob), which the managed mesofact analytics server
+//! renders behind cheers auth (W234 §Mode-2). Node-agnostic by design:
+//! any long-tier node may run the producer and several running at once are
+//! redundant but harmless (identical corpora hash to identical blobs).
 //!
 //!   --snapshot-interval-secs <n>  Snapshot cadence. Enables the producer.
 //!
@@ -133,13 +137,16 @@ fn main() -> ExitCode {
                     return ExitCode::from(1);
                 }
             };
-            // The snapshot producer aggregates this node's own shards; a
-            // coordinator-side producer that spans the whole inventory is a
-            // follow-up (see snapshot.rs module doc).
+            // Empty machine list = DISCOVER: the producer aggregates every
+            // machine with shards under the bucket's `events/` prefix, not
+            // just this node's, so any long-tier node runs it and publishes
+            // the same full-corpus snapshot (operator decision 2026-09-04,
+            // R556-F6: "there should be nothing in our system that requires
+            // a specific node"; see SnapshotConfig::machines).
             let snapshot = snapshot_interval.map(|iv| {
                 SnapshotProducer::new(
                     Arc::clone(&obj_store),
-                    SnapshotConfig::new(vec![machine_id.clone()], retention_ms).with_interval(iv),
+                    SnapshotConfig::new(Vec::new(), retention_ms).with_interval(iv),
                 )
             });
             let lt = Arc::new(LongTierStore::new(

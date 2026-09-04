@@ -126,6 +126,11 @@ pub struct AnalyticsSnapshot {
     pub window_end_ms: u64,
     /// Total events aggregated across every machine's shards in the window.
     pub total_events: u64,
+    /// Machine ids actually covered by this snapshot (configured or
+    /// discovered — see [`SnapshotConfig::machines`]), sorted. Additive
+    /// field: absent in pre-discovery blobs, hence the serde default.
+    #[serde(default)]
+    pub machines: Vec<String>,
     /// Event counts by level, descending by count then level.
     pub by_level: Vec<SnapshotLevelCount>,
     /// Echo of the timeseries bucketing dimension actually used.
@@ -153,8 +158,17 @@ pub struct SnapshotPointer {
 #[derive(Debug, Clone)]
 pub struct SnapshotConfig {
     /// Machine ids whose shards to aggregate (each keyed `events/<id>/<day>.parquet`).
-    /// A single-node deployment passes one; a coordinator-side producer passes
-    /// the whole inventory.
+    ///
+    /// **Empty means DISCOVER** (R556-F6, operator decision 2026-09-04:
+    /// "there should be nothing in our system that requires a specific
+    /// node"): the producer lists the store's `events/` prefix and
+    /// aggregates every machine found there. That makes the producer
+    /// node-agnostic — any long-tier node running it publishes the same
+    /// full-corpus snapshot, so no node is special and running it on
+    /// several is redundant but harmless (content-addressed blobs are
+    /// identical for identical corpora; the pointer flip races benignly,
+    /// last writer wins and every intermediate pointer is valid).
+    /// Pass explicit ids only to scope a snapshot deliberately.
     pub machines: Vec<String>,
     /// Upper `offset_ms` bound of the long-tier corpus — the same value threaded
     /// into [`crate::service::Scryer::with_long_tier`] as the tier boundary.
@@ -220,15 +234,42 @@ impl SnapshotProducer {
         Self { object_store, cfg }
     }
 
-    /// Aggregate the long-tier corpus across every configured machine into a
-    /// single [`AnalyticsSnapshot`]. Pure read — writes nothing.
+    /// Machine ids this pass will aggregate: the configured list, or — when
+    /// it is empty — every machine with at least one shard under `events/`
+    /// in the store (see [`SnapshotConfig::machines`] for why empty means
+    /// discover). Discovered ids are deduped and sorted so two producers
+    /// looking at the same corpus build byte-identical snapshots.
+    fn machine_ids(&self) -> Result<Vec<String>, SnapshotError> {
+        if !self.cfg.machines.is_empty() {
+            return Ok(self.cfg.machines.clone());
+        }
+        let mut ids: Vec<String> = self
+            .object_store
+            .list_prefix("events/")?
+            .into_iter()
+            // Shard keys are `events/<machine-id>/<day>.parquet`; anything
+            // else under the prefix is not a shard and is skipped.
+            .filter_map(|key| {
+                let rest = key.strip_prefix("events/")?;
+                let (machine, shard) = rest.split_once('/')?;
+                shard.ends_with(".parquet").then(|| machine.to_string())
+            })
+            .collect();
+        ids.sort();
+        ids.dedup();
+        Ok(ids)
+    }
+
+    /// Aggregate the long-tier corpus across every configured (or discovered)
+    /// machine into a single [`AnalyticsSnapshot`]. Pure read — writes nothing.
     pub fn build_snapshot(&self) -> Result<AnalyticsSnapshot, SnapshotError> {
         let until_ms = self.cfg.retention_ms;
 
         // Reuse LongTierStore's tested Parquet-read + shard-key scheme by
         // instantiating a per-machine view over the shared object store.
+        let machines = self.machine_ids()?;
         let mut events: Vec<ScopedRow> = Vec::new();
-        for machine in &self.cfg.machines {
+        for machine in &machines {
             let lt = LongTierStore::new(
                 LongTierConfig { machine_id: machine.clone(), retention_ms: self.cfg.retention_ms },
                 Arc::clone(&self.object_store),
@@ -246,6 +287,7 @@ impl SnapshotProducer {
             window_start_ms: 0,
             window_end_ms: until_ms,
             total_events,
+            machines,
             by_level,
             group_by: self.cfg.group_by.clone(),
             timeseries,
@@ -542,6 +584,62 @@ mod tests {
         scope_ids.sort();
         scope_ids.dedup();
         assert_eq!(scope_ids, vec!["svc.a", "svc.b"]);
+        // The snapshot names its coverage.
+        assert_eq!(snap.machines, vec!["m1".to_string(), "m2".to_string()]);
+    }
+
+    /// An EMPTY machine list discovers every machine with shards under
+    /// `events/` — the node-agnostic mode the daemon runs in (R556-F6,
+    /// operator decision 2026-09-04: nothing in the system requires a
+    /// specific node). Same corpus as `aggregates_across_machines`, zero
+    /// configuration.
+    #[test]
+    fn empty_machine_list_discovers_the_whole_corpus() {
+        let store = Arc::new(InMemoryObjectStore::new());
+        let one_day = MS_PER_DAY as u32;
+        let run_a = TaskRunId::new();
+        let run_b = TaskRunId::new();
+        promote_into(
+            &store,
+            "m1",
+            &EventScope::Service(MeshIdent("svc.a".to_string())),
+            vec![make_event(&run_a, 0, one_day, Level::Error)],
+        );
+        promote_into(
+            &store,
+            "m2",
+            &EventScope::Service(MeshIdent("svc.b".to_string())),
+            vec![
+                make_event(&run_b, 0, one_day, Level::Error),
+                make_event(&run_b, 1, one_day, Level::Info),
+            ],
+        );
+        // A non-shard object under the prefix must not invent a machine.
+        store.put("events/notes.txt", b"not a shard".to_vec()).unwrap();
+
+        let producer = SnapshotProducer::new(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            SnapshotConfig::new(Vec::new(), RETENTION_MS),
+        );
+        let snap = producer.build_snapshot().unwrap();
+        assert_eq!(snap.machines, vec!["m1".to_string(), "m2".to_string()]);
+        assert_eq!(snap.total_events, 3);
+
+        // Discovery is deterministic: a second producer over the same store
+        // builds a snapshot whose content-address (everything except the
+        // wall-clock stamp) is identical — the property that makes N
+        // concurrent producers harmless.
+        let second = SnapshotProducer::new(
+            Arc::clone(&store) as Arc<dyn ObjectStore>,
+            SnapshotConfig::new(Vec::new(), RETENTION_MS),
+        )
+        .build_snapshot()
+        .unwrap();
+        let mut a = snap.clone();
+        let mut b = second;
+        a.generated_at_ms = 0;
+        b.generated_at_ms = 0;
+        assert_eq!(a, b);
     }
 
     /// `min_level` drops rows below the floor from the events surface, but not

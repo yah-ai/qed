@@ -299,6 +299,7 @@ pub mod import;
 pub mod matrix;
 pub mod native;
 pub mod nativecross;
+pub mod participants;
 pub mod peers;
 pub mod placement_gate;
 pub mod platform;
@@ -363,7 +364,8 @@ pub use publish::{
 pub use yah_qed_gha;
 pub use registries::{extract_registry_host, RegistryConfig, RegistryConfigError, RegistryEntry};
 pub use runner::{
-    pipeline_is_fully_offloaded, pipeline_needs_offload, sub_pipeline_admission_gap,
+    pipeline_has_node_bound_participant, pipeline_is_fully_offloaded, pipeline_needs_offload,
+    sub_pipeline_admission_gap,
     AdmissionControl, AdmissionGap, AdmissionLane,
     ChildEventFactory, ChildRunInfo,
     LoggingOutcomeDispatcher,
@@ -440,11 +442,23 @@ mod tests {
     /// overshoots; ascend until the marker is found. When consumed as the
     /// standalone github.com/yah-ai/qed export mirror there is no yah `.yah/qed`,
     /// so these workspace-coupled tests skip rather than fail.
+    ///
+    /// R857: the marker is "the directory holds at least one pipeline", NOT a
+    /// specific filename. It used to probe for `release.toml`, and renaming that
+    /// file to `yah-release.toml` made this return `None` — so every caller took
+    /// the skip arm and passed while measuring nothing. A skip-on-miss helper
+    /// keyed to one filename turns any rename into a silent green, which is the
+    /// exact failure these composite tests exist to catch.
     fn find_qed_dir() -> Option<std::path::PathBuf> {
         let mut dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         loop {
             let candidate = dir.join(".yah").join("qed");
-            if candidate.join("release.toml").is_file() {
+            let has_pipeline = std::fs::read_dir(&candidate).is_ok_and(|mut entries| {
+                entries.any(|e| {
+                    e.is_ok_and(|e| e.path().extension().is_some_and(|ext| ext == "toml"))
+                })
+            });
+            if has_pipeline {
                 return Some(candidate);
             }
             if !dir.pop() {
@@ -460,7 +474,7 @@ mod tests {
     // test below exercises the same `load_and_validate_graph` surface against
     // the workspace `.yah/qed/`.
 
-    /// R488-F6: `.yah/qed/release.toml` parses, the SubPipeline graph
+    /// R488-F6: `.yah/qed/yah-release.toml` parses, the SubPipeline graph
     /// (GhaWorkflow child + by-name desktop-release child) validates without
     /// cycles or depth violations, and a single terminal Outcome::Publish is
     /// declared at the parent so one revalidate POST fires after both
@@ -477,9 +491,9 @@ mod tests {
         };
         let loader = PipelineLoader::new(qed_dir);
         let pipeline = loader
-            .load_and_validate_graph("release")
+            .load_and_validate_graph("yah-release")
             .expect("release pipeline loads + graph validates");
-        assert_eq!(pipeline.name, "release");
+        assert_eq!(pipeline.name, "yah-release");
         assert_eq!(pipeline.steps.len(), 2, "two SubPipeline children");
         for step in &pipeline.steps {
             assert_eq!(step.kind, crate::types::StepKind::SubPipeline);
@@ -513,9 +527,9 @@ mod tests {
         };
         let loader = PipelineLoader::new(qed_dir);
         let pipeline = loader
-            .load_and_validate_graph("peer-binaries")
-            .expect("peer-binaries pipeline loads + graph validates");
-        assert_eq!(pipeline.name, "peer-binaries");
+            .load_and_validate_graph("oss-binaries")
+            .expect("oss-binaries pipeline loads + graph validates");
+        assert_eq!(pipeline.name, "oss-binaries");
         assert_eq!(
             pipeline.steps.len(),
             4,
@@ -548,7 +562,7 @@ mod tests {
         );
         assert_eq!(
             yah_path.as_deref(),
-            Some(".yah/qed/release.toml"),
+            Some(".yah/qed/yah-release.toml"),
             "yah self-release path step present",
         );
 

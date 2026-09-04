@@ -507,6 +507,7 @@ impl DocSource {
             alias_of: None,
             pins: Default::default(),
             finally: Vec::new(),
+            participants: None,
         })
     }
 

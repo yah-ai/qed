@@ -20,7 +20,7 @@
 #
 # Layout inside the image:
 #   /usr/bin/tini                        # PID 1
-#   /app/miniflare-sim.mjs               # ESM shim (R327-F2; reads MF_* env)
+#   /app/miniflare-sim.mjs               # ESM shim (R327-F2; reads PORT + MF_* env)
 #   /app/package.json                    # carries the miniflare devDep
 #   /app/node_modules/                   # populated by `bun install` at build
 #   /work/worker.js                      # workload's Worker bundle (bind mount)
@@ -31,7 +31,7 @@
 #   -p <host>:4322                        # operator-visible port
 #   -v <state_dir>/worker.js:/work/worker.js
 #                                        # workload's bundle, bind-mounted RO
-#   -e MF_PORT=4322
+#   -e PORT=4322                          # R844-T13; PORT_HTTP is the same number
 #   -e MF_SCRIPT=/work/worker.js
 #   -e ASSET_ORIGIN=http://minio:9000/<bucket>
 #   -e WORKER_MODE=static|spa|ssr
@@ -83,7 +83,7 @@ COPY oss/yubaba/crates/cloud/worker/miniflare-sim.mjs /app/miniflare-sim.mjs
 # the bundle elsewhere.
 RUN mkdir -p /work
 ENV MF_SCRIPT=/work/worker.js
-ENV MF_PORT=4322
+ENV PORT=4322
 
 EXPOSE 4322
 

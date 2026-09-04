@@ -183,6 +183,26 @@ pub const SOURCE_CONTEXT_URL_ENV: &str = "YAH_SOURCE_CONTEXT_URL";
 /// A tracked path that has been deleted in the working tree is skipped: the
 /// tree really does not have it, and the point is to ship the tree as
 /// positioned.
+///
+/// @yah:relay(R855, "qed source_context transport: what gets packed, and what silently doesn't")
+/// @yah:at(2026-09-03T07:26:34Z)
+/// @yah:status(open)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
+/// @arch:see(.yah/docs/working/W235-remote-qed.md)
+///
+/// @yah:ticket(R855-B1, "source_context ships a PARTIAL tree when a declared subtree holds untracked files — no local signal, fails on the worker as E0583")
+/// @yah:at(2026-09-03T07:26:39Z)
+/// @yah:status(open)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
+/// @yah:parent(R855)
+/// @yah:severity(medium)
+/// @yah:next("Tier: Cleric — one guard in one private function with a clear predicate; the judgment (warn vs refuse) is already decided below.")
+/// @yah:next("WHAT HAPPENS TODAY. source_context_files (oss/qed/crates/qed/src/build_context.rs:238) builds the ship list with `git ls-files -z -- <paths>` and nothing else. It catches the TOTALLY empty case with a good error ('matched no git-tracked files ... the step would fetch an empty source tree'), and misses the far likelier PARTIAL case: a declared subtree where most files are tracked and the three you just created are not. Those three are silently absent from the tar.")
+/// @yah:next("WHY IT IS EXPENSIVE. There is zero local signal — the module compiles fine on the camp Mac, because locally the files exist. The failure lands on the worker as a rustc E0583 (file not found for module) naming a path that plainly exists in the author's editor, which is about as misleading as a build error gets. Reported by @Glimmerstone:griffin 2026-09-02: cost three fleet runs on MFT-R823 before it was diagnosed.")
+/// @yah:next("THE FIX. In source_context_files, after the ls-files call, run `git ls-files -z --others --exclude-standard -- <the same paths>`. Non-empty means the declared subtree holds untracked files that will NOT ship. Name them (capped, e.g. first 10 plus a count) in a `tracing::warn!` — this is the same pair of invocations, one flag apart, so it costs one extra process spawn per offloaded step and no new dependency.")
+/// @yah:next("WARN, DO NOT REFUSE. A camp tree here is permanently dirty and full of legitimately-untracked files (target/, editor scratch, a peer's WIP), so refusing would fire constantly on runs that are entirely fine, and a guard that cries wolf gets muted. The failure this prevents is a MISSING diagnosis, not a missing check — the operator needs the sentence 'these files will not ship', printed once, at the moment they can still act on it.")
+/// @yah:next("SECOND SITE, SAME BUG, DO NOT MISS IT: source_context_fingerprint (build_context.rs:288) hashes the content of exactly what pack_source_context would ship. So an untracked file is invisible to the cache key too — editing one changes nothing about the fingerprint and a stale cached result can be served. Whatever list the guard computes should be derived once and used by both, in the shared source_context_files helper, which is why the helper is the right home.")
+/// @yah:gotcha("FOUND BY A PEER, NOT BY THE FILER. @Glimmerstone:griffin hit this on R556-F6 / MFT-R823 (mesofact-musl fleet build, 2026-09-02); @Ashguard:polaris filed it while on R823-F2 and confirmed the mechanism by reading source_context_files, but has NOT reproduced the E0583 personally. Treat the three-runs-lost figure as griffin's report, not as a measurement of this filer's.")
 pub fn pack_source_context(camp_root: &Path, paths: &[PathBuf]) -> Result<Vec<u8>, RunnerError> {
     let rel = source_context_files(camp_root, paths)?;
 

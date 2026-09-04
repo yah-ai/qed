@@ -813,6 +813,7 @@ target = ["x86_64", "aarch64"]
 
     fn test_pipeline(matrix: Option<MatrixSpec>, steps: Vec<QedStep>) -> Pipeline {
         Pipeline {
+            participants: None,
             max_parallel: None,
             description: None,
             tags: Vec::new(),
@@ -839,6 +840,7 @@ target = ["x86_64", "aarch64"]
 
     fn test_step(name: &str, argv: &[&str], env_pairs: Option<&[(&str, &str)]>) -> QedStep {
         QedStep {
+            participant: None,
             needs: None,
             resource: None,
             inputs: Vec::new(),

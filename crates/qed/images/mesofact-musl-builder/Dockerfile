@@ -267,13 +267,41 @@ RUN set -eux; \
 #             that config file already says.
 #
 # The first two exist because v8's build.rs emits NEITHER on the
-# prebuilt-archive path. Setting all of it as
-# ENV means it also applies to build scripts and proc macros, which here compile
-# for the same musl host triple — that is correct, not incidental. NOTE for any
-# consumer: a workspace `build.rustflags` in .cargo/config.toml would be
-# OVERRIDDEN by this env var. oss/mesofact has no .cargo/config.toml today
-# (checked 2026-08-11); if one ever appears carrying rustflags, this ENV has to
-# merge with it rather than shadow it.
+# prebuilt-archive path.
+#
+# ⚠ THIS ENV DOES NOT REACH BUILD SCRIPTS OR PROC MACROS. Corrected 2026-09-03
+# (R556-F6) — this paragraph previously said the opposite, in as many words:
+# "Setting all of it as ENV means it also applies to build scripts and proc
+# macros, which here compile for the same musl host triple — that is correct,
+# not incidental." That was never true and cost a fleet build to disprove.
+#
+# Cargo applies RUSTFLAGS to TARGET units only once `--target` is passed, and it
+# does so EVEN WHEN the host triple equals the target triple — which is exactly
+# the case here, and exactly why the old sentence read as reasonable. Host units
+# (build scripts, proc macros) are built without these flags. `target-applies-to-
+# host` / `[host] rustflags` exist to change that and are nightly-gated, so there
+# is no stable knob to reach for. `build-mesofact.sh` always passes `--target`
+# and its header defends that at length, so this is not incidental either.
+#
+# HOW IT SURFACED, so the next person recognises it in one look. MFT-R823 gave
+# `mesofact-ssr` a build.rs taking deno_core + four deno extension crates as
+# BUILD-dependencies. The build-script binary therefore linked librusty_v8.a as a
+# host unit, never saw `-lstdc++`, and died with ~30 undefined references to
+# libstdc++ symbols (`std::__throw_length_error`) out of V8 objects — while every
+# TARGET crate in the same run, on this same image, linked fine. Target-vs-host
+# was the only variable. MFT-R823's fix was to remove V8 from the build-script
+# closure entirely (`cargo tree -p mesofact-ssr -e build` is now just serde_json)
+# rather than to patch link flags into the host side, on the grounds that a
+# link-flag patch has to be independently right on darwin, debian-glibc and
+# alpine-musl while only alpine-musl makes being wrong visible.
+#
+# So: A BUILD SCRIPT IN THIS TREE MUST NOT NEED LINK FLAGS. If one ever does,
+# that is the constraint to design around, not a flag to add here.
+#
+# NOTE for any consumer: a workspace `build.rustflags` in .cargo/config.toml
+# would be OVERRIDDEN by this env var. oss/mesofact has no .cargo/config.toml
+# today (checked 2026-08-11); if one ever appears carrying rustflags, this ENV
+# has to merge with it rather than shadow it.
 ENV RUSTY_V8_ARCHIVE=/opt/rusty-v8/librusty_v8.a \
     RUSTY_V8_SRC_BINDING_PATH=/opt/rusty-v8/src_binding.rs \
     RUSTFLAGS="-C link-arg=-Wl,-Bstatic -C link-arg=-Wl,--start-group -C link-arg=-lstdc++ -C link-arg=-latomic -C link-arg=-lgcc -C link-arg=-lc -C link-arg=-Wl,--end-group -C link-arg=-Wl,-z,stacksize=8388608"

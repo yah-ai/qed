@@ -14,12 +14,31 @@
 # only oss/mesofact and cargo dies with "failed to find a workspace root".
 #
 # WHY TWO BINARIES FROM TWO CRATES (W225 §2a). `mesofact` is the prod binary
-# built at the `deploy` feature preset; `mesofact-dev` is a SEPARATE crate
+# built at the `deploy` feature preset; the dev binary is a SEPARATE crate
 # carrying the file watcher + dev S3 surface. Folding dev into prod would put
 # `notify` + `s3s` back into the prod dependency closure. They ship in one
 # tarball; they are not one binary. This mirrors release.yml's `mesofact-build`
 # job leg-for-leg, deliberately — the fleet musl legs and the GHA gnu/darwin legs
 # must produce the same tarball shape or install.sh sees two different products.
+#
+# THE DEV BINARY IS `mes`, FROM PACKAGE `mes` — corrected 2026-09-03 (R556-F6)
+# after this script failed a live run with `error: no bin target named
+# mesofact-dev in mesofact-dev package`. MFT-R822 (operator decision,
+# 2026-09-01) split the two names apart: the PACKAGE `mesofact-dev` keeps its
+# descriptive name and now emits NO binaries at all, while the COMMAND `mes`
+# ships from its own three-line package at oss/mesofact/crates/mes so that
+# `cargo install mes` names something installable. See that package's manifest
+# for the full reasoning.
+#
+# Two consequences worth keeping straight, because only one of the two names
+# moved:
+#   - `-p mesofact-dev` is still a valid package selector, so the W225 §2
+#     closure grep below (which looks for the PACKAGE in `cargo tree`) is
+#     unchanged and must stay as it is.
+#   - the staged filename is now `mes`. install.sh already prefers `mes` and
+#     falls back to `mesofact-dev` only for tarballs cut before the rename
+#     (a declared support window, not a permanent alias), so shipping `mes`
+#     is the shape it wants.
 #
 # WHY `--target` EVEN THOUGH THE HOST IS THE TARGET. The image's rustc is
 # musl-native, so this is a native build either way. Passing --target explicitly
@@ -72,17 +91,17 @@ cd "$MESOFACT"
 # Leg A — the PROD binary. `--features deploy` is the shipped preset, shared with
 # Dockerfile.ssr-runtime; never hand-list the feature set. `--bin mesofact` is
 # pinned so a future extra [[bin]] in the facade cannot silently join the release.
-echo "build-mesofact: [1/4] mesofact (--features deploy)"
+echo "build-mesofact: [1/5] mesofact (--features deploy)"
 cargo build --release --locked --target "$TARGET" -p mesofact --bin mesofact --features deploy
 
 # Leg B — the DEV binary, from its own crate, at DEFAULT features (= ssr). It
 # must NOT be built with `deploy`, which is the prod facade's preset.
-echo "build-mesofact: [2/4] mesofact-dev (default features)"
-cargo build --release --locked --target "$TARGET" -p mesofact-dev --bin mesofact-dev
+echo "build-mesofact: [2/5] mes (default features)"
+cargo build --release --locked --target "$TARGET" -p mes --bin mes
 
 # W225 §2 boundary, enforced here rather than asserted in a doc — the same check
 # release.yml's gnu/darwin legs run, so the musl legs cannot drift off it.
-echo "build-mesofact: [3/4] prod closure carries no dev affordances (W225 §2)"
+echo "build-mesofact: [3/5] prod closure carries no dev affordances (W225 §2)"
 cargo tree -p mesofact --features deploy -e normal --target "$TARGET" > /tmp/deploy-tree.txt
 if grep -nE 'mesofact-dev|notify|s3s' /tmp/deploy-tree.txt; then
   echo "build-mesofact: mesofact --features deploy links dev affordances (W225 §2)" >&2
@@ -94,8 +113,8 @@ echo "build-mesofact: prod closure clean — no mesofact-dev / notify / s3s"
 # build output to a scratch volume — which is what you want on a shared checkout,
 # and what keeps a fleet build from writing into the mounted camp tree.
 SRC="${CARGO_TARGET_DIR:-$MESOFACT/target}/$TARGET/release"
-[ -x "$SRC/mesofact" ]     || { echo "build-mesofact: no $SRC/mesofact" >&2; exit 1; }
-[ -x "$SRC/mesofact-dev" ] || { echo "build-mesofact: no $SRC/mesofact-dev" >&2; exit 1; }
+[ -x "$SRC/mesofact" ] || { echo "build-mesofact: no $SRC/mesofact" >&2; exit 1; }
+[ -x "$SRC/mes" ]      || { echo "build-mesofact: no $SRC/mes" >&2; exit 1; }
 
 # THE CHECK THAT ACTUALLY MATTERS (R546-T4's lesson, one layer up). A green
 # `cargo build` is not evidence the V8 archive is usable — undefined externs bind
@@ -111,7 +130,7 @@ SRC="${CARGO_TARGET_DIR:-$MESOFACT/target}/$TARGET/release"
 # hitting: the check passed in the one environment where the defect is invisible.
 # So assert the artifact property (no interpreter, no NEEDED) in the place that
 # can still see it, then run it.
-echo "build-mesofact: [4/4] the built binaries are static, and run"
+echo "build-mesofact: [4/5] the built binaries are static, and run"
 assert_static() {
   bin="$1"
   if readelf -l "$bin" | grep -q "program interpreter"; then
@@ -128,9 +147,48 @@ assert_static() {
   echo "build-mesofact: $(basename "$bin") is statically linked"
 }
 assert_static "$SRC/mesofact"
-assert_static "$SRC/mesofact-dev"
+assert_static "$SRC/mes"
 "$SRC/mesofact" --version
-"$SRC/mesofact-dev" --version
+"$SRC/mes" --version
+
+# R823 — the step above proves V8 LINKS and the process starts. It does not
+# prove the V8 tier WORKS, and for months it did not: `deno_core::extension!`
+# lowers every declared extension JS file to an absolute path into the COMPILING
+# machine's cargo registry and reads it at `JsRuntime::new`, so a mesofact built
+# here booted here and panicked with `No such file or directory (os error 2)` on
+# every fleet node it was ever shipped to. `--version` never touches V8, and
+# R546's verify-consumer.sh proves only that a deno_core binary LINKS — which is
+# why a link-only gate stayed green through all of it.
+#
+# `selfcheck ssr` boots a real isolate and tears it down: no bundle, no port, no
+# dist layout. Hiding $CARGO_HOME/registry for the length of that ONE command is
+# what makes this a real check rather than a fifth compile-host green — it
+# reproduces, inside the builder, the only condition that distinguishes a fleet
+# node from this container. The registry is moved back before the exit status is
+# consulted, so a failure here cannot leave the image half-dismantled for the
+# caller's later builds (the pipeline's almanac-feed leg still needs it).
+#
+# Same lesson as the static assertion above, one tier up: assert the property in
+# the place that can still see it.
+echo "build-mesofact: [5/5] the SSR isolate boots without this machine's cargo registry (R823)"
+CH="${CARGO_HOME:-/usr/local/cargo}"
+[ -d "$CH/registry" ] || {
+  echo "build-mesofact: no registry at $CH/registry to hide — CARGO_HOME is not where this build read its crates from, so hiding it would prove nothing" >&2
+  exit 1
+}
+mv "$CH/registry" "$CH/registry.r823-hidden"
+if [ -e "$CH/registry" ]; then
+  echo "build-mesofact: $CH/registry still present — the hide did not take, so this check proves nothing" >&2
+  exit 1
+fi
+selfcheck_rc=0
+"$SRC/mesofact" selfcheck ssr || selfcheck_rc=$?
+mv "$CH/registry.r823-hidden" "$CH/registry"
+if [ "$selfcheck_rc" -ne 0 ]; then
+  echo "build-mesofact: the SSR isolate did not boot without this machine's cargo registry" >&2
+  echo "build-mesofact: the shipped binary would panic on every fleet node — see mesofact-ssr/build.rs + src/ext_sources.rs" >&2
+  exit "$selfcheck_rc"
+fi
 
 # Same tarball shape as release.yml's "Package archive" step: one top-level
 # stage dir holding both binaries. install.sh strips components, so the stage
@@ -141,7 +199,7 @@ STAGE_NAME="${STAGE_NAME%.tar.gz}"
 WORK="$(mktemp -d)"
 STAGE="$WORK/$STAGE_NAME"
 mkdir -p "$STAGE" "$(dirname "$OUT")"
-cp "$SRC/mesofact" "$SRC/mesofact-dev" "$STAGE/"
+cp "$SRC/mesofact" "$SRC/mes" "$STAGE/"
 
 # Deterministic tar: fixed mtime/uid/gid/order so two builds of identical bytes
 # produce an identical archive, which is what makes the W212 derivation lock and

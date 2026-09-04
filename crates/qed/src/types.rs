@@ -350,8 +350,8 @@
 //! @yah:gotcha("STATE OF THE CODE, verified in W330's inventory: Trigger::{Manual, Tag, Schedule, Pipeline} are all DECLARED (oss/qed/crates/qed/src/types.rs). Cron and pipeline-chaining fire. NOTHING fires Tag -- the variant exists and its doc comment names a GHA shim or yubaba hook that does not dispatch it. So this is a missing dispatcher, not a missing type.")
 //!
 //! @yah:ticket(R823-F2, "QED multi-participant jobs: N hosts in one run, addressable to each other, one verdict")
-//! @yah:at(2026-09-01T22:32:39Z)
-//! @yah:status(open)
+//! @yah:status(review)
+//! @yah:at(2026-09-03T07:33:21Z)
 //! @yah:assignee(agent:bundle-anthropic-ashguard)
 //! @yah:parent(R823)
 //! @arch:see(.yah/docs/working/W235-remote-qed.md)
@@ -362,6 +362,25 @@
 //! @yah:gotcha("THIS SITS UNDER R823 BECAUSE R823 IS THE LIVE HOME, not because vending is the same problem. The cross-host lineage (R590, R636) is where the mechanism lives, and both those relays are in review - filing under either would land the work on a closed relay. If R823 lands and this is still open, re-parent it rather than stretching R823's scope to cover it.")
 //! @yah:gotcha("DO NOT BUILD THIS AS CHAINED SINGLE-HOST PIPELINES WITH LOG CORRELATION AFTER THE FACT. That is the obvious workaround and it reintroduces exactly the flakiness that makes people distrust hardware CI - a rendezvous that only exists in the log reader cannot fail loudly.")
 //! @yah:assumes("Assumes matrix rows are genuinely independent jobs with no inter-row addressing. Read from .yah/qed/headless.aarch64.toml's own comment (qed::matrix::plan fans into one job per row) and from the absence of any peer-addressing field on QedStep - not from reading matrix::plan itself.")
+//! @yah:handoff("SHIPPED: QED now has a PARTICIPANT SET — N hosts concurrently inside one run, each knowing the others' addresses, one verdict. New module oss/qed/crates/qed/src/participants.rs carries the whole vocabulary and every pure rule; the runner carries the execution.")
+//! @yah:handoff("THE SHAPE. [pipeline.participants] with port_base plus [pipeline.participants.role.<name>] { node, address, ports, coordinator }, and `participant = \"<role>\"` on a step. One role = one participant = one host; there is deliberately no `count` fan-out, because every instance of a role would share that role's one node and address. N hosts is spelled as N roles.")
+//! @yah:handoff("RENDEZVOUS. The plan allocates host + address + port numbers BEFORE any dispatch and injects two env vars into every step of the run: QED_PARTICIPANTS (the whole set as JSON, self included) and QED_PARTICIPANT_SELF. Injected at all THREE exec sites (local native, local container, remote) on purpose — covering two of three is the R577-F3 class of bug where a step's configuration silently vanishes the moment placement offloads it. The rendezvous OVERRIDES a step's own env rather than underlaying it: the ports were assigned by this run, so a literal in the TOML can only be a stale copy of a previous run's addressing.")
+//! @yah:handoff("THE NODE IS NAMED, NOT ADMITTED. TaskLocation::RemoteAny picks a host at dispatch time, which is fine for a build and fatal for a rendezvous. So a node-bound participant pins TaskLocation::Remote from the plan, and its placement outranks even a forced --where=local — there is no honest local fallback for a participant whose peers were already told where it would be.")
+//! @yah:handoff("VERDICT. participants::verdict folds per-participant outcomes into one answer and reports a participant that NEVER STARTED ahead of, and in different words from, one that started and failed ('this is a fleet fault, not a test failure'). The never-started evidence is STRUCTURAL, not string-matched: a remote sidecar whose workload id was never minted was never accepted by any node, which reap_background records as SidecarReap.never_dispatched. The verdict lands on QedRunMeta::failure_reason — the field qed.status and the desktop card read — and can only ADD a failure, never turn a red run green.")
+//! @yah:handoff("TEARDOWN. This is where a remote sidecar is genuinely not a local one: BackgroundTask's own doc says dropping the join handle kills a local sidecar (kill_on_drop), and NONE of that holds across a host boundary — aborting the waiter drops a future watching a log stream while the container keeps running, keeps its port and keeps the machine. reap_background now calls RemoteForgeDriver::kill whenever a workload id exists, including when the waiter already finished, because ForgeStatus::Lost means 'we stopped being able to see it', not 'it stopped'. Teardown order is peers-first-coordinator-last so the coordinator's account is the last thing in the journal instead of N connection errors.")
+//! @yah:handoff("R513-F2's 'background steps run locally only — remote sidecars are a separate lifecycle' refusal is now exactly that separate lifecycle, and it still fires for a background step that offloads WITHOUT being a participant — with a message that routes the author to [pipeline.participants].")
+//! @yah:handoff("VALIDATION AT BOTH ENDS. participants::plan_for is one seam used by the loader (fail the LOAD — a red pipeline in the catalog) and by run_inner's preflight (fail the RUN before any step, because a Pipeline built in code never passes through PipelineLoader). It rejects: no/two coordinators, a named node with no address, duplicate or malformed port names, a port range that runs past 65535, a step naming an undeclared role, a `participant` with no set at all, and a declared role no step claims (dead config that would otherwise surface at verdict time as a fleet fault — the one diagnosis it definitely is not). deny_unknown_fields, so a typo'd `adress` is a parse error rather than a participant nobody can reach.")
+//! @yah:handoff("DISCOVERED WORK #1, outside the ticket: app/yah/cli/src/camp.rs:10364 and :10371 needed the two new struct-literal fields. Mine to fix, since my field additions broke it — @Ashguard:spade flagged it rather than patching it and was right to.")
+//! @yah:handoff("DISCOVERED WORK #2: .yah/schema/qed-pipeline.toml.schema.json regenerated (cargo run -p xtask -- emit-schemas) because PipelineToml gained a field. scripts/check-schema-drift.sh is green.")
+//! @yah:handoff("DOC: new '§Participant sets (R823-F2)' section in .yah/docs/working/W235-remote-qed.md — the shape, the four decisions worth not re-litigating, the verdict and teardown rules, and an explicit 'Not proven against hardware' closing paragraph.")
+//! @yah:verify("cd oss/qed && cargo test -p yah-qed --lib — 932 passed / 0 failed / 1 ignored (pre-existing). Baseline before this ticket was 903; the 29 new tests are 20 in participants.rs, 5 in runner.rs's participant section plus 4 in config.rs.")
+//! @yah:verify("A NEW TEST CAUGHT A REAL BUG IN THIS TICKET'S OWN CODE, which is the one I'd point a reviewer at: port_range_exhaustion_is_caught_at_plan_time failed with 'attempt to add with overflow'. Assigning the last legal port (65535) and then incrementing overflows u16 — a case the range guard cannot prevent, because that assignment IS legal and only the next one is not. Fixed by counting a usize offset from base instead of a running u16.")
+//! @yah:verify("cargo check -p yah --lib and -p yah --tests — both clean after the camp.rs literal fix.")
+//! @yah:verify("./scripts/check-schema-drift.sh — 'ok: .yah/schema is in sync with the Rust types'.")
+//! @yah:gotcha("FILED WHILE HERE, NOT PART OF THIS TICKET: R855-B1 — qed's source_context ships a PARTIAL tree when a declared subtree holds untracked files (git ls-files only; the totally-empty case is caught, the partial case is not), with no local signal and an E0583 on the worker. Reported by @Glimmerstone:griffin, mechanism confirmed by reading source_context_files. Its sibling source_context_fingerprint has the same blindness, so an untracked file is invisible to the cache key too.")
+//! @yah:assumes("NEVER RUN ON TWO REAL MACHINES. Everything is unit-tested, and the remote dispatch path is proven only as far as 'the preflight lets a participant sidecar through and it then fails on the absence of a wired dispatcher' (a_remote_participant_sidecar_clears_the_background_preflight). Filed as R823-T3, which also carries what to check first.")
+//! @yah:assumes("THE LEAST-TESTED LINK IS REACHABILITY, and it is an inference rather than an observation: I read in velveteen-exec's build_workload_spec that every remote forge subprocess workload gets HOST_NETWORK_ANNOTATION (R590-B7), and concluded that a participant binding its assigned port therefore answers on the node's own network stack at the address its peers were handed. I did not observe a packet. If one thing in this ticket is wrong, expect it to be this.")
+//! @yah:assumes("NEVER-STARTED IS DETECTED ONLY FOR BACKGROUND participant steps, because the workload-id evidence lives on the sidecar reap path. A FOREGROUND participant step whose remote dispatch is refused reports as Failed — a less precise diagnosis than it could be. Stated in participant_reports' doc rather than hidden; it is the coordinator-shaped case, and a coordinator that cannot be dispatched fails the run either way.")
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -657,6 +676,26 @@ pub struct Pipeline {
     /// time.
     #[serde(default)]
     pub finally: Vec<QedStep>,
+    /// R823-F2 — `[pipeline.participants]`: the set of hosts that run
+    /// **concurrently inside this one run**, each knowing the others'
+    /// addresses, producing one verdict.
+    ///
+    /// Orthogonal to every neighbouring knob, and worth stating why, because
+    /// three of them look adjacent:
+    ///
+    /// - [`placement`](Self::placement) is a *permission* gate — may this run
+    ///   happen here at all.
+    /// - [`matrix`](Self::matrix) fans steps into rows that are **independent
+    ///   jobs**; no row can address another, which is precisely what a
+    ///   rendezvous needs.
+    /// - A `native = true` [`platform`](QedStep::platform) step offloads *work*
+    ///   to one arch-matched worker and waits for it — one host doing a job for
+    ///   the coordinator, not two hosts talking to each other.
+    ///
+    /// `None` on every pipeline that doesn't declare the block, which is all of
+    /// them until one needs a multi-node case. See [`crate::participants`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub participants: Option<crate::participants::ParticipantSet>,
 }
 
 /// Key an unkeyed pipeline falls back to (R719-F1). Camp-global: every
@@ -1317,6 +1356,31 @@ pub struct QedStep {
     /// bounded only by `max_parallel`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resource: Option<String>,
+    /// R823-F2 — which participant of the pipeline's
+    /// [`participants`](Pipeline::participants) set this step belongs to.
+    ///
+    /// Names a role in `[pipeline.participants.role.<name>]`. Two consequences,
+    /// and only these two:
+    ///
+    /// - **Placement.** A step whose role declares a `node` is dispatched to
+    ///   that named node — pinned, never tag-matched, because the rendezvous
+    ///   address has to be known before dispatch rather than decided by it.
+    /// - **Identity.** The step is told which participant it is, via
+    ///   [`ENV_PARTICIPANT_SELF`](crate::participants::ENV_PARTICIPANT_SELF),
+    ///   so one binary can be either half of a case.
+    ///
+    /// The *set* is visible to every step of a participant run whether or not
+    /// it declares this — a build step that has to bake an address in needs the
+    /// map as much as the participant does. This field says who you are, not
+    /// what you can see.
+    ///
+    /// Lifecycle is unchanged: a long-lived peer is still an ordinary
+    /// [`background`](Self::background) step gated by
+    /// [`background_until`](Self::background_until). The participant set adds
+    /// addressing, a verdict rule and remote teardown — it does not add a
+    /// second way to say "this runs in the background".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub participant: Option<String>,
 }
 
 fn default_enabled() -> bool {
@@ -2754,6 +2818,25 @@ pub struct QedRunMeta {
     /// rerun the pipeline as declared.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub launch: Option<QedRunLaunch>,
+    /// The `workspace = "isolated"` worktree this run built in, kept on disk
+    /// because the run FAILED (R766). `None` for every non-Isolated run, for
+    /// an Isolated run that succeeded (nothing to resume — retaining it would
+    /// be pure cost, a yah worktree's `target/` is GB-scale), and for every
+    /// run meta persisted before this field existed.
+    ///
+    /// The one thing a resume of an Isolated run needs beyond
+    /// [`Self::params`]: without it, `qed.rerun --from-step` positions a
+    /// *fresh* worktree at the pipeline's target ref, which has no memory of
+    /// whatever steps `0..from_step` mutated on disk — wrong for a publish
+    /// wave, where later steps depend on earlier ones' filesystem side
+    /// effects, not just their named [`StepStatus::outputs`].
+    ///
+    /// Subject to retention eviction (a count-bounded sweep over the most
+    /// recent failed runs, since this is GB-scale unlike the rest of a run
+    /// meta) — a path here is not a guarantee the directory still exists;
+    /// resume degrades to a fresh worktree when it doesn't.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retained_workspace: Option<std::path::PathBuf>,
 }
 
 /// How a run was launched, beyond its resolved params (which live on
@@ -3063,12 +3146,14 @@ mod tests {
 
     fn one_step(argv: Vec<&str>, env: &[(&str, &str)]) -> Pipeline {
         Pipeline {
+            participants: None,
             max_parallel: None,
             description: None,
             tags: Vec::new(),
             name: "p".into(),
             label: "p".into(),
             steps: vec![QedStep {
+                            participant: None,
                 needs: None,
                 resource: None,
                 inputs: Vec::new(),
@@ -3685,6 +3770,7 @@ checklist = ["Diff reviewed"]
 
     fn build_image_step(name: &str) -> QedStep {
         QedStep {
+            participant: None,
             needs: None,
             resource: None,
             inputs: Vec::new(),
@@ -3728,6 +3814,7 @@ checklist = ["Diff reviewed"]
 
     fn package_native_tarball_step(name: &str) -> QedStep {
         QedStep {
+            participant: None,
             needs: None,
             resource: None,
             inputs: Vec::new(),
@@ -3771,6 +3858,7 @@ checklist = ["Diff reviewed"]
 
     fn musl_static_preflight_step(name: &str) -> QedStep {
         QedStep {
+            participant: None,
             needs: None,
             resource: None,
             inputs: Vec::new(),
@@ -3968,6 +4056,7 @@ checklist = ["Diff reviewed"]
 
     fn sign_native_tarball_step(name: &str) -> QedStep {
         QedStep {
+            participant: None,
             needs: None,
             resource: None,
             inputs: Vec::new(),
@@ -4408,6 +4497,7 @@ checklist = ["Diff reviewed"]
 
     fn sub_pipeline_step(name: &str, target: SubPipelineRef) -> QedStep {
         QedStep {
+            participant: None,
             needs: None,
             resource: None,
             inputs: Vec::new(),
@@ -4457,6 +4547,7 @@ checklist = ["Diff reviewed"]
 
     fn pipeline_with(name: &str, steps: Vec<QedStep>) -> Pipeline {
         Pipeline {
+            participants: None,
             max_parallel: None,
             description: None,
             tags: Vec::new(),

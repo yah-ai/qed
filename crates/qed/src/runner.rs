@@ -345,9 +345,9 @@
 //! @yah:verify("cargo test -p yah --lib — 1033 pass / 0 fail, including no_camp_pipeline_hands_a_child_a_key_its_parent_does_not_hold (the real-.yah/qed-tree walker).")
 //!
 //! @yah:relay(R766, "Resume-from-step for `workspace = \"isolated\"` pipelines: retain the run's worktree, and bound the retention")
-//! @yah:at(2026-08-15T03:53:59Z)
-//! @yah:status(open)
-//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:status(review)
+//! @yah:at(2026-09-03T08:07:48Z)
+//! @yah:assignee(agent:bundle-anthropic-miravel)
 //! @yah:next("CONTEXT: the cheap half of this already shipped. QedRunMeta / QedRunWire now carry the run's resolved `params`, and the desktop's resume-from-step button replays them, so a `workspace = \"live\"` pipeline (release-wizard) resumes correctly today. This relay is the EXPENSIVE half that was deliberately deferred: `workspace = \"isolated\"` pipelines still cannot resume, because their filesystem state is destroyed.")
 //! @yah:next("THE MECHANISM: runner.rs positions an isolated run at `std::env::temp_dir()/qed-worktree-{run_id}` via `git worktree add --force`, and the guard tears it down when the run ends (see the WorktreeGuard around runner.rs:1418 and the test `workspace_isolated_builds_in_a_worktree_and_guard_cleans_up`). Resuming step N of an isolated run therefore starts from a FRESH checkout of the ref -- every mutation steps 1..N-1 made is gone. For a publish wave that is not merely incomplete, it is wrong: the resume would re-derive state the earlier steps had already changed.")
 //! @yah:next("SCOPE: (1) retain the worktree when a run FAILS (a successful run has nothing to resume, so retaining it is pure cost); (2) record its path on the run meta so a resume can re-enter it instead of positioning a new one; (3) a retention policy, because this is the first qed feature whose per-run footprint is GB-scale rather than KB-scale -- a yah worktree with a populated target/ dwarfs the entire 29 MB run-meta history.")
@@ -358,6 +358,18 @@
 //! @yah:verify("An isolated pipeline whose step 2 fails leaves its worktree on disk, and resuming from step 2 re-enters THAT worktree (assert on the path, not just on success) and sees a file step 1 wrote.")
 //! @yah:assumes("That anyone actually wants to resume an isolated run. No pipeline has asked for it yet -- the demand is inferred from the live-workspace case, not observed. If it stays hypothetical, closing this as won't-do is a legitimate outcome; the cost here is real and the benefit is not yet.")
 //! @yah:verify("Eviction is enforced across a daemon restart: retain N+2 failed isolated runs over a restart, assert only N worktrees survive on disk and `git worktree list` has no stale entries.")
+//! @yah:handoff("Isolated worktree retention: WorktreeGuard gained a Cell<bool> retain flag (oss/qed/crates/qed/src/runner.rs) — Drop skips `git worktree remove --force` when set. run_inner sets it iff overall_status==Failed AND the pipeline is workspace=\"isolated\", and stamps the same path onto the new QedRunMeta::retained_workspace field (types.rs). A successful run (or any non-Isolated mode) still tears down exactly as before.")
+//! @yah:handoff("Resume re-entry: PipelineRunner::with_resume_workspace(path) (runner.rs) makes prepare_workspace's Isolated arm skip `git worktree add` entirely and reuse the existing directory when it's still on disk; a vanished path degrades to an ordinary fresh checkout (tracing::warn, not an error).")
+//! @yah:handoff("Daemon wiring (app/yah/cli/src/camp.rs): qed_run_handler is now a thin wrapper over qed_run_handler_inner(state, p, resume_workspace: Option<PathBuf>) — no wire field added to rpc::QedRunParams, since no caller outside this file may name a worktree path. qed_rerun_handler computes resume_workspace = run_params.from_step.is_some().then(|| meta.retained_workspace.clone()).flatten() — gated on an ACTUAL resume (nonzero start index), not a bare 'rerun', so the rerun button keeps its existing clean-checkout behavior.")
+//! @yah:handoff("Retention policy: MAX_RETAINED_ISOLATED_WORKTREES = 3 (camp.rs), a judgment call — count-bounded LRU over FAILED isolated runs by created_at. evict_stale_retained_worktrees() does its own `.yah/jit/qed/*.json` scan (independent of any in-memory map) and runs from two call sites: the end of every persist_qed_run, and once at boot right after each load_qed_history() call (both the embedded-daemon path and make_daemon_state) — so the cap holds even across a restart, per the ticket's own framing that these are bare temp dirs nothing else cleans up.")
+//! @yah:handoff("9 QedRunMeta struct-literal sites across runner.rs/camp.rs (incl. 3 test helpers) updated for the new field; none needed a schema regen — QedRunMeta carries no #[derive(JsonSchema)], only PipelineToml/WorkloadSpec do.")
+//! @yah:verify("cargo test --manifest-path oss/qed/crates/qed/Cargo.toml --lib -> 934 passed, incl. new workspace_isolated_resume_reenters_the_retained_worktree_without_a_fresh_checkout (path equality + content survives) and workspace_isolated_failed_run_retains_worktree_and_resume_reenters_it (full run_inner path)")
+//! @yah:verify("cargo test -p yah --lib -- camp::r325_f1_tests:: -> 42 passed, incl. new resume_from_step_reenters_the_retained_isolated_worktree (full qed_run_handler/qed_rerun_handler daemon path; flaky-check step's exit code is state-dependent so a fresh checkout provably CANNOT pass it, only a real re-entry can)")
+//! @yah:verify("cargo test -p yah --lib -- eviction_keeps_only_the_n_most_recent -> 1 passed: retains 5 failed-isolated runs, sweeps twice (2nd call simulates the boot sweep re-running after a restart), asserts exactly 3 worktrees survive on disk, their metas keep retained_workspace, the other 2 have it cleared, and `git worktree list --porcelain` carries no stale entries for the evicted 2")
+//! @yah:verify("cargo check -p yah --lib --tests and --manifest-path oss/qed/crates/qed/Cargo.toml --lib --tests both clean (only pre-existing warnings)")
+//! @yah:assumes("MAX_RETAINED_ISOLATED_WORKTREES=3 is my default, not an operator-specified number — cheap to change (one const in camp.rs) if the real footprint (worktree count x populated target/ size) argues for a different cap.")
+//! @yah:assumes("Matrix-fanout resume (qed_run_matrix_fanout) does NOT get resume_workspace wiring — it returns before reaching the single-runner construction site qed_rerun_handler feeds. Resuming a failed matrix row was not resumable before this ticket either, so this is a pre-existing gap, not a regression, but worth naming since 'isolated pipelines can resume' now has that carve-out.")
+//! @yah:assumes("The ticket's own open assumption stands: no pipeline has asked to resume an isolated run yet. I implemented it as scoped rather than treating that as blocking, per the ticket's own framing ('the cost here is real and the benefit is not yet') — shipped so the capability exists once a real isolated pipeline (oss-publish-shaped) needs it, but nothing currently exercises this in production.")
 //!
 //! @yah:relay(R768, "QED run observability: sub-pipeline children are invisible — no events, no persisted run, no recoverable failure reason")
 //! @yah:status(review)
@@ -733,30 +745,59 @@ pub(crate) fn policy_placement(
     }
 }
 
+/// True when a node-bound participant is declared — i.e. some role in
+/// `[pipeline.participants]` carries a `node`, so a step will be dispatched to
+/// that box no matter what `--where` says
+/// ([`PipelineRunner::effective_placement`] puts the binding ahead of even a
+/// forced `--where=local`).
+///
+/// Read off the raw declaration rather than off an allocated
+/// [`ParticipantPlan`](crate::participants::ParticipantPlan) on purpose: this
+/// is asked *before* the run starts, to decide whether to build a dispatcher at
+/// all, and a mis-declared set must fail with its own plan-time diagnosis
+/// (`participants::plan_for`, run from both the loader and `run_inner`) rather
+/// than as a silently driverless run here.
+pub fn pipeline_has_node_bound_participant(pipeline: &Pipeline) -> bool {
+    pipeline
+        .participants
+        .as_ref()
+        .is_some_and(|set| set.roles.values().any(|role| role.node.is_some()))
+}
+
 /// True when any step in `pipeline` resolves to
 /// [`Offload`](crate::platform::Resolution::Offload) on `host` — i.e. a default
 /// (`--where=auto`) run of it needs fleet access even without `--where=remote`
 /// (R590-F4). The CLI uses this to decide whether to stand up a mesh dispatcher
 /// (via [`PipelineRunner::new_auto`]) or stay on the driverless local path: a
 /// pipeline of ordinary cross-compilable steps needs no cloud wiring at all.
+///
+/// R823-T3: a node-bound participant counts too, and it is *not* reachable
+/// through the per-step platform resolution below — a participant step declares
+/// no `platform`, so on the camp Mac every one of them resolves `NativeCross`
+/// and this returned `false` for a pipeline that cannot run without a
+/// dispatcher. The first participant set ever pointed at real hardware died on
+/// exactly that: "no remote dispatcher is wired", from `--where=auto`, on a
+/// pipeline whose whole content is a rendezvous. Placement is a property of the
+/// *binding* there, not of the target triple.
 pub fn pipeline_needs_offload(pipeline: &Pipeline, host: &str) -> bool {
-    pipeline.steps.iter().any(|step| {
-        let p = crate::platform::Platform::compose(
-            host,
-            step.platform.as_ref(),
-            step.triple.as_deref(),
-        );
-        let native = step.platform.as_ref().map(|s| s.native).unwrap_or(false);
-        matches!(
-            crate::platform::resolve_placement(
-                &p.host,
-                p.target.as_deref(),
-                p.container_platform.as_deref(),
-                native,
-            ),
-            crate::platform::Resolution::Offload { .. }
-        )
-    })
+    pipeline_has_node_bound_participant(pipeline)
+        || pipeline.steps.iter().any(|step| {
+            let p = crate::platform::Platform::compose(
+                host,
+                step.platform.as_ref(),
+                step.triple.as_deref(),
+            );
+            let native = step.platform.as_ref().map(|s| s.native).unwrap_or(false);
+            matches!(
+                crate::platform::resolve_placement(
+                    &p.host,
+                    p.target.as_deref(),
+                    p.container_platform.as_deref(),
+                    native,
+                ),
+                crate::platform::Resolution::Offload { .. }
+            )
+        })
 }
 
 /// True when **every** step in `pipeline` resolves to
@@ -1081,6 +1122,23 @@ pub struct PipelineRunner {
     /// (the `yah qed run --allow-emulate` confirmation) and inherited by
     /// SubPipeline children.
     allow_emulate: bool,
+    /// R823-F2 — the pipeline's allocated participant set, or `None` when it
+    /// declares none (which is every pipeline that isn't a multi-host case).
+    ///
+    /// Lazily derived from `pipeline.participants` because the allocation is a
+    /// pure function of the declaration — no host probing, no clock, no I/O —
+    /// so there is nothing a constructor could learn that
+    /// [`crate::participants::plan_for`] doesn't already know. The `Err` arm
+    /// carries the rendered message rather than the typed error only so this
+    /// field stays `Clone`-free and cheap; [`Self::participant_plan`] turns it
+    /// back into a [`RunnerError::InvalidConfig`] at the one place it matters.
+    ///
+    /// A `OnceLock` rather than a plain field for one reason: the allocation
+    /// can fail, and `new()` doesn't return `Result`. Surfacing the failure at
+    /// the run-preflight seam (where every other config refusal already lives)
+    /// beats making four constructors fallible.
+    participant_plan:
+        std::sync::OnceLock<Result<Option<crate::participants::ParticipantPlan>, String>>,
     /// Matrix coordinate this runner is executing for (R506). Set by the
     /// planner when fanning a pipeline over its `[matrix]` block; threaded
     /// into the `if=` expression context so a step can gate on
@@ -1157,6 +1215,16 @@ pub struct PipelineRunner {
     /// `desktop-release` step builds from the same worktree as the run's
     /// `gha-workflow` step, not the live camp root.
     positioned_workspace: std::sync::OnceLock<std::path::PathBuf>,
+    /// An isolated pipeline's previously-retained worktree to re-enter instead
+    /// of positioning a fresh one (R766). Set via
+    /// [`Self::with_resume_workspace`] by `qed_rerun_handler`, which reads it
+    /// off the SOURCE run's `QedRunMeta::retained_workspace` — no caller that
+    /// isn't resuming a failed isolated run ever sets this. A missing/vanished
+    /// path (evicted by retention, or the source run predates this field)
+    /// degrades to exactly what an ordinary `Isolated` run does: `prepare_workspace`
+    /// silently `git worktree add`s a fresh one rather than failing the resume.
+    /// Ignored outside [`WorkspaceMode::Isolated`](crate::types::WorkspaceMode::Isolated).
+    resume_workspace: Option<std::path::PathBuf>,
     /// How a `kind = "manual"` step reaches a human (R622, W282). `None` — the
     /// default, and what `yah qed run` uses — means *headless*: there is no
     /// AnswerQueue to mint a form into, so a manual step advances on its
@@ -1237,6 +1305,39 @@ struct BackgroundTask {
     /// which is what `background_until = None` has always meant.
     gate: Vec<usize>,
     join: tokio::task::JoinHandle<Result<(), RunnerError>>,
+    /// R823-F2 — set when this sidecar is a participant dispatched to a fleet
+    /// node instead of spawned here. `None` for every local sidecar, which is
+    /// every sidecar that existed before participant sets.
+    remote: Option<RemoteSidecar>,
+}
+
+/// R823-F2 — what reaping a *remote* participant sidecar needs that reaping a
+/// local one does not.
+///
+/// The whole reason this type exists: [`BackgroundTask`]'s doc explains that
+/// dropping the join handle kills a local sidecar, because the future owns a
+/// `tokio::process::Child` spawned with `kill_on_drop(true)`. **None of that is
+/// true across a host boundary.** Aborting the waiter drops a future that was
+/// watching a log stream; the container on the node keeps running, keeps its
+/// port bound, and keeps the machine. That is precisely the leak that makes
+/// hardware CI read as flaky when it is actually holding hosts — so teardown
+/// here is an explicit call, not a consequence of a drop.
+struct RemoteSidecar {
+    driver: Arc<RemoteForgeDriver>,
+    /// The node this participant was pinned to. Carried purely so a teardown
+    /// that did not settle can name the box to go look at — "check the node" is
+    /// not an instruction anyone can follow (R823-T3).
+    node: String,
+    /// Written by the dispatch task the moment yubaba accepts the workload.
+    ///
+    /// Still `None` at reap ⇒ the dispatch never got far enough to create
+    /// anything, so there is nothing on any node to tear down — which is a
+    /// meaningfully different state from "we lost track of it", and the reason
+    /// this is an `Option` behind the lock rather than a value handed over at
+    /// spawn time. It cannot be handed over at spawn time regardless: the
+    /// dispatch is a network round-trip and the scheduler loop that spawns
+    /// sidecars must not block on one.
+    forge_id: Arc<std::sync::Mutex<Option<ObsForgeId>>>,
 }
 
 /// Everything one finished step hands back to the R605-F3 scheduler.
@@ -1273,7 +1374,265 @@ struct StepOutcome {
 /// - Already exited on its own with code 0 → `Success`.
 /// - Already exited non-zero (or panicked) → [`RunStatus::Failed`] with the
 ///   failure tail: a sidecar that dies mid-pipeline is a genuine problem.
+///
+/// R823-F2: a `remote` sidecar is torn down on the node **first**, and
+/// unconditionally whenever a workload id exists — including when the waiter
+/// has already finished. A redundant teardown of an exited workload costs one
+/// no-op RPC; a skipped one costs a held machine, and the two are
+/// indistinguishable from here because the waiter's terminal status and the
+/// node's actual state can disagree (`Lost` means "we stopped being able to
+/// see it", not "it stopped").
+///
+/// R823-T3, measured: the teardown result used to be dropped on the floor
+/// (`let _ = …kill(&id).await`) on the reasoning that turning a best-effort
+/// cleanup into a second failure would bury the first. Correct as far as the
+/// *status* goes — and it made the one failure this feature exists to prevent
+/// completely silent. On the fleet's shipped yubaba 0.8.28, `POST
+/// /workloads/{ident}/destroy` answers `{"status":"destroyed"}` and leaves the
+/// container RUNNING; three participant runs against a real node each reported
+/// Success while leaving a responder alive on us-west-003 holding port 34500,
+/// and the second run then went green against the *first* run's leak. So the
+/// result is no longer discarded: the reap reports what teardown did without
+/// changing the status it returns. Two ways it can be bad news —
+///
+/// - the `kill` RPC errored, or
+/// - the RPC succeeded and the sidecar's waiter did not settle within
+///   [`REMOTE_TEARDOWN_SETTLE`], which is what "answered destroyed, kept
+///   running" looks like from here.
+///
+/// Neither turns the reap red. A held machine is an infrastructure fault and
+/// the coordinator still owns the verdict (W235); making it *visible* is the
+/// whole fix, and a note the operator can act on beats a red run they cannot
+/// attribute.
+///
+/// @yah:ticket(R823-B4, "Participant teardown is a no-op on the shipped fleet: destroy answers &quot;destroyed&quot; and leaves the container running on 0.8.28")
+/// @yah:at(2026-09-04T09:53:46Z)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
+/// @yah:parent(R823)
+/// @yah:severity(high)
+/// @yah:depends_on(R854)
+/// @yah:gotcha("MEASURED 2026-09-03 (R823-T3), five participant runs against us-west-003. Every green run left its responder RUNNING on the node, holding port 34500, after `yah qed run participant-smoke` reported Success. Proved at the RPC, not inferred: `curl -X POST http://100.64.0.9:7443/workloads/forge.87802530-1aae-4521-98cb-77644ff228f1/destroy` — the exact dotted mesh ident RemoteForgeDriver::kill sends — returned {\"ident\":...,\"revoked\":false,\"status\":\"destroyed\"} while `sudo ctr -n yah tasks ls` still showed the task RUNNING and `ss -ltnp` still showed its python holding 0.0.0.0:34500. Nothing is wrong with the client-side teardown call.")
+/// @yah:gotcha("A LEAK DOES NOT JUST HOLD A MACHINE — IT MAKES THE NEXT RUN PASS. The second run of participant-smoke succeeded on its FIRST dial with no retry, because the FIRST run's leaked responder was still listening at the same address; every run of a given set is handed the same address and the same assigned port, so a leftover is indistinguishable from a healthy peer. Runs that dispatch a fresh responder need one `Connection refused` retry while the container comes up — that retry's absence is the tell. This is the specific reason the leak had to be made loud before anything else was built on participant sets.")
+/// @yah:next("THE FIX IS ALREADY WRITTEN — THIS IS A ROLL, NOT A CODE TICKET. The fleet is on yubaba/kamaji 0.8.28 (GET /health on 100.64.0.9:7443). R854's kamaji-containerd-core `reap_task` — which kills, WAITS on the shim exit event, deletes and re-probes, instead of firing a delete and discarding the result — first appears in-tree at commit aeb0f08c (v0.8.31, 2026-09-03) and has never been on a node. R854's own gotcha says the same thing from the other end: \"the two-deploys-on-a-node assertion needs a kamaji rebuild shipped to us-west-001, which is an operator action\".")
+/// @yah:next("DO NOT ASSUME THE ROLL FIXES IT — that is this ticket's whole job. R854 fixed the DEPLOY-path collision; what was measured here is the DESTROY path answering success on a live task, and pre-R854 reap_container did at least fire a SIGKILL, which plainly did not reach this container. Same fix probably covers both (destroy routes to reap_container), but \"probably\" is why this is a ticket. ACCEPTANCE: roll one node carrying R854 (us-west-003 is the one with the pre-pulled image), point .yah/qed/participant-smoke.toml's responder at it, run `yah qed run participant-smoke --in-process`, and require BOTH — the run passes AND no `qed: teardown: ... did not stop within 20s` line appears AND `sudo ctr -n yah tasks ls` shows no RUNNING task and `ss -ltnp` shows port 34500 free. The teardown line is now emitted by reap_background (R823-T3), so its absence is a real signal rather than the old silence.")
+/// @yah:next("Tier: Cleric — no design left; it is a fleet roll plus a re-run of two pipelines that already exist, with a pass/fail condition stated above. Also worth folding in while on the box: `oss/yubaba/crates/yubaba/src/lib.rs:190` already carries \"DESTROY SEMANTICS BUG: a destroy that reaps the produced dir but leaves the container running is incoherent\" — that note predates this and describes the same shipped behaviour; retire it or point it here once the roll proves the fix.")
+/// @yah:notify_on(R854, "R854 carries the kamaji reap_task fix this ticket is waiting on. When it lands, the roll is unblocked: ship a kamaji/yubaba carrying it to us-west-003 and re-run `yah qed run participant-smoke --in-process`, requiring no `qed: teardown: ... did not stop within 20s` line and a clean `ctr -n yah tasks ls` afterwards.")
+/// @yah:handoff("ROOT CAUSE FOUND, AND IT IS NOT R854. The roll would NOT have fixed this — the ticket's own warning was right. `KamajiSibling::deploy_workload` (oss/kamaji/crates/kamaji/src/sibling.rs:709) names the container from `spec.name`; `teardown_workload` (sibling.rs:813) has only a MeshIdent and sends THAT as the Stop id. For every workload whose name and mesh identity agree those are the same string, so nothing was ever wrong. A forge run is the one shape where they differ — `WorkloadSpec::for_forge` is `name = forge-<uuid>` (DNS-label safe, no dots) against `expose.mesh.identity = forge.<uuid>` (R590-B9, oss/yah-base/crates/workload-spec/src/lib.rs:2485). So Stop probed a container id that had never existed, kamaji-bin `reap_container` took its `probe.is_err() -> return Ok(())` early return (oss/kamaji/crates/kamaji-bin/src/containerd.rs:714), and yubaba answered {\"status\":\"destroyed\"} over a RUNNING container. R854's reap_task never ran at all: the reap is three lines below the early return.")
+/// @yah:handoff("PROVEN ON THE LIVE BOX, not inferred. `sudo ctr -n yah containers info forge-87802530-1aae-4521-98cb-77644ff228f1` on us-west-003 returns labels {yah.ident: forge-87802530-..., yah.name: forge-87802530-..., yah.mesh-ident: forge.87802530-..., yah.tier: infra} — the dotted mesh-ident the destroy RPC was sent with is stamped on the container whose DASHED id Stop was looking for. Both keys are right there; nothing joined them.")
+/// @yah:handoff("FIX (oss/kamaji/crates/kamaji-bin/src/containerd.rs): `ContainerdBackend::teardown` now resolves the Stop key before reaping — new `resolve_container_key_with` behind a `ContainerLookup` trait (same seam shape as R854's kcc TaskOps/reap_task_with, so the logic that was wrong is exercised with no containerd present). Direct `Containers.Get` hit first (an ordinary workload costs one Get and never a label scan, and a container id cannot be hijacked by another workload's mesh-ident label), then a label scan on `yah.mesh-ident`, then fall back to the literal key so Stop stays idempotent and `reap_container` still runs its FIFO/tracking cleanup. Custody is released under both keys (idempotent map removal). `reap_container` itself is untouched: deploy's internal same-id recycle always holds the true container id. This is deliberately the SAME accept-either-key contract the docker backend already shipped for the mirror-image bug (R626-F1 `resolve()`/`teardown_by_key()`, see the gotcha on kamaji-bin/src/server.rs:119) — containerd was simply never given the other half.")
+/// @yah:verify("cargo test -p kamaji-bin --features containerd-integration --lib = 235 passed / 0 failed. 6 new in containerd::tests: a_mesh_ident_stop_key_resolves_to_the_forge_container_id (the leak itself, forge.<uuid> -> forge-<uuid>); a_container_id_that_exists_is_taken_directly_without_a_label_scan (asserts find_by_mesh_ident is NOT called, so the fast path is proven not merely lucky); a_direct_hit_outranks_a_mesh_ident_label_on_a_different_container; an_unknown_key_falls_back_to_itself_so_stop_stays_idempotent; the_mesh_ident_filter_is_containerd_label_syntax; the_mesh_ident_filter_refuses_a_value_it_cannot_quote.")
+/// @yah:verify("The one thing a unit test cannot cover — that containerd accepts the filter this code emits — was checked against the REAL containerd on us-west-003: `sudo ctr -n yah containers ls 'labels.\"yah.mesh-ident\"==\"forge.87802530-1aae-4521-98cb-77644ff228f1\"'` returns exactly that one container. The string ctr was handed is byte-identical to what `mesh_ident_filter` builds. Remaining inference (marked as such): that the containerd gRPC ListContainers filter behaves as ctr's does — same surface, not separately exercised.")
+/// @yah:verify("cargo test --workspace --features kamaji/containerd-integration (in oss/kamaji) = all green, 0 failed. cargo clippy -p kamaji-bin --features containerd-integration --all-targets = no errors; the 2 kamaji-bin warnings (events_tx never read, control_sock_from_spec never used) are pre-existing and are the same two R854 recorded.")
+/// @yah:gotcha("THE PUBLISHED 0.8.31 DOES NOT CONTAIN R854. This ticket's plan assumed \"roll to the released 0.8.31\" would put reap_task on a node; it would not, and anyone acting on that plan would have measured a still-broken box and blamed the fix. Proven by CONTENT, not by version string (which is exactly what roll-node.sh's header warns about): downloaded https://cdn.yah.dev/yubaba/0.8.31/x86_64-unknown-linux-musl/yubaba-x86_64-unknown-linux-musl.tar.gz, sha256 a4e1fbf82e33db4a4e820d05a6d36e7bbd941803e3dbd6a58f53219127c4c292 matching the manifest, and `strings kamaji | grep \"task reap did not complete\"` = 0 hits, while other strings from the same function (\"kamaji: containerd workload torn down\", \"resuming recorded bundle deploy after restart (R755-B5)\") ARE present. Timing agrees: the tarball's inner mtime is 2026-09-02 23:59 and commit aeb0f08c (\"v0.8.31\", the first commit carrying reap_task) is 2026-09-03 11:04. The release was cut from a pre-fix tree that already carried the version bump.")
+/// @yah:gotcha("CURRENT us-west-003 STATE, snapshotted 2026-09-03 before any change (ssh -i ~/.ssh/yah yah@192.168.10.32; that key is required, the default keys are refused). kamaji 0.8.28 / yubaba 0.8.28. `ctr -n yah tasks ls` shows 8 forge tasks, ALL STOPPED — the RUNNING responders R823-T3 measured have since died — and `ss -ltnp` shows port 34500 FREE. So the ticket's own trap (\"a leaked responder makes the next run pass on its first dial\") is NOT armed right now: a fresh participant-smoke will need its Connection-refused retry and is currently an honest test. What survives is 9 forge CONTAINER records and 8 orphan task records that destroy never removed — the residue of the same bug. LEFT IN PLACE DELIBERATELY: it is the evidence, and reaping it before the fix is proven destroys the before-picture. `sudo ctr -n yah containers rm forge-<uuid>` cleans it once the roll lands.")
+/// @yah:gotcha("SHARED-TREE NOTE: oss/kamaji has heavy uncommitted work from live peers — @Ashguard:eclipse (R844-T13) and @Ashguard:libra (R844-F16) on ports.rs (+1062), sibling.rs, kamaji-proto, and server.rs, plus a named_ports/spec_digest hunk at kamaji-bin/src/containerd.rs:844-854 (R844-F2 / R852-B4). My hunks in that file are disjoint from theirs (teardown at ~663-690, the resolver free functions after spawn_forwarder, and the new tests) and I changed nothing in `list()`, so no seam is owed. Verify by content before assuming any part of oss/kamaji is mine.")
+/// @yah:next("LIVE ACCEPTANCE IS STILL OPEN AND NOW NEEDS A RELEASE, not just a roll. roll-node.sh installs only from the published manifest by design (no upload-a-local-binary flag, and there should never be one), publish-yubaba-release.sh refuses to republish an existing version, and published 0.8.31 carries neither R854 nor this fix. So the sequence is: bump 0.8.31 -> 0.8.32 in lockstep across the root and oss/ workspaces (/release skill), `scripts/publish-yubaba-release.sh --publish`, `scripts/roll-node.sh us-west-003 --to 0.8.32`, then `yah qed run participant-smoke --in-process`. REQUIRE ALL FOUR: the run passes; no `qed: teardown: ... did not stop within 20s` line; `sudo ctr -n yah tasks ls` shows no RUNNING task; `ss -ltnp` shows 34500 free. Then reap the 9 stale forge container records and retire the R603-B6 note.")
+/// @yah:next("THAT SAME 0.8.32 RELEASE UNPARKS TWO OTHER TICKETS, which is the argument for cutting it rather than waiting: R854's headline verify (two back-to-back deploys on us-west-001, both 200) and R848's end-to-end verify are both blocked on exactly \"a kamaji carrying reap_task reaches a node\", and both were filed believing 0.8.31 would deliver it. Roll us-west-001 in the same wave and all three close together. ORDERING per roll-node.sh's header: us-west-003 is a non-voter with no serving workloads, so roll it first as the cheap proof; us-west-001 carries workloads and needs `yah cloud apply` planned into the roll.")
+/// @yah:handoff("STATE AS OF 2026-09-03 ~16:30 PDT, for whoever picks this up after the daemon restart. The fix IS COMMITTED and verified by content in HEAD (408056be): `git show HEAD:oss/kamaji/crates/kamaji-bin/src/containerd.rs | grep -c resolve_container_key_with` = 9. The tree is bumped to 0.8.32 in lockstep (cargo xtask release 0.8.32, 221 edits, Cargo.lock refreshed — 95 entries at 0.8.32, zero left at 0.8.31), also in HEAD. Note the shared-tree churn while this ran: HEAD moved from cbdbee05 to 408056be and two earlier sync commits left the first-parent line; both my hunks and the bump survived, checked by content, not by git status.")
+/// @yah:gotcha("RELEASE-WIZARD ATTEMPT 1 FAILED AT ITS FIRST GATE, and the reason is worth knowing before the rerun: run 18f3aa04-8810-4cf2-be5d-2012d56dcb84 died in version-bump's `check-tag-hygiene` child with \"Unshipped local tag(s) — no matching ref on origin: v0.8.31\". Confirmed: `git ls-remote --tags origin` tops out at v0.8.30, while v0.8.31 exists locally pointing at HEAD. So the 0.8.31 release tagged locally and published the yubaba BINARY leg only — the CLI index is still 0.8.29 and mesofact/desktop are 0.8.30. Operator call taken 2026-09-03: leave the tag alone (it is unpublished), rerun the wizard, and clear the gate with `release_tag_hygiene=warn` or by pushing/deleting v0.8.31 — operator is driving the rerun.")
+/// @yah:handoff("CODE IS DONE AND COMMITTED; ONLY THE LIVE ACCEPTANCE REMAINS, and it is gated on an operator-driven 0.8.32 release. Handing off rather than holding the claim because the next step in the camp is a desktop relaunch that ends every session. The root cause was NOT R854 — see the handoff entries above: yubaba's Stop carries the mesh ident (forge.&lt;uuid&gt;) while kamaji-bin's containerd backend names the container from spec.name (forge-&lt;uuid&gt;), so teardown probed a container that never existed and answered \"destroyed\" over a live one. Fixed by resolving the Stop key through the yah.mesh-ident label; 6 new tests, kamaji workspace green, filter string validated against the real containerd on us-west-003.")
+/// @yah:handoff("Tree anchor at handoff: 408056be5958b3696165bdfc9cdc1c1c0dd1ffe0 — the shared tree as I left it. Diff against it (`git diff 408056be5958b3696165bdfc9cdc1c1c0dd1ffe0..HEAD`) to see what landed under you, and quote this SHA rather than 'HEAD' in any revert/restore instruction.")
+/// @yah:gotcha("THE 0.8.32 RELEASE IS STUCK IN A LOOP AND RERUNNING THE WIZARD AS-IS CANNOT BREAK IT (found 2026-09-04, R823-B4). Two wizard runs with publish=1 (6c3fcf7a at 00:30Z, e7a5c680 at 02:56Z) both died at release-check -> mesofact-new-smoke -> check-mesofact-new, 41 passed / 8 failed. The 8 are two causes: the barrel cell asserting @mesofact/runtime@0.8.32 is installed (npm has 0.8.31 top) and the library tier compiling a scaffold that pins mesofact 0.8.32 (crates.io has 0.8.30 top) plus 6 cascades from that unresolvable build. BOTH are the same ordering paradox: release-check runs BEFORE the publishes whose existence it asserts. A fix for exactly this is ALREADY WRITTEN and sitting UNCOMMITTED in the working tree, authored 2026-09-03 18:13-18:32 PDT: registry-probing SKIP branches in oss/mesofact/scripts/check-mesofact-new.sh (sections 4 and 7a), the __MESOFACT_VERSION__ token in crates/mesofact/src/cli/new/template-lib/Cargo.toml.tmpl (expand() already substitutes it in HEAD's mod.rs:256), and an npm-publish + mesofact-new-smoke-armed pair added to .yah/qed/yah-release-wizard.toml. NONE of it is in HEAD. Why that makes the loop unbreakable: the wizard's release-check step sets own_workspace = true, which per the wizard's own comment at line 55 repositions the child into an isolated worktree AT HEAD, so it can only ever see committed bytes; and the preceding commit-and-tag step is kind = manual with advance = 'git describe --tags --exact-match', which is ALREADY satisfied because v0.8.32 points at HEAD 9e454f0321b74fb0f808faf4e4ac8b2ccb867e2b (committed 2026-09-03 17:25 PDT, before the fix was written). So commit-and-tag auto-advanced in 17ms on the 02:56Z rerun without re-freezing, and release-check re-tested the 17:25 bytes for the second time. Every further rerun does the same. Verified by content: `git show HEAD:oss/mesofact/scripts/check-mesofact-new.sh | grep -c 'skip()'` = 0 and HEAD's Cargo.toml.tmpl still pins the literal 0.8.31.")
+/// @yah:notify_on(R858, "R823-B4's live acceptance dials the responder over the MESH, so it cannot run until R858 is restored. .yah/qed/participant-smoke.toml pins role.responder address = \"100.64.0.9\" (the mesh IP, chosen deliberately over the LAN literal — see its own header comment), and the coordinator runs on the camp Mac. Measured 2026-09-04 from this camp: `curl --max-time 8 http://100.64.0.9:7443/health` = exit 28, HTTP 000. Note the roll itself is NOT blocked — scripts/roll-node.sh reaches us-west-003 over LAN SSH (yah@192.168.10.32, .yah/infra/machines/us-west-003.toml:392, verified working today) and runs its yubaba health probe ON the node via 127.0.0.1, which us-west-003 binds. So roll first, then wait on R858 for the smoke.")
+/// @yah:verify("THE ORPHANED WORKING-TREE FIX IS PROVEN TO CLEAR THE RELEASE GATE (2026-09-04, R823-B4). Ran `yah qed run mesofact-new-smoke` top-level (run 96829b22-0052-4c77-8480-52495868d340) — that pipeline declares workspace = \"live\", so unlike the wizard's own release-check leg it reads the working tree. Result: success, \"PASSED: 40 passed, 0 failed, 2 skipped\", against 41 passed / 8 failed on the HEAD bytes the wizard tested (run 8380da70-9041-4919-8acd-e7846bb0d525). Both skips fired with the right reason: \"SKIP — @mesofact/runtime@0.8.32 is not on npm yet (scaffold installed 0.8.31)\" and \"SKIP — the library tier — the scaffold pins mesofact/mesofact-dev 0.8.32, which is not on crates.io yet (latest published: 0.8.30)\". Probes re-measured by hand and both agree: registry.npmjs.org/@mesofact%2Fruntime/0.8.32 = 404 (0.8.31 = 200), index.crates.io/me/so/mesofact tops out at 0.8.30. So committing those files is all that stands between the wizard and a green release-check.")
+/// @yah:next("TWO OPERATOR CALLS, 2026-09-04 — both asked on the ask_user rail and on party.chat; BOTH TIMED OUT after 1800s because the approval gate went unattended after the desktop relaunch, so they live here instead. CALL 1: may the 0.8.32 freeze be re-cut? Commit oss/mesofact/scripts/check-mesofact-new.sh, oss/mesofact/crates/mesofact/src/cli/new/template-lib/Cargo.toml.tmpl and .yah/qed/yah-release-wizard.toml, DELETE the stale v0.8.32 tag (it points at 9e454f03, the pre-fix freeze, and while it stands commit-and-tag auto-advances and the wizard re-tests the old bytes), then rerun spec=0.8.32 publish=1 release_tag_hygiene=warn. RECOMMEND THE OPERATOR DO THIS BY HAND rather than authorise an agent commit: the wizard diff adds an npm-publish step shipping @mesofact/runtime to npm on every publish=1 run, npm has a 72h unpublish window and no yank after it, and that is an outward-facing change to the release wave nobody has reviewed. CALL 2: restore the mesh per R858, or say who will — participant-smoke dials the responder at mesh ip 100.64.0.9 and there has been no coordination server since 2026-09-03T06:03:03Z; measured today from this camp, health on 100.64.0.9:7443 is HTTP 000 exit 28. I did not take R858 restore: production box, and R858 already calls it an operator action. NEITHER CALL BLOCKS THE ROLL ITSELF — only the publish does.")
+/// @yah:next("NOTHING ON THE NODE SIDE IS STALE OR BLOCKED — re-verified 2026-09-04 so the next picker does not redo it. ssh -i ~/.ssh/yah yah@192.168.10.32 answers; kamaji 0.8.28 / yubaba 0.8.28; ctr -n yah tasks ls shows the same 8 forge tasks ALL STOPPED; ss -ltnp shows 34500 FREE. That is byte-for-byte the before-state R823-T3 recorded, so the leak trap is still disarmed and a fresh participant-smoke is still an honest test. The ROLL is unaffected by the R858 mesh outage: roll-node.sh reaches the box over LAN SSH (.yah/infra/machines/us-west-003.toml:392, verified today) and runs its yubaba health probe ON the node against 127.0.0.1, which us-west-003 binds — only the participant-smoke needs the mesh. And the acceptance marker is confirmed in the bytes that will ship: the string \"resolved Stop key to a container by its yah.mesh-ident label\" is in HEAD at oss/kamaji/crates/kamaji-bin/src/containerd.rs:1018, with resolve_container_key_with appearing 9 times in both HEAD and the working tree.")
+/// @yah:blocked_on(operator)
+/// @yah:gotcha("THE WEDGE ITSELF IS NOW FILED AS R605-B17 (.yah/qed/yah-release-wizard.toml:101) — the wizard defect is separable from this ticket and outlives it, so do not re-derive it here. Short form for anyone standing in front of the same wall: delete the tag before rerunning the wizard, or commit-and-tag will auto-advance on the tag it already cut and release-check will re-test the pre-fix commit again. ALSO NOTE, for whoever picks this up: the approval gate went unattended around 2026-09-04 07:45Z (after the yah-desktop-install run 50caf63f completed and relaunched the app). ask_user, party.chat to operator, and MCP board writes all aborted after 1800s of silence. Simple single-quoted single-flag `yah board update` calls over Bash still passed, which is how these entries landed; heredoc/multi-statement Bash shapes escalated and hung. If your gated writes are hanging, that is the environment, not your arguments.")
+/// @yah:handoff("SESSION 2026-09-04 (Ashguard:dragon, session:6afc83b6) — NO CODE CHANGED, AND NONE NEEDED TO. The kamaji fix is still committed and intact in HEAD; I re-verified it by content rather than trusting the prior handoff (resolve_container_key_with = 9 occurrences in HEAD and in the working tree, and the acceptance marker string \"resolved Stop key to a container by its yah.mesh-ident label\" at oss/kamaji/crates/kamaji-bin/src/containerd.rs:1018). What I did instead was diagnose why the 0.8.32 release this ticket waits on has not moved in 30 hours, and the answer is that it CANNOT move by being rerun. Full chain in the gotchas; the one-line version is that release-check reads HEAD (own_workspace = true) while the fix for the gate it fails on sits uncommitted, and commit-and-tag auto-advances on the already-cut v0.8.32 tag so nothing ever re-freezes. Two wizard runs burned on that loop. I proved the uncommitted fix clears the gate — mesofact-new-smoke run 96829b22-0052-4c77-8480-52495868d340, 40 passed / 0 failed / 2 skipped, against 41/8-failed on the HEAD bytes the wizard tested — so the release is one operator freeze away, not one debugging session away.")
+/// @yah:handoff("DISCOVERED WORK DONE, beyond the ticket title. (1) Filed R605-B17 (.yah/qed/yah-release-wizard.toml:101) for the rerun wedge, which is separable release-infra and outlives this ticket. (2) Subscribed this ticket to R858 via notify_on, because the mesh outage blocks the acceptance run independently of the release — participant-smoke dials the responder at the mesh ip 100.64.0.9 and that address has answered nothing since 2026-09-03T06:03:03Z. (3) Re-measured the whole node-side precondition set on us-west-003 so the next picker does not: reachable over LAN SSH, still 0.8.28, 8 forge tasks all STOPPED, port 34500 free — byte-for-byte the before-state R823-T3 recorded, so the leak trap is disarmed and a fresh smoke is an honest test. (4) Established that the ROLL is not blocked by R858 (LAN SSH, on-node 127.0.0.1 health probe), only the smoke is.")
+/// @yah:handoff("WHAT I DELIBERATELY DID NOT DO, and why, so nobody reads it as an omission. I did not commit the three orphaned mesofact/wizard files even though doing so would have unblocked my own ticket. The wizard half of that diff adds an npm-publish step that ships @mesofact/runtime to npm on every publish=1 run, npm gives 72 hours to unpublish and no yank after that, and the operator has never reviewed it — committing it quietly so that the next wizard rerun publishes to npm is an outward-facing consequence I am not entitled to cause. I also did not run R858 restore: a live coordination server on a production box, which R858 itself calls an operator action. Both are recorded as calls in @yah:next.")
+/// @yah:handoff("Tree anchor at handoff: 9e454f0321b74fb0f808faf4e4ac8b2ccb867e2b — the shared tree as I left it. Diff against it (`git diff 9e454f0321b74fb0f808faf4e4ac8b2ccb867e2b..HEAD`) to see what landed under you, and quote this SHA rather than 'HEAD' in any revert/restore instruction.")
+/// @yah:verify("Tree anchor at handoff: 9e454f0321b74fb0f808faf4e4ac8b2ccb867e2b (= v0.8.32, the stale freeze). Quote this SHA rather than HEAD in any revert or restore instruction. I made no source edits this session, so nothing of mine is in the working tree; the uncommitted mesofact/wizard changes described above are NOT mine and were authored 2026-09-03 18:13-18:32 PDT by a session that has since ended. The only files I wrote are board annotations: oss/qed/crates/qed/src/runner.rs (this ticket) and .yah/qed/yah-release-wizard.toml:101 (R605-B17, appended only — the 67 uncommitted lines already in that file are intact, verified by diffstat 67 to 76 insertions and by both new step names still being present).")
 async fn reap_background(
+    mut join: tokio::task::JoinHandle<Result<(), RunnerError>>,
+    remote: Option<RemoteSidecar>,
+) -> SidecarReap {
+    // R823-F2: a remote sidecar that never got a workload id was never accepted
+    // by any node — nothing ran, as opposed to something running and failing.
+    // Read structurally, from the absence of the id, rather than by matching on
+    // the error text: it is the same fact the teardown below keys on, and it is
+    // what lets the participant verdict say "fleet fault" instead of "the test
+    // failed" (see `crate::participants::verdict`).
+    let mut never_dispatched = false;
+    let mut teardown_note = None;
+    if let Some(sidecar) = remote {
+        let forge_id = sidecar
+            .forge_id
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        match forge_id {
+            Some(id) => {
+                // Whether the waiter had already resolved BEFORE the teardown
+                // decides whether the settle check below means anything: a
+                // sidecar that had already finished has nothing left to stop.
+                let already_finished = join.is_finished();
+                if let Err(e) = sidecar.driver.kill(&id).await {
+                    teardown_note = Some(format!(
+                        "teardown of participant workload forge.{id} on {} failed: {e} \
+                         — it is probably still running there",
+                        sidecar.node,
+                    ));
+                } else if !already_finished {
+                    // Confirm the teardown rather than assume it. The status is
+                    // deliberately NOT read off `join` here — after our own kill
+                    // every terminal status is expected, and classifying a
+                    // killed-on-schedule sidecar by its exit code would turn the
+                    // healthy lifecycle red. All that is wanted is whether it
+                    // stopped at all.
+                    if tokio::time::timeout(REMOTE_TEARDOWN_SETTLE, &mut join)
+                        .await
+                        .is_err()
+                    {
+                        teardown_note = Some(format!(
+                            "participant workload forge.{id} did not stop within {}s of a \
+                             teardown that reported success — it may still be RUNNING on \
+                             {node}, holding its assigned port. Check {node} before the next \
+                             run: a live leftover answers at the same address the next run's \
+                             peers are handed, which is how a leaked participant makes a \
+                             later run pass.",
+                            REMOTE_TEARDOWN_SETTLE.as_secs(),
+                            node = sidecar.node,
+                        ));
+                    }
+                }
+            }
+            None => never_dispatched = true,
+        }
+    }
+    let (status, msg) = reap_status(join).await;
+    SidecarReap {
+        status,
+        msg,
+        never_dispatched,
+        teardown_note,
+    }
+}
+
+/// How long [`reap_background`] waits for a remote sidecar's waiter to settle
+/// after a teardown that reported success, before saying it did not stop.
+///
+/// Bounds the *observation*, not the teardown: `kill` has already returned by
+/// the time this starts, so what is being waited on is the log stream closing
+/// and the workload reaching a terminal status. Sized above kamaji's own
+/// `TASK_REAP_TIMEOUT` (15s) so a node that is legitimately taking its full
+/// reap budget is not reported as a leak.
+const REMOTE_TEARDOWN_SETTLE: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// What reaping one sidecar established. R823-F2 split this out of a bare
+/// tuple so `never_dispatched` — the fact that separates a fleet fault from a
+/// test failure — travels with the status instead of being re-derived from a
+/// message string somewhere downstream.
+struct SidecarReap {
+    status: RunStatus,
+    msg: Option<String>,
+    /// Only ever `true` for a remote participant sidecar whose workload was
+    /// never accepted by a node. A local sidecar always started (or failed to
+    /// spawn, which the executor reports as a real failure with a real reason).
+    never_dispatched: bool,
+    /// R823-T3 — what teardown did, when that is worth saying: the `kill` RPC
+    /// errored, or it succeeded and the workload did not stop. Separate from
+    /// [`msg`](Self::msg), which belongs to the sidecar's own outcome: a leaked
+    /// participant is a fault of the fleet, not of the step, and folding the
+    /// two would put infrastructure text in a step's `error` field.
+    teardown_note: Option<String>,
+}
+
+/// R823-F2 — read each participant's outcome off the step rows its steps left
+/// behind.
+///
+/// Pure, so the verdict rule is testable without a fleet — which matters more
+/// here than usual, because the whole value of the participant set is what it
+/// says when the fleet is *not* there.
+///
+/// `rows` is `run_inner`'s `main_statuses`: indexed by step, `None` for a step
+/// the run never reached. The three outcomes come from three distinguishable
+/// states, in this precedence:
+///
+/// 1. **Never started, structurally** — a sidecar in `never_dispatched` is one
+///    no node ever accepted. Ranked first because it is the strongest evidence
+///    available and it is about the fleet, not the code.
+/// 2. **Never started, by absence** — every one of the participant's steps has
+///    no row or a `Skipped` row. The run aborted before reaching it, or its
+///    steps were gated off. Either way nothing of this participant executed, so
+///    reporting `Completed` would be a lie by vacuous truth.
+/// 3. **Failed / Completed** — ordinary step outcomes.
+///
+/// Known gap, stated rather than hidden: (1) is detected only for *background*
+/// participant steps, because the workload-id evidence lives on the sidecar
+/// reap path. A foreground participant step whose remote dispatch is refused
+/// reports as `Failed`, which is a less precise diagnosis than it could be —
+/// but it is the coordinator-shaped case, and a coordinator that cannot be
+/// dispatched fails the run either way.
+fn participant_reports(
+    plan: &crate::participants::ParticipantPlan,
+    steps: &[crate::types::QedStep],
+    rows: &[Option<StepStatus>],
+    never_dispatched: &std::collections::HashSet<usize>,
+) -> Vec<crate::participants::ParticipantReport> {
+    use crate::participants::{ParticipantOutcome, ParticipantReport};
+    plan.participants()
+        .iter()
+        .map(|participant| {
+            let mine: Vec<usize> = steps
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.participant.as_deref() == Some(participant.name.as_str()))
+                .map(|(i, _)| i)
+                .collect();
+
+            let outcome = if let Some(&i) = mine.iter().find(|i| never_dispatched.contains(i)) {
+                ParticipantOutcome::NeverStarted {
+                    reason: format!(
+                        "step `{}` was never accepted by node `{}`",
+                        steps[i].name,
+                        participant.node.as_deref().unwrap_or("local"),
+                    ),
+                }
+            } else if mine.iter().all(|&i| {
+                rows.get(i)
+                    .and_then(|r| r.as_ref())
+                    .is_none_or(|r| r.status == RunStatus::Skipped)
+            }) {
+                ParticipantOutcome::NeverStarted {
+                    reason: format!(
+                        "none of its {} step(s) executed ({})",
+                        mine.len(),
+                        mine.iter()
+                            .map(|&i| steps[i].name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    ),
+                }
+            } else if let Some(failed) = mine.iter().find_map(|&i| {
+                rows.get(i)
+                    .and_then(|r| r.as_ref())
+                    .filter(|r| r.status == RunStatus::Failed)
+                    .map(|r| (i, r))
+            }) {
+                let (i, row) = failed;
+                ParticipantOutcome::Failed {
+                    detail: format!(
+                        "step `{}` failed: {}",
+                        steps[i].name,
+                        row.error.as_deref().unwrap_or("no reason recorded"),
+                    ),
+                }
+            } else {
+                ParticipantOutcome::Completed
+            };
+
+            ParticipantReport {
+                name: participant.name.clone(),
+                coordinator: participant.coordinator,
+                outcome,
+            }
+        })
+        .collect()
+}
+
+async fn reap_status(
     join: tokio::task::JoinHandle<Result<(), RunnerError>>,
 ) -> (RunStatus, Option<String>) {
     if join.is_finished() {
@@ -1329,6 +1688,7 @@ impl PipelineRunner {
             allow_emulate: false,
             matrix_coord: None,
             host_triple: crate::platform::detect_host_triple(),
+            participant_plan: std::sync::OnceLock::new(),
             cross_availability: std::sync::OnceLock::new(),
             host_toolchains: std::sync::OnceLock::new(),
             provider_registry: Arc::new(crate::provider::ProviderRegistry::new()),
@@ -1336,6 +1696,7 @@ impl PipelineRunner {
             git_ref: None,
             params: std::collections::HashMap::new(),
             positioned_workspace: std::sync::OnceLock::new(),
+            resume_workspace: None,
             manual_gate: None,
             admission: None,
             admission_lane: None,
@@ -1372,6 +1733,7 @@ impl PipelineRunner {
             allow_emulate: false,
             matrix_coord: None,
             host_triple: crate::platform::detect_host_triple(),
+            participant_plan: std::sync::OnceLock::new(),
             cross_availability: std::sync::OnceLock::new(),
             host_toolchains: std::sync::OnceLock::new(),
             provider_registry: Arc::new(crate::provider::ProviderRegistry::new()),
@@ -1379,6 +1741,7 @@ impl PipelineRunner {
             git_ref: None,
             params: std::collections::HashMap::new(),
             positioned_workspace: std::sync::OnceLock::new(),
+            resume_workspace: None,
             manual_gate: None,
             admission: None,
             admission_lane: None,
@@ -1464,6 +1827,15 @@ impl PipelineRunner {
     /// the workspace.
     pub fn with_camp_root(mut self, root: std::path::PathBuf) -> Self {
         self.camp_root = Some(root);
+        self
+    }
+
+    /// Resume into a previously-retained `Isolated` worktree (R766) instead of
+    /// positioning a fresh one. A vanished/missing path degrades to an
+    /// ordinary fresh `Isolated` checkout rather than failing the run. No-op
+    /// outside [`WorkspaceMode::Isolated`](crate::types::WorkspaceMode::Isolated).
+    pub fn with_resume_workspace(mut self, path: std::path::PathBuf) -> Self {
+        self.resume_workspace = Some(path);
         self
     }
 
@@ -1643,6 +2015,33 @@ impl PipelineRunner {
             }
             // Build in a dedicated worktree at the ref; camp root untouched.
             WorkspaceMode::Isolated => {
+                // R766: re-enter a retained worktree from a failed run rather
+                // than positioning a fresh one — the whole point of resuming
+                // is that steps 1..N-1's mutations are still on disk there.
+                // `git worktree add` is skipped entirely: running it again
+                // would reset the tree to a clean checkout of `git_ref`,
+                // destroying exactly the state we're re-entering for. A
+                // vanished path (evicted by retention, or a source run that
+                // predates this field) degrades to an ordinary fresh
+                // `Isolated` run below rather than failing the resume.
+                if let Some(existing) = self.resume_workspace.as_ref() {
+                    if existing.is_dir() {
+                        tracing::info!(
+                            path = %existing.display(),
+                            "qed: resuming isolated run into its retained worktree"
+                        );
+                        let guard = WorktreeGuard {
+                            camp_root: camp_root.to_path_buf(),
+                            worktree: existing.clone(),
+                            retain: std::cell::Cell::new(false),
+                        };
+                        return Ok((existing.clone(), Some(guard)));
+                    }
+                    tracing::warn!(
+                        path = %existing.display(),
+                        "qed: resume requested a retained worktree that no longer exists on disk; positioning a fresh one"
+                    );
+                }
                 let worktree = std::env::temp_dir().join(format!("qed-worktree-{}", self.run_id));
                 // A prior crashed run may have left this path registered; clear
                 // it first so `worktree add` doesn't fail on a stale entry.
@@ -1661,6 +2060,7 @@ impl PipelineRunner {
                 let guard = WorktreeGuard {
                     camp_root: camp_root.to_path_buf(),
                     worktree: worktree.clone(),
+                    retain: std::cell::Cell::new(false),
                 };
                 Ok((worktree, Some(guard)))
             }
@@ -1958,6 +2358,24 @@ impl PipelineRunner {
         }
     }
 
+    /// R823-T3 — report what a remote sidecar's teardown actually did.
+    ///
+    /// Sent as the step's own stderr rather than as a new event variant: it
+    /// then travels every rail a step's output already travels (the CLI's live
+    /// sink, the desktop pane, scryer) with no schema change, and it lands
+    /// attached to the participant it is about. A leaked machine is worth one
+    /// loud line on a run that is otherwise green — which is exactly the run it
+    /// will happen on, since teardown runs after the coordinator has already
+    /// passed.
+    fn emit_teardown_note(&self, event_index: usize, step: &str, note: String) {
+        self.emit(QedEvent::StepOutput {
+            index: event_index,
+            name: step.to_string(),
+            stream: OutputStream::Stderr,
+            line: format!("qed: teardown: {note}"),
+        });
+    }
+
     /// Pick the sandboxing runtime for a step.  Explicit `step.runtime`
     /// always wins; otherwise default by location (R380-T3):
     ///
@@ -2104,6 +2522,7 @@ impl PipelineRunner {
             allow_emulate: false,
             matrix_coord: None,
             host_triple: crate::platform::detect_host_triple(),
+            participant_plan: std::sync::OnceLock::new(),
             cross_availability: std::sync::OnceLock::new(),
             host_toolchains: std::sync::OnceLock::new(),
             provider_registry: Arc::new(crate::provider::ProviderRegistry::new()),
@@ -2111,6 +2530,7 @@ impl PipelineRunner {
             git_ref: None,
             params: std::collections::HashMap::new(),
             positioned_workspace: std::sync::OnceLock::new(),
+            resume_workspace: None,
             manual_gate: None,
             admission: None,
             admission_lane: None,
@@ -2392,6 +2812,17 @@ impl PipelineRunner {
     /// step follows the forced mode, preserving the pre-F4 all-local / all-remote
     /// behaviour — so only an `Auto` runner routes per-step.
     fn effective_placement(&self, step: &crate::types::QedStep) -> RunWhere {
+        // R823-F2: a participant bound to a named node is placed by that
+        // binding, ahead of everything else — including a forced
+        // `--where=local`. The set's addressing was allocated against that node
+        // before dispatch, so running the step somewhere else would not be a
+        // degraded placement, it would be a participant answering at an address
+        // no peer was told about. There is no honest local fallback for a
+        // rendezvous, which is why this arm precedes the forced-mode fast path
+        // rather than following it.
+        if self.participant_binding(step).is_some_and(|p| p.node.is_some()) {
+            return RunWhere::Remote;
+        }
         match self.run_where {
             // Fast path: a forced runner never inspects the step, so we skip the
             // resolve() work (and keep the many resolve_runtime test callers on
@@ -2399,6 +2830,54 @@ impl PipelineRunner {
             RunWhere::Local => RunWhere::Local,
             RunWhere::Remote => RunWhere::Remote,
             RunWhere::Auto => policy_placement(RunWhere::Auto, &self.resolve_step(step)),
+        }
+    }
+
+    /// R823-F2 — the pipeline's allocated participant set, or `None` when it
+    /// declares one.
+    ///
+    /// Computed once, on first ask. The loader already proved this allocates
+    /// (`PipelineLoader::pipeline_from_str`), but a runner can be handed a
+    /// `Pipeline` built in code that never went through the loader, so the
+    /// check is repeated here rather than assumed — cheap, pure, and the
+    /// difference between a clear refusal at second zero and a participant
+    /// dispatched with no address.
+    fn participant_plan(
+        &self,
+    ) -> Result<Option<&crate::participants::ParticipantPlan>, RunnerError> {
+        self.participant_plan
+            .get_or_init(|| {
+                crate::participants::plan_for(&self.pipeline).map_err(|e| e.to_string())
+            })
+            .as_ref()
+            .map(|opt| opt.as_ref())
+            .map_err(|msg| RunnerError::InvalidConfig(msg.clone()))
+    }
+
+    /// Which participant `step` belongs to, if any. `None` both for a run with
+    /// no participant set and for an ordinary step inside one (a shared build
+    /// step belongs to the run, not to a role).
+    fn participant_binding(
+        &self,
+        step: &crate::types::QedStep,
+    ) -> Option<&crate::participants::Participant> {
+        let role = step.participant.as_deref()?;
+        self.participant_plan().ok().flatten()?.get(role)
+    }
+
+    /// The rendezvous env every step of a participant run receives — the whole
+    /// allocated set, plus this step's own role when it has one.
+    ///
+    /// Empty for a run with no participant set, which is the only reason this
+    /// can be called unconditionally from each of the three env-building sites
+    /// (local native, local container, remote). Calling it at all three is the
+    /// point: a set injected into two of the three paths would produce a
+    /// participant that can see its peers locally and cannot see them once the
+    /// step offloads — the exact class of bug R577-F3 fixed for `step.env`.
+    fn rendezvous_env(&self, step: &crate::types::QedStep) -> Vec<(String, String)> {
+        match self.participant_plan().ok().flatten() {
+            Some(plan) => plan.rendezvous_env(step.participant.as_deref()),
+            None => Vec::new(),
         }
     }
 
@@ -2594,6 +3073,12 @@ impl PipelineRunner {
         // `kill_on_drop` task handles, so an early-return drops it and kills
         // every live sidecar.
         let mut background_tasks: Vec<BackgroundTask> = Vec::new();
+        // R823-F2: step indices whose remote participant sidecar was never
+        // accepted by a node. Distinct from "failed" and collected here rather
+        // than inferred later, because the participant verdict reports the two
+        // as different diagnoses (see `crate::participants::verdict`).
+        let mut never_dispatched_steps: std::collections::HashSet<usize> =
+            std::collections::HashSet::new();
 
         self.emit(QedEvent::RunStarted {
             total_steps: self.index_offset + self.pipeline.steps.len(),
@@ -2631,6 +3116,14 @@ impl PipelineRunner {
         // instead of silently costing an hour. Fail-fast, like the toolchain gate.
         self.emulation_gate()?;
 
+        // R823-F2: allocate the participant set before anything runs. Every
+        // later consumer (`participant_binding`, `rendezvous_env`) reads the
+        // cached result and treats a failure as "no set", so this call is what
+        // turns a mis-declared rendezvous into a refusal at second zero rather
+        // than into a run whose peers were silently never told about each
+        // other. Fail-fast, like the two gates above.
+        let participant_plan = self.participant_plan()?.cloned();
+
         // R605-F3: resolve the step dependency graph once, before anything
         // runs. `Missing::Satisfied` because a resume-from-step run is handed a
         // pipeline whose leading steps were `drain`ed (see
@@ -2664,18 +3157,32 @@ impl PipelineRunner {
             if !step.is_background() {
                 continue;
             }
+            // R823-F2: a sidecar bound to a node-carrying participant IS the
+            // "separate lifecycle" R513-F2's refusal below was holding the door
+            // for — `spawn_remote_participant_step` dispatches it and
+            // `reap_background` tears it down on the node explicitly. Everything
+            // after this point is about local sidecars.
+            let remote_participant = self
+                .participant_binding(step)
+                .is_some_and(|p| p.node.is_some());
             // R590-F4: gate on the step's *effective* placement, not the raw
             // run_where — an Auto runner is fine for a background step that
             // resolves local; only a background step that would offload to the
             // fleet is rejected (remote sidecars are a separate lifecycle).
-            if self.effective_placement(step) != RunWhere::Local {
+            if !remote_participant && self.effective_placement(step) != RunWhere::Local {
                 return Err(RunnerError::InvalidConfig(format!(
                     "step `{}`: background steps run locally only (R513-F2) — \
-                     remote sidecars are yubaba-supervised, a separate lifecycle",
+                     remote sidecars are yubaba-supervised, a separate lifecycle. \
+                     A step that genuinely belongs on another host is a participant: \
+                     declare it in [pipeline.participants] and name the role with \
+                     `participant = \"…\"` (R823-F2)",
                     step.name,
                 )));
             }
-            if self.resolve_runtime(step) != TaskRuntime::Native {
+            // A remote participant runs in a forge container by construction —
+            // that is what the offload path dispatches — so the native-only rule
+            // is about local sidecars and does not apply to it.
+            if !remote_participant && self.resolve_runtime(step) != TaskRuntime::Native {
                 return Err(RunnerError::InvalidConfig(format!(
                     "step `{}`: background steps run native only in v1 (R513-F2) — \
                      drop `runtime = \"container\"`",
@@ -2760,16 +3267,25 @@ impl PipelineRunner {
         // instead. `base_camp_root()` still resolves to the PARENT's
         // (already-positioned) tree in that case, so `git worktree add`
         // runs against the same repository the parent is standing in.
-        let _run_worktree_guard = if self.parent_run_id.is_some() && !self.own_workspace {
-            None
+        // R766: the Isolated worktree path, held alongside the guard so a
+        // FAILED run can persist it onto `QedRunMeta::retained_workspace` for
+        // a later resume. `None` for every other WorkspaceMode (nothing to
+        // retain — a Live/Checkout run's tree IS the camp root, already
+        // durable) and for an inheriting sub-pipeline child (no guard here at
+        // all — the PARENT's guard owns that worktree's lifetime).
+        let (run_worktree_path, _run_worktree_guard) = if self.parent_run_id.is_some()
+            && !self.own_workspace
+        {
+            (None, None)
         } else {
             let base = self.base_camp_root()?;
             let (workspace, guard) = self.prepare_workspace(&base)?;
             // OnceLock: this is the only writer (run_inner runs once per runner
             // instance) and it fires before the first step, so every step-time
             // resolve_camp_root() sees the positioned tree.
-            let _ = self.positioned_workspace.set(workspace);
-            guard
+            let _ = self.positioned_workspace.set(workspace.clone());
+            let path = guard.is_some().then_some(workspace);
+            (path, guard)
         };
 
         // ── R605-F3: the step scheduler ──────────────────────────────────
@@ -2917,25 +3433,55 @@ impl PipelineRunner {
                 // terminal moment to read it back, and downstream substitution
                 // can't wait on a server that never exits.
                 if step.is_background() {
-                    let spec = build_subprocess_spec(step, TaskRuntime::Native, None);
-                    let camp_root = self.resolve_camp_root()?;
-                    let cwd = match step.cwd.as_ref() {
-                        Some(rel) => camp_root.join(rel),
-                        None => camp_root,
-                    };
-                    // R744-T2: same base-env underlay as `execute_step_local` —
-                    // a background sidecar is a local native subprocess too,
-                    // and a `cargo run`-shaped one wants the host's build cache
-                    // exactly as much as a foreground build does.
-                    let mut env: Vec<(String, String)> =
-                        step.env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
-                    for (k, v) in &self.base_env {
-                        if !env.iter().any(|(existing, _)| existing == k) {
-                            env.push((k.clone(), v.clone()));
+                    // R823-F2: a node-bound participant's sidecar is dispatched
+                    // to that node instead of spawned here. Both arms return a
+                    // join handle and neither awaits — the admission loop must
+                    // not block, which is why the remote dispatch itself happens
+                    // inside the spawned task rather than on this line.
+                    let remote_participant = self
+                        .participant_binding(step)
+                        .filter(|p| p.node.is_some())
+                        .cloned();
+                    let (join, remote) = match remote_participant {
+                        Some(participant) => {
+                            let (join, sidecar) = self
+                                .spawn_remote_participant_step(event_index, step, &participant)?;
+                            (join, Some(sidecar))
                         }
-                    }
-                    let ctx = ExecContext::default().with_cwd(cwd).with_env(env);
-                    let join = self.spawn_background_step(event_index, step, spec, ctx);
+                        None => {
+                            let spec = build_subprocess_spec(step, TaskRuntime::Native, None);
+                            let camp_root = self.resolve_camp_root()?;
+                            let cwd = match step.cwd.as_ref() {
+                                Some(rel) => camp_root.join(rel),
+                                None => camp_root,
+                            };
+                            // R744-T2: same base-env underlay as
+                            // `execute_step_local` — a background sidecar is a
+                            // local native subprocess too, and a `cargo
+                            // run`-shaped one wants the host's build cache
+                            // exactly as much as a foreground build does.
+                            let mut env: Vec<(String, String)> = step
+                                .env
+                                .iter()
+                                .map(|(k, v)| (k.clone(), v.clone()))
+                                .collect();
+                            for (k, v) in &self.base_env {
+                                if !env.iter().any(|(existing, _)| existing == k) {
+                                    env.push((k.clone(), v.clone()));
+                                }
+                            }
+                            // R823-F2: the rendezvous overrides, same rule as
+                            // every other env site.
+                            let rendezvous = self.rendezvous_env(step);
+                            env.retain(|(k, _)| !rendezvous.iter().any(|(rk, _)| rk == k));
+                            env.extend(rendezvous);
+                            let ctx = ExecContext::default().with_cwd(cwd).with_env(env);
+                            (
+                                self.spawn_background_step(event_index, step, spec, ctx),
+                                None,
+                            )
+                        }
+                    };
                     main_statuses[index] = Some(StepStatus {
                         name: step.name.clone(),
                         task_run_id: None,
@@ -2956,6 +3502,7 @@ impl PipelineRunner {
                         name: step.name.clone(),
                         gate: background_gates[index].clone(),
                         join,
+                        remote,
                     });
                     // R605-F3: a sidecar satisfies its dependents at SPAWN. It
                     // has no exit to wait for, so any other reading would make
@@ -3050,7 +3597,18 @@ impl PipelineRunner {
                     && background_tasks[i].gate.iter().all(|&g| done[g]);
                 if fired {
                     let bg = background_tasks.remove(i);
-                    let (bg_status, bg_msg) = reap_background(bg.join).await;
+                    let SidecarReap {
+                        status: bg_status,
+                        msg: bg_msg,
+                        never_dispatched,
+                        teardown_note,
+                    } = reap_background(bg.join, bg.remote).await;
+                    if never_dispatched {
+                        never_dispatched_steps.insert(bg.status_index);
+                    }
+                    if let Some(note) = teardown_note {
+                        self.emit_teardown_note(bg.event_index, &bg.name, note);
+                    }
                     let bg_completed_at = Utc::now();
                     if bg_status == RunStatus::Failed {
                         overall_status = RunStatus::Failed;
@@ -3087,7 +3645,18 @@ impl PipelineRunner {
         // terminal-outcome selection so a sidecar that *crashed* mid-pipeline
         // flips the run to Failed and fires `on_fail`.
         for bg in background_tasks.drain(..) {
-            let (bg_status, bg_msg) = reap_background(bg.join).await;
+            let SidecarReap {
+                status: bg_status,
+                msg: bg_msg,
+                never_dispatched,
+                teardown_note,
+            } = reap_background(bg.join, bg.remote).await;
+            if never_dispatched {
+                never_dispatched_steps.insert(bg.status_index);
+            }
+            if let Some(note) = teardown_note {
+                self.emit_teardown_note(bg.event_index, &bg.name, note);
+            }
             let bg_completed_at = Utc::now();
             if bg_status == RunStatus::Failed {
                 overall_status = RunStatus::Failed;
@@ -3107,6 +3676,29 @@ impl PipelineRunner {
                 } else {
                     None
                 };
+            }
+        }
+
+        // R823-F2: fold the participant set into ONE verdict, after every
+        // sidecar has been reaped (so a peer that died mid-run is visible here)
+        // and before the step rows are flattened (so a participant whose steps
+        // never produced a row is still distinguishable from one whose steps
+        // ran). A participant verdict can only ADD a failure — it never turns a
+        // failed run green.
+        let mut run_failure_reason: Option<String> = None;
+        if let Some(plan) = &participant_plan {
+            let reports = participant_reports(
+                plan,
+                &self.pipeline.steps,
+                &main_statuses,
+                &never_dispatched_steps,
+            );
+            if let crate::participants::Verdict::Fail { summary } =
+                crate::participants::verdict(&reports)
+            {
+                tracing::error!(target: "qed::participants", run = %self.run_id, "{summary}");
+                overall_status = RunStatus::Failed;
+                run_failure_reason = Some(summary);
             }
         }
 
@@ -3255,6 +3847,24 @@ impl PipelineRunner {
             });
         }
 
+        // R766: a FAILED Isolated run keeps its worktree instead of tearing it
+        // down, so a later `qed.rerun --from-step` can re-enter the exact tree
+        // steps 1..N-1 left behind rather than a fresh checkout that has
+        // forgotten their mutations. A successful run has nothing to resume,
+        // so it tears down as before (retained_workspace stays `None`).
+        // Decided here, BEFORE `dispatch_terminal_outcomes` below, so a
+        // failing terminal-outcome dispatch (which aborts this function via
+        // `?`, before `QedRunMeta` is even built) still leaves the worktree on
+        // disk rather than losing it to the guard's ordinary teardown.
+        let retained_workspace = if overall_status == RunStatus::Failed {
+            if let Some(guard) = _run_worktree_guard.as_ref() {
+                guard.retain();
+            }
+            run_worktree_path.clone()
+        } else {
+            None
+        };
+
         // Terminal outcomes (publish / vendor ship / warden deploy) fire off
         // the *work* status snapshotted before `finally` ran, so a flaky
         // teardown never redirects `on_success` → `on_fail`. Extracted to
@@ -3281,7 +3891,9 @@ impl PipelineRunner {
                 // Step-level failures carry their reason on the failing
                 // `StepStatus.error`; a run that completes the step loop has
                 // no run-level (outside-any-step) failure to report.
-                failure_reason: None,
+                // R823-F2: a participant verdict is a run-level failure computed
+                // after the last step, which is exactly what this field is for.
+                failure_reason: run_failure_reason,
                 parent_run_id: self.parent_run_id.clone(),
                 // The runner has no notion of the matrix row it's running;
                 // the daemon re-stamps this from the previously-registered
@@ -3301,6 +3913,9 @@ impl PipelineRunner {
                 // steps that simply aren't there). The daemon carries this
                 // over from the meta it registered before spawning.
                 launch: None,
+                // R766: set only for a FAILED `Isolated` run — see the
+                // `retained_workspace` computation above.
+                retained_workspace,
             },
             produced,
         ))
@@ -4117,6 +4732,9 @@ impl PipelineRunner {
             // Carry the parent's already-probed toolchain set when present so
             // a child sub-pipeline doesn't re-probe; otherwise a fresh lazy
             // cache (it shares the host, so the result would match anyway).
+            // R823-F2: a child sub-pipeline has its OWN pipeline, so it allocates
+            // its own set (usually none) rather than inheriting the parent's.
+            participant_plan: std::sync::OnceLock::new(),
             cross_availability: match self.cross_availability.get() {
                 Some(a) => std::sync::OnceLock::from(*a),
                 None => std::sync::OnceLock::new(),
@@ -4147,6 +4765,7 @@ impl PipelineRunner {
             // leaves this unset) and inherits the parent's positioned tree via
             // camp_root above (W224 R533-F11).
             positioned_workspace: std::sync::OnceLock::new(),
+            resume_workspace: None,
             // Inherit the human surface: a `kind = "manual"` step buried in a
             // sub-pipeline is no less blocked on a person than a top-level one,
             // and dropping the gate here would silently downgrade it to the
@@ -5141,6 +5760,13 @@ impl PipelineRunner {
         for (k, v) in &self.base_env {
             merged_env.entry(k.clone()).or_insert_with(|| v.clone());
         }
+        // R823-F2: the rendezvous OVERRIDES the step's own env rather than
+        // underlaying it — same rule as R560-T8's source-context URL, for the
+        // same reason. The port numbers were allocated milliseconds ago by this
+        // run's plan, so a literal `QED_PARTICIPANTS` in the TOML can only be a
+        // stale copy of a previous run's addressing, and honouring it would
+        // point a participant at a peer that isn't there.
+        merged_env.extend(self.rendezvous_env(step));
         if let Some(extra) = extra_env {
             merged_env.extend(extra.iter().map(|(k, v)| (k.clone(), v.clone())));
         }
@@ -5215,12 +5841,17 @@ impl PipelineRunner {
         let image = step_image_override(step)?
             .unwrap_or_else(velveteen_exec::default_image::default_forge_image);
         let spec = build_subprocess_spec(step, TaskRuntime::Container, Some(image));
-        let ctx = ExecContext::default().with_cwd(mount_cwd).with_env(
-            step.env
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
-        );
+        // R823-F2: rendezvous env last, so it wins over a stale literal — see
+        // the sibling comment in `execute_step_local`.
+        let mut env: std::collections::HashMap<String, String> = step
+            .env
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        env.extend(self.rendezvous_env(step));
+        let ctx = ExecContext::default()
+            .with_cwd(mount_cwd)
+            .with_env(env.into_iter().collect());
         self.drive_subprocess_step(index, step, spec, ctx).await
     }
 
@@ -5381,6 +6012,176 @@ impl PipelineRunner {
                 Err(ForgeExecutorError::Remote(msg)) => Err(RunnerError::Remote(msg)),
             }
         })
+    }
+
+    /// R823-F2 — spawn a **remote** participant sidecar: a long-lived process
+    /// on the named fleet node, dispatched but not awaited.
+    ///
+    /// The sibling of [`Self::spawn_background_step`] across a host boundary,
+    /// and it differs from [`Self::execute_step_remote`] in three ways that are
+    /// the substance of this ticket rather than incidental:
+    ///
+    /// - **Nothing is awaited here.** The dispatch is a network round-trip and
+    ///   this is called from the scheduler's admission loop, which must not
+    ///   block — a stalled loop stops polling every step already in flight. So
+    ///   the whole dispatch-then-wait sequence lives inside the spawned task,
+    ///   and the workload id it produces is published back through
+    ///   [`RemoteSidecar::forge_id`] for the reap to find.
+    /// - **The node is pinned, not matched.** `participant.node` comes straight
+    ///   from the plan, and the peers were told this participant's address
+    ///   *before* dispatch. Letting admission choose the node here would make
+    ///   the rendezvous a lie, so this deliberately does not go through
+    ///   [`Self::remote_location`] (which would apply the run's `--where=node:`
+    ///   pin over the top of the participant's own binding).
+    /// - **No source-context publish, no `produces` retrieval.** A participant
+    ///   is a peer to talk to, not a build to collect from; its artifact is the
+    ///   traffic it answers, and its verdict is carried by the coordinator.
+    ///
+    /// Reachability is not this function's doing and is worth knowing: every
+    /// remote forge subprocess workload already runs with host networking
+    /// (`HOST_NETWORK_ANNOTATION`, applied in `velveteen_exec`'s
+    /// `build_workload_spec` since R590-B7), so a participant that binds its
+    /// assigned port is answering on the node's own network stack — which is
+    /// exactly the address its peers were handed.
+    fn spawn_remote_participant_step(
+        &self,
+        event_index: usize,
+        step: &crate::types::QedStep,
+        participant: &crate::participants::Participant,
+    ) -> Result<(tokio::task::JoinHandle<Result<(), RunnerError>>, RemoteSidecar), RunnerError>
+    {
+        let driver = self.remote_driver.clone().ok_or_else(|| {
+            RunnerError::InvalidConfig(format!(
+                "step `{}` is participant `{}`, pinned to node `{}`, but no remote \
+                 dispatcher is wired — a participant set cannot fall back to local, \
+                 because its peers were already told this address",
+                step.name,
+                participant.name,
+                participant.node.as_deref().unwrap_or("?"),
+            ))
+        })?;
+        let node = participant.node.clone().ok_or_else(|| {
+            RunnerError::InvalidConfig(format!(
+                "step `{}`: participant `{}` has no node — this is a caller bug, \
+                 `spawn_remote_participant_step` is only for node-bound participants",
+                step.name, participant.name,
+            ))
+        })?;
+
+        let spec = ForgeSpec {
+            command: ForgeCommand::Subprocess {
+                argv: step.argv.clone(),
+                image: step_image_override(step)?,
+            },
+            where_: TaskPlacement::new(
+                TaskLocation::Remote {
+                    node: workload_spec::MeshIdent(node.clone()),
+                },
+                self.resolve_runtime(step),
+            ),
+            timeout: step.timeout.map(Millis::from_secs),
+            label: Some(step.name.clone()),
+            initiator: Initiator::Human { camp: "qed".into() },
+            mesh_access: MeshAccess::None,
+        };
+
+        // Same env discipline as `execute_step_remote`: the step's declared env
+        // travels (R577-F3), `base_env` does not (it names host paths a worker
+        // has no referent for), and the rendezvous wins over both.
+        let mut env: Vec<(String, String)> = step
+            .env
+            .iter()
+            .filter(|(k, _)| {
+                k.as_str() != crate::participants::ENV_PARTICIPANTS
+                    && k.as_str() != crate::participants::ENV_PARTICIPANT_SELF
+            })
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        env.extend(self.rendezvous_env(step));
+        let ctx = ExecContext::default().with_env(env);
+
+        let forge_id: Arc<std::sync::Mutex<Option<ObsForgeId>>> = Arc::new(std::sync::Mutex::new(None));
+        let sidecar = RemoteSidecar {
+            driver: driver.clone(),
+            node: node.clone(),
+            forge_id: forge_id.clone(),
+        };
+
+        // R717-T2: same secret opt-out as the local sidecar path — taken here
+        // because `step` is borrowed and the spawned future is 'static.
+        let events = if step.secret { None } else { self.events.clone() };
+        let name = step.name.clone();
+        let join = tokio::spawn(async move {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ExecEvent>();
+            let adapter = {
+                let events = events.clone();
+                let name = name.clone();
+                tokio::spawn(async move {
+                    while let Some(ev) = rx.recv().await {
+                        let Some(events) = &events else { continue };
+                        if let ExecEvent::Output { stream, line } = ev {
+                            let qed_stream = match stream {
+                                velveteen_exec::OutputStream::Stdout => OutputStream::Stdout,
+                                velveteen_exec::OutputStream::Stderr => OutputStream::Stderr,
+                            };
+                            let _ = events.send(QedEvent::StepOutput {
+                                index: event_index,
+                                name: name.clone(),
+                                stream: qed_stream,
+                                line,
+                            });
+                        }
+                    }
+                })
+            };
+
+            let handle = driver
+                .start_with_context(spec, Some(tx), &ctx)
+                .await
+                .map_err(|e| RunnerError::Remote(e.to_string()))?;
+            // Publish the id BEFORE waiting — R603-T1's discipline, and here it
+            // is also what makes teardown possible at all: a reap that fires
+            // while this task is still inside `wait()` has to find the id
+            // somewhere, and the task cannot hand it over after the fact.
+            *forge_id
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(handle.id.clone());
+            if let Some(events) = &events {
+                let _ = events.send(QedEvent::StepRemoteDispatched {
+                    index: event_index,
+                    name: name.clone(),
+                    forge_id: handle.id.to_string(),
+                    at: Utc::now(),
+                });
+            }
+
+            let status = handle.wait().await;
+            let _ = adapter.await;
+            match status {
+                ForgeStatus::Done { exit_code: 0, .. } => Ok(()),
+                ForgeStatus::Done { exit_code, .. } => Err(RunnerError::StepFailed {
+                    step: name,
+                    msg: format!("participant exited with code {exit_code}"),
+                }),
+                ForgeStatus::TimedOut { .. } => Err(RunnerError::StepFailed {
+                    step: name,
+                    msg: "participant timed out".into(),
+                }),
+                ForgeStatus::Killed { signal, .. } => Err(RunnerError::StepFailed {
+                    step: name,
+                    msg: format!("participant killed by signal {signal}"),
+                }),
+                ForgeStatus::Lost { reason } => Err(RunnerError::StepFailed {
+                    step: name,
+                    msg: format!("participant lost: {reason}"),
+                }),
+                ForgeStatus::Pending | ForgeStatus::Running => {
+                    unreachable!("ForgeRunHandle::wait returns a terminal status")
+                }
+            }
+        });
+
+        Ok((join, sidecar))
     }
 }
 
@@ -5567,14 +6368,32 @@ fn inputs_to_value(inputs: &std::collections::HashMap<String, String>) -> yah_qe
 /// runs `git worktree remove --force` so a release run — including one that
 /// errors mid-step — never leaves an orphaned tree behind. Best-effort: a
 /// failed removal is swallowed (the next run's pre-add cleanup clears it).
+///
+/// R766: `retain` opts a *failed* run's worktree out of that teardown so a
+/// resume can re-enter it — see [`Self::retain`]. `Cell` rather than a plain
+/// `bool` because the guard is dropped by value (immutable `&self` in every
+/// caller's scope; nothing holds `&mut` at drop time) — [`PipelineRunner::run_inner`]
+/// only learns the run's terminal status *after* the guard was created, so
+/// the flag has to be settable through a shared reference.
 #[derive(Debug)]
 struct WorktreeGuard {
     camp_root: std::path::PathBuf,
     worktree: std::path::PathBuf,
+    retain: std::cell::Cell<bool>,
+}
+
+impl WorktreeGuard {
+    /// Skip teardown on drop — the worktree survives for a later resume.
+    fn retain(&self) {
+        self.retain.set(true);
+    }
 }
 
 impl Drop for WorktreeGuard {
     fn drop(&mut self) {
+        if self.retain.get() {
+            return;
+        }
         let _ = std::process::Command::new("git")
             .current_dir(&self.camp_root)
             .args(["worktree", "remove", "--force"])
@@ -7890,12 +8709,14 @@ mod tests {
 
     fn one_step_pipeline(name: &str, argv: Vec<String>) -> Pipeline {
         Pipeline {
+            participants: None,
             max_parallel: None,
             description: None,
             tags: Vec::new(),
             name: name.to_string(),
             label: name.to_string(),
             steps: vec![crate::types::QedStep {
+                            participant: None,
                 needs: None,
                 resource: None,
                 inputs: Vec::new(),
@@ -8674,6 +9495,7 @@ mod tests {
 
         let mut pipeline = one_step_pipeline("test-abort", vec!["false".to_string()]);
         pipeline.steps.push(crate::types::QedStep {
+                                participant: None,
             needs: None,
             resource: None,
             inputs: Vec::new(),
@@ -8782,12 +9604,14 @@ mod tests {
         argv: Vec<String>,
     ) -> Pipeline {
         Pipeline {
+            participants: None,
             max_parallel: None,
             description: None,
             tags: Vec::new(),
             name: "test".to_string(),
             label: "test".to_string(),
             steps: vec![crate::types::QedStep {
+                            participant: None,
                 needs: None,
                 resource: None,
                 inputs: Vec::new(),
@@ -9604,6 +10428,50 @@ mod tests {
         plain.platform.as_mut().unwrap().native = false;
         let no_native = bg_pipeline("plain", vec![plain]);
         assert!(!pipeline_needs_offload(&no_native, "aarch64-apple-darwin"));
+    }
+
+    /// R823-T3, measured on hardware: a participant set's steps declare no
+    /// `platform`, so the per-step resolution above says `NativeCross` for every
+    /// one of them and `pipeline_needs_offload` used to answer `false` — the CLI
+    /// then ran a rendezvous with no dispatcher and died on "no remote
+    /// dispatcher is wired". A node-bound role is a fleet dependency the step's
+    /// target triple cannot express.
+    #[test]
+    fn a_node_bound_participant_needs_fleet_wiring_on_any_host() {
+        let mut step = shell_step("responder", vec!["true"]);
+        step.participant = Some("responder".into());
+        let mut pipeline = bg_pipeline("rendezvous", vec![step]);
+        pipeline.participants = Some(participant_set(
+            r#"
+            [role.responder]
+            node    = "us-west-003"
+            address = "100.64.0.9"
+            ports   = ["echo"]
+
+            [role.runner]
+            coordinator = true
+        "#,
+        ));
+
+        assert!(pipeline_has_node_bound_participant(&pipeline));
+        // True on EITHER host: the binding names a box, so there is no host this
+        // could resolve to a local run on — unlike a cross-arch build, which
+        // stops needing the fleet the moment you run it on the matching arch.
+        assert!(pipeline_needs_offload(&pipeline, "aarch64-apple-darwin"));
+        assert!(pipeline_needs_offload(&pipeline, "x86_64-unknown-linux-gnu"));
+
+        // A set whose every role is local still needs nothing: those steps run
+        // as local subprocesses, rendezvous env and all.
+        let mut local_only = pipeline.clone();
+        local_only.participants = Some(participant_set(
+            r#"
+            [role.runner]
+            coordinator = true
+            ports = ["control"]
+        "#,
+        ));
+        assert!(!pipeline_has_node_bound_participant(&local_only));
+        assert!(!pipeline_needs_offload(&local_only, "aarch64-apple-darwin"));
     }
 
     /// R719-F3: the dual of the above. `needs_offload` answers "do I need fleet
@@ -11309,12 +12177,14 @@ mod tests {
 
     fn build_image_pipeline(image: &str) -> Pipeline {
         Pipeline {
+            participants: None,
             max_parallel: None,
             description: None,
             tags: Vec::new(),
             name: "image".to_string(),
             label: "Bake image".to_string(),
             steps: vec![crate::types::QedStep {
+                            participant: None,
                 needs: None,
                 resource: None,
                 inputs: Vec::new(),
@@ -11575,12 +12445,14 @@ description = "smoke test image"
     /// don't depend on a real cross build.
     fn package_native_tarball_pipeline(image: &str, binary_rel: &str, triple: &str) -> Pipeline {
         Pipeline {
+            participants: None,
             max_parallel: None,
             description: None,
             tags: Vec::new(),
             name: "pack".to_string(),
             label: "Package native tarball".to_string(),
             steps: vec![crate::types::QedStep {
+                            participant: None,
                 needs: None,
                 resource: None,
                 inputs: Vec::new(),
@@ -11848,12 +12720,14 @@ produces    = ["native-tarball"]
 
     fn musl_preflight_pipeline(package: &str) -> Pipeline {
         Pipeline {
+            participants: None,
             max_parallel: None,
             description: None,
             tags: Vec::new(),
             name: "preflight".to_string(),
             label: "musl-static preflight".to_string(),
             steps: vec![crate::types::QedStep {
+                            participant: None,
                 needs: None,
                 resource: None,
                 inputs: Vec::new(),
@@ -11984,6 +12858,7 @@ produces    = ["native-tarball"]
     /// the same image+triple → on-disk-path convention both steps share.
     fn pack_and_sign_pipeline(image: &str, binary_rel: &str, triple: &str) -> Pipeline {
         Pipeline {
+            participants: None,
             max_parallel: None,
             description: None,
             tags: Vec::new(),
@@ -11991,6 +12866,7 @@ produces    = ["native-tarball"]
             label: "Package + sign native tarball".to_string(),
             steps: vec![
                 crate::types::QedStep {
+                    participant: None,
                     needs: None,
                     resource: None,
                     inputs: Vec::new(),
@@ -12031,6 +12907,7 @@ produces    = ["native-tarball"]
                     outputs: Vec::new(),
                 },
                 crate::types::QedStep {
+                    participant: None,
                     needs: None,
                     resource: None,
                     inputs: Vec::new(),
@@ -12093,12 +12970,14 @@ produces    = ["native-tarball"]
     /// already exist" gate without coupling to the packaging step.
     fn sign_only_pipeline(image: &str, triple: &str) -> Pipeline {
         Pipeline {
+            participants: None,
             max_parallel: None,
             description: None,
             tags: Vec::new(),
             name: "sign".to_string(),
             label: "Sign native tarball".to_string(),
             steps: vec![crate::types::QedStep {
+                            participant: None,
                 needs: None,
                 resource: None,
                 inputs: Vec::new(),
@@ -12355,6 +13234,7 @@ produces    = ["native-tarball"]
             platform: None,
             toolchain: None,
             outputs: Vec::new(),
+            participant: None,
         }
     }
 
@@ -12709,6 +13589,7 @@ produces    = ["native-tarball"]
         propagate_produces: bool,
     ) -> crate::types::QedStep {
         crate::types::QedStep {
+            participant: None,
             needs: None,
             resource: None,
             inputs: Vec::new(),
@@ -12786,6 +13667,7 @@ produces    = ["native-tarball"]
             alias_of: None,
             pins: Default::default(),
             finally: Vec::new(),
+            participants: None,
         }
     }
 
@@ -12937,6 +13819,95 @@ produces    = ["native-tarball"]
         let wt = ws.clone();
         drop(guard);
         assert!(!wt.join("f.txt").exists(), "guard tears the worktree down on drop");
+    }
+
+    /// R766, low-level: a `retain`ed guard skips teardown, and `prepare_workspace`
+    /// re-enters that exact path (no `git worktree add`) when handed it back via
+    /// `with_resume_workspace`, rather than resetting to a fresh checkout.
+    #[test]
+    fn workspace_isolated_resume_reenters_the_retained_worktree_without_a_fresh_checkout() {
+        let repo = init_git_repo();
+        let runner =
+            PipelineRunner::new(pipeline_with_workspace(crate::types::WorkspaceMode::Isolated))
+                .with_camp_root(repo.path().to_path_buf());
+        let (ws, guard) = runner.prepare_workspace(repo.path()).unwrap();
+        // What a prior FAILED run's step left behind: an uncommitted file a
+        // fresh `git worktree add` would never carry (it isn't in the repo).
+        std::fs::write(ws.join("marker.txt"), "step-1-output").unwrap();
+        guard.unwrap().retain();
+
+        let resumed = PipelineRunner::new(pipeline_with_workspace(
+            crate::types::WorkspaceMode::Isolated,
+        ))
+        .with_camp_root(repo.path().to_path_buf())
+        .with_resume_workspace(ws.clone());
+        let (resumed_ws, resumed_guard) = resumed.prepare_workspace(repo.path()).unwrap();
+        assert_eq!(resumed_ws, ws, "resume re-enters the SAME worktree path");
+        assert_eq!(
+            std::fs::read_to_string(resumed_ws.join("marker.txt")).unwrap(),
+            "step-1-output",
+            "a fresh `git worktree add` would have wiped this away"
+        );
+        drop(resumed_guard);
+        assert!(!ws.exists(), "an unretained guard on the resumed run still tears down normally");
+    }
+
+    /// R766, end-to-end: a failed `Isolated` run's meta carries the worktree
+    /// path, and a second runner constructed with `with_resume_workspace` off
+    /// that path actually sees the first run's filesystem mutation.
+    #[tokio::test]
+    async fn workspace_isolated_failed_run_retains_worktree_and_resume_reenters_it() {
+        let repo = init_git_repo();
+        let mut pipeline = make_pipeline(
+            "resume-isolated",
+            vec![
+                shell_step("write-marker", vec!["sh", "-c", "echo from-step-1 > marker.txt"]),
+                failing_step("boom"),
+            ],
+        );
+        pipeline.workspace = crate::types::WorkspaceMode::Isolated;
+        // `failing_step` sets `on_fail = Continue` for its own tests; this one
+        // wants the ordinary default (a failure ends the run Failed).
+        pipeline.steps[1].on_fail = OnFail::Abort;
+
+        let meta = PipelineRunner::new(pipeline)
+            .with_camp_root(repo.path().to_path_buf())
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(meta.status, RunStatus::Failed);
+        let worktree = meta
+            .retained_workspace
+            .clone()
+            .expect("a failed Isolated run must retain its worktree");
+        assert!(
+            worktree.join("marker.txt").exists(),
+            "the retained tree still carries step 1's write"
+        );
+
+        // The daemon drains `pipeline.steps[0..from_step]` before constructing
+        // the resume runner (camp.rs `qed_run_handler_inner`); mirrored by hand.
+        let mut resume_pipeline = make_pipeline(
+            "resume-isolated",
+            vec![shell_step("check-marker", vec!["sh", "-c", "test -f marker.txt"])],
+        );
+        resume_pipeline.workspace = crate::types::WorkspaceMode::Isolated;
+
+        let resumed_meta = PipelineRunner::new(resume_pipeline)
+            .with_camp_root(repo.path().to_path_buf())
+            .with_resume_workspace(worktree)
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(
+            resumed_meta.status,
+            RunStatus::Success,
+            "resume must see step 1's marker.txt inside the retained worktree, not a fresh checkout"
+        );
+        assert!(
+            resumed_meta.retained_workspace.is_none(),
+            "a successful resume has nothing left to retain"
+        );
     }
 
     /// A relative `produces` under `workspace = "isolated"` must reach the
@@ -13641,6 +14612,7 @@ jobs:
         // Synthesised one-step pipeline carrying the GhaWorkflow step,
         // exactly as `LoaderSubPipelineResolver::resolve` would build it.
         let step = crate::types::QedStep {
+                       participant: None,
             needs: None,
             resource: None,
             inputs: Vec::new(),
@@ -13686,6 +14658,7 @@ jobs:
             toolchain: None,
         };
         let child = Pipeline {
+                        participants: None,
             max_parallel: None,
             description: None,
             tags: Vec::new(),
@@ -13921,6 +14894,7 @@ jobs:
         // Synthesised one-step pipeline carrying the GhaWorkflow step, exactly
         // as `LoaderSubPipelineResolver::resolve` would build it.
         let step = crate::types::QedStep {
+                       participant: None,
             needs: None,
             resource: None,
             inputs: Vec::new(),
@@ -13966,6 +14940,7 @@ jobs:
             toolchain: None,
         };
         let child = Pipeline {
+                        participants: None,
             max_parallel: None,
             description: None,
             tags: Vec::new(),
@@ -15317,6 +16292,7 @@ jobs:
 
     fn gating_step(name: &str) -> crate::types::QedStep {
         crate::types::QedStep {
+            participant: None,
             needs: None,
             resource: None,
             inputs: Vec::new(),
@@ -15365,6 +16341,7 @@ jobs:
         let mut s = gating_step("disabled");
         s.enabled = false;
         let pipeline = Pipeline {
+                           participants: None,
             max_parallel: None,
             description: None,
             tags: Vec::new(),
@@ -15406,6 +16383,7 @@ jobs:
         let mut s = gating_step("stubbed");
         s.activation = crate::types::StepActivation::Stubbed;
         let pipeline = Pipeline {
+                           participants: None,
             max_parallel: None,
             description: None,
             tags: Vec::new(),
@@ -15443,6 +16421,7 @@ jobs:
         let mut s = gating_step("stubbed");
         s.activation = crate::types::StepActivation::Stubbed;
         let pipeline = Pipeline {
+                           participants: None,
             max_parallel: None,
             description: None,
             tags: Vec::new(),
@@ -15483,6 +16462,7 @@ jobs:
         s.enabled = false;
         s.activation = crate::types::StepActivation::Stubbed; // both knobs set
         let pipeline = Pipeline {
+                           participants: None,
             max_parallel: None,
             description: None,
             tags: Vec::new(),
@@ -15522,6 +16502,7 @@ jobs:
         let mut s = gating_step("conditional");
         s.if_cond = Some("matrix.target == 'ios-device'".into());
         let pipeline = Pipeline {
+                           participants: None,
             max_parallel: None,
             description: None,
             tags: Vec::new(),
@@ -15568,6 +16549,7 @@ jobs:
         let mut s = gating_step("conditional");
         s.if_cond = Some("matrix.target == 'ios-device'".into());
         let pipeline = Pipeline {
+                           participants: None,
             max_parallel: None,
             description: None,
             tags: Vec::new(),
@@ -15608,6 +16590,7 @@ jobs:
         let mut s = gating_step("conditional");
         s.if_cond = Some("${{ matrix.target == 'ios-device' }}".into());
         let pipeline = Pipeline {
+                           participants: None,
             max_parallel: None,
             description: None,
             tags: Vec::new(),
@@ -15659,6 +16642,7 @@ jobs:
         params: HashMap<String, crate::types::ParamDef>,
     ) -> Pipeline {
         Pipeline {
+            participants: None,
             max_parallel: None,
             description: None,
             tags: Vec::new(),
@@ -15828,6 +16812,7 @@ jobs:
         let mut gated = gating_step("cleanup");
         gated.if_cond = Some("always()".into());
         let pipeline = Pipeline {
+                           participants: None,
             max_parallel: None,
             description: None,
             tags: Vec::new(),
@@ -15864,6 +16849,7 @@ jobs:
         let mut gated = gating_step("only-on-fail");
         gated.if_cond = Some("failure()".into());
         let pipeline = Pipeline {
+                           participants: None,
             max_parallel: None,
             description: None,
             tags: Vec::new(),
@@ -15895,6 +16881,7 @@ jobs:
         let mut gated = gating_step("only-on-fail");
         gated.if_cond = Some("failure()".into());
         let pipeline = Pipeline {
+                           participants: None,
             max_parallel: None,
             description: None,
             tags: Vec::new(),
@@ -15926,6 +16913,7 @@ jobs:
         let mut gated = gating_step("only-on-success");
         gated.if_cond = Some("success()".into());
         let pipeline = Pipeline {
+                           participants: None,
             max_parallel: None,
             description: None,
             tags: Vec::new(),
@@ -15957,6 +16945,7 @@ jobs:
         let mut gated = gating_step("on-cancel");
         gated.if_cond = Some("cancelled()".into());
         let pipeline = Pipeline {
+                           participants: None,
             max_parallel: None,
             description: None,
             tags: Vec::new(),
@@ -15985,5 +16974,462 @@ jobs:
             RunStatus::Skipped,
             "cancelled() is unreachable from inside an if= gate; always evaluates false"
         );
+    }
+
+    // ── R823-F2 participant sets ─────────────────────────────────────────────
+
+    use crate::participants::{
+        Participant, ParticipantOutcome, ParticipantSet, ParticipantSpec, Verdict,
+        ENV_PARTICIPANTS, ENV_PARTICIPANT_SELF,
+    };
+
+    fn participant_set(src: &str) -> ParticipantSet {
+        toml::from_str(src).expect("participant set parses")
+    }
+
+    /// The rendezvous actually reaches the process. Asserted by running a real
+    /// step rather than by inspecting an `ExecContext`, because the failure this
+    /// guards against — env built in one code path and not another — is
+    /// invisible to a test that reads the same map the code wrote.
+    #[tokio::test]
+    async fn rendezvous_env_reaches_a_local_participant_step() {
+        let camp = tempfile::tempdir().unwrap();
+        let mut step = shell_step(
+            "runner",
+            vec![
+                "sh",
+                "-c",
+                "printf %s \"$QED_PARTICIPANTS\" > peers; printf %s \"$QED_PARTICIPANT_SELF\" > self",
+            ],
+        );
+        step.participant = Some("runner".into());
+        let mut pipeline = make_pipeline("rendezvous", vec![step]);
+        pipeline.participants = Some(participant_set(
+            r#"
+            [role.runner]
+            coordinator = true
+            ports = ["control"]
+        "#,
+        ));
+
+        let meta = PipelineRunner::new(pipeline)
+            .with_camp_root(camp.path().to_path_buf())
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(meta.status, RunStatus::Success, "{:?}", meta.failure_reason);
+
+        assert_eq!(
+            std::fs::read_to_string(camp.path().join("self")).unwrap(),
+            "runner",
+        );
+        let peers: Vec<Participant> =
+            serde_json::from_str(&std::fs::read_to_string(camp.path().join("peers")).unwrap())
+                .expect("QED_PARTICIPANTS is the documented JSON array");
+        assert_eq!(peers.len(), 1);
+        assert_eq!(peers[0].address, crate::participants::LOCAL_ADDRESS);
+        assert_eq!(
+            peers[0].ports["control"],
+            crate::participants::DEFAULT_PORT_BASE
+        );
+    }
+
+    /// A `QED_PARTICIPANTS` literal in the recipe loses to the allocated one.
+    /// The ports were assigned by THIS run, so a value written in the TOML can
+    /// only be a copy of a previous run's addressing — honouring it would point
+    /// the participant at a peer that isn't there.
+    #[tokio::test]
+    async fn the_allocated_rendezvous_outranks_a_stale_literal() {
+        let camp = tempfile::tempdir().unwrap();
+        let mut step = shell_step(
+            "runner",
+            vec!["sh", "-c", "printf %s \"$QED_PARTICIPANTS\" > peers"],
+        );
+        step.participant = Some("runner".into());
+        step.env
+            .insert(ENV_PARTICIPANTS.to_string(), "[STALE]".to_string());
+        let mut pipeline = make_pipeline("rendezvous-precedence", vec![step]);
+        pipeline.participants = Some(participant_set(
+            r#"
+            [role.runner]
+            coordinator = true
+        "#,
+        ));
+
+        PipelineRunner::new(pipeline)
+            .with_camp_root(camp.path().to_path_buf())
+            .run()
+            .await
+            .unwrap();
+        let written = std::fs::read_to_string(camp.path().join("peers")).unwrap();
+        assert_ne!(written, "[STALE]");
+        assert!(written.contains("\"runner\""), "{written}");
+    }
+
+    /// A step with no `participant` still sees the set — it may have to bake an
+    /// address into something — but is told no identity.
+    #[tokio::test]
+    async fn an_unbound_step_sees_the_set_but_has_no_self() {
+        let camp = tempfile::tempdir().unwrap();
+        let mut runner_step = shell_step("runner", vec!["true"]);
+        runner_step.participant = Some("runner".into());
+        let probe = shell_step(
+            "probe",
+            vec![
+                "sh",
+                "-c",
+                "printf %s \"$QED_PARTICIPANTS\" > peers; printf '[%s]' \"$QED_PARTICIPANT_SELF\" > self",
+            ],
+        );
+        let mut pipeline = make_pipeline("unbound", vec![runner_step, probe]);
+        pipeline.participants = Some(participant_set(
+            r#"
+            [role.runner]
+            coordinator = true
+        "#,
+        ));
+
+        PipelineRunner::new(pipeline)
+            .with_camp_root(camp.path().to_path_buf())
+            .run()
+            .await
+            .unwrap();
+        assert!(std::fs::read_to_string(camp.path().join("peers"))
+            .unwrap()
+            .contains("\"runner\""));
+        assert_eq!(
+            std::fs::read_to_string(camp.path().join("self")).unwrap(),
+            "[]",
+        );
+    }
+
+    /// A node-bound participant is placed by its binding even on a runner
+    /// forced local. There is no honest local fallback for a rendezvous: the
+    /// peers were told this participant's address before dispatch, so running
+    /// it here would leave it answering somewhere nobody is calling.
+    #[test]
+    fn a_node_bound_participant_outranks_a_forced_local_runner() {
+        let mut step = shell_step("responder", vec!["true"]);
+        step.participant = Some("responder".into());
+        let mut pipeline = make_pipeline("pinned", vec![step.clone()]);
+        pipeline.participants = Some(participant_set(
+            r#"
+            [role.responder]
+            coordinator = true
+            node    = "us-west-011"
+            address = "100.64.0.11"
+        "#,
+        ));
+        let runner = PipelineRunner::new(pipeline);
+        assert_eq!(runner.run_where, RunWhere::Local);
+        assert_eq!(runner.effective_placement(&step), RunWhere::Remote);
+    }
+
+    /// A local participant is placed exactly as any other step — the field is
+    /// not a placement override in general, only for a node-bound role.
+    #[test]
+    fn a_local_participant_does_not_disturb_placement() {
+        let mut step = shell_step("runner", vec!["true"]);
+        step.participant = Some("runner".into());
+        let mut pipeline = make_pipeline("local-participant", vec![step.clone()]);
+        pipeline.participants = Some(participant_set(
+            r#"
+            [role.runner]
+            coordinator = true
+        "#,
+        ));
+        let runner = PipelineRunner::new(pipeline);
+        assert_eq!(runner.effective_placement(&step), RunWhere::Local);
+    }
+
+    /// The R513-F2 refusal still fires for a background step that offloads
+    /// WITHOUT being a participant, and its message now routes the author to the
+    /// feature that does support it.
+    #[tokio::test]
+    async fn a_non_participant_background_step_may_still_not_offload() {
+        let mut step = shell_step("sidecar", vec!["sleep", "60"]);
+        step.background = true;
+        step.platform = Some(crate::platform::PlatformSpec {
+            target: Some("x86_64-unknown-linux-musl".into()),
+            native: true,
+            ..Default::default()
+        });
+        let pipeline = make_pipeline("bg-offload", vec![step]);
+        let dir = TempDir::new().unwrap();
+        let err = PipelineRunner::new_auto(
+            pipeline,
+            make_scryer(&dir),
+            Arc::new(ScriptedWarden::new(vec![], 0)),
+        )
+        .with_host_triple("aarch64-apple-darwin")
+        .run()
+        .await
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("background steps run locally only"), "{msg}");
+        assert!(msg.contains("[pipeline.participants]"), "{msg}");
+    }
+
+    /// …and a participant sidecar gets PAST that refusal, failing instead on
+    /// the thing that is genuinely missing here — a wired dispatcher. Proving
+    /// it by the error it reaches is the only way to show the preflight let it
+    /// through without standing up a fleet.
+    #[tokio::test]
+    async fn a_remote_participant_sidecar_clears_the_background_preflight() {
+        let camp = tempfile::tempdir().unwrap();
+        let mut sidecar = shell_step("responder", vec!["sleep", "60"]);
+        sidecar.background = true;
+        sidecar.background_until = Some("runner".into());
+        sidecar.participant = Some("responder".into());
+        let mut runner_step = shell_step("runner", vec!["true"]);
+        runner_step.participant = Some("runner".into());
+
+        let mut pipeline = make_pipeline("participant-sidecar", vec![sidecar, runner_step]);
+        pipeline.participants = Some(participant_set(
+            r#"
+            [role.runner]
+            coordinator = true
+            [role.responder]
+            node    = "us-west-011"
+            address = "100.64.0.11"
+            ports   = ["clock"]
+        "#,
+        ));
+
+        let err = PipelineRunner::new(pipeline)
+            .with_camp_root(camp.path().to_path_buf())
+            .run()
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            !msg.contains("background steps run locally only"),
+            "preflight should no longer refuse a participant sidecar: {msg}"
+        );
+        assert!(msg.contains("no remote dispatcher is wired"), "{msg}");
+        assert!(msg.contains("us-west-011"), "{msg}");
+    }
+
+    /// A mis-declared set refuses the RUN, not just the load — a `Pipeline`
+    /// built in code never passes through `PipelineLoader`.
+    #[tokio::test]
+    async fn a_mis_declared_set_refuses_the_run_before_any_step() {
+        let mut step = shell_step("boom", vec!["sh", "-c", "touch ran"]);
+        step.participant = Some("nobody".into());
+        let camp = tempfile::tempdir().unwrap();
+        let mut pipeline = make_pipeline("bad-set", vec![step]);
+        pipeline.participants = Some(participant_set(
+            r#"
+            [role.runner]
+            coordinator = true
+        "#,
+        ));
+        let err = PipelineRunner::new(pipeline)
+            .with_camp_root(camp.path().to_path_buf())
+            .run()
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("names no declared role"), "{err}");
+        assert!(
+            !camp.path().join("ran").exists(),
+            "no step may run once the set is known to be wrong"
+        );
+    }
+
+    // ── participant_reports: step rows → outcomes ─────────────────────────────
+
+    fn reports_fixture(
+        rows: Vec<Option<RunStatus>>,
+        never: &[usize],
+    ) -> Vec<crate::participants::ParticipantReport> {
+        let mut set = ParticipantSet::default();
+        set.roles.insert(
+            "runner".into(),
+            ParticipantSpec {
+                coordinator: true,
+                ..Default::default()
+            },
+        );
+        set.roles.insert(
+            "responder".into(),
+            ParticipantSpec {
+                node: Some("us-west-011".into()),
+                address: Some("100.64.0.11".into()),
+                ..Default::default()
+            },
+        );
+        let plan = set.plan().unwrap();
+
+        let names = ["runner", "responder"];
+        let steps: Vec<crate::types::QedStep> = names
+            .iter()
+            .map(|n| {
+                let mut s = shell_step(n, vec!["true"]);
+                s.participant = Some((*n).to_string());
+                s
+            })
+            .collect();
+        let status_rows: Vec<Option<StepStatus>> = rows
+            .into_iter()
+            .enumerate()
+            .map(|(i, status)| {
+                status.map(|status| StepStatus {
+                    name: names[i].to_string(),
+                    task_run_id: None,
+                    status,
+                    started_at: None,
+                    completed_at: None,
+                    error: Some("boom".into()),
+                    outputs: Default::default(),
+                    applied_binds: Vec::new(),
+                    jobs: Vec::new(),
+                    input_hashes: Default::default(),
+                })
+            })
+            .collect();
+        participant_reports(
+            &plan,
+            &steps,
+            &status_rows,
+            &never.iter().copied().collect(),
+        )
+    }
+
+    #[test]
+    fn all_rows_green_is_one_passing_verdict() {
+        let reports = reports_fixture(
+            vec![Some(RunStatus::Success), Some(RunStatus::Success)],
+            &[],
+        );
+        assert_eq!(verdict_of(&reports), Verdict::Pass);
+    }
+
+    fn verdict_of(reports: &[crate::participants::ParticipantReport]) -> Verdict {
+        crate::participants::verdict(reports)
+    }
+
+    #[test]
+    fn a_peer_whose_workload_was_never_accepted_reads_as_never_started() {
+        // The distinction the whole feature turns on: the responder's step row
+        // says Failed (its waiter returned an error), but the workload id was
+        // never minted, so nothing ran on any node. Reporting this as a test
+        // failure would send an operator to read the code.
+        let reports = reports_fixture(
+            vec![Some(RunStatus::Success), Some(RunStatus::Failed)],
+            &[1],
+        );
+        assert!(matches!(
+            reports[1].outcome,
+            ParticipantOutcome::NeverStarted { .. }
+        ));
+        let Verdict::Fail { summary } = verdict_of(&reports) else {
+            panic!("expected a failure")
+        };
+        assert!(summary.contains("fleet fault"), "{summary}");
+        assert!(summary.contains("us-west-011"), "{summary}");
+    }
+
+    #[test]
+    fn a_participant_the_run_never_reached_reads_as_never_started() {
+        let reports = reports_fixture(vec![Some(RunStatus::Success), None], &[]);
+        assert!(matches!(
+            reports[1].outcome,
+            ParticipantOutcome::NeverStarted { .. }
+        ));
+    }
+
+    #[test]
+    fn a_skipped_participant_is_never_started_not_completed() {
+        // Vacuous truth is the wrong answer: `if = false` on the only step of a
+        // participant means it contributed nothing, and a set that reports Pass
+        // on that has verified nothing about the peer.
+        let reports = reports_fixture(
+            vec![Some(RunStatus::Success), Some(RunStatus::Skipped)],
+            &[],
+        );
+        assert!(matches!(
+            reports[1].outcome,
+            ParticipantOutcome::NeverStarted { .. }
+        ));
+    }
+
+    #[test]
+    fn a_participant_that_started_and_failed_reads_as_failed() {
+        let reports = reports_fixture(
+            vec![Some(RunStatus::Success), Some(RunStatus::Failed)],
+            &[],
+        );
+        match &reports[1].outcome {
+            ParticipantOutcome::Failed { detail } => {
+                assert!(detail.contains("responder"), "{detail}");
+                assert!(detail.contains("boom"), "{detail}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn participant_reports_name_the_coordinator() {
+        let reports = reports_fixture(
+            vec![Some(RunStatus::Success), Some(RunStatus::Success)],
+            &[],
+        );
+        assert!(reports[0].coordinator);
+        assert!(!reports[1].coordinator);
+    }
+
+    /// A participant failure surfaces as the run's `failure_reason`, not only
+    /// in a log line — that field is what `qed.status` and the desktop card
+    /// read, and a verdict nobody can see is not a verdict.
+    #[tokio::test]
+    async fn a_failing_participant_lands_in_the_runs_failure_reason() {
+        let camp = tempfile::tempdir().unwrap();
+        let mut coordinator = shell_step("runner", vec!["true"]);
+        coordinator.participant = Some("runner".into());
+        let mut peer = shell_step("peer", vec!["sh", "-c", "exit 3"]);
+        peer.participant = Some("peer".into());
+        peer.on_fail = OnFail::Continue;
+
+        let mut pipeline = make_pipeline("failing-peer", vec![coordinator, peer]);
+        pipeline.participants = Some(participant_set(
+            r#"
+            [role.runner]
+            coordinator = true
+            [role.peer]
+        "#,
+        ));
+
+        let meta = PipelineRunner::new(pipeline)
+            .with_camp_root(camp.path().to_path_buf())
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(meta.status, RunStatus::Failed);
+        let reason = meta.failure_reason.expect("participant verdict is recorded");
+        assert!(reason.contains("peer"), "{reason}");
+    }
+
+    /// The set is silent on a pipeline that declares none — no env, no verdict,
+    /// no behaviour change. This is the regression guard for every existing
+    /// pipeline in every camp.
+    #[tokio::test]
+    async fn a_pipeline_without_a_set_is_untouched() {
+        let camp = tempfile::tempdir().unwrap();
+        let step = shell_step(
+            "probe",
+            vec!["sh", "-c", "printf '[%s]' \"$QED_PARTICIPANTS\" > peers"],
+        );
+        let meta = PipelineRunner::new(make_pipeline("no-set", vec![step]))
+            .with_camp_root(camp.path().to_path_buf())
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(meta.status, RunStatus::Success);
+        assert!(meta.failure_reason.is_none());
+        assert_eq!(
+            std::fs::read_to_string(camp.path().join("peers")).unwrap(),
+            "[]",
+        );
+        let _ = ENV_PARTICIPANT_SELF;
     }
 }

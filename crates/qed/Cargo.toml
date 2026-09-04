@@ -16,12 +16,12 @@ name = "yah-qed"
 path = "src/bin/qed.rs"
 
 [dependencies]
-velveteen = { path = "../velveteen", version = "0.8.30" }
-velveteen-exec = { path = "../velveteen-exec", version = "0.8.30" }
-task-runs = { path = "../task-runs", version = "0.8.30" }
-workload-spec = { package = "yah-workload-spec", version = "0.8.30" }
-yah-scryer = { path = "../scryer", version = "0.8.30" }
-observation = { path = "../observation", version = "0.8.30" }
+velveteen = { path = "../velveteen", version = "0.8.32" }
+velveteen-exec = { path = "../velveteen-exec", version = "0.8.32" }
+task-runs = { path = "../task-runs", version = "0.8.32" }
+workload-spec = { package = "yah-workload-spec", version = "0.8.32" }
+yah-scryer = { path = "../scryer", version = "0.8.32" }
+observation = { path = "../observation", version = "0.8.32" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 toml = { version = "0.8", features = ["preserve_order"] }
@@ -53,7 +53,7 @@ flate2 = "1"
 # transitive dep tree to flag glibc-only crates before the cross build.
 cargo_metadata = "0.18"
 # W200-F9: dispatch StepKind::GhaWorkflow into the native GHA runtime.
-yah-qed-gha = { path = "../qed-gha", version = "0.8.30" }
+yah-qed-gha = { path = "../qed-gha", version = "0.8.32" }
 # R533-F1 (W224): blake3 content-hash pin for an imported `workflow.yml`
 # source. Same content-addressing primitive the rest of yah uses (kept at the
 # workspace-wide `1.x` line).
@@ -69,11 +69,11 @@ indexmap = { version = "2", features = ["serde"] }
 # R487 follow-up: vault-backed `~/.yah/qed/secrets.toml` resolver — maps GHA
 # secret names to vault slot names so workflows that reference
 # ${{ secrets.X }} get the same value GHA's secret store would.
-fob = { version = "0.8.30" }
+fob = { version = "0.8.32" }
 # W209: pipeline outputs → manifest bind. Parse-time schema (BindSpec,
 # OutputDecl, OutputRef, ValueType, Intent) consumed by the pipeline TOML
 # loader; the applier itself runs at step boundaries inside the runner.
-manifest-bind = { path = "../manifest-bind", version = "0.8.30" }
+manifest-bind = { path = "../manifest-bind", version = "0.8.32" }
 # R533-T10 (W224): JSON Schema derivation for the .yah/qed/*.toml pipeline
 # format. Optional + default-off so the runtime binary deps don't carry
 # schemars; xtask turns it on to generate qed-pipeline.toml.schema.json (same

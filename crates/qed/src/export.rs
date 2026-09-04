@@ -472,6 +472,7 @@ mod tests {
 
     fn pipeline(name: &str, steps: Vec<QedStep>) -> Pipeline {
         Pipeline {
+            participants: None,
             max_parallel: None,
             description: None,
             tags: Vec::new(),

@@ -244,14 +244,34 @@ mod tests {
         assert!(res.is_ok(), "got: {res:?}");
     }
 
+    /// R823-T3: bind-then-drop does not *reserve* the port it frees — on a busy
+    /// machine the kernel can hand that ephemeral number to an unrelated
+    /// process between the drop and the probe, and then a correct
+    /// `probe_tcp_once` connects and this test fails. Observed once during a
+    /// full `cargo test -p yah-qed --lib` in this camp (which runs many
+    /// concurrent sessions), passing on the very next run — the shape of a
+    /// flake that costs someone a bisect.
+    ///
+    /// Retrying with a *fresh* port makes the outcome deterministic without
+    /// pretending the race is not there: losing it twice in a row on
+    /// independently-allocated ports is not something a passing run should be
+    /// held to.
     #[tokio::test]
     async fn tcp_probe_fails_against_a_dead_port() {
-        // Bind then drop to free a port nothing is listening on.
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
-        drop(listener);
-        let res = probe_tcp_once(&addr, Duration::from_millis(200)).await;
-        assert!(res.is_err(), "expected connect failure on a dead port");
+        for attempt in 1..=5 {
+            // Bind then drop to free a port nothing is listening on.
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+            drop(listener);
+            if probe_tcp_once(&addr, Duration::from_millis(200)).await.is_err() {
+                return;
+            }
+            assert!(
+                attempt < 5,
+                "five freed ephemeral ports in a row were re-taken before the probe — \
+                 that is no longer a race, look at probe_tcp_once"
+            );
+        }
     }
 
     #[tokio::test]

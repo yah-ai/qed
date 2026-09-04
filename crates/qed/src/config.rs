@@ -151,6 +151,12 @@ pub enum ConfigError {
     /// dropped an edge, or one that hangs with nothing ready.
     #[error("Invalid step graph: {0}")]
     InvalidDag(#[from] crate::dag::DagError),
+    /// R823-F2: the `[pipeline.participants]` set doesn't allocate, or a step
+    /// claims a role the set doesn't declare. Rejected at load for the same
+    /// reason as the DAG: a rendezvous whose addressing is wrong fails as a
+    /// connection refusal several layers from its cause.
+    #[error("Invalid participant set: {0}")]
+    InvalidParticipants(#[from] crate::participants::ParticipantError),
     /// R751-F2: a specialization whose `alias_of` names a pipeline that doesn't
     /// exist. Separate from [`Self::NotFound`] because the name the operator
     /// asked for *did* resolve — it's the file's own reference that dangles,
@@ -325,6 +331,10 @@ pub struct PipelineConfig {
     /// [`Pipeline::finally`] and validated with [`QedStep::validate_finally`].
     #[serde(default)]
     finally: Vec<QedStep>,
+    /// R823-F2 — `[pipeline.participants]`. See
+    /// [`crate::types::Pipeline::participants`].
+    #[serde(default)]
+    participants: Option<crate::participants::ParticipantSet>,
 }
 
 #[derive(Clone)]
@@ -580,11 +590,17 @@ impl PipelineLoader {
             binds: parsed.binds,
             on_change: parsed.on_change,
             finally: parsed.pipeline.finally,
+            participants: parsed.pipeline.participants,
         };
         self.validate_steps(&pipeline)?;
         self.validate_dag(&pipeline)?;
         self.validate_binds(&pipeline)?;
         self.validate_params(&pipeline)?;
+        // R823-F2: allocate the set here purely to prove it allocates. The
+        // runner re-derives it (the plan is pure, so both get the same one);
+        // this is the load-time half, so a mis-declared rendezvous is a red
+        // pipeline in the catalog rather than a run that dies mid-flight.
+        crate::participants::plan_for(&pipeline)?;
         Ok(pipeline)
     }
 
@@ -655,6 +671,9 @@ impl PipelineLoader {
         }
         if cfg.toolchain.is_some() {
             body_keys.push("toolchain");
+        }
+        if cfg.participants.is_some() {
+            body_keys.push("participants");
         }
         if !parsed.binds.is_empty() {
             body_keys.push("[[bind]]");
@@ -1002,6 +1021,7 @@ fn synthesise_gha_pipeline(entry: &GhaWorkflowEntry) -> Pipeline {
         alias_of: None,
         pins: Default::default(),
         finally: Vec::new(),
+        participants: None,
     }
 }
 
@@ -1110,6 +1130,7 @@ impl SubPipelineResolver for LoaderSubPipelineResolver {
                     alias_of: None,
                     pins: Default::default(),
                     finally: Vec::new(),
+                    participants: None,
                 })
             }
             // Peer resolution (R494-F2). Look the peer up in this camp's
@@ -3499,5 +3520,130 @@ argv = ["cargo", "build", "--release"]
         assert!(resolver
             .unresolved_reason(&SubPipelineRef::Path(".yah/qed/missing.toml".into()))
             .is_none());
+    }
+
+    // ── R823-F2 participant sets ─────────────────────────────────────────────
+
+    /// The documented shape survives the loader, ports and all. Asserted
+    /// through `load_from_str` rather than by deserializing `ParticipantSet`
+    /// directly, because the failure mode this guards is a field wired into
+    /// `PipelineConfig` and forgotten in the hoist to `Pipeline` — which a
+    /// direct parse test cannot see.
+    #[test]
+    fn a_participant_set_survives_the_loader() {
+        let toml = r#"
+[pipeline]
+name = "clock-cases-fleet"
+label = "Clock cases across two hosts"
+workspace = "live"
+
+[pipeline.participants]
+port_base = 34500
+
+[pipeline.participants.role.runner]
+coordinator = true
+
+[pipeline.participants.role.responder]
+node    = "us-west-011"
+address = "100.64.0.11"
+ports   = ["clock"]
+
+[[pipeline.steps]]
+name = "responder"
+participant = "responder"
+background = true
+background_until = "runner"
+argv = ["clock_case_responder"]
+
+[[pipeline.steps]]
+name = "runner"
+participant = "runner"
+argv = ["clock_case_runner"]
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let p = PipelineLoader::new(dir.path()).load_from_str(toml).unwrap();
+        let plan = crate::participants::plan_for(&p).unwrap().unwrap();
+        assert_eq!(plan.participants().len(), 2);
+        assert!(plan.coordinator().name == "runner");
+        let responder = plan.get("responder").unwrap();
+        assert_eq!(responder.node.as_deref(), Some("us-west-011"));
+        assert_eq!(responder.ports["clock"], 34500);
+        assert_eq!(p.steps[0].participant.as_deref(), Some("responder"));
+    }
+
+    /// A step naming a role the set doesn't declare fails the LOAD — so it is a
+    /// red pipeline in the catalog, not a run that dies after dispatching half
+    /// a rendezvous.
+    #[test]
+    fn a_step_naming_an_undeclared_role_fails_the_load() {
+        let toml = r#"
+[pipeline]
+name = "typo"
+label = "Typo"
+workspace = "live"
+
+[pipeline.participants.role.runner]
+coordinator = true
+
+[[pipeline.steps]]
+name = "go"
+participant = "runer"
+argv = ["true"]
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let err = PipelineLoader::new(dir.path())
+            .load_from_str(toml)
+            .unwrap_err();
+        assert!(
+            matches!(err, ConfigError::InvalidParticipants(_)),
+            "got {err:?}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("names no declared role"), "{msg}");
+        assert!(msg.contains("runner"), "the message names what IS declared: {msg}");
+    }
+
+    /// `participant` with no `[pipeline.participants]` block at all is caught
+    /// too — the likeliest authoring mistake once one pipeline in a camp uses
+    /// the feature and the next one copies a step out of it.
+    #[test]
+    fn a_participant_step_without_a_set_fails_the_load() {
+        let toml = r#"
+[pipeline]
+name = "orphan"
+label = "Orphan"
+workspace = "live"
+
+[[pipeline.steps]]
+name = "go"
+participant = "responder"
+argv = ["true"]
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let err = PipelineLoader::new(dir.path())
+            .load_from_str(toml)
+            .unwrap_err();
+        assert!(err.to_string().contains("declares no [pipeline.participants]"), "{err}");
+    }
+
+    /// A specialization may not declare a set: it binds the base's body, and a
+    /// participant set is body.
+    #[test]
+    fn an_alias_may_not_declare_a_participant_set() {
+        let toml = r#"
+[pipeline]
+name = "spec"
+label = "Specialization"
+alias_of = "base"
+
+[pipeline.participants.role.runner]
+coordinator = true
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let err = PipelineLoader::new(dir.path())
+            .load_from_str(toml)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("participants"), "{msg}");
     }
 }
