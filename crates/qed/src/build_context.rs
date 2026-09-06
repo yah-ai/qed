@@ -191,9 +191,9 @@ pub const SOURCE_CONTEXT_URL_ENV: &str = "YAH_SOURCE_CONTEXT_URL";
 /// @arch:see(.yah/docs/working/W235-remote-qed.md)
 ///
 /// @yah:ticket(R855-B1, "source_context ships a PARTIAL tree when a declared subtree holds untracked files — no local signal, fails on the worker as E0583")
-/// @yah:at(2026-09-03T07:26:39Z)
-/// @yah:status(open)
-/// @yah:assignee(agent:bundle-anthropic-ashguard)
+/// @yah:status(review)
+/// @yah:at(2026-09-04T21:17:21Z)
+/// @yah:assignee(agent:bundle-anthropic-miravel)
 /// @yah:parent(R855)
 /// @yah:severity(medium)
 /// @yah:next("Tier: Cleric — one guard in one private function with a clear predicate; the judgment (warn vs refuse) is already decided below.")
@@ -203,6 +203,13 @@ pub const SOURCE_CONTEXT_URL_ENV: &str = "YAH_SOURCE_CONTEXT_URL";
 /// @yah:next("WARN, DO NOT REFUSE. A camp tree here is permanently dirty and full of legitimately-untracked files (target/, editor scratch, a peer's WIP), so refusing would fire constantly on runs that are entirely fine, and a guard that cries wolf gets muted. The failure this prevents is a MISSING diagnosis, not a missing check — the operator needs the sentence 'these files will not ship', printed once, at the moment they can still act on it.")
 /// @yah:next("SECOND SITE, SAME BUG, DO NOT MISS IT: source_context_fingerprint (build_context.rs:288) hashes the content of exactly what pack_source_context would ship. So an untracked file is invisible to the cache key too — editing one changes nothing about the fingerprint and a stale cached result can be served. Whatever list the guard computes should be derived once and used by both, in the shared source_context_files helper, which is why the helper is the right home.")
 /// @yah:gotcha("FOUND BY A PEER, NOT BY THE FILER. @Glimmerstone:griffin hit this on R556-F6 / MFT-R823 (mesofact-musl fleet build, 2026-09-02); @Ashguard:polaris filed it while on R823-F2 and confirmed the mechanism by reading source_context_files, but has NOT reproduced the E0583 personally. Treat the three-runs-lost figure as griffin's report, not as a measurement of this filer's.")
+/// @yah:handoff("Added warn_on_untracked_files() in oss/qed/crates/qed/src/build_context.rs, called from the shared source_context_files() helper right before it returns — so both pack_source_context and source_context_fingerprint get the warning for free, exactly the second-site risk the ticket flagged.")
+/// @yah:handoff("Runs `git ls-files -z --others --exclude-standard -- <paths>` (same paths as the tracked-files call, one flag apart) and tracing::warn!s the count + first 10 names + '(+N more)' when non-empty. Never refuses — matches the WARN-DO-NOT-REFUSE judgment already decided on the ticket.")
+/// @yah:handoff("git failure on the untracked-scan is swallowed (best-effort, returns silently) rather than propagated, since the preceding tracked-files call already proved git works in this camp_root.")
+/// @yah:verify("cargo build -p yah-qed — clean.")
+/// @yah:verify("cargo test -p yah-qed --lib build_context:: — 16/16 pass, including two new tests: warns_on_untracked_file_in_declared_subtree_but_still_packs (asserts the warning names the untracked file AND that pack_source_context still succeeds and excludes it from the tar) and does_not_warn_about_untracked_files_outside_the_declared_paths (no noise for files elsewhere in a dirty camp tree). Warning capture uses a hand-rolled tracing::Subscriber in the test module — no new dependency, tracing is already a direct dependency of yah-qed.")
+/// @yah:verify("cargo clippy -p yah-qed --lib — 19 pre-existing warnings elsewhere in the crate (secrets_bridge.rs, types.rs, etc.), none in build_context.rs.")
+/// @yah:verify("cargo fmt -p yah-qed -- --check crates/qed/src/build_context.rs — clean; the crate has pre-existing fmt drift in unrelated files (bin/qed.rs, artifact_local.rs, doc_source.rs, config.rs) untouched by this change.")
 pub fn pack_source_context(camp_root: &Path, paths: &[PathBuf]) -> Result<Vec<u8>, RunnerError> {
     let rel = source_context_files(camp_root, paths)?;
 
@@ -302,7 +309,58 @@ fn source_context_files(camp_root: &Path, paths: &[PathBuf]) -> Result<Vec<PathB
         )));
     }
 
+    warn_on_untracked_files(camp_root, paths);
+
     Ok(rel)
+}
+
+/// Warn (never refuse — R855-B1) when `paths` contains untracked files, since
+/// those are silently absent from both [`pack_source_context`]'s tar and
+/// [`source_context_fingerprint`]'s cache key. A camp tree is permanently
+/// dirty with legitimate untracked files (`target/`, editor scratch, a
+/// peer's WIP), so this only fires for untracked files that fall *under a
+/// declared source_context path* — the actually-relevant subset — and it
+/// never fails the build over it.
+fn warn_on_untracked_files(camp_root: &Path, paths: &[PathBuf]) {
+    let mut cmd = std::process::Command::new("git");
+    cmd.arg("-C")
+        .arg(camp_root)
+        .args(["ls-files", "-z", "--others", "--exclude-standard", "--"]);
+    for path in paths {
+        cmd.arg(path);
+    }
+    let out = match cmd.output() {
+        Ok(out) if out.status.success() => out,
+        _ => return, // Best-effort: the tracked-files call above already
+                     // proved git works here, so a failure here just means
+                     // skip the warning rather than fail the build.
+    };
+
+    let untracked: Vec<PathBuf> = out
+        .stdout
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| PathBuf::from(String::from_utf8_lossy(s).into_owned()))
+        .collect();
+
+    if untracked.is_empty() {
+        return;
+    }
+
+    const SHOWN: usize = 10;
+    let shown: Vec<_> = untracked.iter().take(SHOWN).collect();
+    let more = untracked.len().saturating_sub(SHOWN);
+    tracing::warn!(
+        "source_context under {:?} has {} untracked file(s) that will NOT ship: {:?}{}",
+        paths,
+        untracked.len(),
+        shown,
+        if more > 0 {
+            format!(" (+{more} more)")
+        } else {
+            String::new()
+        },
+    );
 }
 
 /// BLAKE3 over the *content* of everything [`pack_source_context`] would ship —
@@ -761,6 +819,91 @@ mod tests {
         let err =
             source_context_fingerprint(repo.path(), &[PathBuf::from("oss/typo")]).unwrap_err();
         assert!(err.to_string().contains("no git-tracked files"), "{err}");
+    }
+
+    /// A minimal `tracing::Subscriber` that records event messages, so
+    /// `warn_on_untracked_files` can be asserted on without a logging
+    /// dependency the crate doesn't otherwise need.
+    #[derive(Default)]
+    struct CapturingSubscriber {
+        events: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl tracing::Subscriber for CapturingSubscriber {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Visitor(String);
+            impl tracing::field::Visit for Visitor {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0 = format!("{value:?}");
+                    }
+                }
+            }
+            let mut visitor = Visitor(String::new());
+            event.record(&mut visitor);
+            self.events.lock().unwrap().push(visitor.0);
+        }
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// R855-B1: an untracked file under a declared `source_context` path is
+    /// silently absent from both the tar and the fingerprint (by design —
+    /// only tracked files travel), so the one local signal an author gets is
+    /// this warning. It must name the file and must not fail the pack.
+    #[test]
+    fn warns_on_untracked_file_in_declared_subtree_but_still_packs() {
+        let repo = source_repo();
+        std::fs::write(repo.path().join("pkg/src/new_module.rs"), b"// new\n").unwrap();
+
+        let subscriber = std::sync::Arc::new(CapturingSubscriber::default());
+        let tarball = tracing::subscriber::with_default(subscriber.clone(), || {
+            pack_source_context(repo.path(), &[PathBuf::from("pkg")]).unwrap()
+        });
+
+        let names: Vec<String> = entries_of(&tarball).into_iter().map(|(n, _)| n).collect();
+        assert!(
+            !names.contains(&"pkg/src/new_module.rs".to_string()),
+            "untracked file must not ship: {names:?}"
+        );
+
+        let events = subscriber.events.lock().unwrap();
+        assert!(
+            events.iter().any(|e| e.contains("new_module.rs")),
+            "must warn naming the untracked file: {events:?}"
+        );
+    }
+
+    /// A file outside every declared `source_context` path is not this step's
+    /// business — warning about it would be noise for e.g. every peer's WIP
+    /// elsewhere in a permanently-dirty camp tree.
+    #[test]
+    fn does_not_warn_about_untracked_files_outside_the_declared_paths() {
+        let repo = source_repo();
+        std::fs::write(repo.path().join("elsewhere/scratch.rs"), b"// scratch\n").unwrap();
+
+        let subscriber = std::sync::Arc::new(CapturingSubscriber::default());
+        tracing::subscriber::with_default(subscriber.clone(), || {
+            pack_source_context(repo.path(), &[PathBuf::from("pkg")]).unwrap()
+        });
+
+        let events = subscriber.events.lock().unwrap();
+        assert!(
+            events.is_empty(),
+            "must not warn about files outside the declared paths: {events:?}"
+        );
     }
 
     /// The unwired default refuses rather than silently falling back to the
