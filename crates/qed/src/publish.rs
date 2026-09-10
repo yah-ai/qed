@@ -61,6 +61,29 @@
 //! @yah:verify("cargo test -p qed --lib runner::tests::sub_pipeline (9 tests)")
 //! @yah:verify("cargo test -p qed --lib")
 //! @yah:verify("cargo check --workspace")
+//!
+//! @yah:ticket(R876-F6, "mesofact-musl cannot be run to iterate: succeeding publishes a release to cdn.yah.dev as a side effect of building")
+//! @yah:at(2026-09-09T08:24:35Z)
+//! @yah:status(review)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R876)
+//! @yah:next("Tier: Cleric — the mechanism is small but the decision is about what a release IS, and getting it wrong publishes to a CDN that install.sh reads. THE CONFLICT, in one sentence: R876-T1's iteration loop starts with `yah qed run mesofact-musl`, and that pipeline carries `[[pipeline.on_success]] kind = \\\"publish\\\" provider = \\\"r2\\\" bucket = \\\"yah-dev\\\" base_url = \\\"https://cdn.yah.dev\\\"` — so the build step of an iteration loop cuts an outward-facing release the moment it fully succeeds.")
+//! @yah:next("WHY NOBODY HAS HIT IT YET, AND WHY THAT IS ABOUT TO CHANGE. The publish has NEVER fired: the aarch64 leg has failed on all 14 recorded runs, so the pipeline never reaches on_success. The cause is fixed in the tree — `execute_step_local_container` now publishes/injects/discards `source_context` (oss/qed/crates/qed/src/runner.rs, committed 24d24042, three tests) — but the run on 2026-09-09 04:24Z (ac1101c5) still failed identically, because `/Users/leif/.local/bin/yah` was built 2026-09-08 20:57, five minutes BEFORE the fix landed. See app/yah/cli/CLAUDE.md: `cargo build` does not touch the installed binary. So the first `cargo xtask install` after that commit arms the publish, and the next green mesofact-musl run writes 0.8.35 to cdn.yah.dev and merges it into mesofact/index.json.")
+//! @yah:next("THE SHAPE TO AIM FOR, and it already exists one repo over: hotship's whole charter is \\\"IT NEVER WRITES THE CDN, AND MUST NOT LEARN HOW\\\", and that refusal is what makes it safe to hand to an agent. The build half of the same loop should be separable on the same axis — a `publish` param defaulting to false, or an `on_success` that fires only under an explicit release context (YAH_RELEASE_VERSION set, or a tag trigger), so `yah qed run mesofact-musl` is a BUILD and cutting a release is a deliberate second act. Weigh that against the R560-T9/T10 intent recorded in the pipeline header, which is that this pipeline IS the musl half of the release and merges into the same manifest release.yml writes: the answer is probably a param, not deleting the outcome.")
+//! @yah:gotcha("THE VERSION IT WOULD PUBLISH UNDER IS THE DEV WORKSPACE VERSION, WHICH IS THE SHARP EDGE. `publish::resolve_release_version` takes YAH_RELEASE_VERSION when set, else the yah workspace version — 0.8.35 at filing, the SAME number the tree carries between releases. So an iteration build does not publish something obviously wrong-looking like `0.0.0`; it publishes a plausible release number, into `mesofact/index.json`, which `install.sh` reads and resolves for `curl … | sh`. The pipeline header calls the unset case \\\"the right default for a fleet build that is not part of a tagged release\\\" — that was written when the publish could not fire, and is exactly the assumption this ticket should re-examine.")
+//! @yah:verify("The proof this is fixed is a run that BUILDS and does not publish: `yah qed run mesofact-musl` green on both legs, artifacts retrieved into .yah/cache/artifacts/named/, and `curl -s https://cdn.yah.dev/mesofact/index.json` unchanged before and after (diff the bytes, do not eyeball the version). Then the converse: the release path still publishes when asked. Do NOT verify the first half by relying on the aarch64 leg staying broken — reinstall `yah` first (`cargo xtask install`) so both legs actually pass, or the test proves nothing.")
+//! @yah:handoff("STEP 0 (sibling verification, @agent:bundle-anthropic-ashguard's service_records.rs change on R876-B3): ran `cargo test -p yubaba --test main` (the raft/rig integration binary the sibling meant by \"main test group\") twice from oss/yubaba — both runs came back 68 passed / 0 failed, clean, no raft/rig flakiness observed at all. A third attempt in between hit a COMPILE error (`resolve_fleet_inventory`/`overlay_source_providers` not found in scope, oss/yubaba/crates/cloud/src/config.rs) caused by an unrelated live peer editing that file mid-run (tagged R870-B13 in a nearby comment) — not a test failure, and unrelated to service_records/mesh_ip. Also ran `cargo test -p yubaba --lib service_records` directly: 49/0 clean, including the sibling's own new `reconcile_*` unit tests. CONCLUSION: I could not reproduce the sibling's reported 54/14 -> 49/19 split or any raft/rig flapping on two clean runs; nothing in either run named service_records or mesh_ip. This does not confirm the sibling's attribution — it simply did not reproduce for me. Flagging as inconclusive/contradictory rather than confirmed, per instruction to report loudly if anything doesn't match.")
+//! @yah:handoff("R876-F6 CODE LANDED. `oss/qed/crates/qed/src/types.rs`: new `Outcome::Publish::require_explicit_version: bool` (serde default false, so every pre-existing pipeline/call site is unaffected). `oss/qed/crates/qed/src/publish.rs`: added `resolve_release_version_explicit() -> Option<String>` (YAH_RELEASE_VERSION only, no workspace-version fallback); `resolve_release_version()` now just calls it and falls back — unchanged behavior for existing callers (yah-cli-release, native-tarball packaging). `oss/qed/crates/qed/src/runner.rs` `dispatch_terminal_outcomes`: when `require_explicit_version` is true and `resolve_release_version_explicit()` is `None`, the Publish outcome is SKIPPED with a `tracing::warn!` naming why, and the run still reports Success (a build is a build) — it does not fail the pipeline. `.yah/qed/mesofact-musl.toml`: its one `[[pipeline.on_success]] kind=\"publish\"` now sets `require_explicit_version = true`, and the stale comment that called the unset-fallback case \"the right default for a fleet build\" is rewritten to explain the new gate and why (aarch64 leg's perpetual failure hid the danger until now). DESIGN CHOICE, and why it's per-outcome not global: `yah-cli-release.toml`'s publish outcome deliberately keeps the old fallback-to-workspace-version behavior (`require_explicit_version` left at its default `false`) because invoking THAT pipeline at all is already the deliberate release act (its own doc explicitly supports `yah qed run yah-cli-release` with no env var as a real release) — unlike mesofact-musl, which R876-T1 runs repeatedly as a build-only iteration loop. Checked (per the ticket's own instruction) whether any real release-path script sets YAH_RELEASE_VERSION for mesofact-musl before landing this: `scripts/publish-mesofact-release.sh` does NOT invoke `yah qed run mesofact-musl` at all (it's a separate script covering the 4 gnu/darwin triples); nothing in-tree currently sets YAH_RELEASE_VERSION for a musl release run — so the explicit-param gate is the only mechanism, not a redundant one.")
+//! @yah:handoff("Every `Outcome::Publish { .. }` Rust-literal construction site in the tree (15 in runner.rs tests, 1 in export.rs test, 1 in app/yah/cli/tests/camp_qed_image_pins.rs) updated to carry the new field; `app/yah/cli/src/camp.rs`'s two match/construct sites already used `..` and needed no change. `app/yah/cli/tests/camp_qed_image_pins.rs::mesofact_musl_legs_are_arch_matched_and_carry_source_context` extended to assert `require_explicit_version == true` on the real loaded mesofact-musl.toml pipeline — this is the test that would catch a future accidental revert of the TOML flag.")
+//! @yah:gotcha("LIVE DANGER FOUND AND DEFUSED DURING VERIFICATION, 2026-09-09 ~08:10-08:21Z: `yah qed run mesofact-musl` does NOT execute against the freshly `cargo xtask install`-ed CLI binary — it submits to the long-lived camp daemon (`/Applications/yah.app/Contents/MacOS/desktop`, the SAME process serving every session on this machine), and THAT process was still running build `24d24042` (has the source_context/aarch64 fix, does NOT have this ticket's require_explicit_version gate). `yah qed list` surfaces this as \"camp build skew\" but only when you happen to run a command that prints it — there is no proactive warning before `yah qed run` dispatches. I started an iteration run with YAH_RELEASE_VERSION unset to prove the gate; under the daemon's stale binary the aarch64 leg finished SUCCESS in under 10 minutes (first time ever — confirms R560-T8's source_context fix is good) and the x86_64 leg was still running when I cancelled it via `qed.cancel` (run 7613916e). Had I let it finish, this pipeline WOULD have hit the old unconditional Outcome::Publish and published 0.8.35 to cdn.yah.dev under the fallback version — the exact bug this ticket exists to close, on a LIVE daemon serving the whole camp, not just my session. Verified via curl+sha256 that cdn.yah.dev/mesofact/index.json is still byte-identical to before I started (62c1c0b2...). THE DAEMON STILL HAS NOT BEEN RESTARTED as of this writing — anyone running `yah qed run mesofact-musl` against this camp's daemon right now is still exposed until it picks up a build at or after 718dfacb (or wherever this ticket's fix lands next). I deliberately did NOT restart yah.app myself: it is shared infrastructure for every live session on this machine (peers observed mid-session included R870/R877/R853 plus several unlabeled build sessions queued behind the same cargo-target lock), and killing/restarting it would interrupt their in-flight work without their consent — that decision belongs to the operator or leader, not a courier. RECOMMEND: restart yah.app (or equivalent daemon reload) before anyone next runs `yah qed run mesofact-musl` for real, and re-run the live green-both-legs-unchanged-CDN proof this ticket's verify section asks for once that's done — my unit-level proof (both directions of the gate) stands in for it here per the ticket's own fallback clause.")
+//! @yah:verify("Unit tests directly on the gate, both directions, oss/qed/crates/qed/src/runner.rs: `publish_outcome_with_required_version_skips_when_unset` (YAH_RELEASE_VERSION unset -> RunStatus::Success but dispatcher.publish never called) and `publish_outcome_with_required_version_fires_when_set` (set to \"7.7.7\" -> publish fires carrying exactly that version, not the workspace fallback). oss/qed/crates/qed/src/publish.rs: `resolve_release_version_explicit_is_none_when_unset` (covers both truly-unset and explicitly-empty-string) and `resolve_release_version_explicit_is_some_when_set`. All four new + the existing `resolve_release_version_prefers_env` serialized against a shared `RELEASE_VERSION_ENV_LOCK` Mutex per file (this env var is process-global and cargo runs tests in parallel by default).")
+//! @yah:verify("`cargo test -p yah-qed --lib` (from oss/qed workspace): 939 passed / 1 failed / 1 ignored, both before and after this change — the 1 failure (`tests::desktop_release_matrix_routes_each_row_to_its_own_platform`, \"desktop-release pipeline loads: NotFound\") is pre-existing and unrelated: `.yah/qed/desktop-release.toml` was renamed to `yah-desktop-release.toml` in an earlier commit (9e454f03) without updating this test; confirmed via `git log --diff-filter=D` on the old path. My change added exactly 4 new tests (939 vs the pre-change 935 passed), none touch that pipeline. `cargo build -p yah-qed` and `cargo build -p yah`: both clean, 0 errors, only pre-existing warnings unrelated to this change.")
+//! @yah:verify("Live: `cargo xtask install` succeeded (yah 0.8.35+718dfacb-dirty, sha256 01db7894...), confirmed on PATH. `yah qed run mesofact-musl` started with YAH_RELEASE_VERSION unset; SEE GOTCHA — the run executed against the camp daemon's STALE pre-fix binary (24d24042), not the one I just installed, so it was cancelled mid-run (aarch64 leg had already gone green, x86_64 still running) rather than let it reach on_success unguarded. `curl -sS https://cdn.yah.dev/mesofact/index.json` sha256 before this session's install/run activity and after cancellation are BYTE-IDENTICAL: 62c1c0b235e26952857139537b65f8272026cd1c385c1bf6dba20481ee8a6619 both times (27150 bytes). The full green-both-legs live proof against a daemon actually running the guarded build was not completed this session — see gotcha for why and the recommended next step.")
+//! @yah:handoff("LEADER NOTE ON SCOPE. The ticket's open question (\"a param, not deleting the outcome\") was resolved as an opt-in `require_explicit_version` on `Outcome::Publish`, set true on mesofact-musl.toml and left false on yah-cli-release — because running yah-cli-release AT ALL is already the deliberate release act, so the gate belongs on the pipeline that is also an iteration loop, not on the one that is only a release. The `on_success` publish outcome was not deleted; R560-T9/T10's intent that this pipeline is the musl half of the release is preserved.")
+//! @yah:verify("WHAT WAS NOT PROVEN, stated plainly rather than hedged: the ticket's live end-to-end proof (a green-both-legs `yah qed run mesofact-musl` with cdn.yah.dev/mesofact/index.json byte-identical across it) DID NOT RUN TO COMPLETION. It was started and then cancelled mid-flight on discovering the camp daemon executes pipelines from a stale pre-gate build — see R876-B8, which is live and armed. The index.json byte-diff WAS taken across the cancelled run and is identical, and the gate is covered by 4 new unit tests in both directions, but the end-to-end leg is owed and is blocked on B8's daemon restart.")
+//! @yah:verify("E2E LEG DISCHARGED 2026-09-09 by @Ashguard:polaris while running R876-F4's timings (session:ca1ad243). Three `yah qed run mesofact-musl --in-process` runs on a self-built release binary 0.8.35+e714a29f-dirty (verified by content: `yah --version` plus grep -a for the gate's own 'skipping Outcome::Publish' string, present). YAH_RELEASE_VERSION UNSET on all three — the iteration case. ALL THREE RUNS: both legs green (x86_64 offloaded to us-west-003, aarch64 NativeCross locally), pipeline Success, so `[[pipeline.on_success]]` was reached rather than skipped upstream. THE aarch64 LEG WENT GREEN, which closes the half this ticket's proof was missing; the arm-worker 2.5 GB rootfs blocker does not apply because R605-B13 moved that leg to the local pinned linux/arm64 container. cdn.yah.dev/mesofact/index.json sha256 62c1c0b235e26952857139537b65f8272026cd1c385c1bf6dba20481ee8a6619 before the first run and 62c1c0b235e26952857139537b65f8272026cd1c385c1bf6dba20481ee8a6619 after the last, `cmp` byte-identical on the saved files. No publish or staging line in any run log. The `--in-process` route was used precisely because the camp daemon is still on the stale pre-gate 0.8.35+24d24042-dirty build; that daemon was NOT restarted, so this ticket's LIVE-AND-ARMED gotcha about the daemon remains true and is still the operator's call.")
+//! @yah:verify("THE OWED END-TO-END LEG IS NOW DISCHARGED — retracting this ticket's \"what was not proven\" entry above. R876-F4's three `--in-process` runs of mesofact-musl on 2026-09-09 went green on BOTH legs (the aarch64 leg for the first time on record), with YAH_RELEASE_VERSION unset — i.e. exactly the iteration case the gate exists to refuse — and cdn.yah.dev/mesofact/index.json was cmp-byte-identical before and after at sha256 62c1c0b235e26952857139537b65f8272026cd1c385c1bf6dba20481ee8a6619. That is the ticket's stated pass condition, met by byte comparison rather than by eyeballing a version. The `--in-process` path (found by R876-B8) is what made this runnable without the daemon restart the earlier attempt was blocked on.")
+//! @yah:gotcha("THE GATE'S SCOPE IS NARROWER THAN THE STALE-DAEMON WARNING THIS ENTRY ORIGINALLY CARRIED, AND THE HAZARD IS NOW CLOSED FOR THE PATH THAT MATTERS. R876-B8 landed a build-skew refusal on the CLI side and, separately, established `yah qed run <pipeline> --in-process` — which executes with the freshly installed binary, so the F6 gate applies and the camp daemon's stale build is bypassed entirely. Iterating on mesofact-musl is safe TODAY via --in-process. What remains true: a `yah qed run` WITHOUT --in-process still goes to the daemon, and B8's skew gate now refuses exactly that for publish-carrying pipelines rather than letting it through silently.")
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -87,11 +110,25 @@ pub struct PublishRequest {
 /// Resolve the release version: `YAH_RELEASE_VERSION` env override (set by the
 /// release tag / GHA), falling back to the version this binary was built at
 /// (`CARGO_PKG_VERSION`, which is the workspace version — `version.workspace`).
+///
+/// This fallback is safe only where invoking the pipeline at all IS the
+/// deliberate release act (`yah-cli-release`, run by hand to cut a release).
+/// A pipeline that also serves as a build-only iteration loop must NOT use
+/// this for its publish outcome — see [`resolve_release_version_explicit`]
+/// and `Outcome::Publish::require_explicit_version` (R876-F6).
 pub fn resolve_release_version() -> String {
+    resolve_release_version_explicit().unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
+}
+
+/// The same `YAH_RELEASE_VERSION` override, without the workspace-version
+/// fallback: `None` means no release version was ever stated, explicitly, by
+/// whoever invoked this run. R876-F6 — the invariant an unset release version
+/// must never resolve to a publishable number depends on this NOT falling
+/// back to anything.
+pub fn resolve_release_version_explicit() -> Option<String> {
     std::env::var("YAH_RELEASE_VERSION")
         .ok()
         .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
 }
 
 // ── Channel manifest wire types ─────────────────────────────────────────────
@@ -1745,14 +1782,48 @@ mod tests {
         );
     }
 
+    /// `YAH_RELEASE_VERSION` is process-global env; serialize every test that
+    /// mutates it (here and in `runner.rs`'s own copy of this lock) so they
+    /// don't race under cargo's default parallel test threads (R876-F6).
+    static RELEASE_VERSION_ENV_LOCK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn resolve_release_version_prefers_env() {
-        // SAFETY: single-threaded test; we set + clear the override locally.
+        let _guard = RELEASE_VERSION_ENV_LOCK.lock().unwrap();
         std::env::set_var("YAH_RELEASE_VERSION", "9.9.9");
         assert_eq!(resolve_release_version(), "9.9.9");
         std::env::remove_var("YAH_RELEASE_VERSION");
         // Falls back to the compiled crate version (non-empty).
         assert!(!resolve_release_version().is_empty());
+    }
+
+    /// R876-F6 — the invariant the whole ticket exists to land: with no
+    /// explicit `YAH_RELEASE_VERSION`, the explicit resolver returns `None`,
+    /// never a plausible-looking fallback number. This is what
+    /// `Outcome::Publish::require_explicit_version` checks to decide whether
+    /// to skip a publish.
+    #[test]
+    fn resolve_release_version_explicit_is_none_when_unset() {
+        let _guard = RELEASE_VERSION_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("YAH_RELEASE_VERSION");
+        assert_eq!(resolve_release_version_explicit(), None);
+
+        // An explicitly-empty override is the same as unset — filtered out,
+        // not treated as "the empty string is the release version".
+        std::env::set_var("YAH_RELEASE_VERSION", "");
+        assert_eq!(resolve_release_version_explicit(), None);
+        std::env::remove_var("YAH_RELEASE_VERSION");
+    }
+
+    #[test]
+    fn resolve_release_version_explicit_is_some_when_set() {
+        let _guard = RELEASE_VERSION_ENV_LOCK.lock().unwrap();
+        std::env::set_var("YAH_RELEASE_VERSION", "3.4.5");
+        assert_eq!(
+            resolve_release_version_explicit(),
+            Some("3.4.5".to_string())
+        );
+        std::env::remove_var("YAH_RELEASE_VERSION");
     }
 
     // ── PublishingOutcomeDispatcher with a recording publisher ──────────────

@@ -460,6 +460,7 @@ impl QedImageBuilder {
                 label: Some(label),
                 initiator: Initiator::Human { camp: "qed".into() },
                 mesh_access: MeshAccess::None,
+                cache_key: None,
             };
 
             let result = match driver.start(spec).await {

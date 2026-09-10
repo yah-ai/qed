@@ -42,6 +42,47 @@ pub struct ExecContext {
     pub env: Vec<(String, String)>,
     pub platform: Option<String>,
     pub produced: Option<ProducedFile>,
+    /// Host directory to bind at
+    /// [`workload_spec::forge_produced::CONTAINER_DIR`] for a LOCAL CONTAINER
+    /// run, so the step's declared `produces` land on the caller's filesystem
+    /// (R560-B12).
+    ///
+    /// This is the *other* half of the disagreement [`ProducedFile`] documents.
+    /// That doc says "a local run writes its artifact straight onto the
+    /// caller's disk" — true of a local NATIVE run, and false of a local
+    /// container one, whose `docker run --rm` writable layer is discarded on
+    /// exit. A container step therefore exits 0 having written a real file the
+    /// caller cannot read, which is byte-for-byte the remote failure this
+    /// module exists to prevent, minus the excuse of a network in between.
+    ///
+    /// A bind, not a retrieval leg, because the refusal below already names the
+    /// right fix — *"bind the output path directly instead of asking for
+    /// retrieval"*. Binding makes `ProducedFile`'s sentence true again for the
+    /// container case rather than adding a second transport that has to be kept
+    /// in agreement with the first.
+    ///
+    /// Honored by the local driver's container arm only. The native arm refuses
+    /// it (nothing to bind — it already writes to this filesystem) and so does
+    /// the remote driver (kamaji supplies the durable mount from
+    /// [`workload_spec::forge_produced::durable_mount`]; a second one would
+    /// silently shadow it).
+    pub produced_dir: Option<PathBuf>,
+    /// Host directory to bind at
+    /// [`workload_spec::forge_cache::CONTAINER_DIR`] for a LOCAL CONTAINER run
+    /// — the local-placement twin of `ForgeSpec::cache_key` (R876-F4).
+    ///
+    /// The two placements need two mechanisms for the same convention. A remote
+    /// step's cache is a `VolumeMount` in the workload spec, keyed under
+    /// `forge_cache::HOST_ROOT` on the worker and created by yubaba; a local
+    /// container has neither a workload spec nor a yubaba, so the caller picks
+    /// a host dir under its own camp cache and hands it in here. Both land at
+    /// the same container path, so one argv works in both placements — the same
+    /// sameness [`ExecContext::produced_dir`] exists to preserve.
+    ///
+    /// Honored by the local driver's container arm only. The native arm refuses
+    /// it (no mount namespace; the cache would be inert) exactly as it refuses
+    /// `produced_dir`.
+    pub cache_dir: Option<PathBuf>,
     pub admission: Option<AdmissionEnvelope>,
     /// Vault credentials the run needs on the worker (R555-F5). Remote-only,
     /// and **refused** by the local driver rather than ignored: a dev box has
@@ -119,6 +160,20 @@ impl ExecContext {
     /// spec carrying it rather than pretending the retrieval happened.
     pub fn with_produced(mut self, remote_path: PathBuf, dest: PathBuf) -> Self {
         self.produced = Some(ProducedFile { remote_path, dest });
+        self
+    }
+
+    /// Bind `host_dir` at the conventional container produced dir for a local
+    /// container run (R560-B12). See [`ExecContext::produced_dir`].
+    pub fn with_produced_dir(mut self, host_dir: PathBuf) -> Self {
+        self.produced_dir = Some(host_dir);
+        self
+    }
+
+    /// Bind `host_dir` at the conventional container cache dir for a local
+    /// container run (R876-F4). See [`ExecContext::cache_dir`].
+    pub fn with_cache_dir(mut self, host_dir: PathBuf) -> Self {
+        self.cache_dir = Some(host_dir);
         self
     }
 

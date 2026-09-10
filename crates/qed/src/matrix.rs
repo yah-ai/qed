@@ -870,6 +870,7 @@ target = ["x86_64", "aarch64"]
             package: None,
             context: None,
             source_context: Vec::new(),
+            cache: false,
             load: false,
             sub_pipeline: None,
             outputs: Default::default(),

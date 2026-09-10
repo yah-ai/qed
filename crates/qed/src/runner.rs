@@ -436,6 +436,42 @@
 //! @yah:next("THE REASON THIS IS A TICKET AND NOT A ONE-LINE EDIT: two concurrent isolated runs of the same pipeline would collide on one path, and R766 wants per-run worktrees RETAINED for resume-from-step. Settle those two before changing the path. A per-pipeline path plus a lock, or a small pool of numbered slots, are the shapes worth costing.")
 //! @yah:verify("Two consecutive isolated runs of the same pipeline, no source change between them, and the second run's sccache hit rate is materially above zero.")
 //! @yah:gotcha("Do not 'fix' this by moving the worktrees under /Users/leif/ss so a common base dir covers them and the camp tree. That was R833-S1's assigned hypothesis and it was measured false: a common ancestor cannot make two different sub-paths hash alike, and sccache strips nothing on the Rust path regardless. Measured with the common ancestor as a single basedir, and with both roots listed as basedirs -- 0 hits either way.")
+//!
+//! @yah:ticket(R876-B8, "Camp daemon executes QED pipelines from a stale binary and nothing detects the skew: a safety gate can be installed and still not apply")
+//! @yah:at(2026-09-09T09:48:08Z)
+//! @yah:status(review)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R876)
+//! @yah:severity(high)
+//! @yah:next("THE STRUCTURAL BUG, not the operational one: `cargo xtask install` replaces /Users/leif/.local/bin/yah but the camp daemon keeps executing whatever build it started with, and NOTHING reports the skew — no version in the run record, no refusal, no warning. So a fix can be written, tested, installed, and still silently not apply to the thing that actually runs pipelines. The fix is a version handshake: the run record should carry the executing daemon's build, and the CLI should refuse (or loudly warn) when it hands a pipeline to a daemon older than itself. Compare app/yah/cli/CLAUDE.md's existing note that `cargo build` does not touch the installed binary — this is the same class of trap one level further out.")
+//! @yah:verify("Two halves. (1) The immediate one is operational and belongs to the operator: restart the camp daemon, then confirm a `yah qed run` record names the new build. (2) The lasting one is the handshake — prove it by pinning a deliberately stale daemon and showing the CLI refuses/warns rather than running silently.")
+//! @yah:gotcha("LIVE AND ARMED AS OF 2026-09-09 — THIS IS NOT HISTORICAL. R876-F6 landed require_explicit_version on Outcome::Publish and installed the fixed binary, then started `yah qed run mesofact-musl` and found the run executing under the camp daemon (yah.app) on a stale pre-gate build that does not carry the gate at all. The run was cancelled mid-flight and cdn.yah.dev/mesofact/index.json verified byte-identical before and after, so nothing was published. But until that daemon is restarted, ANY session in this camp running `yah qed run mesofact-musl` can still publish workspace-version 0.8.35 into mesofact/index.json, which install.sh resolves for `curl | sh`. The stale daemon build DOES carry the source_context fix (24d24042), so the aarch64 leg can now go green and reach [[pipeline.on_success]] — which is exactly why the hazard is armed now and was not before.")
+//! @yah:handoff("NON-DAEMON EXECUTION PATH: IT ALREADY EXISTS. `yah qed run <pipeline> --in-process` runs the pipeline in THIS binary's process instead of proxying to the camp daemon — no daemon restart needed, and it unblocks R876-F4 and R876-F6 today. Exact invocations: `yah qed run mesofact-musl --in-process` (F6's end-to-end proof; export YAH_RELEASE_VERSION=<tag> only when you actually intend to publish, otherwise R876-F6's require_explicit_version gate correctly skips the publish outcome) and `time yah qed run mesofact-musl --in-process` x3 (F4's timings vs the 9m56s/9m57s/11m10s cold baseline). GROUNDED, not inferred: the flag is declared at app/yah/cli/src/qed.rs (`#[arg(long, default_value_t = false)] in_process: bool`), routed by `CliPlacement::should_proxy_to_daemon(has_runtime_override, force_in_process) = !force_in_process && !has_runtime_override` (qed.rs:600), and PRESENT IN THE CURRENTLY-INSTALLED BINARY — `yah qed run --help` on /Users/leif/.local/bin/yah (0.8.35+718dfacb-dirty) prints its help text verbatim. It landed as R330-B42; its own doc comment states the rationale this ticket rediscovered (\"the daemon is a separately-built binary, so a proxied run executes ITS code, not yours\"). THE FLEET LEG STILL WORKS UNDER --in-process, which is the non-obvious half: `CliPlacement::needs_fleet()` is true for Auto, so `run_one_in_process` builds the mesh client in-process, and R833-F8 live-proved exactly this — `yah qed run node-pin-smoke --where=node:us-west-003 --in-process` deployed a container on us-west-003 from the arm64 Mac. So mesofact-musl's x86_64 offload leg to us-west-003 is expected to work. COSTS, stated so nobody is surprised: the run does NOT appear in `yah qed list` or the desktop QED tab, and it dies with the terminal (not daemon-hosted, so not durable/resumable) — for F4's wall-clock timings that is irrelevant, for F6's proof it means capturing the result from the terminal rather than from a run record. I did NOT run either pipeline: reporting the invocation only, per dispatch instruction.")
+//! @yah:handoff("CORRECTION TO THIS TICKET'S OWN PREMISE, measured not assumed. The ticket says the skew produces \"no version in the run record, no refusal, no warning\". Two of three were right; THE WARNING ALREADY EXISTS AND FIRES. Observed verbatim on 2026-09-09 by running `yah qed list --limit 2` and capturing stderr: \"==> yah: camp build skew — the daemon ran this command, and it is NOT this binary. / this binary: 0.8.35+718dfacb-dirty / daemon: 0.8.35+24d24042-dirty / one or both peers built from a dirty tree — restart yah.app...\". It comes from `note_build_skew_once` (app/yah/cli/src/hub_dispatch.rs:130), fires on EVERY proxied subcommand including `yah qed run`, and landed as R330-B42 — whose doc block explicitly says \"Warns, never refuses\". R876-F6 was warned and proceeded. THAT IS THE ACTUAL DEFECT AND IT SHARPENS THE FIX: the gap is not a missing warning, it is that a warning which fires on every command in a camp that is skewed most of the working day has a signal value that decays to zero, and a publish gate must not rest on a notice the operator has been trained to scroll past. So this ticket's contribution is (a) a REFUSAL on the one verb that can publish, and (b) the durable record, not a second warning. Anyone re-reading R876-F6's gotcha (\"there is no proactive warning before `yah qed run` dispatches\") should read it as \"the warning does not STOP anything\" — it does print, on the same call.")
+//! @yah:handoff("LIVE SKEW, ESTABLISHED READ-ONLY, and how. Installed CLI: `/Users/leif/.local/bin/yah --version` -> `yah 0.8.35+718dfacb-dirty`, file mtime Sep 9 01:10. Camp daemon: pid 10867 `/Applications/yah.app/Contents/MacOS/desktop`, started Sep 8 23:53 (`ps aux`); the bundle's sibling CLI `/Applications/yah.app/Contents/MacOS/yah --version` reports `yah 0.8.35+24d24042-dirty`, all five bundle binaries mtime Sep 8 23:53. So the daemon predates the install by ~77 minutes and is 3 commits back (24d24042 -> 5f4c7b8b -> c6cd94fd -> 718dfacb). THE LOAD-BEARING DETAIL FOR THE DESIGN: both sides report semver 0.8.35 and differ ONLY in the git SHA. A semver comparison detects nothing here, and a SHA carries no order without consulting the repo — which is why this gate refuses on ANY skew rather than on \"daemon older than CLI\" as the ticket's next-line proposed. `rpc::skew_hint` already concedes the same point, falling back to \"same version, different SHA\". Direction is not the hazard anyway: a newer daemon running your older CLI's pipeline is equally \"not the code you tested\".")
+//! @yah:handoff("WHAT LANDED, two halves. (1) THE DURABLE RECORD. New `QedRunMeta::executor_build_id: Option<String>` (oss/qed/crates/qed/src/types.rs, serde default + skip_serializing_if, so all ~494 metas already on disk stay readable) mirrored as `QedRunWire::executor_build_id` (crates/yah/rpc/src/lib.rs). Named \"executor\" not \"daemon\" on purpose: an `--in-process` run's executor IS the CLI, and a field that only ever named the daemon would be silent on exactly the runs deliberately routed around it. Stamped by one helper, `executor_build_id()` in app/yah/cli/src/camp.rs (returns `env!(\"YAH_BUILD_ID\")` — compiled-in, not a runtime git read, because the question is which build COMPILED the running code, not which tree it happens to stand in), applied at the five daemon registration sites and carried across the runner's terminal meta beside `meta.launch` (camp.rs, in the `Ok(mut meta)` arm) — the runner returns None because yah-qed is a library with no build stamp of its own, exactly the existing precedent for `label` and `launch`. Rendered by `yah qed status` as `executed by: <id>`, flagged `(NOT this binary: <id>)` on mismatch — recording without surfacing would have left the question answerable only via --json. BEFORE/AFTER EVIDENCE: the actual run record R876-F6 cancelled, .yah/jit/qed/7613916e-07c1-4aef-a315-a91415a70fb5.json, has keys [completed_at, created_at, id, params, pipeline, status, steps] — no build identity of any kind. (2) THE REFUSAL — see the next handoff entry.")
+//! @yah:handoff("(2) THE REFUSAL, and the four design calls behind it, each defended because each departs from something. `qed_run_skew_verdict(skew, allow_build_skew) -> Result<(), String>` in app/yah/cli/src/qed.rs, called in the proxy branch of `QedCommands::Run` BEFORE the QED_RUN call. New flag `--allow-build-skew`. CALL A — refuse, not warn, and only on this verb: `hub_dispatch::note_build_skew_once` is right to only warn for `board show`; `qed run` is the one verb that can reach [[pipeline.on_success]] and publish to cdn.yah.dev, which install.sh resolves for `curl | sh`, so the trade inverts exactly here and nowhere else. CALL B — the CLI is the enforcement point, not the daemon. The daemon already reads Hello.build_id (R656-F4, camp.rs `record_client_build`) and could refuse there; it must not be the only gate, because a daemon-side gate is unreachable precisely when needed — installing it requires restarting the daemon, and if you could restart the daemon there would be no skew to gate. The CLI is the half `cargo xtask install` updates, so a CLI-side refusal arms at the exact moment the hazard begins. CALL C — refuse on ANY skew, not \"daemon older\" (see the live-skew entry: same semver, unordered SHAs — \"older\" is not computable in the case that matters). CALL D — how the skew is learned: a discarded `camp.client_builds` call forces a handshake and the verdict then reads `agent_tools::daemon_client::observed_build_skew()`, the camp's SINGLE existing skew decision (R656-F1, shared with the `[build skew]` error suffix and the desktop banner), so this gate cannot disagree with the notice printed beside it. Probe errors are swallowed — a daemon that refuses that verb still completed the handshake, and a diagnostic must not be able to fail a run. No daemon / no build id advertised / matching builds all proceed silently: absence is not evidence of skew, and a gate that fires when nothing is wrong gets deleted.")
+//! @yah:verify("LIVE PROOF OF THE REFUSAL, against the REAL stale daemon (pid 10867, 0.8.35+24d24042-dirty) — not a simulated boundary. Probe pipeline was `node-pin-smoke`, chosen because it is a single `echo \"$(uname -srm)\"` container step with NO [[pipeline.on_success]], so a gate that FAILED to fire could do no harm; that is what made running it against the live daemon safe. (A) DEFAULT, gate armed: `./target/debug/yah qed run node-pin-smoke --path .` -> exit 1, nothing dispatched, stderr \"==> yah qed run: REFUSED — the camp daemon would execute this pipeline, and it is NOT this binary. / this binary: 0.8.35+e714a29f-dirty / daemon: 0.8.35+24d24042-dirty\" followed by the three named ways forward. (B) ESCAPE HATCH: the same command with `--allow-build-skew` produced NO refusal and proceeded to the real qed.run call, which then failed on an unrelated pre-existing daemon transport error (\"daemon I/O: Resource temporarily unavailable (os error 35)\", the known R477-F11 EAGAIN, auto-tagged by R477-F12's `[build skew]` suffix machinery). So the gate blocks by default and provably stops blocking when told to. NOTE the client id moved from 718dfacb to e714a29f between measurement and proof — a peer committed mid-session on this shared tree; the daemon stayed 24d24042 throughout, so the skew under test is unchanged.")
+//! @yah:verify("TESTS, against a baseline MEASURED BEFORE the change (not inherited). `cargo test -p yah --lib`: baseline 1478 passed / 1 failed / 1 ignored -> after 1484 passed / 0 failed / 1 ignored. Delta fully accounted for: +5 are this ticket's new `skew_gate_tests` in app/yah/cli/src/qed.rs (a_stale_daemon_is_refused_rather_than_handed_the_pipeline — pinned to the exact live pair 718dfacb vs 24d24042; the_refusal_names_every_way_forward; a_matching_daemon_proceeds; allow_build_skew_proceeds_on_the_same_skew_that_refuses; skew_refuses_in_both_directions), and the baseline's single failure (plugin_host::tests::host_supplied_args_reach_the_child_and_the_child_is_retained) was @Ashguard:hydra's R877-F4 Seatbelt change landing in my measurement window — they confirmed it by message and fixed the fixture, which is why it converts to a pass rather than my having touched it. `cargo test -p yah-rpc --lib`: 62 passed / 0 failed, unchanged. `cargo check -p yah --lib` and `--all-targets`: both Finished, 0 errors. `cargo check --manifest-path oss/qed/Cargo.toml -p yah-qed --lib`: Finished, 0 errors.")
+//! @yah:gotcha("PRE-EXISTING FAILURE IN yah-qed, NOT FROM THIS TICKET — do not attribute it here and do not let it mask a real regression. `cargo test --manifest-path oss/qed/Cargo.toml -p yah-qed --lib` = 939 passed / 1 failed / 1 ignored; the failure is `tests::desktop_release_matrix_routes_each_row_to_its_own_platform` at oss/qed/crates/qed/src/lib.rs:603, panicking `desktop-release pipeline loads: NotFound(\"desktop-release\")`. CAUSE: the pipeline was renamed — `.yah/qed/` now holds `yah-desktop-release.toml` (added in commit 0a85122c) and no `desktop-release.toml`; the test's `PipelineLoader::load(\"desktop-release\")` string was never updated. ATTRIBUTION IS PROVEN, not assumed: `git show HEAD:oss/qed/crates/qed/src/lib.rs` carries the identical `load(\"desktop-release\")` at line 602, `git cat-file -e HEAD:.yah/qed/desktop-release.toml` reports the path absent from HEAD, and `git diff -- oss/qed/crates/qed/src/lib.rs` is empty (this ticket never touched that file). DELIBERATELY NOT FIXED HERE, and the reason is not laziness: the one-line rename to \"yah-desktop-release\" is only correct if the renamed pipeline is the SAME pipeline the test's matrix assertions were written against, and it may instead be a successor with a different matrix — in which case the honest fix is to update or retire the assertions, which is a call about the desktop release pipeline's intent that I have no grounding for. I did NOT take a pre-change yah-qed baseline (the failure was found post-change), so the 939/1 figure is not a measured delta; the mechanism above is what establishes it as pre-existing, not the count. R833-F8's handoff records this crate at 886/886 on 2026-08-29, which is a historical figure I did not re-measure.")
+//! @yah:gotcha("THE RECORD HALF DOES NOT TAKE EFFECT UNTIL THE DAEMON IS RESTARTED, and that is inherent rather than an oversight — it is the very asymmetry this ticket exists to expose. `executor_build_id` is stamped BY THE EXECUTING PROCESS, so a run proxied to the current daemon (24d24042) still persists a record with no such field, because that daemon does not contain the stamping code. Proven in passing: the R876-F6 run record .yah/jit/qed/7613916e-...json has keys [completed_at, created_at, id, params, pipeline, status, steps] and no build identity. THE REFUSAL HALF, BY CONTRAST, IS LIVE THE MOMENT THE CLI IS INSTALLED — it runs entirely in the CLI process. That split is deliberate and is design call B on the handoff: the enforcement lives in the half that `cargo xtask install` actually updates, so the camp is protected now, and the audit trail lights up later when the daemon is next restarted. Do not read a fieldless run record after installing this as evidence the change did not land; check `yah qed status <run>` for an `executed by:` line only on runs created AFTER a daemon restart. NOTE ALSO that per app/yah/cli/CLAUDE.md the camp daemon is the DESKTOP process (app/yah/desktop links camp.rs statically), so picking this up needs a desktop rebuild + reinstall (`yah qed run yah-desktop-build` then app/yah/desktop/install-app.sh, or Settings > build > \"Install & restart\"), NOT merely `cargo xtask install`.")
+//! @yah:gotcha("BEHAVIOUR CHANGE WITH A BLAST RADIUS BEYOND `yah qed run`, flagged because it is the likeliest surprise: `QedCommands::Run` has a SECOND construction site, `QedDispatch::dispatch` in app/yah/cli/src/serve_build.rs:124, which is how `yah serve` builds its binaries. It now passes `allow_build_skew: false`, so a serve-triggered build REFUSES under camp skew too. That was a deliberate call and it is arguable: this path never publishes, so a carve-out is defensible on hazard grounds. I refused it on gate grounds — whether a pipeline is \"safe\" depends on its `on_success` outcomes, not on its caller, so a caller-keyed exception cannot be stated precisely, and an imprecise exception is how a gate becomes decorative. The escape hatch still exists and the refusal names it. IF THIS PROVES ANNOYING IN PRACTICE the narrow fix is NOT to flip that literal to true but to key the gate on the pipeline's outcomes (refuse only when a resolved pipeline carries `[[pipeline.on_success]] kind = \"publish\"`), which is strictly better than either and was left out only because it widens this ticket past the handshake it was dispatched for. ALSO UNVERIFIED AT RUNTIME, stated plainly: the new `executed by:` line in `yah qed status` compiles and is covered by no test, and I could not exercise it — rendering it requires a run record that carries the field, which requires the restarted daemon this ticket is explicitly not allowed to produce.")
+//! @yah:handoff("UNCOMMITTED — every edit is live in the working tree and in nothing else; no git write was attempted (the camp git plugin owns those, and the dispatch did not ask for a commit). FILES TOUCHED, so a sweeper can scope a pathspec: oss/qed/crates/qed/src/types.rs (+executor_build_id field), oss/qed/crates/qed/src/runner.rs (+one None initializer), crates/yah/rpc/src/lib.rs (+QedRunWire::executor_build_id), app/yah/cli/src/qed.rs (--allow-build-skew flag, qed_run_skew_verdict + 5 tests, the preflight in the proxy branch, the `executed by:` line in qed status), app/yah/cli/src/camp.rs (executor_build_id() helper, 9 construction sites, the carry-across, qed_meta_to_wire), app/yah/cli/src/serve_build.rs (one field on the second QedCommands::Run literal). CAUTION FOR WHOEVER SWEEPS: app/yah/cli/src/camp.rs and app/yah/cli/src/qed.rs both carry large amounts of OTHER sessions' uncommitted work on this shared tree — R833-F8's own gotcha records camp.rs as ~780 lines of diff of which ~80 were its own — so a whole-file commit of either will sweep in peers' in-flight changes. I stayed out of oss/yubaba/crates/cloud/src/config.rs (@Miravel on R870-F16) and the three dirty .yah/infra/machines/*.toml (R870-F19) as instructed, and touched neither plugin_host.rs nor plugin_grants.rs (@Ashguard:hydra, R877-F4).")
+//! @yah:handoff("GATE NARROWED 2026-09-09 at @Ashguard:dove's call — SUPERSEDES design call A and the serve_build decision in the two handoff entries above. Read this entry as the current state; those are kept for the reasoning trail, not as description of the code. THE ARGUMENT, which is the leader's and is right: refusing on skew ALONE, for every pipeline, traded a contained hazard (an accidental CDN publish) for a broader one (nobody in the camp can build). This camp is skewed most of the working day BY CONSTRUCTION — `cargo build` does not touch the installed binary and `cargo xtask install` is comparatively rare — so a blanket refusal wired into serve_build.rs meant the next install armed a camp-wide `yah serve` refusal for every peer until someone restarted the daemon. A gate whose failure mode is \"nobody can work\" gets disarmed by whoever hits it first, and then it protects nothing. My original reasoning for the blanket form (that a caller-keyed exception cannot be stated precisely) was correct about CALLERS and drew the wrong conclusion — the precise key was never the caller, it is the PIPELINE'S OWN OUTCOMES. NEW SHAPE: `qed_run_skew_verdict(skew, outward_outcomes, allow_build_skew)` refuses only when the resolved pipeline declares a terminal outcome that reaches outside this machine. It reads `gate_pipeline` — already loaded a few lines above in qed.rs's existing pre-proxy gate block, and the same TOML the daemon will load — via the new `Pipeline::outward_facing_outcomes()`. serve_build.rs keeps `allow_build_skew: false`, which is now INERT rather than a carve-out: its pipelines declare no outcomes, so they proceed. Left at `false` rather than `true` deliberately — `true` would suppress the gate even if a serve_build pipeline ever grew a publish outcome, and the caller does not get to decide a pipeline is safe.")
+//! @yah:handoff("HOW \"OUTWARD-FACING\" IS DECIDED, and the one design property worth preserving if this is ever touched. New `Outcome::is_outward_facing()` + `Outcome::kind_str()` and `Pipeline::outward_facing_outcomes()` in oss/qed/crates/qed/src/types.rs — placed next to the enum rather than in the CLI so the daemon can reuse the same predicate and so a new variant is classified where it is defined. All four variants (Publish, Provider, YubabaDeploy, AlmanacRun) currently answer true, and that is not an accident of the current set: an `Outcome` IS qed's name for a terminal side effect on the world, and a build-only pipeline declares none — which is exactly the distinction the gate needs. IT IS STILL WRITTEN AS AN EXHAUSTIVE MATCH RATHER THAN `true`, on purpose: a future inward-facing outcome must be classified deliberately, and until someone does, adding an `Outcome` variant fails to compile. A wildcard arm would be R876-B8's own bug in miniature — a gate quietly widening its blind spot every time the enum grows. BOTH `on_success` AND `on_fail` are read, because `dispatch_terminal_outcomes` selects a list from the run's status, so an outward effect declared under on_fail is equally reachable; reading only on_success would be another \"installed but does not apply\". BLAST RADIUS, MEASURED not estimated: across all of `.yah/qed/*.toml` exactly four pipelines declare any terminal outcome — mesofact-musl, oss-binaries, yah-cli-release, yah-release, all `kind = \"publish\"` — and there are ZERO `[[pipeline.on_fail]]` outcome blocks in the camp. So the gate now catches four release pipelines and nothing else. A `--doc` run is never gated either: that path stands up `Pipeline::default()`, which declares no outcomes, which is correct — a doc declares cells, not releases.")
+//! @yah:handoff("NEW TEST FIXTURE, and why it is a file rather than a one-off command: `.yah/qed/r876b8-skew-gate-probe.toml`. Proving the REFUSING half live needs a pipeline that declares an outward-facing outcome — and every real one in the camp (mesofact-musl, oss-binaries, yah-cli-release, yah-release) genuinely publishes to cdn.yah.dev, so pointing a live gate test at one means that IF THE GATE IS BROKEN THE TEST PUBLISHES A RELEASE. The proof would be the incident. This pipeline therefore declares a publish outcome it can never reach, guarded three independent ways, any one sufficient: (1) its only step is `/bin/sh -c \"... exit 1\"`, and `on_success` outcomes dispatch only on a Success status, so a run failing at step 1 cannot reach the outcome; (2) `require_explicit_version = true`, so even a hypothetical success skips the publish unless YAH_RELEASE_VERSION is exported — do not export it for this pipeline; (3) `produces = []`, so there is no artifact set to upload. Bucket prefix is a deliberately non-existent probe path. Kept rather than deleted after use, on the node-pin-smoke precedent (R833-F8) and for a specific reason: `yah qed run r876b8-skew-gate-probe` (must REFUSE) paired with `yah qed run node-pin-smoke` (must PROCEED) is the acceptance pair for the narrowing — same camp, same daemon, same skew, opposite verdicts. IF BOTH REFUSE, the gate has reverted to blanket refusal and will brick every peer's builds; that is the regression the file exists to make one command away from detectable. It carries no annotation block of its own (participant of R876-B8, whose annotation lives on oss/qed/crates/qed/src/runner.rs), so no board_adopt was needed.")
+//! @yah:verify("TESTS AFTER THE NARROWING: `cargo test -p yah --lib` = 1488 passed / 0 failed / 1 ignored, against the 1484/0/1 recorded before it (and the 1478 passed/1 failed measured before any of this ticket's code). The +4 are the narrowing's own tests, all in `skew_gate_tests` in app/yah/cli/src/qed.rs: `a_build_only_pipeline_proceeds_under_the_same_skew_that_refuses_a_publish` (the load-bearing one — it asserts BOTH sides against one skew value, so a revert to blanket refusal fails it), `every_outward_facing_outcome_gates` (publish/provider/yubaba-deploy/almanac-run), `outward_facing_outcomes_separates_a_build_from_a_publish` (asserted against real `yah_qed::Pipeline`/`Outcome` values rather than hand-passed strings, which is what ties the CLI gate to the enum it keys on), and `an_on_fail_outcome_gates_as_well_as_an_on_success_one`. The five pre-narrowing tests were updated to the three-argument signature rather than left asserting the old behaviour. `cargo check --manifest-path oss/qed/Cargo.toml -p yah-qed --lib`: clean, 0 errors.")
+//! @yah:verify("THE `executed by:` LINE IN `yah qed status` IS COMPILED BUT NOT RUNTIME-VERIFIED — stating this explicitly so no reader takes it as proven. It has no test, and I could not exercise it: rendering it needs a run record that CARRIES `executor_build_id`, which only a daemon containing the stamping code can write, which needs the daemon restart this ticket is explicitly not permitted to perform. What IS verified about it: it compiles, and the field it reads is populated at the five daemon registration sites and carried across the runner's terminal meta. What a reviewer should do to close this: after the next desktop rebuild + reinstall, run any pipeline and check `yah qed status <run_id>` prints an `executed by: <build-id>` line, and that the `(NOT this binary: …)` suffix appears when the CLI is subsequently reinstalled ahead of the daemon. Until then treat it as unproven. Same caveat, same reason, applies to the persisted-field half generally: a run proxied to the CURRENT daemon still writes a record with no such field, because that daemon does not contain the stamping code.")
+//! @yah:gotcha("SUPERSEDED, do not act on: an earlier gotcha on this ticket said the skew gate applies to `yah serve` builds via app/yah/cli/src/serve_build.rs and recommended keying on publish outcomes only \"if this proves annoying\". That narrowing HAS SINCE BEEN DONE (see the handoff entries dated 2026-09-09 after @Ashguard:dove's call) — serve_build pipelines declare no terminal outcomes and now proceed under skew. The `allow_build_skew: false` literal is still at serve_build.rs but is inert rather than a carve-out. That older gotcha is retained only for the reasoning trail; the code no longer matches its description.")
+//! @yah:gotcha("THE PROBE PIPELINE'S THREE GUARDS EARNED THEIR KEEP ON THEIR FIRST USE — recorded because it is the strongest available argument for building test fixtures this way. On the first attempt at the post-narrowing live proof, `yah qed run r876b8-skew-gate-probe` was executed with a binary I BELIEVED carried the gate and did not: `target/debug/yah` reported `0.8.32+6f193f90-dirty` (three minor versions behind a 0.8.35 workspace) and `yah qed run --help | grep -c allow-build-skew` returned 0, despite cargo printing `Finished` and the artifact being freshly mtimed (245 MB, 02:44). So the gate could not fire, and the probe DISPATCHED to the daemon for real (run 1c77e139-13ed-4168-997a-1e555c17b2c0). Guard 1 held exactly as designed: the step exited 1, the run went FAILED, `on_success` was never selected by `dispatch_terminal_outcomes`, and nothing was published. Had I pointed that attempt at mesofact-musl or yah-cli-release — the only OTHER pipelines in this camp carrying an outward outcome — a broken-gate test would have become a live CDN publish under a stale daemon, i.e. precisely the R876-F6 incident, caused by the test for it. THE LESSON, for anyone testing a refusal: the failure mode you are testing for is \"the gate does not fire\", so the test target must be safe IN THAT CASE, not merely safe when the gate works. A single guard would have been a coin flip; three independent ones made the failed attempt a non-event.")
+//! @yah:gotcha("`target/debug/yah` IS NOT TRUSTWORTHY ON THIS SHARED TREE — verify a binary's identity before drawing any conclusion from running it. Observed 2026-09-09: `cargo build -p yah --bin yah` printed `Finished`, `ls -l target/debug/yah` showed a fresh full-size artifact (245 MB, mtime 02:44), and the binary at that path reported `0.8.32+6f193f90-dirty` with none of this ticket's code in it. Minutes earlier the SAME path had correctly served `0.8.35+718dfacb-dirty` and then `0.8.35+e714a29f-dirty`. It was also seen mid-window as a 79 MB Sep-4 artifact. ORPHAN-GC IS EXONERATED, checked per the root CLAUDE.md procedure BEFORE rebuilding rather than after: `cargo orphan-gc log -n 200` grepped for the path and the yah family shows `deleted 0 artifacts (0 bytes; 0 already gone)` across every sweep in the window — nothing was reclaimed, so this is NOT the R770 bug and should not be filed as evidence for it. Most likely cause is a cargo hardlink relink race: `target/debug/yah` is a link cargo repoints at whichever `target/debug/deps/yah-<hash>` matches the current fingerprint, and a dozen concurrent camp sessions building `-p yah` with differing fingerprints can leave it pointing at another variant's artifact, mtime and size and all. MITIGATION, and the practice worth adopting for any live proof: build and SNAPSHOT in one command (`cargo build ... && cp target/debug/yah /tmp/<private>`), then assert the snapshot's `--version` AND a string unique to your change (here `qed run --help | grep -c allow-build-skew`) before trusting a single thing it prints. Two independent identity checks, because a version string alone would not have caught a same-version peer variant.")
+//! @yah:verify("THE NARROWING PROVEN LIVE, acceptance pair, against the REAL stale daemon (0.8.35+24d24042-dirty) with a binary verified on TWO axes first (`--version` = 0.8.35+e714a29f-dirty AND `qed run --help | grep -c allow-build-skew` = 1, snapshotted to /tmp/r876b8-yah in the same command as the build — see the target/debug/yah gotcha for why an unverified binary invalidated the first attempt). SAME camp, SAME daemon, SAME skew, OPPOSITE verdicts, which is the whole point: (A) `yah qed run r876b8-skew-gate-probe` (declares `[[pipeline.on_success]] kind = \"publish\"`) -> exit 1, REFUSED before dispatch, message naming the triggering outcome explicitly — \"This pipeline declares an outcome that reaches outside this machine (publish)\" — plus both build ids and the three ways forward. (B) `yah qed run node-pin-smoke` (build-only, declares no outcome) -> PROCEEDED: no refusal, dispatched to the daemon as run 8ebd1ce8-021d-47f7-b605-24b4ee26a39b, step `identify-worker` green, \"pipeline 'node-pin-smoke' passed\". It printed only the pre-existing R330-B42 skew notice, which is exactly the intended behaviour for a build under skew — warn, do not block. That B passes is the regression guard for @Ashguard:dove's whole objection: if a future change reverts the gate to blanket refusal, B fails and the camp's builds are about to break.")
+//! @yah:verify("THE RECORD HALF'S STATED LIMITATION, CONFIRMED EMPIRICALLY rather than merely asserted. Both runs produced by the live proofs above were executed by the stale daemon, and their persisted metas carry NO build identity: `.yah/jit/qed/8ebd1ce8-021d-47f7-b605-24b4ee26a39b.json` (status success) and `.../1c77e139-13ed-4168-997a-1e555c17b2c0.json` (status failed) both have `executor_build_id` ABSENT. That is the predicted and correct result — the field is stamped BY THE EXECUTING PROCESS, and that process does not contain the stamping code — and it is now measured rather than reasoned. It also means the two halves of this ticket have genuinely different activation points, which is the asymmetry the whole design turns on: the REFUSAL is live the moment the CLI is installed (it runs entirely in the CLI process, and the proofs above are that), while the RECORD lights up only after the daemon is next rebuilt and reinstalled. Do not read a fieldless run record as evidence the change did not land.")
+//! @yah:gotcha("PRE-EXISTING yah-qed FAILURE, re-stated compactly so the next reader does not re-derive it (an earlier gotcha on this ticket has the long form). `cargo test --manifest-path oss/qed/Cargo.toml -p yah-qed --lib` fails ONE test, `tests::desktop_release_matrix_routes_each_row_to_its_own_platform` (oss/qed/crates/qed/src/lib.rs:603), with `NotFound(\"desktop-release\")`. It is NOT from this ticket and is NOT fixed here. EVIDENCE, all read-only git: `git show HEAD:oss/qed/crates/qed/src/lib.rs` carries the identical `.load(\"desktop-release\")` at line 602; `git cat-file -e HEAD:.yah/qed/desktop-release.toml` reports the path absent from HEAD; `git diff -- oss/qed/crates/qed/src/lib.rs` is empty, so this session never touched the file. Cause is a pipeline rename — `.yah/qed/yah-desktop-release.toml` exists (added in 0a85122c), `desktop-release.toml` does not — and the test's literal was never updated. LEFT ALONE DELIBERATELY: the one-line rename is only correct if the renamed pipeline is the same pipeline the matrix assertions were written against, and it may be a successor with a different matrix, in which case the honest fix is to update or retire those assertions. That is a judgement about the desktop release pipeline's intent, which this ticket has no grounding for. `cargo check -p yah-qed --lib` is clean, so this is a test-fixture staleness, not a compile break.")
+//! @yah:handoff("FILE LIST, UPDATED after the narrowing — supersedes the earlier list. Still UNCOMMITTED; no git write was attempted. oss/qed/crates/qed/src/types.rs (QedRunMeta::executor_build_id; Outcome::kind_str/is_outward_facing; Pipeline::outward_facing_outcomes), oss/qed/crates/qed/src/runner.rs (one `executor_build_id: None` initializer — note this file is also R876-B8's annotation home, so every board_update on this ticket writes @yah: lines into it and dirties a yah-qed build input; that is the R835-B6/B7 self-confounding trap and it is why the camp's build-input skew verdict named runner.rs during my own test runs), crates/yah/rpc/src/lib.rs (QedRunWire::executor_build_id), app/yah/cli/src/qed.rs (--allow-build-skew; qed_run_skew_verdict now three-arg and outcome-keyed; 9 tests in skew_gate_tests; the preflight + `gate_pipeline.outward_facing_outcomes()` call site; the `executed by:` line in qed status), app/yah/cli/src/camp.rs (executor_build_id() helper, 9 construction sites, the carry-across beside meta.launch, qed_meta_to_wire), app/yah/cli/src/serve_build.rs (one field, now inert), and NEW FILE .yah/qed/r876b8-skew-gate-probe.toml. UNCHANGED CAUTION: camp.rs and qed.rs both carry large amounts of other sessions' uncommitted work on this shared tree, so a whole-file commit of either sweeps in peers' in-flight changes. I stayed out of oss/yubaba/crates/cloud/src/config.rs and the three .yah/infra/machines/*.toml, and touched neither plugin_host.rs nor plugin_grants.rs.")
+//! @yah:handoff("LEADER DECISION MID-TICKET, recorded because the first shape was wrong and the reasoning should outlive it. The courier's initial gate refused on ANY build skew and extended to `serve_build.rs`, so `yah serve` builds would have refused too. I overruled that and had it narrowed to outcome-keyed: refuse only when the resolved pipeline declares an outward-facing terminal outcome. The asymmetry is the argument — this camp is skewed most of the working day by construction (`cargo build` does not touch the installed binary and `cargo xtask install` is rare), so a blanket refusal would have armed a camp-wide `yah serve` outage on the next install, trading a contained hazard (an accidental CDN publish) for a broader one. A gate whose failure mode is \"nobody can work\" gets disarmed by whoever hits it first, and then it protects nothing.")
+//! @yah:verify("MEASURED BLAST RADIUS OF THE NARROWED GATE: exactly four pipelines in the camp declare any terminal outcome (mesofact-musl, oss-binaries, yah-cli-release, yah-release — all `publish`), and there are zero `on_fail` outcome blocks, so everything else proceeds with only the pre-existing warning. Proven live as an acceptance pair against the real stale daemon, same skew, opposite verdicts: a purpose-built publish-carrying probe REFUSED at exit 1 naming the outcome, and `node-pin-smoke` PROCEEDED green. `cargo test -p yah --lib` 1488 passed / 0 failed (from a 1478/1 baseline whose single failure was @Ashguard:hydra's R877-F4, since fixed).")
+//! @yah:gotcha("THE COURIER'S FIRST PROOF ATTEMPT WAS INVALID AND IT CAUGHT THAT ITSELF — worth knowing because the same trap is live for anyone else building here. `target/debug/yah` reported `0.8.32+6f193f90-dirty` with zero `allow-build-skew` matches after cargo printed `Finished`: a three-versions-stale artifact on the shared target dir. Per CLAUDE.md it checked `cargo orphan-gc log` BEFORE rebuilding; orphan-gc deleted 0 artifacts and is EXONERATED here, not implicated (likely a hardlink relink race). The real proofs ran against a snapshot verified on two independent axes. That failed attempt is also why the probe pipeline was guarded three ways — the test target has to be safe in the case where the gate FAILS, not merely where it works; aiming that attempt at mesofact-musl would have caused the very incident R876-F6 exists to prevent.")
 
 use std::sync::Arc;
 
@@ -896,6 +932,100 @@ fn remote_subprocess_mesh_tags(step: &crate::types::QedStep) -> Vec<String> {
         ),
         None => Vec::new(),
     }
+}
+
+/// The build-cache sharing key for a step that declares `cache = true`
+/// (R876-F4), or `None` when it does not.
+///
+/// Derived from **pipeline + step name + target triple**, and derived rather
+/// than configured on purpose. The hazard a shared cargo target dir carries is
+/// not a slow build, it is a wrong one: two different pipelines, or one
+/// pipeline's two triples, writing one target dir. `concurrency_key` does not
+/// close that — it is camp-side scheduling, so it constrains this camp's runs
+/// of this pipeline and says nothing about a second camp or a hand-rolled
+/// dispatch aimed at the same worker. A key nobody can typo makes the collision
+/// impossible instead of unlikely.
+///
+/// Steps with no `[platform].target` fall back to `step.triple`, then to
+/// `host` — a host-native build's cache is still per-pipeline+step, and the
+/// literal is only ever a component of a key, never a claim about the arch.
+fn step_cache_key(pipeline: &str, step: &crate::types::QedStep) -> Option<String> {
+    if !step.cache {
+        return None;
+    }
+    let triple = step
+        .platform
+        .as_ref()
+        .and_then(|p| p.target.as_deref())
+        .or(step.triple.as_deref())
+        .unwrap_or("host");
+    Some(workload_spec::forge_cache::key_from_parts(
+        pipeline, &step.name, triple,
+    ))
+}
+
+/// Evict aged-out / disk-pressuring dirs from the camp-local build-cache root
+/// (R876-F4). The local-container twin of yubaba's worker-side sweep, sharing
+/// its policy through `forge_cache::evict_plan` so the two cannot drift.
+///
+/// Best-effort and opportunistic — called just before a cached local step, the
+/// same way `sweep_stale_produced_dirs` rides the deploy path, so bounded
+/// growth costs no background task. A failure here loses disk, never a build,
+/// so it warns rather than propagating.
+fn sweep_build_cache_root(root: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    let mut dirs = Vec::new();
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else { continue };
+        if !meta.is_dir() {
+            continue;
+        }
+        let Ok(mtime) = meta.modified() else { continue };
+        dirs.push((entry.path(), mtime));
+    }
+    let plan = workload_spec::forge_cache::evict_plan(
+        &dirs,
+        std::time::SystemTime::now(),
+        workload_spec::forge_cache::RETENTION,
+        free_bytes_at(root).unwrap_or(u64::MAX),
+        workload_spec::forge_cache::FREE_FLOOR_BYTES,
+    );
+    for dir in plan {
+        match std::fs::remove_dir_all(&dir) {
+            // Deleting a build cache is destructive-ish and silently expensive
+            // (the next run is cold), so it is legible at default verbosity —
+            // the same call `reap_produced_dir` was corrected to make.
+            Ok(()) => tracing::info!(dir = %dir.display(), "evicted stale qed build cache"),
+            Err(e) => tracing::warn!(dir = %dir.display(), error = %e, "failed to evict build cache"),
+        }
+    }
+}
+
+/// Free bytes on the filesystem holding `path`, via POSIX `df -Pk`.
+///
+/// `df` rather than `statvfs` for the reason yubaba's `read_filesystem` states:
+/// it is dep-free and identical on both platforms. `None` when `df` is
+/// unavailable or unparseable — the caller then treats free space as unbounded
+/// and falls back to the retention rule alone, which fails toward keeping a
+/// cache rather than toward deleting one on a bad read.
+fn free_bytes_at(path: &std::path::Path) -> Option<u64> {
+    let out = std::process::Command::new("df")
+        .arg("-Pk")
+        .arg(path)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    // Filesystem  1024-blocks  Used  Available  Capacity  Mounted-on
+    let fields: Vec<&str> = text.lines().nth(1)?.split_whitespace().collect();
+    if fields.len() < 4 {
+        return None;
+    }
+    fields[3].parse::<u64>().ok()?.checked_mul(1024)
 }
 
 /// Per-step container image override (R590-F2, finishing the R381 `step.image`
@@ -1658,6 +1788,32 @@ async fn reap_status(
     }
 }
 
+/// @yah:ticket(R876-T1, "First live exercise of the mesofact hot-ship arm: bring the fleet current and prove bundle-serve activation")
+/// @yah:at(2026-09-09T04:41:34Z)
+/// @yah:status(review)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
+/// @yah:parent(R876)
+/// @yah:next("Tier: Cleric — live production fleet, an unproven activation path, and an R2-publish side effect that has to be reasoned about before the first green run. Not a fast-and-cheap ticket.")
+/// @yah:next("THE LOOP, which is the deliverable: `yah qed run mesofact-musl` (~10 min, builds on the x86 build worker) then `yah qed run hotship --param nodes=us-east-001 --param binaries=mesofact` (seconds, repeatable across nodes and retries). Step 1 only when source changed. Prove BOTH halves actually work on hardware — everything below the build is currently reasoned, not observed.")
+/// @yah:next("ASK THE OPERATOR BEFORE THE FIRST `yah qed run mesofact-musl`, because the answer is not yours to assume: that pipeline carries `[[pipeline.on_success]] kind = \"publish\" provider = \"r2\" bucket = \"yah-dev\" base_url = \"https://cdn.yah.dev\"`, and it has never fired because the aarch64 leg always failed. The runner.rs fix in this relay may make both legs pass, so the FIRST green run publishes the workspace version (0.8.35 at filing) to cdn.yah.dev and merges it into `mesofact/index.json`, which `install.sh` reads. That is an outward-facing release. Either get explicit authorization, or set YAH_RELEASE_VERSION deliberately, or arrange to run only the leg you need.")
+/// @yah:next("START WITH `--param restart=false` (stages bytes + stamp, activates nothing), THEN activate deliberately. Reason, and it is R876-T2's whole subject: us-east-001 is the ONLY node running mesofact and it is the live yah.dev origin, with no second node able to take the load. There is nothing to serve the site while you debug a bad re-fork. `install` replaces the inode, so a staged ship leaves both running processes untouched on their old one — staging is a real outcome here, exactly as it already is for the passway arm.")
+/// @yah:verify("THE ONE THING ONLY A LIVE RUN CAN SETTLE — does `bundle-serve` activation actually pick up new bytes? The claim is that SIGTERM to the serve processes is sufficient because kamaji's native supervisor holds them at `RestartPolicy::Always` with `entrypoint` set to the runtime-asset path itself (oss/kamaji/crates/kamaji-bin/src/server.rs ~2896/2914), so the re-fork execs the replaced file and no kamaji restart is needed. That is read off the source, NOT observed. Verify by: sha256 of the running process's binary before and after (`sudo sha256sum /proc/<pid>/exe`), the `.hotship` stamp contents, and https://yah.dev/ + /releases staying 200 across the re-fork.")
+/// @yah:gotcha("FLEET STATE AS MEASURED 2026-09-08. us-east-001 (debian@51.81.85.145, mesh 100.64.0.3) is the ONLY node with a runtimes/mesofact tree — it caches 0.8.23, 0.8.31 and 0.8.32 and RUNS two 0.8.32 serve processes: the bundle (`--listen 100.64.0.3:34759`) and a revalidate tier (`--allow-route /releases --allow-route /issues`). Those two ARE the live yah.dev origin. us-south-001 has no runtimes/mesofact at all. n-dir is `/var/lib/yah/kamaji/bundles` and bundle origin is `https://cdn.yah.dev`, both read off `systemctl show kamaji -p Environment` — they arrive as a drop-in `Environment=`, never in the unit's ExecStart, so read them from the running unit rather than the unit file.")
+/// @yah:gotcha("A HOT-SHIPPED RUNTIME ASSET IS NODE-LOCAL AND NON-DURABLE, and this bites T2's drill directly. Re-place the workload or rebuild the node and kamaji cold-fetches the PUBLISHED blob from cdn.yah.dev and blake3-verifies it (runtimes/mesofact/0.8.32/x86_64-unknown-linux-musl.toml is live, 200, naming serve=e11e7fe0a469e455ce334e8e899eeea6281ee53a7c77d7896067901a67cc322a) — so the node silently reverts to release bytes and the `.hotship` stamp goes with it. Correct behaviour for an iteration tool, but it means \"is my fix still live\" can become \"no\" after a failover with nothing reporting an error. Re-ship after any move.")
+/// @yah:gotcha("The hot-ship arm deliberately overwrites ONLY versions with a running serve process, and prints `skipped <ver> (cached, not running)` for the rest. Do not \"fix\" that to cover all cached versions: us-east-001 carries three and runs one, and hot bytes under two idle release numbers would be picked up silently by a workload deployed months later, via the same cache-hit short-circuit, with nobody watching.")
+/// @yah:gotcha("MEASURED 2026-09-09 04:10-04:20Z, AND IT INVALIDATES THE PLAN: THE ARM CANNOT BE EXERCISED WITH THE ARTIFACT ON DISK. unpack_artifact resolves the newest tarball, .yah/cache/artifacts/named/2dba084468be2f2324f8a46f5853a723ae0543fafd9e40106880cdb090bff026/mesofact-x86_64-unknown-linux-musl.tar.gz (retrieved 2026-09-04 23:50Z, qed run d62e9bdd). Its `mesofact` binary is blake3 e11e7fe0a469e455ce334e8e899eeea6281ee53a7c77d7896067901a67cc322a, sha256 26b12731d60d851d2160d522c76278a822c7c711cae05b9f4dc98c1e7dbd2aa6. us-east-001's /var/lib/yah/kamaji/bundles/runtimes/mesofact/0.8.32/x86_64-unknown-linux-musl/serve has the SAME sha256, and all three running serve procs' /proc/<pid>/exe hash to it. Byte-identical: a hot ship of this artifact installs the bytes already running. Proving byte pickup needs a FRESH `yah qed run mesofact-musl`, which is the operator-gated publish.")
+/// @yah:gotcha("GOOD NEWS, MEASURED: NO R746-T3 DRIFT ON us-east-001. That same blake3 e11e7fe0a469e455ce334e8e899eeea6281ee53a7c77d7896067901a67cc322a is exactly what https://cdn.yah.dev/runtimes/mesofact/0.8.32/x86_64-unknown-linux-musl.toml declares as `serve`. `sudo find /var/lib/yah/kamaji/bundles/runtimes -name '*.hotship' -o -name '*.prehotship'` returns nothing. The node runs release bytes under the release number it claims. HASH-KIND TRAP that cost a wrong conclusion on the way here: the runtime manifest's `serve` is BLAKE3 and hotship.sh verifies with sha256sum. Both are 64 hex chars and look comparable; they are not. Use `b3sum` when comparing a local file to a runtime manifest.")
+/// @yah:next("THE PROOF THAT STILL WORKS WITH IDENTICAL BYTES IS INODE IDENTITY, and it closes this ticket's central verify question at zero compatibility risk — no new build, no publish, no operator gate. `sudo install` replaces the file with a NEW inode while running procs keep the old one open, so: (1) stage with --no-restart, assert the on-disk inode CHANGED and pids 610120/610121 still report the OLD inode via `sudo stat -L -c %i /proc/<pid>/exe` — that proves staging is real; (2) activate, assert the new pids' exe inode EQUALS the newly installed file's inode — that proves kamaji's SIGTERM re-fork execs the replaced file rather than a cached image. BASELINE CAPTURED 2026-09-09 04:14Z: on-disk 0.8.32 serve inode=530444 mtime=2026-09-04 23:52:09Z; 0.8.31 inode=529912; 0.8.23 inode=393560; running pids 610120 (yah-marketing bundle, 100.64.0.3:34759) and 610121 (revalidate tier, :40995) both exe_inode=530444.")
+/// @yah:gotcha("THE NODE IS NOT QUIET AND THE ARM IS NOT TENANT-SCOPED — check both before running. hotship's bundle-serve activation does `pkill -TERM -f \"<ndir>/runtimes/mesofact/\"`, which matches EVERY mesofact serve process on the box, not just yah-marketing's. us-east-001 currently runs three: yah-marketing's bundle (:34759), its revalidate tier (:40995) and NOISETABLE's bundle (:41507, tenant 2, R870). Measured 2026-09-09: @Miravel:polaris's R870-T9 roll restarted kamaji at 04:06:08Z, and the noisetable serve re-forked three times with three different bundle digests (c130e77e 04:11 -> 21dabdf8 04:15, pids 610309/610489/610549) because `yah cloud apply --service noisetable-marketing` was live in the OPERATOR's own terminal (camp-Mac pid 7294, started 2026-09-08 21:14 local). Confirmed with @Miravel:polaris by party.chat. Do not run the arm during another tenant's apply.")
+/// @yah:gotcha("PRE-EXISTING NOISE, NOT CAUSED BY THIS WORK, seen while baselining: kamaji on us-east-001 logs `WARN kamaji_bin::server: duplicate workload id across backends - collapsing to the most-live row; the dropped row is likely a stale record id=yah-marketing kept_state=Running kept_pid=Some(610120) dropped_state=Pending dropped_pid=None` every ~5 seconds, continuously. That is R599-B11 (filed 2026-07-21 as a cosmetic double-list on GET /workloads) still live and now a journal-spam problem — it made `journalctl -u kamaji` unreadable without a grep -v while diagnosing this ticket. Separately, `asynchronous bundle deploy failed id=noisetable reason=materialize bundle f75c6940...: missing blob manifests/f75c6940... for path manifest.toml` at 04:06:08Z is R870-T9's known bug, not this ticket's.")
+/// @yah:verify("STAGED HALF PROVEN ON REAL HARDWARE 2026-09-09 04:24:27Z. `scripts/hotship.sh --nodes us-east-001 --binaries mesofact --no-restart` (stamp 0.8.36-h8) against the live yah.dev origin. (a) THE RUNNING-VERSIONS-ONLY FILTER HELD: printed `skipped mesofact/0.8.23 (cached, not running)` and the same for 0.8.31, installed only 0.8.32; their inodes are still 393560 and 529912, unchanged. (b) INSTALL IS A REPLACE, NOT AN OVERWRITE: the 0.8.32 serve went inode 530444 -> 531343, and all three running serve procs (610120, 610121, 610763) still reported exe_inode=530444 via `sudo stat -L -c %i /proc/<pid>/exe`. So staging genuinely changes nothing until activation. (c) THE STAMP LANDED: serve.hotship, 188 bytes, hotship_version=0.8.36-h8 / sha256=26b12731... / release_version=0.8.32 / triple=x86_64-unknown-linux-musl / installed_at=2026-09-09T04:24:27Z, with serve.prehotship beside it still dated 2026-09-04 23:52 as the rollback anchor.")
+/// @yah:handoff("FIXED IN-PASS, discovered by the staged run itself: scripts/hotship.sh's closing message asserted \"These nodes now run bytes that are NOT on the CDN and match no release manifest\" on EVERY non-dry run, including --no-restart. Both halves were false for the run that exposed it — nothing was running the new bytes (all three procs still on the old inode, measured), and the bytes matched the published manifest exactly. --no-restart now gets its own branch saying the ship is STAGED, that every running process still executes the inode it already held, how to activate, and that rollback while staged is just `mv serve.prehotship serve` + `rm serve.hotship`. `bash -n` clean; --dry-run re-run confirms the dry-run branch is unaffected.")
+/// @yah:verify("THE CENTRAL QUESTION IS ANSWERED: `bundle-serve` ACTIVATION DOES PICK UP NEW BYTES, PROVEN ON THE LIVE APEX 2026-09-09 04:39Z, stamp 0.8.36-h9. Fresh artifact f5211a44 (qed run ac1101c5, x86 leg 11m16s) carries mesofact 0.8.35 at sha256 7201cbbcdc1b13cc40bdb109c04c16a084518ac779c3490c76e2d0ce45eb5290 — genuinely different from the 26b12731... the node had been running. After `scripts/hotship.sh --nodes us-east-001 --binaries mesofact`: on-disk serve sha256 = 7201cbbc..., and ALL THREE running serve processes are new pids (611259/611260/611273, all started 04:39:17Z, replacing 610120/610121/610763) whose `/proc/<pid>/exe` hashes to 7201cbbc... and resolves to inode 531343, the installed file. So the SIGTERM re-fork execs the replaced file and NO kamaji restart is needed — the claim that was read off server.rs and never observed. Idle 0.8.23 (678d0d04...) and 0.8.31 (7db565a6...) hashes unchanged, so the running-versions filter held on the activating path too.")
+/// @yah:verify("ACTIVATION IS NOT FREE AND NOW HAS A NUMBER: ~2 SECONDS OF 502 ON THE APEX. One GET/s against https://yah.dev/ across the real activation (.yah/cache/hotship/apex-probe.sh): 34 x 200/44242, with 502/0 at exactly 04:39:16 and 04:39:17 and 200 again at 04:39:18 — the SIGTERM-to-re-fork gap, matching the new processes' 04:39:17 start. A gap, not a drain; kamaji re-forks unaided. Added to hotship.sh's \"WHAT ACTIVATION COSTS\" header, which previously documented yubaba/kamaji/door costs and said nothing about bundle-serve. SAFETY THAT MADE THIS CHEAP TO RUN: before touching the live inode I booted the new binary on the node against the SAME live bundle dir on 127.0.0.1:38999 — / 200/44242, /releases 200/41629, /nope 404, byte-identical sizes to production — so 0.8.35-serving-an-0.8.32-era-bundle was proven compatible rather than assumed. Scratch binary and process removed afterwards; :38999 free.")
+/// @yah:gotcha("THE PUBLISH NEVER FIRED, AND THAT WAS LUCK RATHER THAN DESIGN — the operator authorized it, so this is a note about the pipeline, not about consent. `yah qed run mesofact-musl` (ac1101c5, 2026-09-09 04:24-04:35Z) went x86 SUCCESS / aarch64 FAILED with the identical `YAH_SOURCE_CONTEXT_URL: no source context published` error as all 13 prior runs, so `[[pipeline.on_success]]` still has not fired and nothing was written to cdn.yah.dev. THE FIX IS IN THE TREE BUT NOT IN THE BINARY: `execute_step_local_container` publishes source_context at oss/qed/crates/qed/src/runner.rs:5871 (committed in 24d24042, 2026-09-08 21:02:32 -0700, with three new tests), while /Users/leif/.local/bin/yah was built 2026-09-08 20:57 — five minutes EARLIER. Rebuild and reinstall `yah` before concluding the aarch64 leg is still broken. Useful side effect for this ticket: the failed pipeline still left its x86 artifact in .yah/cache/artifacts/named/f5211a44.../, which is what made a real byte-difference proof possible with no CDN write.")
+/// @yah:handoff("SHIPPED AND PROVEN ON THE LIVE APEX. The mesofact hot-ship loop closes end to end on real hardware: `yah qed run mesofact-musl` (x86 leg, 11m16s) -> `scripts/hotship.sh --nodes us-east-001 --binaries mesofact` (seconds) -> three serve processes re-forked onto the freshly built binary, verified by pid, inode and sha256 of /proc/<pid>/exe. us-east-001 now runs mesofact 0.8.35 bytes under the 0.8.32 runtime label, attributably: serve.hotship carries hotship_version=0.8.36-h9, sha256=7201cbbc..., release_version=0.8.32, installed_at=2026-09-09T04:39:10Z, with serve.prehotship beside it as the rollback anchor. \"Bring the fleet current\" is one node for this tier by construction - us-east-001 is the only machine with a runtimes/mesofact tree at all.")
+/// @yah:verify("Three independent facts, each measured rather than reasoned: (1) new pids 611259/611260/611273 replaced 610120/610121/610763, all starting 04:39:17Z; (2) their /proc/<pid>/exe hashes to 7201cbbc..., the artifact's sha256, and resolves to inode 531343, the installed file; (3) idle runtime versions 0.8.23 and 0.8.31 kept their original hashes, so the running-versions-only filter held on both the staged and the activating path.")
+/// @yah:verify("FINAL AVAILABILITY FIGURE, superseding the interim 34-of-36 above: 150 probes at 1/s across 04:38:59-04:42:16Z, 148 x 200/44242 and exactly 2 x 502/0 at 04:39:16 and 04:39:17. No blip after recovery — the apex ran clean for 2m58s on the hot-shipped bytes. TOOLING NOTE, and a correction to a path cited earlier in this ticket: the probe was first written to .yah/cache/hotship/apex-probe.sh, which `git check-ignore` shows is covered by .yah/.gitignore:8 (/cache) — a measurement tool nobody can re-run turns a measurement back into a claim. It now lives at scripts/hotship-probe.sh beside hotship.sh and hotship-version.sh, takes an optional count and URL, and records bytes alongside the status code deliberately (a door answering 200 with a different body is a failure a code-only probe calls success). hotship.sh's header points at it so the ~2s figure can be disagreed with rather than inherited.")
 impl PipelineRunner {
     /// Local execution — steps run as subprocesses on this machine.
     pub fn new(pipeline: Pipeline) -> Self {
@@ -3791,7 +3947,11 @@ impl PipelineRunner {
                     self.execute_step_local(event_index, step, None).await
                 }
                 (RunWhere::Local, TaskRuntime::Container) => {
-                    self.execute_step_local_container(event_index, step).await
+                    // `finally` teardown collects no artifacts — a produced
+                    // artifact belongs to the work result, not to teardown.
+                    self.execute_step_local_container(event_index, step)
+                        .await
+                        .map(|_| ())
                 }
                 (RunWhere::Local, TaskRuntime::MicroVm) => Err(local_microvm_is_refused(step)),
                 // Auto is resolved to Local/Remote by effective_placement.
@@ -3916,6 +4076,11 @@ impl PipelineRunner {
                 // R766: set only for a FAILED `Isolated` run — see the
                 // `retained_workspace` computation above.
                 retained_workspace,
+                // R876-B8: same shape as `label` and `launch` above — the
+                // runner is a library and has no build stamp of its own, so
+                // the host that owns the process stamps it on the meta it
+                // registers before spawning and carries it across this one.
+                executor_build_id: None,
             },
             produced,
         ))
@@ -4113,11 +4278,20 @@ impl PipelineRunner {
                     let _ = std::fs::remove_file(&outputs_path);
                     (result, None, collected)
                 }
-                (RunWhere::Local, TaskRuntime::Container) => (
-                    self.execute_step_local_container(event_index, step).await,
-                    None,
-                    std::collections::HashMap::new(),
-                ),
+                // R560-B12: a local container step's artifacts are collected off
+                // its bound produced dir and land in the same CAS the remote leg
+                // uses, so they flow into `remote_produced` — which despite the
+                // name is simply "the retrieved, path-rewritten set", the thing
+                // that must replace the raw container-path declarations.
+                (RunWhere::Local, TaskRuntime::Container) => {
+                    match self.execute_step_local_container(event_index, step).await {
+                        Ok(collected) => {
+                            remote_produced = collected;
+                            (Ok(()), None, std::collections::HashMap::new())
+                        }
+                        Err(e) => (Err(e), None, std::collections::HashMap::new()),
+                    }
+                }
                 (RunWhere::Local, TaskRuntime::MicroVm) => (
                     Err(local_microvm_is_refused(step)),
                     None,
@@ -4316,6 +4490,7 @@ impl PipelineRunner {
                     bucket,
                     prefix,
                     base_url,
+                    require_explicit_version,
                 } => {
                     // SubPipeline children with `propagate.produces = true`
                     // have their publish suppressed — the parent owns the
@@ -4329,12 +4504,32 @@ impl PipelineRunner {
                         );
                         continue;
                     }
+                    // R876-F6: a pipeline that doubles as an iteration loop
+                    // (mesofact-musl, run repeatedly with no args) declares
+                    // `require_explicit_version = true` so a green build never
+                    // resolves the workspace-version fallback into a
+                    // publishable number. Refuse loudly rather than silently
+                    // skipping, so an operator scanning run output sees why.
+                    let publish_version = if *require_explicit_version {
+                        match crate::publish::resolve_release_version_explicit() {
+                            Some(v) => v,
+                            None => {
+                                tracing::warn!(
+                                    run_id = %self.run_id,
+                                    "skipping Outcome::Publish: this outcome requires YAH_RELEASE_VERSION to be set explicitly and it is unset — the build succeeded but no release was cut"
+                                );
+                                continue;
+                            }
+                        }
+                    } else {
+                        version.clone()
+                    };
                     let req = crate::publish::PublishRequest {
                         provider: provider.clone(),
                         bucket: bucket.clone(),
                         prefix: prefix.clone(),
                         base_url: base_url.clone(),
-                        version: version.clone(),
+                        version: publish_version,
                         artifacts: staged.clone(),
                     };
                     self.outcome_dispatcher.publish(&req).await?;
@@ -5285,17 +5480,18 @@ impl PipelineRunner {
     }
 
     /// Dispatch a [`StepKind::WaitFor`] step (R513-F3, W207 Gap #5): poll the
-    /// configured endpoint until it is healthy, then return `Ok(())`; fail the
+    /// configured target until it is healthy, then return `Ok(())`; fail the
     /// step if it never comes up within `timeout_secs`.
     ///
-    /// The loop emits a live [`QedEvent::StepOutput`] line per attempt so the
-    /// QED tail shows "waiting … (attempt N)" and, on success, "healthy after
-    /// Nms" — the same streaming contract a subprocess step has. Cancellation is
-    /// structural: on `qed.cancel` the whole run future is dropped, which drops
-    /// this loop mid-`sleep`/probe — no lingering poller.
+    /// Emits a live [`QedEvent::StepOutput`] line per attempt so the QED tail
+    /// shows "waiting … (attempt N)" and, on success, "healthy after Nms" —
+    /// the same streaming contract a subprocess step has. Cancellation is
+    /// structural: on `qed.cancel` the whole run future is dropped, which
+    /// drops this loop mid-`sleep`/probe — no lingering poller.
     ///
-    /// The probe primitives live in [`crate::waitfor`]; this owns only the
-    /// deadline/interval scheduling and event emission.
+    /// The probe/backoff loop itself lives in the standalone `pleasehold`
+    /// crate ([`crate::waitfor`]); this owns only target resolution and event
+    /// emission around it.
     async fn execute_step_wait_for(
         &self,
         event_index: usize,
@@ -5311,98 +5507,80 @@ impl PipelineRunner {
         // Resolve the probe shape once, up front, so a malformed URL fails the
         // step immediately instead of burning the whole timeout budget retrying
         // an un-parseable target.
-        enum Probe {
-            Http(crate::waitfor::HttpTarget, Option<u16>),
-            Tcp(String),
-        }
-        let (probe, target_label) = if let Some(url) = cfg.http.as_ref() {
-            let target = crate::waitfor::parse_http_url(url).map_err(|msg| {
+        let probe = if let Some(url) = cfg.http.as_ref() {
+            crate::waitfor::Probe::http(url, cfg.expect_status).map_err(|msg| {
                 RunnerError::StepFailed {
                     step: step.name.clone(),
                     msg: format!("wait-for: {msg}"),
                 }
-            })?;
-            (Probe::Http(target, cfg.expect_status), url.clone())
+            })?
         } else if let Some(addr) = cfg.tcp.as_ref() {
-            (Probe::Tcp(addr.clone()), addr.clone())
+            crate::waitfor::Probe::tcp(addr)
+        } else if let Some(command) = cfg.shell.as_ref() {
+            crate::waitfor::Probe::shell(command)
         } else {
             // validate() guarantees exactly one target; defensive only.
             return Err(RunnerError::InvalidConfig(format!(
-                "step `{}`: wait-for with no http/tcp target (validate() should have caught this)",
+                "step `{}`: wait-for with no http/tcp/shell target (validate() should have caught this)",
                 step.name,
             )));
         };
+        let target_label = probe.label();
 
-        let timeout_budget = std::time::Duration::from_secs(cfg.timeout_secs);
-        let interval = std::time::Duration::from_millis(cfg.interval_ms.max(1));
-        // Per-attempt timeout: never let a single probe outlast the whole budget.
-        let attempt_timeout = timeout_budget.min(std::time::Duration::from_secs(5));
-        let deadline = tokio::time::Instant::now() + timeout_budget;
+        let backoff = crate::waitfor::BackoffConfig {
+            timeout: std::time::Duration::from_secs(cfg.timeout_secs),
+            initial_interval: std::time::Duration::from_millis(cfg.interval_ms),
+            max_interval: std::time::Duration::from_millis(cfg.max_interval_ms()),
+            multiplier: cfg.backoff_multiplier,
+        };
 
         self.emit(QedEvent::StepOutput {
             index: event_index,
             name: step.name.clone(),
             stream: crate::events::OutputStream::Stdout,
             line: format!(
-                "wait-for: polling {target_label} (timeout {}s, interval {}ms)",
-                cfg.timeout_secs, cfg.interval_ms,
+                "wait-for: polling {target_label} (timeout {}s, interval {}ms, backoff x{})",
+                cfg.timeout_secs, cfg.interval_ms, cfg.backoff_multiplier,
             ),
         });
 
-        let started = tokio::time::Instant::now();
-        let mut attempt: u32 = 0;
-        loop {
-            attempt += 1;
-            let outcome: Result<(), String> = match &probe {
-                Probe::Http(target, expect) => {
-                    match crate::waitfor::probe_http_once(target, attempt_timeout).await {
-                        Ok(status) if crate::waitfor::http_status_ok(status, *expect) => Ok(()),
-                        Ok(status) => Err(match expect {
-                            Some(want) => format!("HTTP {status} (want {want})"),
-                            None => format!("HTTP {status} (want 2xx/3xx)"),
-                        }),
-                        Err(e) => Err(e),
-                    }
-                }
-                Probe::Tcp(addr) => crate::waitfor::probe_tcp_once(addr, attempt_timeout).await,
-            };
+        let outcome = crate::waitfor::poll_until(&probe, &backoff, |a| match a.result {
+            Ok(()) => {}
+            Err(reason) => self.emit(QedEvent::StepOutput {
+                index: event_index,
+                name: step.name.clone(),
+                stream: crate::events::OutputStream::Stderr,
+                line: format!(
+                    "wait-for: attempt {} not ready ({reason}); retrying",
+                    a.number
+                ),
+            }),
+        })
+        .await;
 
-            match outcome {
-                Ok(()) => {
-                    let elapsed = started.elapsed().as_millis();
-                    self.emit(QedEvent::StepOutput {
-                        index: event_index,
-                        name: step.name.clone(),
-                        stream: crate::events::OutputStream::Stdout,
-                        line: format!(
-                            "wait-for: {target_label} healthy after {elapsed}ms ({attempt} attempt{})",
-                            if attempt == 1 { "" } else { "s" },
-                        ),
-                    });
-                    return Ok(());
-                }
-                Err(reason) => {
-                    // Stop if the next interval would push us past the budget —
-                    // no point sleeping only to give up.
-                    if tokio::time::Instant::now() + interval >= deadline {
-                        return Err(RunnerError::StepFailed {
-                            step: step.name.clone(),
-                            msg: format!(
-                                "wait-for: {target_label} never became healthy within {}s \
-                                 ({attempt} attempts; last: {reason})",
-                                cfg.timeout_secs,
-                            ),
-                        });
-                    }
-                    self.emit(QedEvent::StepOutput {
-                        index: event_index,
-                        name: step.name.clone(),
-                        stream: crate::events::OutputStream::Stderr,
-                        line: format!("wait-for: attempt {attempt} not ready ({reason}); retrying"),
-                    });
-                    tokio::time::sleep(interval).await;
-                }
+        match outcome {
+            Ok(success) => {
+                self.emit(QedEvent::StepOutput {
+                    index: event_index,
+                    name: step.name.clone(),
+                    stream: crate::events::OutputStream::Stdout,
+                    line: format!(
+                        "wait-for: {target_label} healthy after {}ms ({} attempt{})",
+                        success.elapsed.as_millis(),
+                        success.attempts,
+                        if success.attempts == 1 { "" } else { "s" },
+                    ),
+                });
+                Ok(())
             }
+            Err(failure) => Err(RunnerError::StepFailed {
+                step: step.name.clone(),
+                msg: format!(
+                    "wait-for: {target_label} never became healthy within {}s \
+                     ({} attempts; last: {})",
+                    cfg.timeout_secs, failure.attempts, failure.last_error,
+                ),
+            }),
         }
     }
 
@@ -5790,11 +5968,13 @@ impl PipelineRunner {
     /// to `yah-rust-bun` since R381-T8). A per-step image catalog (the
     /// rest of R381) lets pipelines pick yah-rust / yah-python / yah-cuda
     /// by name via `task::default_image::catalog_image(name)`.
+    /// `Ok(Some(..))` carries the step's `produces` rewritten to camp-local CAS
+    /// paths (R560-B12); `Ok(None)` means the step declared none.
     async fn execute_step_local_container(
         &self,
         index: usize,
         step: &crate::types::QedStep,
-    ) -> Result<(), RunnerError> {
+    ) -> Result<Option<Vec<ProducedArtifact>>, RunnerError> {
         if step.argv.is_empty() {
             return Err(RunnerError::InvalidConfig("step argv is empty".to_string()));
         }
@@ -5849,10 +6029,104 @@ impl PipelineRunner {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         env.extend(self.rendezvous_env(step));
-        let ctx = ExecContext::default()
+
+        // `source_context` used to be published on the REMOTE path only, so a
+        // step that declared one and resolved to local execution reached its
+        // argv with `$YAH_SOURCE_CONTEXT_URL` unset and died in the first
+        // second. That is not a corner: `.yah/qed/mesofact-musl.toml`'s aarch64
+        // leg declares `container_platform = "linux/arm64"`, which makes it
+        // genuinely native on the arm64 camp Mac and therefore local — and it
+        // failed that way on every one of its runs, 0 for 13, while the x86 leg
+        // beside it (offloaded, same argv, same declarations) passed. The
+        // pipeline as a whole never reached `on_success`, so its publish never
+        // fired either.
+        //
+        // Publishing for a LOCAL container means an upload the container then
+        // downloads over the loopback-ish path, which looks redundant and is
+        // the point: the two legs' argvs must stay byte-identical or they run
+        // two different builds, and that file says so in as many words. The
+        // alternative — a bind mount for the local case — is a second transport
+        // to keep in agreement with the first.
+        let source_context = self.publish_source_context(step).await?;
+        if let Some(published) = &source_context {
+            // Same precedence as the remote path: a literal in the TOML can
+            // only ever be a stale URL, so ours replaces it rather than
+            // merging behind it.
+            env.insert(
+                crate::build_context::SOURCE_CONTEXT_URL_ENV.to_string(),
+                published.url.clone(),
+            );
+        }
+
+        // R560-B12: `docker run --rm` discards the container's writable layer,
+        // so a step's declared `produces` have to be written through a bind or
+        // they cease to exist at exit — the step passes, `build-mesofact: PASS`
+        // and all, and staging then fails on a path that was never on this
+        // filesystem. Run-and-step-scoped so two concurrent legs (they are roots
+        // now) cannot land on each other's filenames.
+        let produced_dir = if step.produces.is_empty() {
+            None
+        } else {
+            let dir = self
+                .resolve_camp_root()?
+                .join(".yah/cache/qed/produced")
+                .join(&self.run_id)
+                .join(tag_to_filename(&step.name));
+            std::fs::create_dir_all(&dir).map_err(RunnerError::Io)?;
+            Some(dir)
+        };
+
+        // R876-F4: the local-placement twin of the remote cache mount. Same
+        // container path, same derived key, different host root — a worker has
+        // `forge_cache::HOST_ROOT` and yubaba to mkdir under it, a camp Mac has
+        // its own cache tree and nobody but this function. Emphatically NOT
+        // run-scoped like `produced_dir` above: a per-run cache dir is a cold
+        // build wearing a mount.
+        let cache_dir = match step_cache_key(&self.pipeline.name, step) {
+            None => None,
+            Some(key) => {
+                let root = self.resolve_camp_root()?.join(".yah/cache/qed/build");
+                let dir = workload_spec::forge_cache::cache_dir_under(&root, &key).ok_or_else(
+                    || {
+                        RunnerError::InvalidConfig(format!(
+                            "step `{}`: derived build-cache key `{key}` is not a safe path \
+                             component (R876-F4)",
+                            step.name,
+                        ))
+                    },
+                )?;
+                std::fs::create_dir_all(&dir).map_err(RunnerError::Io)?;
+                sweep_build_cache_root(&root);
+                env.insert(
+                    workload_spec::forge_cache::CACHE_DIR_ENV.to_string(),
+                    workload_spec::forge_cache::CONTAINER_DIR.to_string(),
+                );
+                Some(dir)
+            }
+        };
+
+        let mut ctx = ExecContext::default()
             .with_cwd(mount_cwd)
             .with_env(env.into_iter().collect());
-        self.drive_subprocess_step(index, step, spec, ctx).await
+        if let Some(dir) = &produced_dir {
+            ctx = ctx.with_produced_dir(dir.clone());
+        }
+        if let Some(dir) = &cache_dir {
+            ctx = ctx.with_cache_dir(dir.clone());
+        }
+        let result = self.drive_subprocess_step(index, step, spec, ctx).await;
+        // Single-use key, dropped on BOTH legs — a failed build is exactly when
+        // the temp object is least wanted and most likely to be forgotten.
+        self.discard_source_context(source_context.as_ref()).await;
+
+        // Collect only on success: a failed step's half-written tarball is not
+        // an artifact, and surfacing a read error here would mask the build
+        // failure that actually caused it.
+        match (result, produced_dir) {
+            (Ok(()), Some(dir)) => self.collect_local_container_artifacts(step, &dir).map(Some),
+            (Ok(()), None) => Ok(None),
+            (Err(e), _) => Err(e),
+        }
     }
 
     /// Hand a `(ForgeSpec, ExecContext)` to [`Self::executor`] and translate
@@ -6083,6 +6357,7 @@ impl PipelineRunner {
             label: Some(step.name.clone()),
             initiator: Initiator::Human { camp: "qed".into() },
             mesh_access: MeshAccess::None,
+            cache_key: None,
         };
 
         // Same env discipline as `execute_step_remote`: the step's declared env
@@ -6584,6 +6859,7 @@ fn build_subprocess_spec(
         label: Some(step.name.clone()),
         initiator: Initiator::Human { camp: "qed".into() },
         mesh_access: MeshAccess::None,
+        cache_key: None,
     }
 }
 
@@ -7425,6 +7701,7 @@ impl PipelineRunner {
             label: Some(step.name.clone()),
             initiator: Initiator::Human { camp: "qed".into() },
             mesh_access: MeshAccess::None,
+            cache_key: None,
         };
 
         let dispatch = driver
@@ -7807,7 +8084,13 @@ impl PipelineRunner {
         // hand the step the URL through the env; the argv fetches it.
         let source_context = self.publish_source_context(step).await?;
 
+        // R876-F4: the fourth thing, and the one that makes the other three
+        // worth repeating — a host-persistent build cache keyed so no two
+        // runs that should not share a cargo target dir can.
+        let cache_key = step_cache_key(&self.pipeline.name, step);
+
         let spec = ForgeSpec {
+            cache_key: cache_key.clone(),
             command: ForgeCommand::Subprocess {
                 argv: step.argv.clone(),
                 image,
@@ -7893,6 +8176,17 @@ impl PipelineRunner {
             let key = crate::build_context::SOURCE_CONTEXT_URL_ENV;
             env.retain(|(k, _)| k != key);
             env.push((key.to_string(), published.url.clone()));
+        }
+        // R876-F4. Same drop-then-set discipline: the container path is qed's
+        // convention, so a literal in the TOML could only disagree with the
+        // mount that was actually made.
+        if cache_key.is_some() {
+            let key = workload_spec::forge_cache::CACHE_DIR_ENV;
+            env.retain(|(k, _)| k != key);
+            env.push((
+                key.to_string(),
+                workload_spec::forge_cache::CONTAINER_DIR.to_string(),
+            ));
         }
         let ctx = ExecContext::default().with_env(env);
 
@@ -7991,35 +8285,106 @@ impl PipelineRunner {
                         artifact.path
                     ),
                 })?;
-            let landed = store.land(&bytes).map_err(RunnerError::Io)?;
-            // R560-T9: hand the publish leg a path whose BASENAME is still the
-            // build's own filename. `stage_release` keys a release object as
-            // `<binary>/<version>/<triple>/<basename>`, so rewriting `path` to
-            // the bare CAS address would publish the tarball under its 64-hex
-            // BLAKE3 — a URL no install script constructs. The CAS entry is
-            // untouched (it is R546-T3's input and the preservation check); the
-            // named path is a hard link into the same bytes.
-            let filename = remote_path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .ok_or_else(|| RunnerError::StepFailed {
-                    step: step.name.clone(),
-                    msg: format!(
-                        "produced artifact path `{}` has no filename component",
-                        artifact.path
-                    ),
-                })?;
-            let named = store
-                .link_named(&landed, filename)
-                .map_err(RunnerError::Io)?;
-            retrieved.push(ProducedArtifact {
-                binary: artifact.binary.clone(),
-                path: named.to_string_lossy().into_owned(),
-                triple: artifact.triple.clone(),
-            });
+            retrieved.push(land_produced_artifact(
+                &store, &step.name, artifact, remote_path, &bytes,
+            )?);
         }
         Ok(retrieved)
     }
+
+    /// R560-B12: the local-container analogue of
+    /// [`Self::retrieve_remote_artifacts`] — read each declared `produces` out
+    /// of the host dir that was bound at the container's produced dir, and land
+    /// it in the same content-addressed store.
+    ///
+    /// There is no fetch here because the bind already moved the bytes; what
+    /// remains is the half that is NOT about transport, and that half has to be
+    /// identical or the two legs of a pipeline diverge downstream. Both end at
+    /// [`land_produced_artifact`], so a `mesofact-musl` tarball is CAS-landed,
+    /// named-linked and handed to `stage_release` the same way whether it was
+    /// built on us-west-003 or in a container on this Mac.
+    fn collect_local_container_artifacts(
+        &self,
+        step: &crate::types::QedStep,
+        produced_dir: &std::path::Path,
+    ) -> Result<Vec<ProducedArtifact>, RunnerError> {
+        let store = crate::artifact_retrieval::ContentAddressedStore::new(
+            self.resolve_camp_root()?.join(".yah/cache/artifacts"),
+        );
+
+        let mut collected = Vec::with_capacity(step.produces.len());
+        for artifact in &step.produces {
+            let declared = std::path::Path::new(&artifact.path);
+            // Reuses the remote path's traversal guard rather than trusting the
+            // bind: `produces` is operator-authored, and `-v` would happily
+            // follow `/yah/produced/../../etc` back out onto the host.
+            let host_path = workload_spec::forge_produced::host_path_under(produced_dir, declared)
+                .ok_or_else(|| RunnerError::StepFailed {
+                    step: step.name.clone(),
+                    msg: format!(
+                        "produced artifact path `{}` is not under {} (or escapes it with `..`) \
+                         — a local container step's `produces` must sit in the bound produced \
+                         dir, the same constraint the remote leg enforces at dispatch",
+                        artifact.path,
+                        workload_spec::forge_produced::CONTAINER_DIR,
+                    ),
+                })?;
+            let bytes = std::fs::read(&host_path).map_err(|e| RunnerError::StepFailed {
+                step: step.name.clone(),
+                msg: format!(
+                    "reading produced artifact `{}` from the container's bound produced dir \
+                     ({}): {e} — the step exited 0, so it either wrote somewhere else or \
+                     wrote nothing",
+                    artifact.path,
+                    host_path.display(),
+                ),
+            })?;
+            collected.push(land_produced_artifact(
+                &store, &step.name, artifact, declared, &bytes,
+            )?);
+        }
+        Ok(collected)
+    }
+}
+
+/// Land one produced artifact's bytes in the camp's content-addressed store and
+/// return the declaration rewritten to point at them.
+///
+/// Shared by the remote retrieval leg and the local-container collection leg
+/// (R560-B12). Everything below the transport is common, and the R560-T9 naming
+/// rule in particular is the kind of subtlety that silently rots in a second
+/// copy.
+fn land_produced_artifact(
+    store: &crate::artifact_retrieval::ContentAddressedStore,
+    step_name: &str,
+    artifact: &ProducedArtifact,
+    declared_path: &std::path::Path,
+    bytes: &[u8],
+) -> Result<ProducedArtifact, RunnerError> {
+    let landed = store.land(bytes).map_err(RunnerError::Io)?;
+    // R560-T9: hand the publish leg a path whose BASENAME is still the
+    // build's own filename. `stage_release` keys a release object as
+    // `<binary>/<version>/<triple>/<basename>`, so rewriting `path` to
+    // the bare CAS address would publish the tarball under its 64-hex
+    // BLAKE3 — a URL no install script constructs. The CAS entry is
+    // untouched (it is R546-T3's input and the preservation check); the
+    // named path is a hard link into the same bytes.
+    let filename = declared_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .ok_or_else(|| RunnerError::StepFailed {
+            step: step_name.to_string(),
+            msg: format!(
+                "produced artifact path `{}` has no filename component",
+                artifact.path
+            ),
+        })?;
+    let named = store.link_named(&landed, filename).map_err(RunnerError::Io)?;
+    Ok(ProducedArtifact {
+        binary: artifact.binary.clone(),
+        path: named.to_string_lossy().into_owned(),
+        triple: artifact.triple.clone(),
+    })
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -8744,6 +9109,7 @@ mod tests {
                 package: None,
                 context: None,
                 source_context: Vec::new(),
+                cache: false,
                 load: false,
                 sub_pipeline: None,
                 gha_workflow: None,
@@ -9227,6 +9593,288 @@ mod tests {
         );
     }
 
+    /// The same contract on the LOCAL container path, which did not have it.
+    ///
+    /// `source_context` was published only by `execute_step_remote`, so a step
+    /// that declared one and resolved to local execution reached its argv with
+    /// `$YAH_SOURCE_CONTEXT_URL` unset. `.yah/qed/mesofact-musl.toml`'s aarch64
+    /// leg is exactly that shape — `container_platform = "linux/arm64"` makes
+    /// it native on the arm64 camp Mac, so it runs here rather than offloading
+    /// — and it failed in ~1.4s on every one of its 13 runs while the x86 leg
+    /// beside it passed. The pipeline never reached `on_success`, so its
+    /// publish never fired either.
+    ///
+    /// The fixture reproduces that resolution rather than asserting on a bare
+    /// step: same host triple, same platform block. Both halves are asserted
+    /// for the same reason the remote sibling asserts both — skip the publish
+    /// and the failure is invisible until a container's `:?` fires; skip the
+    /// discard and every local build leaks a tarball into the bucket.
+    #[tokio::test]
+    async fn local_container_step_publishes_its_source_context_and_reclaims_the_key() {
+        let camp = git_camp_with_tracked_file();
+        let exec = std::sync::Arc::new(CapturingExecutor::default());
+        let publisher = Arc::new(RecordingContextPublisher::default());
+
+        let mut pipeline = one_step_pipeline(
+            "build-mesofact-aarch64-musl",
+            vec!["build-mesofact.sh".to_string()],
+        );
+        pipeline.steps[0].source_context = vec![std::path::PathBuf::from("oss/mesofact")];
+        pipeline.steps[0].platform = Some(crate::platform::PlatformSpec {
+            target: Some("aarch64-unknown-linux-musl".to_string()),
+            container_platform: Some("linux/arm64".to_string()),
+            native: true,
+        });
+
+        let runner = PipelineRunner::new(pipeline)
+            .with_host_triple("aarch64-apple-darwin")
+            .with_camp_root(camp.path().to_path_buf())
+            .with_build_context_publisher(publisher.clone())
+            .with_executor(exec.clone());
+
+        let step = runner.pipeline.steps[0].clone();
+        // Guard the premise: if this ever resolves to Offload the step never
+        // reaches this path and the test would pass while asserting nothing.
+        assert!(
+            !matches!(
+                runner.resolve_step(&step),
+                crate::platform::Resolution::Offload { .. }
+            ),
+            "fixture must resolve to a LOCAL verdict or it is not testing this path",
+        );
+        runner.execute_step_local_container(0, &step).await.unwrap();
+
+        let published = publisher.published.lock().unwrap().clone();
+        assert_eq!(published.len(), 1, "exactly one source context per step");
+        let (key, tarball) = &published[0];
+        assert!(!tarball.is_empty(), "the packed tar must carry bytes");
+
+        let (_argv, env) = exec.seen.lock().unwrap().clone().unwrap();
+        let got = env
+            .iter()
+            .find(|(k, _)| k == crate::build_context::SOURCE_CONTEXT_URL_ENV)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| {
+                panic!(
+                    "the container must learn where to fetch its source; env carried {:?}",
+                    env.iter().map(|(k, _)| k).collect::<Vec<_>>()
+                )
+            });
+        assert_eq!(got, format!("https://ctx.test/{key}.tar.gz"));
+
+        assert_eq!(
+            *publisher.discarded.lock().unwrap(),
+            vec![key.clone()],
+            "the single-use key must be reclaimed once the step ends",
+        );
+    }
+
+    /// An executor that writes files into `ctx.produced_dir`, which is what a
+    /// real container does through the bind mount, and records the dir it was
+    /// handed.
+    #[derive(Default)]
+    struct ProducingExecutor {
+        /// Basenames to write under the produced dir, with their bytes.
+        writes: Vec<(String, Vec<u8>)>,
+        seen_produced_dir: std::sync::Mutex<Option<Option<std::path::PathBuf>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl ForgeExecutor for ProducingExecutor {
+        async fn execute(
+            &self,
+            _spec: ForgeSpec,
+            ctx: ExecContext,
+            _sink: Option<tokio::sync::mpsc::UnboundedSender<ExecEvent>>,
+        ) -> Result<velveteen_exec::ExecOutcome, ForgeExecutorError> {
+            *self.seen_produced_dir.lock().unwrap() = Some(ctx.produced_dir.clone());
+            if let Some(dir) = &ctx.produced_dir {
+                for (name, bytes) in &self.writes {
+                    std::fs::write(dir.join(name), bytes).unwrap();
+                }
+            }
+            Ok(velveteen_exec::ExecOutcome {
+                status: ForgeStatus::Done {
+                    exit_code: 0,
+                    ended_at: 0,
+                },
+                stderr_tail: String::new(),
+            })
+        }
+    }
+
+    fn produces(binary: &str, path: &str, triple: &str) -> ProducedArtifact {
+        ProducedArtifact {
+            binary: binary.to_string(),
+            path: path.to_string(),
+            triple: Some(triple.to_string()),
+        }
+    }
+
+    /// R560-B12. `docker run --rm` throws the writable layer away at exit, so a
+    /// local container step used to exit 0 having written a real tarball the
+    /// caller could not read — `mesofact-musl`'s aarch64 leg printed
+    /// `build-mesofact: PASS`, produced 60 MB, and then died in staging on
+    /// "No such file or directory" for the container path it had just written.
+    ///
+    /// The assertion that matters is the LAST one: the returned artifacts must
+    /// be camp-local paths that exist, not the declared container paths, so the
+    /// publish leg reads bytes instead of a hole.
+    #[tokio::test]
+    async fn local_container_step_collects_its_produced_artifacts_off_the_bind() {
+        let camp = git_camp_with_tracked_file();
+        let exec = std::sync::Arc::new(ProducingExecutor {
+            writes: vec![
+                ("mesofact-aarch64-unknown-linux-musl.tar.gz".into(), b"tarball-bytes".to_vec()),
+                ("almanac-feed-aarch64-unknown-linux-musl.tar.gz".into(), b"feed-bytes".to_vec()),
+            ],
+            ..Default::default()
+        });
+
+        let mut pipeline =
+            one_step_pipeline("build-mesofact-aarch64-musl", vec!["build.sh".to_string()]);
+        pipeline.steps[0].produces = vec![
+            produces(
+                "mesofact",
+                "/yah/produced/mesofact-aarch64-unknown-linux-musl.tar.gz",
+                "aarch64-unknown-linux-musl",
+            ),
+            produces(
+                "almanac-feed",
+                "/yah/produced/almanac-feed-aarch64-unknown-linux-musl.tar.gz",
+                "aarch64-unknown-linux-musl",
+            ),
+        ];
+
+        let runner = PipelineRunner::new(pipeline)
+            .with_host_triple("aarch64-apple-darwin")
+            .with_camp_root(camp.path().to_path_buf())
+            .with_executor(exec.clone());
+
+        let step = runner.pipeline.steps[0].clone();
+        let collected = runner
+            .execute_step_local_container(0, &step)
+            .await
+            .expect("the step succeeds and its artifacts are collectable")
+            .expect("a step declaring `produces` returns them");
+
+        assert_eq!(collected.len(), 2);
+        // The declaration's `binary` and `triple` survive — `stage_release`
+        // keys the release object off them.
+        assert_eq!(collected[0].binary, "mesofact");
+        assert_eq!(
+            collected[0].triple.as_deref(),
+            Some("aarch64-unknown-linux-musl")
+        );
+        for artifact in &collected {
+            let path = std::path::Path::new(&artifact.path);
+            assert!(
+                path.is_absolute() && path.exists(),
+                "the publish leg must receive a path on THIS filesystem, got {}",
+                artifact.path,
+            );
+            assert!(
+                !artifact.path.starts_with("/yah/produced"),
+                "the raw container path must not survive — it is what staging failed on",
+            );
+        }
+        // R560-T9: the basename is the build's own filename, not the CAS hash,
+        // because the release key ends in it.
+        assert!(
+            collected[0].path.ends_with("mesofact-aarch64-unknown-linux-musl.tar.gz"),
+            "got {}",
+            collected[0].path,
+        );
+        assert_eq!(
+            std::fs::read(&collected[0].path).unwrap(),
+            b"tarball-bytes",
+            "the landed bytes must be the ones the step wrote",
+        );
+    }
+
+    /// The floor: a step declaring no `produces` gets no bind at all, so this
+    /// cannot put a mount (or a mkdir) on every local container step in the
+    /// corpus.
+    #[tokio::test]
+    async fn local_container_step_without_produces_binds_no_produced_dir() {
+        let camp = git_camp_with_tracked_file();
+        let exec = std::sync::Arc::new(ProducingExecutor::default());
+        let pipeline = one_step_pipeline("plain", vec!["true".to_string()]);
+
+        let runner = PipelineRunner::new(pipeline)
+            .with_host_triple("aarch64-apple-darwin")
+            .with_camp_root(camp.path().to_path_buf())
+            .with_executor(exec.clone());
+
+        let step = runner.pipeline.steps[0].clone();
+        let collected = runner.execute_step_local_container(0, &step).await.unwrap();
+
+        assert!(collected.is_none(), "no produces means nothing to collect");
+        assert_eq!(
+            *exec.seen_produced_dir.lock().unwrap(),
+            Some(None),
+            "a step with no `produces` must be handed no produced dir",
+        );
+    }
+
+    /// The traversal guard. `produces` is operator-authored and `-v` would
+    /// happily follow `..` back out of the bind onto the host, so the local leg
+    /// enforces the same containment the remote leg enforces at dispatch.
+    #[tokio::test]
+    async fn local_container_produces_outside_the_produced_dir_is_refused() {
+        let camp = git_camp_with_tracked_file();
+        let exec = std::sync::Arc::new(ProducingExecutor::default());
+
+        let mut pipeline = one_step_pipeline("escapee", vec!["true".to_string()]);
+        pipeline.steps[0].produces = vec![produces(
+            "yah",
+            "/yah/produced/../../etc/passwd",
+            "aarch64-unknown-linux-musl",
+        )];
+
+        let runner = PipelineRunner::new(pipeline)
+            .with_host_triple("aarch64-apple-darwin")
+            .with_camp_root(camp.path().to_path_buf())
+            .with_executor(exec.clone());
+
+        let step = runner.pipeline.steps[0].clone();
+        let err = runner
+            .execute_step_local_container(0, &step)
+            .await
+            .expect_err("a `..` escape must be refused, not read");
+        assert!(
+            err.to_string().contains("/yah/produced"),
+            "the refusal must name the dir the path had to be under; got {err}",
+        );
+    }
+
+    /// A local container step declaring NO `source_context` must still make no
+    /// upload and see no new variable — the same floor the remote path has, so
+    /// the fix above cannot put a network call on every local container step.
+    #[tokio::test]
+    async fn local_container_step_without_source_context_publishes_nothing() {
+        let camp = git_camp_with_tracked_file();
+        let exec = std::sync::Arc::new(CapturingExecutor::default());
+        let publisher = Arc::new(RecordingContextPublisher::default());
+
+        let pipeline = one_step_pipeline("plain", vec!["true".to_string()]);
+        let runner = PipelineRunner::new(pipeline)
+            .with_camp_root(camp.path().to_path_buf())
+            .with_build_context_publisher(publisher.clone())
+            .with_executor(exec.clone());
+
+        let step = runner.pipeline.steps[0].clone();
+        runner.execute_step_local_container(0, &step).await.unwrap();
+
+        assert!(publisher.published.lock().unwrap().is_empty());
+        let (_argv, env) = exec.seen.lock().unwrap().clone().unwrap();
+        assert!(
+            !env.iter()
+                .any(|(k, _)| k == crate::build_context::SOURCE_CONTEXT_URL_ENV),
+            "a step that declares no source_context must see no URL",
+        );
+    }
+
     /// The whole existing corpus declares no `source_context`, and must
     /// therefore make no upload and see no new variable. Without this, adding
     /// the field would have quietly put a network call on the critical path of
@@ -9523,6 +10171,7 @@ mod tests {
             package: None,
             context: None,
             source_context: Vec::new(),
+            cache: false,
             load: false,
             sub_pipeline: None,
             gha_workflow: None,
@@ -9554,12 +10203,18 @@ mod tests {
 
     struct RecordingDispatcher {
         calls: Mutex<Vec<String>>,
+        /// `req.version` from each `publish()` call, in order — separate from
+        /// `calls` so R876-F6's gate tests can assert the resolved version
+        /// without disturbing the `publish:{bucket}:{count}` string other
+        /// tests already assert on.
+        publish_versions: Mutex<Vec<String>>,
     }
 
     impl RecordingDispatcher {
         fn new() -> Arc<Self> {
             Arc::new(Self {
                 calls: Mutex::new(vec![]),
+                publish_versions: Mutex::new(vec![]),
             })
         }
 
@@ -9594,6 +10249,7 @@ mod tests {
                 req.bucket,
                 req.artifacts.len()
             ));
+            self.publish_versions.lock().unwrap().push(req.version.clone());
             Ok(())
         }
     }
@@ -9639,6 +10295,7 @@ mod tests {
                 package: None,
                 context: None,
                 source_context: Vec::new(),
+                cache: false,
                 load: false,
                 sub_pipeline: None,
                 gha_workflow: None,
@@ -9741,6 +10398,7 @@ mod tests {
                 bucket: "yah-releases".into(),
                 prefix: None,
                 base_url: None,
+                require_explicit_version: false,
             }],
             vec![],
             vec!["true".to_string()],
@@ -9755,6 +10413,80 @@ mod tests {
 
         assert_eq!(meta.status, RunStatus::Success);
         assert_eq!(dispatcher.recorded(), vec!["publish:yah-releases:1"]);
+    }
+
+    /// R876-F6: `YAH_RELEASE_VERSION` is process-global env, and several tests
+    /// in this module set/clear it. Serializing the ones that do keeps them
+    /// from racing each other under cargo's default parallel test threads.
+    static RELEASE_VERSION_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// R876-F6 — the gate itself: `require_explicit_version = true` refuses to
+    /// dispatch when `YAH_RELEASE_VERSION` is unset. The run still succeeds
+    /// (a build is a build), but nothing reaches `dispatcher.publish`, which is
+    /// the whole invariant — a green iteration run must never cut a release
+    /// under the fallback workspace version.
+    #[tokio::test]
+    async fn publish_outcome_with_required_version_skips_when_unset() {
+        let _guard = RELEASE_VERSION_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("YAH_RELEASE_VERSION");
+
+        let dispatcher = RecordingDispatcher::new();
+        let pipeline = pipeline_with_outcomes(
+            vec![Outcome::Publish {
+                provider: "r2".into(),
+                bucket: "yah-dev".into(),
+                prefix: None,
+                base_url: None,
+                require_explicit_version: true,
+            }],
+            vec![],
+            vec!["true".to_string()],
+        );
+        let runner = PipelineRunner::new_with_dispatcher(pipeline, dispatcher.clone());
+        let meta = runner.run().await.unwrap();
+
+        assert_eq!(
+            meta.status,
+            RunStatus::Success,
+            "the build itself must not fail just because publish was skipped"
+        );
+        assert!(
+            dispatcher.recorded().is_empty(),
+            "no publish call may reach the dispatcher when the release version was never stated"
+        );
+    }
+
+    /// R876-F6 — the converse: an explicit `YAH_RELEASE_VERSION` still
+    /// publishes, carrying that exact version, proving the gate is a refusal
+    /// of the *implicit* fallback and not a disabled outcome.
+    #[tokio::test]
+    async fn publish_outcome_with_required_version_fires_when_set() {
+        let _guard = RELEASE_VERSION_ENV_LOCK.lock().unwrap();
+        std::env::set_var("YAH_RELEASE_VERSION", "7.7.7");
+
+        let dispatcher = RecordingDispatcher::new();
+        let pipeline = pipeline_with_outcomes(
+            vec![Outcome::Publish {
+                provider: "r2".into(),
+                bucket: "yah-dev".into(),
+                prefix: None,
+                base_url: None,
+                require_explicit_version: true,
+            }],
+            vec![],
+            vec!["true".to_string()],
+        );
+        let runner = PipelineRunner::new_with_dispatcher(pipeline, dispatcher.clone());
+        let meta = runner.run().await.unwrap();
+        std::env::remove_var("YAH_RELEASE_VERSION");
+
+        assert_eq!(meta.status, RunStatus::Success);
+        assert_eq!(dispatcher.recorded(), vec!["publish:yah-dev:0"]);
+        assert_eq!(
+            *dispatcher.publish_versions.lock().unwrap(),
+            vec!["7.7.7".to_string()],
+            "the explicit version must be the one actually published, not the workspace fallback"
+        );
     }
 
     /// R603-T4: `resume_terminal_publish_for_remote_step` replays the terminal
@@ -9785,6 +10517,7 @@ mod tests {
                 bucket: "yah-releases".into(),
                 prefix: None,
                 base_url: None,
+                require_explicit_version: false,
             }],
             vec![],
             vec!["build-v8.sh".to_string()],
@@ -9838,6 +10571,7 @@ mod tests {
                 bucket: "yah-releases".into(),
                 prefix: None,
                 base_url: None,
+                require_explicit_version: false,
             }],
             vec![],
             vec!["build-v8.sh".to_string()],
@@ -9880,6 +10614,7 @@ mod tests {
                 bucket: "yah-releases".into(),
                 prefix: None,
                 base_url: None,
+                require_explicit_version: false,
             }],
             vec!["false".to_string()],
         );
@@ -9981,6 +10716,7 @@ mod tests {
                     bucket: "yah-releases".into(),
                     prefix: None,
                     base_url: None,
+                    require_explicit_version: false,
                 },
             ],
             vec![],
@@ -10108,6 +10844,57 @@ mod tests {
     /// declared `[platform].target` arch — so an arm64 host targeting
     /// x86_64-unknown-linux-musl is pinned to an x86 build-worker (us-west-002),
     /// not left to emulate. No target ⇒ empty (any infra node).
+    /// R876-F4: the sharing key must separate the two things that would
+    /// otherwise share one cargo target dir on a worker — `mesofact-musl`'s
+    /// two triples, and any two pipelines that happen to name a step the same.
+    /// A step that does not declare `cache` gets no key at all.
+    #[test]
+    fn the_build_cache_key_separates_pipelines_steps_and_triples() {
+        use crate::platform::PlatformSpec;
+
+        let plat = |t: &str| {
+            Some(PlatformSpec {
+                target: Some(t.into()),
+                container_platform: None,
+                native: true,
+            })
+        };
+
+        let mut uncached = mk_step("build-mesofact-x86_64-musl", &["true"]);
+        uncached.platform = plat("x86_64-unknown-linux-musl");
+        assert_eq!(
+            step_cache_key("mesofact-musl", &uncached),
+            None,
+            "cold-every-run stays the default",
+        );
+
+        let mut x86 = uncached.clone();
+        x86.cache = true;
+        let mut arm = x86.clone();
+        arm.name = "build-mesofact-aarch64-musl".into();
+        arm.platform = plat("aarch64-unknown-linux-musl");
+
+        let k_x86 = step_cache_key("mesofact-musl", &x86).expect("cache = true yields a key");
+        let k_arm = step_cache_key("mesofact-musl", &arm).expect("cache = true yields a key");
+        let k_other = step_cache_key("some-other-pipeline", &x86).expect("key");
+
+        assert_ne!(k_x86, k_arm, "the two legs must not share a target dir");
+        assert_ne!(
+            k_x86, k_other,
+            "a second pipeline must not land on this one's target dir",
+        );
+        for k in [&k_x86, &k_arm, &k_other] {
+            assert!(
+                workload_spec::forge_cache::is_valid_key(k),
+                "{k} must be a safe single path component",
+            );
+        }
+        assert!(
+            k_x86.contains("mesofact-musl") && k_x86.contains("x86_64-unknown-linux-musl"),
+            "the key should stay legible on the worker for debugging + eviction: {k_x86}",
+        );
+    }
+
     #[test]
     fn remote_subprocess_mesh_tags_pins_arch_matched_worker_from_target() {
         use crate::platform::PlatformSpec;
@@ -11069,11 +11856,10 @@ mod tests {
         let gate = mk_wait_for(
             "wait:db",
             crate::types::WaitForConfig {
-                http: None,
                 tcp: Some(addr),
-                expect_status: None,
                 timeout_secs: 5,
                 interval_ms: 50,
+                ..Default::default()
             },
         );
         let work = mk_step("work", &["sh", "-c", "echo done"]);
@@ -11116,10 +11902,9 @@ mod tests {
             "wait:ready",
             crate::types::WaitForConfig {
                 http: Some(format!("http://{addr}/health")),
-                tcp: None,
-                expect_status: None,
                 timeout_secs: 5,
                 interval_ms: 50,
+                ..Default::default()
             },
         );
         let (tx, mut rx) = mpsc::unbounded_channel();
@@ -11150,11 +11935,10 @@ mod tests {
         let gate = mk_wait_for(
             "wait:never",
             crate::types::WaitForConfig {
-                http: None,
                 tcp: Some(addr),
-                expect_status: None,
                 timeout_secs: 1,
                 interval_ms: 100,
+                ..Default::default()
             },
         );
         let pipeline = bg_pipeline("wf-timeout", vec![gate]);
@@ -11166,6 +11950,65 @@ mod tests {
         assert!(
             err.contains("never became healthy"),
             "timeout surfaces a clear message; got {err:?}"
+        );
+    }
+
+    /// A `shell` wait-for polls an arbitrary command — the escape hatch for
+    /// targets `http`/`tcp` can't express (HTTPS, an npm-registry check).
+    /// Backed by a marker file so the probe genuinely fails until a later
+    /// attempt, exercising the retry loop the same way the http/tcp tests do.
+    #[tokio::test]
+    async fn wait_for_shell_passes_once_marker_file_appears() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("ready");
+        let marker_for_writer = marker.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            std::fs::write(&marker_for_writer, b"ok").unwrap();
+        });
+
+        let gate = mk_wait_for(
+            "wait:shell",
+            crate::types::WaitForConfig {
+                shell: Some(format!("test -f {}", marker.display())),
+                timeout_secs: 5,
+                interval_ms: 20,
+                ..Default::default()
+            },
+        );
+        let pipeline = bg_pipeline("wf-shell", vec![gate]);
+        let meta = PipelineRunner::new(pipeline).run().await.unwrap();
+        assert_eq!(meta.status, RunStatus::Success);
+    }
+
+    /// `backoff_multiplier > 1.0` grows the poll interval — a run whose gate
+    /// never becomes healthy takes noticeably longer to reach its `attempts`
+    /// count than a fixed-interval gate would, and the failure message still
+    /// reports both.
+    #[tokio::test]
+    async fn wait_for_backoff_grows_interval_on_repeated_misses() {
+        let gate = mk_wait_for(
+            "wait:backoff",
+            crate::types::WaitForConfig {
+                shell: Some("exit 1".to_string()),
+                timeout_secs: 1,
+                interval_ms: 50,
+                backoff_multiplier: 3.0,
+                max_interval_ms: Some(400),
+                ..Default::default()
+            },
+        );
+        let pipeline = bg_pipeline("wf-backoff", vec![gate]);
+        let meta = PipelineRunner::new(pipeline).run().await.unwrap();
+        assert_eq!(meta.status, RunStatus::Failed);
+        let row = meta.steps.iter().find(|s| s.name == "wait:backoff").unwrap();
+        let err = row.error.as_deref().unwrap_or_default();
+        // 50ms then 150ms (capped under 400ms) sleeps inside a 1s budget: at
+        // most a handful of attempts, never the ~20 a fixed 50ms interval
+        // would allow.
+        assert!(
+            err.contains("attempts") && !err.contains("15 attempts") && !err.contains("20 attempts"),
+            "expected backoff to sharply cut attempt count; got {err:?}"
         );
     }
 
@@ -11586,10 +12429,9 @@ mod tests {
             "wait:tls",
             crate::types::WaitForConfig {
                 http: Some("https://localhost:8443/health".to_string()),
-                tcp: None,
-                expect_status: None,
                 timeout_secs: 30, // long budget; must NOT be consumed
                 interval_ms: 100,
+                ..Default::default()
             },
         );
         let pipeline = bg_pipeline("wf-tls", vec![gate]);
@@ -12212,6 +13054,7 @@ mod tests {
                 package: None,
                 context: None,
                 source_context: Vec::new(),
+                cache: false,
                 load: false,
                 sub_pipeline: None,
                 gha_workflow: None,
@@ -12480,6 +13323,7 @@ description = "smoke test image"
                 package: None,
                 context: None,
                 source_context: Vec::new(),
+                cache: false,
                 load: false,
                 sub_pipeline: None,
                 gha_workflow: None,
@@ -12755,6 +13599,7 @@ produces    = ["native-tarball"]
                 package: Some(package.to_string()),
                 context: None,
                 source_context: Vec::new(),
+                cache: false,
                 load: false,
                 sub_pipeline: None,
                 gha_workflow: None,
@@ -12894,6 +13739,7 @@ produces    = ["native-tarball"]
                     package: None,
                     context: None,
                     source_context: Vec::new(),
+                    cache: false,
                     load: false,
                     sub_pipeline: None,
                     gha_workflow: None,
@@ -12935,6 +13781,7 @@ produces    = ["native-tarball"]
                     package: None,
                     context: None,
                     source_context: Vec::new(),
+                    cache: false,
                     load: false,
                     sub_pipeline: None,
                     gha_workflow: None,
@@ -13005,6 +13852,7 @@ produces    = ["native-tarball"]
                 package: None,
                 context: None,
                 source_context: Vec::new(),
+                cache: false,
                 load: false,
                 sub_pipeline: None,
                 gha_workflow: None,
@@ -13223,6 +14071,7 @@ produces    = ["native-tarball"]
             package: None,
             context: None,
             source_context: Vec::new(),
+            cache: false,
             load: false,
             sub_pipeline: None,
             gha_workflow: None,
@@ -13617,6 +14466,7 @@ produces    = ["native-tarball"]
             package: None,
             context: None,
             source_context: Vec::new(),
+            cache: false,
             load: false,
             sub_pipeline: Some(SubPipelineConfig {
                 target,
@@ -13928,6 +14778,7 @@ produces    = ["native-tarball"]
                 bucket: "yah-dev".into(),
                 prefix: None,
                 base_url: None,
+                require_explicit_version: false,
             }],
             vec![],
             // Write the artifact where `produces` says it is — relative to the
@@ -13986,6 +14837,7 @@ produces    = ["native-tarball"]
                 bucket: "yah-dev".into(),
                 prefix: None,
                 base_url: Some("https://cdn.yah.dev".into()),
+                require_explicit_version: false,
             }],
             vec![],
             vec![
@@ -14030,6 +14882,7 @@ produces    = ["native-tarball"]
                 bucket: "yah-dev".into(),
                 prefix: None,
                 base_url: Some("https://cdn.yah.dev".into()),
+                require_explicit_version: false,
             }],
             vec![],
             vec!["true".into()],
@@ -14640,6 +15493,7 @@ jobs:
             package: None,
             context: None,
             source_context: Vec::new(),
+            cache: false,
             load: false,
             sub_pipeline: None,
             outputs: Vec::new(),
@@ -14922,6 +15776,7 @@ jobs:
             package: None,
             context: None,
             source_context: Vec::new(),
+            cache: false,
             load: false,
             sub_pipeline: None,
             outputs: Vec::new(),
@@ -15053,6 +15908,7 @@ jobs:
             bucket: "yah-releases".into(),
             prefix: None,
             base_url: None,
+            require_explicit_version: false,
         }];
 
         // Parent: SubPipeline child with propagate.produces=true + its own
@@ -15071,6 +15927,7 @@ jobs:
             bucket: "yah-releases".into(),
             prefix: None,
             base_url: None,
+            require_explicit_version: false,
         }];
 
         let mut map = std::collections::HashMap::new();
@@ -15102,6 +15959,7 @@ jobs:
             bucket: "yah-releases".into(),
             prefix: None,
             base_url: None,
+            require_explicit_version: false,
         }];
 
         let mut root = make_pipeline(
@@ -15117,6 +15975,7 @@ jobs:
             bucket: "yah-releases".into(),
             prefix: None,
             base_url: None,
+            require_explicit_version: false,
         }];
 
         let mut map = std::collections::HashMap::new();
@@ -15163,6 +16022,7 @@ jobs:
             bucket: "yah-releases".into(),
             prefix: None,
             base_url: None,
+            require_explicit_version: false,
         }];
 
         let mut map = std::collections::HashMap::new();
@@ -15322,6 +16182,7 @@ jobs:
             bucket: "yah-releases".into(),
             prefix: None,
             base_url: Some("https://releases.yah.dev".into()),
+            require_explicit_version: false,
         }];
 
         let mut map = std::collections::HashMap::new();
@@ -15330,8 +16191,10 @@ jobs:
         map.insert("builtin:child-mesofact".to_string(), child_mesofact);
         let resolver: Arc<dyn SubPipelineResolver + Send + Sync> = Arc::new(MapResolver(map));
 
-        // Pin the version so the staged path is deterministic. SAFETY:
-        // single-threaded test; set + clear locally.
+        // Pin the version so the staged path is deterministic. R876-F6:
+        // serialized against the other YAH_RELEASE_VERSION-mutating tests via
+        // RELEASE_VERSION_ENV_LOCK — this env var is process-global.
+        let _env_guard = RELEASE_VERSION_ENV_LOCK.lock().unwrap();
         std::env::set_var("YAH_RELEASE_VERSION", "1.2.3");
 
         let recorder = Arc::new(StageRecorder::default());
@@ -15732,6 +16595,7 @@ jobs:
                 bucket: "yah-dev".into(),
                 prefix: None,
                 base_url: None,
+                require_explicit_version: false,
             }],
             vec![],
             vec!["true".to_string()],
@@ -16322,6 +17186,7 @@ jobs:
             package: None,
             context: None,
             source_context: Vec::new(),
+            cache: false,
             load: false,
             sub_pipeline: None,
             outputs: Vec::new(),

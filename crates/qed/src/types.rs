@@ -381,6 +381,28 @@
 //! @yah:assumes("NEVER RUN ON TWO REAL MACHINES. Everything is unit-tested, and the remote dispatch path is proven only as far as 'the preflight lets a participant sidecar through and it then fails on the absence of a wired dispatcher' (a_remote_participant_sidecar_clears_the_background_preflight). Filed as R823-T3, which also carries what to check first.")
 //! @yah:assumes("THE LEAST-TESTED LINK IS REACHABILITY, and it is an inference rather than an observation: I read in velveteen-exec's build_workload_spec that every remote forge subprocess workload gets HOST_NETWORK_ANNOTATION (R590-B7), and concluded that a participant binding its assigned port therefore answers on the node's own network stack at the address its peers were handed. I did not observe a packet. If one thing in this ticket is wrong, expect it to be this.")
 //! @yah:assumes("NEVER-STARTED IS DETECTED ONLY FOR BACKGROUND participant steps, because the workload-id evidence lives on the sidecar reap path. A FOREGROUND participant step whose remote dispatch is refused reports as Failed — a less precise diagnosis than it could be. Stated in participant_reports' doc rather than hidden; it is the coordinator-shaped case, and a coordinator that cannot be dispatched fails the run either way.")
+//!
+//! @yah:ticket(R876-F4, "Persistent CARGO_TARGET_DIR for offloaded builds: every fleet build is cold because only /yah/produced survives")
+//! @yah:at(2026-09-09T10:40:28Z)
+//! @yah:status(review)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R876)
+//! @yah:next("Tier: Wizard — a schema addition to QedStep plus a mount in build_workload_spec, with a real correctness edge (cache poisoning / concurrent runs) to design out rather than discover. THE PAYOFF, measured: mesofact-musl's x86_64 leg is 9m56s / 9m57s / 11m10s across its three successful runs, and every one of those is a COLD full release build. That ~10 min is the whole remaining cost of R876-T1's iteration loop once the hot-ship arm removes the publish/republish/apply round trip.")
+//! @yah:next("WHY IT IS COLD, precisely. A remote subprocess step gets exactly three things — image, argv, and the `/yah/produced` durable mount (qed task remote.rs `build_workload_spec`; the constraint is stated verbatim at types.rs:1072 and build_context.rs:40). mesofact-musl's argv then does `mkdir -p /work`, fetches the source_context tarball, extracts, and builds with CARGO_TARGET_DIR defaulting to `/work/oss/mesofact/target` — inside the container, which kamaji reaps. Nothing carries over. `/yah/produced` is NOT a usable cache either: it maps to `/var/lib/yah/qed/produced/<forge_id>`, one dir per run, reaped on destroy with a 3-day TTL sweep.")
+//! @yah:next("THE HOOK ALREADY EXISTS — this is not new plumbing. R603-B6's fourth-defect fix generalized the host-state root: `workload_spec::forge_state` names `/var/lib/yah/qed` as THE forge state root with an `is_forge_state_path()` prefix+traversal guard, yubaba's `ensure_forge_state_dirs` mkdirs any forge bind under it, and yubaba.service grants the root once (StateDirectory=yah/qed, ReadWritePaths=/var/lib/yah/qed) rather than per-leaf. That handoff says in as many words: \"A fifth forge mount now needs neither code nor a unit-file edit.\" So the shape is a QedStep field lowering to a VolumeMount under forge_state::HOST_ROOT, validated by is_forge_state_path — mirroring forge_produced::durable_mount.")
+//! @yah:gotcha("DESIGN THE SHARING KEY BEFORE WRITING THE MOUNT — an unkeyed shared target dir is a correctness bug, not just a race. Two concurrent runs of different pipelines, or the same pipeline at different source revisions, must not share one cargo target dir on the worker. mesofact-musl's own `concurrency_key = \"mesofact-musl\"` already serializes it against itself, but that key is camp-side scheduling and does NOT constrain a second camp or a hand-rolled dispatch to the same node. Key the mount by something that makes collision impossible (pipeline+step+triple at minimum) and decide explicitly what evicts it — an unbounded cache on a worker rootfs is R702's subject, and the arm workers' 2.5 GB rootfs is already the recorded blocker for mesofact-musl's aarch64 leg.")
+//! @yah:gotcha("CARGO'S FRESHNESS IS MTIME-BASED and the source arrives as a fresh tar extract every run, so a warm target dir does not automatically mean a warm build — `tar` sets mtimes from the archive, and qed packs deterministically (`--mtime='@0'` is used on the produced side). Check what the source_context tar does to mtimes before assuming incremental reuse actually fires; a mount that caches nothing is worse than none, because it looks like it works. R833-S5 is the sibling question for a network-mounted tree (\"does cargo's mtime-based freshness survive\") and is worth reading first rather than re-deriving.")
+//! @yah:verify("Success is a measurement, not a green build: re-run mesofact-musl's x86_64 leg twice with no source change and once with a one-line change, and report all three wall-clock times against the 9m56s / 9m57s / 11m10s cold baseline recorded above. A second run that is not materially faster means the mount is mounted but cargo is not reusing it — see the mtime gotcha.")
+//! @yah:handoff("SHIPPED AND MEASURED. New `forge_cache` module in oss/yah-base/crates/workload-spec/src/lib.rs (sibling of `forge_produced`, under `forge_state::HOST_ROOT` as R603-B6 predicted): CONTAINER_DIR=/yah/cache, CACHE_DIR_ENV=YAH_CACHE_DIR, HOST_ROOT=/var/lib/yah/qed/cache, key validation, `durable_mount`, and the pure `evict_plan` policy fn. `ForgeSpec.cache_key: Option<String>` (oss/qed/crates/velveteen/src/lib.rs:445) lowers to a writable VolumeMount in `remote::build_workload_spec` (oss/qed/crates/velveteen-exec/src/remote.rs); `ExecContext.cache_dir` + a 7th `local_container_command` arg do the same for the LOCAL container placement, same container path so mesofact-musl's two argvs stay byte-identical. `QedStep.cache: bool` (oss/qed/crates/qed/src/types.rs) with `step_cache_key()` in runner.rs deriving the key. .yah/qed/mesofact-musl.toml: `cache = true` on both legs plus `export CARGO_TARGET_DIR=\"${YAH_CACHE_DIR:?...}/target\"` in each argv (in the argv, not injected — same seam as YAH_SOURCE_CONTEXT_URL).")
+//! @yah:handoff("SHARING KEY = pipeline + step name + target triple, DERIVED not configured. `QedStep.cache` is a bool on purpose: the hazard is a wrong build, not a slow one, and a key nobody can typo makes the collision impossible rather than unlikely. Live keys: `mesofact-musl.build-mesofact-x86_64-musl.x86_64-unknown-linux-musl` (worker) and `mesofact-musl.build-mesofact-aarch64-musl.aarch64-unknown-linux-musl` (camp-local) — legible on the box for debugging and eviction. Chars outside [A-Za-z0-9._-] collapse to `-`; over 96 chars truncates + appends an FNV-1a suffix of the FULL string so shortening cannot merge two keys (FNV not blake3 because workload-spec is deliberately a zero-dep schema crate — even its cipher is opt-in). Two runs of the SAME key do share, which is the point; cargo's own .cargo-lock serializes any overlap. Refused rather than ignored on: non-subprocess kinds, `runtime = native` (no mount namespace), Workload/BuildImage forge commands, and any key that is not a safe single path component.")
+//! @yah:handoff("EVICTION IS EXPLICIT AND BOUNDED IN BOTH TIME AND BYTES — no unbounded mount shipped. One policy fn, `forge_cache::evict_plan`, shared by both holders of a cache root so worker and Mac cannot drift: (1) any cache dir idle past RETENTION (14 days) is removed unconditionally; (2) while the filesystem holding the root is under FREE_FLOOR_BYTES (10 GiB) the least-recently-used survivor is removed, one per sweep, so under sustained pressure the worst case is a cold build and never a full disk. Free space is read with POSIX `df -Pk` (dep-free, same reason yubaba's node::read_filesystem gives); an unreadable df means \"no pressure\", so a bad read can never become a reason to delete a cache. Worker side: `sweep_build_cache_dirs()` in oss/yubaba/crates/yubaba/src/lib.rs:4876, called at deploy right beside `sweep_stale_produced_dirs()` — a cache dir has no reap-on-destroy leg by design, so this sweep is the ONLY thing bounding it. Camp side: `sweep_build_cache_root()` in oss/qed/crates/qed/src/runner.rs, called before each cached local-container step. Measured after 3 runs: worker cache 2.8 GB on a 60 GB /var with 25 GB free; camp-local cache 2.7 GB.")
+//! @yah:handoff("THE MTIME TRAP — CHECKED FIRST, AND IT DOES NOT BITE, for a reason worth writing down because the ticket's own gotcha guessed the other way. The `--mtime='@0'` determinism is on the PRODUCED side only (the pipeline's own tar of almanac-feed). The SOURCE packer does the opposite: `pack_source_context` (oss/qed/crates/qed/src/build_context.rs:247) uses `tar::Builder::append_file`, which that same file's doc comment at line 371-372 states copies the file's mode, uid/gid AND MTIME into each header; the argv extracts with `tar --no-same-owner -xzf`, and GNU tar restores mtimes from the archive by default (no -m/--touch). So the worker's /work tree carries the CAMP WORKING-TREE mtimes, not extraction time and not epoch 0 — an unchanged camp tree therefore extracts byte-identical mtimes every run, all older than the previous run's target-dir outputs, and cargo's mtime freshness holds. The container path is /work both runs, and the digest-pinned image fixes CARGO_HOME/registry, so nothing else in the fingerprint moves either. Proven by counting, not by inference: 795 `Compiling` lines in run 1 vs 4 in run 2, with every source file under the three shipped subtrees carrying an mtime older than run 1's start.")
+//! @yah:verify("THE MEASUREMENT (three timed `yah qed run mesofact-musl --in-process` runs, release binary 0.8.35+e714a29f-dirty built by me and verified BY CONTENT before use — `yah --version` plus grep -a on the binary for YAH_CACHE_DIR / /yah/cache / 'mount namespace for the bind' / 'evicted stale qed build cache', all present. `--in-process` because the camp daemon is on a stale 0.8.35+24d24042-dirty build; the daemon was NOT restarted). Baseline was 9m56s / 9m57s / 11m10s, all cold. Run 1 (cold, cache created): 11m13s — in baseline range, as expected for the run that fills the cache. Run 2 (no source change): 37.955s — 17.7x faster than run 1, and 4 crates recompiled instead of 795. Run 3 (one-line comment added to oss/mesofact/crates/mesofact/src/health.rs): 3m57s — only mesofact + mes + mesofact-dev rebuilt, the remaining ~4 min is the two irreducible release LINKS of the V8-linked binaries. All three runs: BOTH legs green, pipeline Success. The marker line was reverted with an editor write, not git; grep confirms 0 occurrences remain.")
+//! @yah:verify("THE MOUNT WAS CONFIRMED ON THE BOX, not just in the timings. During run 1, `/var/lib/yah/qed/cache/mesofact-musl.build-mesofact-x86_64-musl.x86_64-unknown-linux-musl/target/x86_64-unknown-linux-musl/` appeared on us-west-003 and grew (164 MB mid-run, 2.8 GB at rest), created by the DEPLOYED yubaba 0.8.28 — no yubaba deploy needed, exactly as R603-B6's 'a fifth forge mount needs neither code nor a unit-file edit' promised. Files land root:root, which is writable because kamaji runs these containers as uid 0 with no userns remap (verified against the existing produced dirs' ownership, not assumed). Camp-local twin appeared at .yah/cache/qed/build/mesofact-musl.build-mesofact-aarch64-musl.aarch64-unknown-linux-musl. NOTE FOR WHOEVER ROLLS YUBABA NEXT: the eviction sweep is in the tree but NOT on us-west-003 until yubaba is redeployed — the mount is bounded by design and unbounded in practice until that roll. Unit tests: 8 new in workload-spec (forge_cache_tests), 4 in velveteen-exec remote (mount shape / no-key / traversing-key refusal / native refusal), 2 in velveteen-exec local (cache bind + absent-by-default), 1 in qed types (both validate refusals + the accepted shape), 1 in qed runner (key separates pipelines, steps and triples) — all pass. `cargo run -p xtask -- emit-schemas` re-run: qed-pipeline.toml.schema.json carries the new `cache` field; check-workload-spec-ts.sh reports in sync.")
+//! @yah:verify("R876-F6 RIDER, DISCHARGED IN FULL ON RUN 1 — the owed end-to-end proof. cdn.yah.dev/mesofact/index.json sha256 BEFORE any run: 62c1c0b235e26952857139537b65f8272026cd1c385c1bf6dba20481ee8a6619. AFTER all three runs: 62c1c0b235e26952857139537b65f8272026cd1c385c1bf6dba20481ee8a6619 — `cmp` on the saved bytes reports byte-identical, not eyeballed. YAH_RELEASE_VERSION was UNSET throughout (the iteration case the gate must refuse), and every run reached `[[pipeline.on_success]]` because every run passed. THE aarch64 LEG WENT GREEN — on all three runs — which is what F6's proof was missing: its full condition is both legs green with the index unchanged, and that is now met. The 2.5 GB-rootfs blocker recorded for the arm workers never applied here: this leg resolves NativeCross and runs locally in its pinned linux/arm64 container on the camp Mac (R605-B13), not on the Pi5s. No publish/staging line appears in any run log, and the binary carries the gate's own 'skipping Outcome::Publish' string, so the refusal is the gate firing rather than the outcome never being reached.")
+//! @yah:handoff("LEADER DECISION on the sharing key, so it is not reopened: keyed by pipeline + step + target triple, derived BY QED rather than declared — `QedStep.cache` is a bool, so a colliding key cannot be typed by a pipeline author. Eviction is explicit rather than unbounded, via a shared `forge_cache::evict_plan`: idle > 14 days unconditionally, plus LRU while the holding filesystem is under a 10 GiB free floor. Swept by yubaba at deploy and by the runner before each cached local step. An unbounded cache on a worker rootfs was the trap here — the arm workers' 2.5 GB rootfs is the recorded blocker this had to not make worse.")
+//! @yah:verify("THE MEASUREMENT, which is this ticket's actual deliverable, three timed in-process runs against the 9m56s / 9m57s / 11m10s cold baseline: **11m13s cold** (cache created, 795 crates compiled), **37.955s with no source change** (4 crates), **3m57s with a one-line change** (only the changed crate plus dependents; the residue is two irreducible V8 links). THE MTIME TRAP DOES NOT BITE, and this was checked rather than assumed: `pack_source_context`'s `tar::Builder::append_file` carries the camp tree's real mtimes through the extract, so cargo's freshness survives. The no-change run was confirmed a genuine warm build and not a short-circuit — no source mtime changed between runs, and the 795-vs-4 crate counts are the evidence.")
+//! @yah:gotcha("THE aarch64 LEG WENT GREEN, ON ALL THREE RUNS. It had failed on every one of the 14+ recorded runs before this. That is a bigger deal than the timings: it means `[[pipeline.on_success]]` is now reachable for the first time, so mesofact-musl's publish is genuinely armed and R876-F6's gate is the only thing standing between an iteration run and a write to cdn.yah.dev. Also note the eviction sweep is in the tree but reaches us-west-003 only on the next yubaba roll — until then that node has the mount without the sweep.")
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -1106,6 +1128,61 @@ pub struct QedStep {
     /// upload, for the whole existing corpus.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub source_context: Vec<std::path::PathBuf>,
+    /// Give this *subprocess* step a host-persistent build cache that outlives
+    /// the container it runs in (R876-F4) — the missing third thing an
+    /// offloaded step gets, alongside [`Self::source_context`] and
+    /// `/yah/produced`.
+    ///
+    /// # The gap this closes
+    ///
+    /// A container's writable layer is destroyed when it is reaped, and
+    /// `/yah/produced` is per-run. So a step that compiles a tree compiles it
+    /// from scratch *every* run: `mesofact-musl`'s x86_64 leg measured 9m56s /
+    /// 9m57s / 11m10s and every one of those was a cold full release build.
+    ///
+    /// # What the step sees
+    ///
+    /// The runner binds a host dir at `/yah/cache` and sets
+    /// **`YAH_CACHE_DIR`** to it. The argv points its own toolchain there —
+    /// `export CARGO_TARGET_DIR="$YAH_CACHE_DIR/target"`. Deliberately *in the
+    /// argv*, exactly as `YAH_SOURCE_CONTEXT_URL`'s fetch is: the mount is
+    /// toolchain-agnostic, and injecting a cargo-shaped prelude would make the
+    /// TOML stop describing what actually runs.
+    ///
+    /// # The sharing key is derived, never written here
+    ///
+    /// This is a `bool`, not a key, and that is the whole safety argument. Two
+    /// runs sharing one cargo target dir that should not is a correctness bug;
+    /// `concurrency_key` is camp-side scheduling and does not constrain a
+    /// second camp or a hand-rolled dispatch at the same worker. The runner
+    /// derives the key from **pipeline + step name + target triple**
+    /// (`workload_spec::forge_cache::key_from_parts`), so a collision between
+    /// two pipelines, or between one pipeline's two triples, is impossible by
+    /// construction rather than by convention.
+    ///
+    /// Two runs of the *same* pipeline+step+triple do share, which is the
+    /// entire point; cargo's own `.cargo-lock` in the target dir serializes any
+    /// two that overlap in time.
+    ///
+    /// # Eviction
+    ///
+    /// Bounded at both ends by `forge_cache::evict_plan`: a cache dir idle past
+    /// `forge_cache::RETENTION` (14 days) is removed, and while the filesystem
+    /// holding the cache root is under `forge_cache::FREE_FLOOR_BYTES` (10 GiB)
+    /// the least-recently-used dirs are removed too. yubaba sweeps the worker
+    /// root at deploy; the runner sweeps the camp-local root before a cached
+    /// local-container step.
+    ///
+    /// # Where it applies
+    ///
+    /// Subprocess steps that run in a container — remote (a `VolumeMount` under
+    /// `forge_cache::HOST_ROOT` on the worker) or local (a bind of a camp-cache
+    /// dir), same container path either way. A *native* step is refused rather
+    /// than ignored: it has no mount namespace, its build scratch already
+    /// persists, and a silently-inert cache is the exact failure this field
+    /// exists to avoid.
+    #[serde(default)]
+    pub cache: bool,
     /// For `kind = build-image`: load the finished image into the local
     /// docker daemon with `--load` instead of writing an OCI archive.
     /// Use in dev pipelines where the image must be immediately runnable.
@@ -1731,7 +1808,7 @@ pub struct ImportConfig {
 }
 
 /// Step-level config for [`StepKind::WaitFor`] (R513-F3, W207 Gap #5). Names a
-/// single network endpoint to poll and the time budget for it to come up.
+/// single thing to poll and the time budget for it to become healthy.
 ///
 /// ```toml
 /// [[steps]]
@@ -1740,31 +1817,44 @@ pub struct ImportConfig {
 /// [steps.wait_for]
 /// http = "http://localhost:3000/health"   # plaintext HTTP GET, healthy on 2xx/3xx
 /// timeout_secs = 30                        # give up (and fail the step) after this
-/// # interval_ms = 500                      # poll cadence (default 500ms)
+/// # interval_ms = 500                      # initial poll cadence (default 500ms)
+/// # backoff_multiplier = 1.0               # >1.0 grows the interval each miss
+/// # max_interval_ms = 500                  # cap on the grown interval
 /// # expect_status = 200                    # require an exact status instead of any 2xx/3xx
 /// ```
 ///
-/// Exactly one of [`Self::http`] / [`Self::tcp`] must be set. The `http` probe
-/// is a dependency-free plaintext HTTP/1.1 GET (no TLS in v1 — an `https://`
-/// URL is rejected at runtime; use a `tcp` gate or terminate TLS in front);
-/// the `tcp` probe is a bare connect to `host:port`, healthy the moment the
-/// port accepts. [`Self::expect_status`] is HTTP-only.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// Exactly one of [`Self::http`] / [`Self::tcp`] / [`Self::shell`] must be
+/// set. `http` is a dependency-free plaintext HTTP/1.1 GET (no TLS — an
+/// `https://` URL is rejected at runtime; use `shell` with `curl`, or a `tcp`
+/// gate); `tcp` is a bare connect to `host:port`, healthy the moment the port
+/// accepts; `shell` runs `sh -c <command>`, healthy on exit 0 — the escape
+/// hatch for anything the other two can't express (HTTPS, an npm-registry
+/// check, a DB query). [`Self::expect_status`] is HTTP-only.
+///
+/// The actual probe/backoff loop lives in the standalone `pleasehold` crate
+/// (`oss/qed/crates/pleasehold`) so a non-qed caller (e.g. almanac) can poll
+/// the same way without depending on qed's scheduler stack.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct WaitForConfig {
     /// Plaintext-HTTP URL to GET each poll (e.g. `http://localhost:3000/health`).
     /// Healthy on a 2xx/3xx response, or on an exact match to
-    /// [`Self::expect_status`] when set. Mutually exclusive with [`Self::tcp`].
+    /// [`Self::expect_status`] when set. Mutually exclusive with [`Self::tcp`]
+    /// and [`Self::shell`].
     #[serde(default)]
     pub http: Option<String>,
     /// `host:port` to connect to each poll (e.g. `127.0.0.1:5432`). Healthy the
     /// moment the connect succeeds — no bytes are exchanged. Mutually exclusive
-    /// with [`Self::http`].
+    /// with [`Self::http`] and [`Self::shell`].
     #[serde(default)]
     pub tcp: Option<String>,
+    /// Shell command to run each poll (`sh -c <command>`), healthy on exit 0.
+    /// Mutually exclusive with [`Self::http`] and [`Self::tcp`].
+    #[serde(default)]
+    pub shell: Option<String>,
     /// Require this exact HTTP status to consider the endpoint healthy, instead
     /// of the default "any 2xx/3xx". HTTP-only — `validate()` rejects it
-    /// alongside a `tcp` target. `None` ⇒ any 2xx/3xx.
+    /// alongside a `tcp` or `shell` target. `None` ⇒ any 2xx/3xx.
     #[serde(default)]
     pub expect_status: Option<u16>,
     /// Total budget, in seconds, for the endpoint to become healthy. The step
@@ -1772,10 +1862,23 @@ pub struct WaitForConfig {
     /// Defaults to 30s.
     #[serde(default = "default_wait_timeout_secs")]
     pub timeout_secs: u64,
-    /// Delay between poll attempts, in milliseconds. Defaults to 500ms — snappy
-    /// enough for a fast-booting dev server without hammering the socket.
+    /// Delay before the second attempt, in milliseconds (the first attempt is
+    /// immediate). Defaults to 500ms — snappy enough for a fast-booting dev
+    /// server without hammering the socket.
     #[serde(default = "default_wait_interval_ms")]
     pub interval_ms: u64,
+    /// Each failed attempt's delay is multiplied by this for the next one.
+    /// Defaults to `1.0` — a fixed interval, the original `wait-for` behavior.
+    /// Set `> 1.0` for exponential backoff (e.g. an eventually-consistent
+    /// registry publish, where hammering every 500ms for 3 minutes is wasted
+    /// traffic and a slow-growing interval is a better citizen).
+    #[serde(default = "default_wait_backoff_multiplier")]
+    pub backoff_multiplier: f64,
+    /// Cap on the grown interval, in milliseconds, however large
+    /// `backoff_multiplier` is. Defaults to [`Self::interval_ms`] (i.e. no
+    /// growth) when unset.
+    #[serde(default)]
+    pub max_interval_ms: Option<u64>,
 }
 
 fn default_wait_timeout_secs() -> u64 {
@@ -1784,6 +1887,10 @@ fn default_wait_timeout_secs() -> u64 {
 
 fn default_wait_interval_ms() -> u64 {
     500
+}
+
+fn default_wait_backoff_multiplier() -> f64 {
+    1.0
 }
 
 impl WaitForConfig {
@@ -1795,6 +1902,25 @@ impl WaitForConfig {
         self.http
             .as_deref()
             .is_some_and(|u| u.trim_start().starts_with("https://"))
+    }
+
+    pub fn max_interval_ms(&self) -> u64 {
+        self.max_interval_ms.unwrap_or(self.interval_ms)
+    }
+}
+
+impl Default for WaitForConfig {
+    fn default() -> Self {
+        WaitForConfig {
+            http: None,
+            tcp: None,
+            shell: None,
+            expect_status: None,
+            timeout_secs: default_wait_timeout_secs(),
+            interval_ms: default_wait_interval_ms(),
+            backoff_multiplier: default_wait_backoff_multiplier(),
+            max_interval_ms: None,
+        }
     }
 }
 
@@ -2158,6 +2284,28 @@ pub enum StepValidationError {
          tarball with"
     )]
     SourceContextRequiresSubprocess(String),
+    /// R876-F4: `cache` binds a host dir into the step's *container*. Every
+    /// other step kind either has no container (`wait-for`, `import`,
+    /// `package-native-tarball`) or has its own caching story (`build-image` →
+    /// BuildKit), so the mount would be created, bound, and never written —
+    /// which is worse than no cache, because it looks like one.
+    #[error(
+        "step `{0}`: `cache = true` is a subprocess-only knob — it binds a \
+         host-persistent dir at `/yah/cache` for the step's argv to point its \
+         toolchain at, and no other step kind has an argv to use it (a \
+         build-image step caches through BuildKit instead)"
+    )]
+    CacheRequiresSubprocess(String),
+    /// R876-F4: the container half of the same argument. A native step has no
+    /// mount namespace to bind into and its build scratch already persists on
+    /// the host, so honoring `cache` there would mount nothing while reporting
+    /// a cache — the silent-no-op this field is designed not to be.
+    #[error(
+        "step `{0}`: `cache = true` requires `runtime = \"container\"` — a native \
+         step has no mount namespace for the bind and its build scratch already \
+         lives on this filesystem, so the cache would be silently inert"
+    )]
+    CacheRequiresContainerRuntime(String),
     #[error(
         "step `{0}`: `secret = true` cannot be combined with declared `outputs` — a secret step's \
          $YAH_OUTPUTS is dropped unread, so the output would always be empty and any [[bind]] \
@@ -2168,25 +2316,31 @@ pub enum StepValidationError {
     #[error("step `{0}`: wait-for steps must omit `argv` (a wait-for is a pure gate)")]
     WaitForHasArgv(String),
     #[error(
-        "step `{0}`: wait-for steps require a `[wait_for]` block with `http = ...` or `tcp = ...`"
+        "step `{0}`: wait-for steps require a `[wait_for]` block with `http = ...`, \
+         `tcp = ...`, or `shell = ...`"
     )]
     WaitForMissingConfig(String),
     #[error(
-        "step `{0}`: wait-for needs exactly one target — set `http = \"http://…\"` \
-         OR `tcp = \"host:port\"`, not neither"
+        "step `{0}`: wait-for needs exactly one target — set `http = \"http://…\"`, \
+         `tcp = \"host:port\"`, or `shell = \"...\"`, not neither"
     )]
     WaitForNeedsTarget(String),
     #[error(
-        "step `{0}`: wait-for accepts only one target — set `http` OR `tcp`, not both"
+        "step `{0}`: wait-for accepts only one target — set exactly one of `http`, \
+         `tcp`, `shell`"
     )]
     WaitForAmbiguousTarget(String),
     #[error(
         "step `{0}`: `expect_status` only applies to an `http` wait-for — \
-         a `tcp` gate is healthy on connect, with no status to match"
+         a `tcp`/`shell` gate has no status to match"
     )]
     WaitForStatusNeedsHttp(String),
     #[error("step `{0}`: wait-for `timeout_secs` must be greater than zero")]
     WaitForZeroTimeout(String),
+    #[error("step `{0}`: wait-for `interval_ms` must be greater than zero")]
+    WaitForZeroInterval(String),
+    #[error("step `{0}`: wait-for `backoff_multiplier` must be finite and >= 1.0 (1.0 = fixed interval)")]
+    WaitForBadBackoffMultiplier(String),
     #[error("step `{0}`: manifest-stitch steps must omit `argv` (the stitch is a pure registry op)")]
     ManifestStitchHasArgv(String),
     #[error(
@@ -2306,6 +2460,22 @@ impl QedStep {
             return Err(StepValidationError::SourceContextRequiresSubprocess(
                 self.name.clone(),
             ));
+        }
+        // R876-F4: same closed-set discipline again, in two parts — the kind
+        // has to have an argv to point at the mount, and the runtime has to
+        // have a mount namespace to bind it into. Both refusals exist because
+        // a cache that is declared and inert is strictly worse than none.
+        if self.cache {
+            if self.kind != StepKind::Subprocess {
+                return Err(StepValidationError::CacheRequiresSubprocess(
+                    self.name.clone(),
+                ));
+            }
+            if self.runtime == Some(TaskRuntime::Native) {
+                return Err(StepValidationError::CacheRequiresContainerRuntime(
+                    self.name.clone(),
+                ));
+            }
         }
         match self.kind {
             StepKind::Subprocess => {
@@ -2434,22 +2604,30 @@ impl QedStep {
                 let Some(cfg) = self.wait_for.as_ref() else {
                     return Err(StepValidationError::WaitForMissingConfig(self.name.clone()));
                 };
-                match (cfg.http.is_some(), cfg.tcp.is_some()) {
-                    (false, false) => {
+                match (cfg.http.is_some(), cfg.tcp.is_some(), cfg.shell.is_some()) {
+                    (false, false, false) => {
                         return Err(StepValidationError::WaitForNeedsTarget(self.name.clone()));
                     }
-                    (true, true) => {
+                    (true, false, false) | (false, true, false) | (false, false, true) => {}
+                    _ => {
                         return Err(StepValidationError::WaitForAmbiguousTarget(
                             self.name.clone(),
                         ));
                     }
-                    _ => {}
                 }
-                if cfg.expect_status.is_some() && cfg.tcp.is_some() {
+                if cfg.expect_status.is_some() && cfg.http.is_none() {
                     return Err(StepValidationError::WaitForStatusNeedsHttp(self.name.clone()));
                 }
                 if cfg.timeout_secs == 0 {
                     return Err(StepValidationError::WaitForZeroTimeout(self.name.clone()));
+                }
+                if cfg.interval_ms == 0 {
+                    return Err(StepValidationError::WaitForZeroInterval(self.name.clone()));
+                }
+                if cfg.backoff_multiplier < 1.0 || !cfg.backoff_multiplier.is_finite() {
+                    return Err(StepValidationError::WaitForBadBackoffMultiplier(
+                        self.name.clone(),
+                    ));
                 }
                 Ok(())
             }
@@ -2713,6 +2891,17 @@ pub enum Outcome {
         /// When `None`, manifest URLs are written as bucket-relative keys.
         #[serde(default)]
         base_url: Option<String>,
+        /// R876-F6: when `true`, this outcome refuses to dispatch unless
+        /// `YAH_RELEASE_VERSION` is explicitly set — the workspace-version
+        /// fallback in [`crate::publish::resolve_release_version`] is NOT
+        /// consulted for this outcome. Pipelines that double as an iteration
+        /// loop (`mesofact-musl`, run repeatedly with no args) set this so a
+        /// green build never cuts a release under the dev workspace version by
+        /// accident; pipelines whose only purpose IS a release act
+        /// (`yah-cli-release`, run deliberately) leave it `false` and keep the
+        /// existing fallback-to-workspace-version behaviour.
+        #[serde(default)]
+        require_explicit_version: bool,
     },
     /// Dispatch a named vendor release adapter (R509) — Apple notarize/staple,
     /// Authenticode sign, Sparkle appcast, TestFlight/Play/GitHub upload.
@@ -2736,6 +2925,77 @@ pub enum Outcome {
         #[serde(default)]
         base_url: Option<String>,
     },
+}
+
+impl Outcome {
+    /// The `kind = "…"` token this variant is declared as in a pipeline TOML.
+    /// Kept beside the `#[serde(rename_all = "kebab-case")]` that produces it,
+    /// so the two cannot drift into different spellings of one outcome.
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            Outcome::YubabaDeploy { .. } => "yubaba-deploy",
+            Outcome::AlmanacRun { .. } => "almanac-run",
+            Outcome::Publish { .. } => "publish",
+            Outcome::Provider { .. } => "provider",
+        }
+    }
+
+    /// Does dispatching this outcome change something OUTSIDE this machine?
+    /// (R876-B8 — the property `yah qed run`'s build-skew gate keys on.)
+    ///
+    /// Every variant answers `true` today, and that is not an accident of the
+    /// current set: an `Outcome` *is* qed's name for a terminal side effect on
+    /// the world — pushing bytes to a bucket, handing an artifact to a vendor,
+    /// moving a live service, purging a public cache. A pipeline that only
+    /// builds declares none, which is exactly the distinction the gate needs.
+    ///
+    /// It is written as an EXHAUSTIVE MATCH RATHER THAN `true` on purpose. A
+    /// future inward-facing outcome (something that only writes local state)
+    /// must be classified deliberately here, and until someone does, adding a
+    /// variant fails to compile. R876-B8 exists because a safety gate silently
+    /// failed to apply to the thing that actually runs pipelines; a wildcard
+    /// arm here would be the same bug in miniature, quietly widening the gate's
+    /// blind spot every time the enum grows.
+    pub fn is_outward_facing(&self) -> bool {
+        match self {
+            // Writes release artifacts to a public bucket (cdn.yah.dev), which
+            // `install.sh` resolves for `curl | sh`. The R876-F6 hazard itself.
+            Outcome::Publish { .. } => true,
+            // Hands artifacts to vendor services — notarize, Authenticode,
+            // Sparkle appcast, TestFlight/Play/GitHub upload.
+            Outcome::Provider { .. } => true,
+            // Moves a live service in the camp's cloud.
+            Outcome::YubabaDeploy { .. } => true,
+            // Fires the almanac revalidate hook, which purges a public site's
+            // cache. Classified outward on that basis; no pipeline in this camp
+            // currently declares it as an outcome, so the call is free today
+            // and is recorded here rather than left to be re-derived.
+            Outcome::AlmanacRun { .. } => true,
+        }
+    }
+}
+
+impl Pipeline {
+    /// The `kind` tokens of every terminal outcome this pipeline would dispatch
+    /// that reaches outside this machine (R876-B8). Empty for a build-only
+    /// pipeline.
+    ///
+    /// Both lists are consulted, not just `on_success`: `dispatch_terminal_outcomes`
+    /// selects one of the two from the run's status, so an outward effect
+    /// declared under `on_fail` is equally reachable — and a gate that read only
+    /// the success list would be exactly the "installed but does not apply"
+    /// shape this ticket is about.
+    pub fn outward_facing_outcomes(&self) -> Vec<&'static str> {
+        let mut kinds: Vec<&'static str> = self
+            .on_success
+            .iter()
+            .chain(self.on_fail.iter())
+            .filter(|o| o.is_outward_facing())
+            .map(|o| o.kind_str())
+            .collect();
+        kinds.dedup();
+        kinds
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2837,6 +3097,30 @@ pub struct QedRunMeta {
     /// resume degrades to a fresh worktree when it doesn't.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retained_workspace: Option<std::path::PathBuf>,
+    /// `YAH_BUILD_ID` of the process that actually EXECUTED this run (R876-B8).
+    ///
+    /// Every other field here describes the pipeline. This one describes the
+    /// *interpreter* — and without it a run record cannot answer the question
+    /// R876-F6 had to answer by reading binaries: **did the code I just
+    /// installed run this?** `cargo xtask install` replaces `~/.local/bin/yah`
+    /// while the camp daemon goes on executing whatever build it launched with,
+    /// so a fix can be written, tested, installed, and still not be the code
+    /// that ran the pipeline. The CLI's stderr skew notice (R330-B42) says so
+    /// at the time, but it is ephemeral; this is the durable half, and it is
+    /// what makes a *past* run auditable rather than merely a present one
+    /// warnable.
+    ///
+    /// "Executor", not "daemon": a `--in-process` run's executor is the CLI
+    /// itself, and stamping that honestly is the point — a record that only
+    /// ever named the daemon would be silent on exactly the runs deliberately
+    /// routed around it.
+    ///
+    /// `None` on every run meta already on disk, and on the terminal meta the
+    /// runner returns — `yah-qed` is a library with no build stamp of its own,
+    /// so the host that owns the process stamps it on the registered meta and
+    /// carries it across, exactly as it already does for `label` and `launch`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor_build_id: Option<String>,
 }
 
 /// How a run was launched, beyond its resolved params (which live on
@@ -3184,6 +3468,7 @@ mod tests {
                 package: None,
                 context: None,
                 source_context: Vec::new(),
+                cache: false,
                 load: false,
                 sub_pipeline: None,
                 gha_workflow: None,
@@ -3798,6 +4083,7 @@ checklist = ["Diff reviewed"]
             package: None,
             context: None,
             source_context: Vec::new(),
+            cache: false,
             load: false,
             sub_pipeline: None,
             gha_workflow: None,
@@ -3842,6 +4128,7 @@ checklist = ["Diff reviewed"]
             package: None,
             context: None,
             source_context: Vec::new(),
+            cache: false,
             load: false,
             sub_pipeline: None,
             gha_workflow: None,
@@ -3886,6 +4173,7 @@ checklist = ["Diff reviewed"]
             package: Some("yubaba".into()),
             context: None,
             source_context: Vec::new(),
+            cache: false,
             load: false,
             sub_pipeline: None,
             gha_workflow: None,
@@ -4084,6 +4372,7 @@ checklist = ["Diff reviewed"]
             package: None,
             context: None,
             source_context: Vec::new(),
+            cache: false,
             load: false,
             sub_pipeline: None,
             gha_workflow: None,
@@ -4353,6 +4642,45 @@ checklist = ["Diff reviewed"]
         );
     }
 
+    /// R876-F4: `cache = true` binds a host dir into the step's container for
+    /// its argv to point a toolchain at. Both halves of that sentence are
+    /// gates — a kind with no argv cannot use it, and a runtime with no mount
+    /// namespace cannot receive it — and both refuse rather than ignore,
+    /// because a declared-but-inert cache is the failure this field exists to
+    /// avoid (it looks like it works, and every build stays cold).
+    #[test]
+    fn cache_requires_a_containerised_subprocess_step() {
+        let mut wrong_kind = QedStep::default();
+        wrong_kind.name = "image".into();
+        wrong_kind.kind = StepKind::BuildImage;
+        wrong_kind.image = Some("yah-yubaba".into());
+        wrong_kind.cache = true;
+        assert!(matches!(
+            wrong_kind.validate(),
+            Err(StepValidationError::CacheRequiresSubprocess(_))
+        ));
+
+        let mut native = QedStep::default();
+        native.name = "build".into();
+        native.argv = vec!["cargo build".into()];
+        native.runtime = Some(TaskRuntime::Native);
+        native.cache = true;
+        assert!(matches!(
+            native.validate(),
+            Err(StepValidationError::CacheRequiresContainerRuntime(_))
+        ));
+
+        let mut ok = QedStep::default();
+        ok.name = "build-mesofact".into();
+        ok.argv = vec!["build-mesofact.sh …".into()];
+        ok.runtime = Some(TaskRuntime::Container);
+        ok.cache = true;
+        assert!(
+            ok.validate().is_ok(),
+            "cache IS valid on a containerised subprocess step",
+        );
+    }
+
     /// A secret step's `$YAH_OUTPUTS` is dropped unread, so a *declared* output
     /// would be permanently empty and a `[[bind]]` reading it would bind
     /// nothing — silently. Reject the pair where the author can still see it.
@@ -4525,6 +4853,7 @@ checklist = ["Diff reviewed"]
             package: None,
             context: None,
             source_context: Vec::new(),
+            cache: false,
             load: false,
             sub_pipeline: Some(SubPipelineConfig {
                 target,
@@ -4812,10 +5141,7 @@ checklist = ["Diff reviewed"]
     fn http_wait(url: &str) -> WaitForConfig {
         WaitForConfig {
             http: Some(url.into()),
-            tcp: None,
-            expect_status: None,
-            timeout_secs: 30,
-            interval_ms: 500,
+            ..Default::default()
         }
     }
 
@@ -4859,13 +5185,7 @@ checklist = ["Diff reviewed"]
     fn wait_for_step_rejects_no_target_and_both_targets() {
         let neither = wait_for_step(
             "gate",
-            WaitForConfig {
-                http: None,
-                tcp: None,
-                expect_status: None,
-                timeout_secs: 30,
-                interval_ms: 500,
-            },
+            WaitForConfig::default(),
         );
         assert_eq!(
             neither.validate(),
@@ -4877,9 +5197,7 @@ checklist = ["Diff reviewed"]
             WaitForConfig {
                 http: Some("http://localhost/health".into()),
                 tcp: Some("localhost:80".into()),
-                expect_status: None,
-                timeout_secs: 30,
-                interval_ms: 500,
+                ..Default::default()
             },
         );
         assert_eq!(
@@ -4893,16 +5211,62 @@ checklist = ["Diff reviewed"]
         let step = wait_for_step(
             "gate",
             WaitForConfig {
-                http: None,
                 tcp: Some("localhost:5432".into()),
                 expect_status: Some(200),
-                timeout_secs: 30,
-                interval_ms: 500,
+                ..Default::default()
             },
         );
         assert_eq!(
             step.validate(),
             Err(StepValidationError::WaitForStatusNeedsHttp("gate".into()))
+        );
+    }
+
+    #[test]
+    fn wait_for_step_accepts_shell_target() {
+        let step = wait_for_step(
+            "gate",
+            WaitForConfig {
+                shell: Some("curl -fsS http://example.com".into()),
+                ..Default::default()
+            },
+        );
+        assert!(step.validate().is_ok());
+    }
+
+    #[test]
+    fn wait_for_step_rejects_shell_combined_with_http() {
+        let step = wait_for_step(
+            "gate",
+            WaitForConfig {
+                http: Some("http://localhost/health".into()),
+                shell: Some("true".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            step.validate(),
+            Err(StepValidationError::WaitForAmbiguousTarget("gate".into()))
+        );
+    }
+
+    #[test]
+    fn wait_for_step_rejects_zero_interval() {
+        let mut step = wait_for_step("gate", http_wait("http://localhost/health"));
+        step.wait_for.as_mut().unwrap().interval_ms = 0;
+        assert_eq!(
+            step.validate(),
+            Err(StepValidationError::WaitForZeroInterval("gate".into()))
+        );
+    }
+
+    #[test]
+    fn wait_for_step_rejects_bad_backoff_multiplier() {
+        let mut step = wait_for_step("gate", http_wait("http://localhost/health"));
+        step.wait_for.as_mut().unwrap().backoff_multiplier = 0.5;
+        assert_eq!(
+            step.validate(),
+            Err(StepValidationError::WaitForBadBackoffMultiplier("gate".into()))
         );
     }
 
@@ -4940,10 +5304,10 @@ checklist = ["Diff reviewed"]
             "wait:ready",
             WaitForConfig {
                 http: Some("http://localhost:3000/health".into()),
-                tcp: None,
                 expect_status: Some(204),
                 timeout_secs: 45,
                 interval_ms: 250,
+                ..Default::default()
             },
         );
         let toml_str = toml::to_string(&step).expect("serialize wait-for step");

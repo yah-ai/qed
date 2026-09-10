@@ -95,6 +95,8 @@ pub fn local_container_command(
     cwd: Option<&Path>,
     env: &[(String, String)],
     platform: Option<&str>,
+    produced_dir: Option<&Path>,
+    cache_dir: Option<&Path>,
 ) -> Command {
     let mut cmd = Command::new("docker");
     cmd.arg("run").arg("--rm");
@@ -106,6 +108,34 @@ pub fn local_container_command(
     if let Some(cwd) = cwd {
         cmd.arg("-v").arg(format!("{0}:{0}", cwd.display()));
         cmd.arg("-w").arg(cwd);
+    }
+
+    // R560-B12: bind the caller's produced dir at the conventional container
+    // path, so a step's declared `produces` survive `--rm`. Mounted at
+    // `forge_produced::CONTAINER_DIR` — the SAME path kamaji binds on a remote
+    // worker — so one argv writes to one path and works in both placements.
+    // That sameness is the point: `mesofact-musl`'s two legs differ only in
+    // triple and image, and a local-only output convention would have made them
+    // differ in the one place the file insists they must not.
+    if let Some(produced_dir) = produced_dir {
+        cmd.arg("-v").arg(format!(
+            "{}:{}",
+            produced_dir.display(),
+            workload_spec::forge_produced::CONTAINER_DIR
+        ));
+    }
+
+    // R876-F4: the build-cache bind, at the SAME container path a remote
+    // worker's kamaji binds `forge_cache::HOST_ROOT/<key>` to. Only the host
+    // side differs between placements — a camp-cache dir here, a worker state
+    // dir there — so `mesofact-musl`'s two legs can export one
+    // `CARGO_TARGET_DIR` and mean it in both.
+    if let Some(cache_dir) = cache_dir {
+        cmd.arg("-v").arg(format!(
+            "{}:{}",
+            cache_dir.display(),
+            workload_spec::forge_cache::CONTAINER_DIR
+        ));
     }
 
     for (k, v) in env {
@@ -327,7 +357,37 @@ impl ForgeExecutor for LocalForgeDriver {
         let runtime = spec.where_.runtime;
         match spec.command {
             ForgeCommand::Subprocess { argv, image } => match runtime {
-                TaskRuntime::Native => run_subprocess(build_native_command(&argv, &ctx)?, sink).await,
+                TaskRuntime::Native => {
+                    // R560-B12: a produced-dir bind is a CONTAINER affordance.
+                    // A native local run has no filesystem boundary to bridge,
+                    // so honoring this would mean silently mounting nothing and
+                    // letting the step write wherever it liked — the caller then
+                    // reads an empty dir and blames its own path. Refuse, in the
+                    // same spirit as the `produced` refusal above.
+                    if ctx.produced_dir.is_some() {
+                        return Err(ForgeExecutorError::Unsupported(
+                            "LocalForgeDriver received ExecContext::produced_dir on a NATIVE \
+                             step. That field binds a host dir into a container; a native run \
+                             already writes straight onto this filesystem, so there is no \
+                             boundary to bridge. Point the step's `produces` at the path it \
+                             actually writes, or set runtime = container",
+                        ));
+                    }
+                    // R876-F4: same shape, same reason. A native run's build
+                    // scratch already lives on this filesystem and persists on
+                    // its own; binding a cache dir into a process that has no
+                    // mount namespace would mount nothing and report a cache
+                    // the step never saw.
+                    if ctx.cache_dir.is_some() {
+                        return Err(ForgeExecutorError::Unsupported(
+                            "LocalForgeDriver received ExecContext::cache_dir on a NATIVE \
+                             step. That field binds a host dir into a container; a native run \
+                             already keeps its build scratch on this filesystem. Drop `cache` \
+                             from the step, or set runtime = container (R876-F4)",
+                        ));
+                    }
+                    run_subprocess(build_native_command(&argv, &ctx)?, sink).await
+                }
                 TaskRuntime::Container => {
                     let image = image.ok_or(ForgeExecutorError::Unsupported(
                         "container runtime requires a Subprocess image",
@@ -375,6 +435,8 @@ fn build_container_command(image: &ImageRef, argv: &[String], ctx: &ExecContext)
         ctx.cwd.as_deref(),
         &ctx.env,
         ctx.platform.as_deref(),
+        ctx.produced_dir.as_deref(),
+        ctx.cache_dir.as_deref(),
     )
 }
 
@@ -531,7 +593,7 @@ mod tests {
             "latest",
             workload_spec::testing::TEST_DIGEST,
         );
-        let cmd = local_container_command(&image, &["true".into()], None, &[], None);
+        let cmd = local_container_command(&image, &["true".into()], None, &[], None, None, None);
         assert_eq!(cmd.as_std().get_program(), "docker");
     }
 
@@ -545,6 +607,8 @@ mod tests {
             &["echo".into(), "hi".into()],
             None,
             &[],
+            None,
+            None,
             None,
         );
         assert_eq!(
@@ -563,7 +627,7 @@ mod tests {
     fn command_mounts_and_chdirs_into_cwd() {
         let image = img("ghcr.io", "yah-ai/forge-minimal", "latest", TEST_PIN);
         let cwd = PathBuf::from("/work/repo");
-        let cmd = local_container_command(&image, &["pwd".into()], Some(&cwd), &[], None);
+        let cmd = local_container_command(&image, &["pwd".into()], Some(&cwd), &[], None, None, None);
         assert_eq!(
             args_of(&cmd),
             vec![
@@ -579,11 +643,123 @@ mod tests {
         );
     }
 
+    /// R560-B12: the produced dir is bound at the CONVENTIONAL container path,
+    /// not at its host path. Asserting the exact `-v` string is the point — the
+    /// remote leg's argv writes to `/yah/produced/…` because kamaji binds it
+    /// there, and a local leg that bound it anywhere else would force the two
+    /// legs of a pipeline to carry different argvs for the same build.
+    #[test]
+    fn command_binds_the_produced_dir_at_the_conventional_container_path() {
+        let image = img("ghcr.io", "yah-ai/forge-minimal", "latest", TEST_PIN);
+        let produced = PathBuf::from("/camp/.yah/cache/qed/produced/run1/build");
+        let cmd = local_container_command(
+            &image,
+            &["true".into()],
+            None,
+            &[],
+            None,
+            Some(&produced),
+            None,
+        );
+        assert_eq!(
+            args_of(&cmd),
+            vec![
+                "run",
+                "--rm",
+                "-v",
+                "/camp/.yah/cache/qed/produced/run1/build:/yah/produced",
+                &format!("ghcr.io/yah-ai/forge-minimal:latest@{TEST_PIN}"),
+                "true",
+            ],
+        );
+    }
+
+    /// Absent by default, so every pre-R560-B12 call site keeps emitting the
+    /// exact same docker argv it always did.
+    #[test]
+    fn no_produced_dir_means_no_extra_mount() {
+        let image = img("ghcr.io", "yah-ai/forge-minimal", "latest", TEST_PIN);
+        let cmd = local_container_command(&image, &["true".into()], None, &[], None, None, None);
+        assert!(
+            !args_of(&cmd).iter().any(|a| a.contains("/yah/produced")),
+            "a step declaring no produces must get no produced mount",
+        );
+    }
+
+    /// R876-F4: the local placement binds its cache at the SAME container path
+    /// a remote worker does, which is what lets `mesofact-musl`'s two legs run
+    /// one argv. Only the host side differs.
+    #[test]
+    fn command_binds_the_cache_dir_at_the_conventional_container_path() {
+        let image = img("ghcr.io", "yah-ai/forge-minimal", "latest", TEST_PIN);
+        let cache = PathBuf::from("/camp/.yah/cache/qed/build/p.step.aarch64-unknown-linux-musl");
+        let cmd = local_container_command(
+            &image,
+            &["true".into()],
+            None,
+            &[],
+            None,
+            None,
+            Some(&cache),
+        );
+        assert_eq!(
+            args_of(&cmd),
+            vec![
+                "run",
+                "--rm",
+                "-v",
+                "/camp/.yah/cache/qed/build/p.step.aarch64-unknown-linux-musl:/yah/cache",
+                &format!("ghcr.io/yah-ai/forge-minimal:latest@{TEST_PIN}"),
+                "true",
+            ],
+        );
+    }
+
+    #[test]
+    fn no_cache_dir_means_no_cache_mount() {
+        let image = img("ghcr.io", "yah-ai/forge-minimal", "latest", TEST_PIN);
+        let cmd = local_container_command(&image, &["true".into()], None, &[], None, None, None);
+        assert!(
+            !args_of(&cmd).iter().any(|a| a.contains("/yah/cache")),
+            "a step declaring no cache must get no cache mount",
+        );
+    }
+
+    /// The refusal that keeps `produced_dir` from being read as "an output
+    /// directory" in general. On a native local step there is no boundary to
+    /// bridge, so honoring it would mount nothing and silently succeed.
+    #[tokio::test]
+    async fn a_produced_dir_on_a_native_step_is_refused_rather_than_ignored() {
+        let err = LocalForgeDriver::new()
+            .execute(
+                ForgeSpec {
+                    command: ForgeCommand::Subprocess {
+                        argv: vec!["true".into()],
+                        image: None,
+                    },
+                    where_: velveteen::TaskPlacement::new(TaskLocation::Local, TaskRuntime::Native),
+                    timeout: None,
+                    label: None,
+                    initiator: velveteen::Initiator::Human { camp: "t".into() },
+                    mesh_access: velveteen::MeshAccess::None,
+                    cache_key: None,
+                },
+                ExecContext::default().with_produced_dir(PathBuf::from("/tmp/out")),
+                None,
+            )
+            .await
+            .expect_err("produced_dir is a container affordance");
+        assert!(
+            matches!(err, ForgeExecutorError::Unsupported(m) if m.contains("NATIVE")),
+            "the refusal must name the placement that caused it",
+        );
+    }
+
     #[test]
     fn command_passes_env_vars_with_dash_e() {
         let image = img("ghcr.io", "yah-ai/forge-minimal", "latest", TEST_PIN);
         let env = vec![("FOO".into(), "bar".into()), ("BAZ".into(), "qux".into())];
-        let cmd = local_container_command(&image, &["env".into()], None, &env, None);
+        let cmd = local_container_command(&image, &["env".into()], None, &env, None, None, None);
         let args = args_of(&cmd);
         // -e arrives in declared order
         let foo_idx = args.iter().position(|a| a == "FOO=bar").unwrap();
@@ -602,7 +778,7 @@ mod tests {
             "latest",
             TEST_PIN,
         );
-        let cmd = local_container_command(&image, &["true".into()], None, &[], None);
+        let cmd = local_container_command(&image, &["true".into()], None, &[], None, None, None);
         let args = args_of(&cmd);
         let expected = format!("ghcr.io/yah-ai/forge-minimal:latest@{TEST_PIN}");
         assert!(
@@ -784,6 +960,8 @@ mod tests {
             None,
             &[],
             None,
+            None,
+            None,
         );
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
@@ -812,6 +990,7 @@ mod tests {
             label: None,
             initiator: Initiator::Human { camp: "test".into() },
             mesh_access: MeshAccess::None,
+            cache_key: None,
         }
     }
 
@@ -972,6 +1151,7 @@ mod tests {
             label: None,
             initiator: Initiator::Human { camp: "test".into() },
             mesh_access: MeshAccess::None,
+            cache_key: None,
         };
         let result = driver.execute(spec, ExecContext::default(), None).await;
         // Either spawn fails (no docker) or docker exits non-zero (image
@@ -1005,6 +1185,7 @@ mod tests {
             label: None,
             initiator: Initiator::Human { camp: "test".into() },
             mesh_access: MeshAccess::None,
+            cache_key: None,
         };
         let err = driver
             .execute(spec, ExecContext::default(), None)
@@ -1129,6 +1310,7 @@ mod tests {
             label: None,
             initiator: Initiator::Human { camp: "test".into() },
             mesh_access: MeshAccess::None,
+            cache_key: None,
         };
         let err = driver
             .execute(spec, ExecContext::default(), None)

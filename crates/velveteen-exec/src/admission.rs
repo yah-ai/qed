@@ -316,6 +316,7 @@ timeout = 9000
                     shift: "test".into(),
                 },
                 mesh_access: MeshAccess::default(),
+                cache_key: None,
             };
             let forge_id = ForgeId::new();
             let mut ws = crate::remote::build_workload_spec(&forge_id, &spec).unwrap();

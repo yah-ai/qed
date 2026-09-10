@@ -143,6 +143,7 @@ mod tests {
                 camp: "test".into(),
             },
             mesh_access: MeshAccess::default(),
+            cache_key: None,
         }
     }
 

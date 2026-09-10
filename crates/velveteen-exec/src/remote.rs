@@ -518,6 +518,23 @@ fn exec_error(e: RemoteForgeError) -> ForgeExecutorError {
 ///   the wrong architecture, which is precisely the R546 failure this seam
 ///   exists to retire.
 pub(crate) fn apply_exec_context(ws: &mut WorkloadSpec, ctx: &ExecContext) -> Result<(), RemoteForgeError> {
+    if let Some(dir) = &ctx.produced_dir {
+        // R560-B12: local-only, and refused rather than ignored because the
+        // remote path ALREADY has a produced-dir mount — `build_workload_spec`
+        // adds `forge_produced::durable_mount(forge_id)` at the same container
+        // path. Honoring this would put a second bind on top of it and send the
+        // build's output to a host dir on the WORKER named after a directory on
+        // the coordinator; ignoring it would leave a caller believing it had
+        // redirected an output it had not.
+        return Err(RemoteForgeError::InvalidSpec(format!(
+            "produced_dir = {} is a local-container affordance with no remote equivalent. \
+             A remote forge already binds its durable produced dir at {} \
+             (forge_produced::durable_mount) and the retrieval leg reads it back off the \
+             worker — drop `produced_dir` and let that transport do it (R560-B12).",
+            dir.display(),
+            workload_spec::forge_produced::CONTAINER_DIR,
+        )));
+    }
     if let Some(platform) = &ctx.platform {
         return Err(RemoteForgeError::InvalidSpec(format!(
             "placement.platform = {platform:?} is a local-only emulation knob and has no \
@@ -799,6 +816,49 @@ pub(crate) fn build_workload_spec(
             workload_spec::HOST_NETWORK_ANNOTATION.into(),
             workload_spec::HOST_NETWORK_VALUE.into(),
         );
+    }
+
+    // R876-F4: the host-persistent build cache. Third mount under
+    // `forge_state::HOST_ROOT`, and — as R603-B6's handoff promised a fifth
+    // would be — it needed no yubaba code and no unit-file edit, because
+    // `ensure_forge_state_dirs` mkdirs any forge bind under that root.
+    //
+    // Refused rather than ignored on the two image-backed command shapes: a
+    // `Workload` forge carries its own volume list (adding one behind the
+    // caller's back would silently contradict a spec they wrote), and a
+    // `BuildImage` forge's caching is BuildKit's, not a bind's. Ignoring a
+    // declared cache is the failure mode this ticket exists to avoid — a mount
+    // that looks like it works.
+    if let Some(key) = &spec.cache_key {
+        if !matches!(spec.command, ForgeCommand::Subprocess { .. }) {
+            return Err(RemoteForgeError::InvalidSpec(
+                "a build cache is supported only for a subprocess forge command — a \
+                 workload forge carries its own volumes and a build-image forge caches \
+                 through BuildKit (R876-F4)."
+                    .into(),
+            ));
+        }
+        // Same reasoning one step further out: a natively executed forge has no
+        // mount namespace at all, so the bind would be inert and the step would
+        // build cold while reporting a cache. `apply_exec_context` already
+        // refuses `produced_dir` on that path for the identical reason.
+        if native_exec {
+            return Err(RemoteForgeError::InvalidSpec(
+                "a build cache is a container affordance — a native forge has no mount \
+                 namespace for the bind, so the cache would be silently inert. Set \
+                 placement.runtime = container (R876-F4)."
+                    .into(),
+            ));
+        }
+        let mount = workload_spec::forge_cache::durable_mount(key).ok_or_else(|| {
+            RemoteForgeError::InvalidSpec(format!(
+                "build cache key `{key}` is not a safe single path component under {} \
+                 — keys are derived with forge_cache::key_from_parts, not written by \
+                 hand (R876-F4).",
+                workload_spec::forge_cache::HOST_ROOT,
+            ))
+        })?;
+        ws.volumes.push(mount);
     }
 
     if native_exec {
@@ -1431,6 +1491,7 @@ mod remote {
             label: None,
             initiator: Initiator::Human { camp: "test-camp".into() },
             mesh_access: velveteen::MeshAccess::None,
+            cache_key: None,
         }
     }
 
@@ -1466,6 +1527,87 @@ mod remote {
                 host_path: workload_spec::forge_produced::host_dir(&forge_id.to_string()),
             },
             "host source must be the per-forge durable dir under the convention root"
+        );
+    }
+
+    /// R876-F4: a `cache_key` lowers to a writable bind of
+    /// `forge_cache::HOST_ROOT/<key>` at `/yah/cache`. The host path must sit
+    /// under the forge state root or yubaba's `ensure_forge_state_dirs` will
+    /// not mkdir it and runc refuses the bind — the opaque failure R603-B6 and
+    /// R636-B1 each rediscovered on a live box.
+    #[test]
+    fn a_cache_key_lowers_to_a_bind_under_the_forge_state_root() {
+        let forge_id = ForgeId::new();
+        let mut spec = subprocess_spec(remote_any_infra(), None);
+        spec.cache_key = Some("mesofact-musl.build.x86_64-unknown-linux-musl".into());
+        let ws = build_workload_spec(&forge_id, &spec).expect("synthesis ok");
+
+        let mount = ws
+            .volumes
+            .iter()
+            .find(|v| v.target == PathBuf::from(workload_spec::forge_cache::CONTAINER_DIR))
+            .expect("a cache_key must produce a /yah/cache mount");
+        assert!(!mount.read_only, "a build cache the step cannot write is useless");
+        let VolumeSource::Bind { host_path } = &mount.source else {
+            panic!("expected a bind, got {:?}", mount.source);
+        };
+        assert!(
+            workload_spec::forge_state::is_forge_state_path(host_path),
+            "{host_path:?} must be under the forge state root or yubaba will not create it"
+        );
+    }
+
+    #[test]
+    fn no_cache_key_means_no_cache_mount() {
+        let forge_id = ForgeId::new();
+        let spec = subprocess_spec(remote_any_infra(), None);
+        let ws = build_workload_spec(&forge_id, &spec).expect("synthesis ok");
+        assert!(
+            !ws.volumes
+                .iter()
+                .any(|v| v.target == PathBuf::from(workload_spec::forge_cache::CONTAINER_DIR)),
+            "the default is still cold-every-run — no cache mount unless asked for"
+        );
+    }
+
+    /// A key that is not a safe single path component is REFUSED, not
+    /// sanitized into something else: mounting a different directory than the
+    /// caller named is how a cache silently becomes shared.
+    #[test]
+    fn a_traversing_cache_key_is_refused() {
+        let forge_id = ForgeId::new();
+        let mut spec = subprocess_spec(remote_any_infra(), None);
+        spec.cache_key = Some("../../etc".into());
+        let err = build_workload_spec(&forge_id, &spec)
+            .expect_err("a traversing key must not synthesise a mount");
+        assert!(
+            matches!(err, RemoteForgeError::InvalidSpec(ref m) if m.contains("cache key")),
+            "{err:?}"
+        );
+    }
+
+    /// R876-F4: refused rather than ignored on a native forge — it has no
+    /// mount namespace, so the cache would be inert while the step reported
+    /// one. Same refusal `produced_dir` gets on the local native arm.
+    #[test]
+    fn a_cache_key_on_a_native_forge_is_refused_rather_than_ignored() {
+        let forge_id = ForgeId::new();
+        let mut spec = subprocess_spec(
+            TaskPlacement::new(
+                TaskLocation::RemoteAny {
+                    tier: TierTag("infra".into()),
+                    mesh_tags: vec![],
+                },
+                TaskRuntime::Native,
+            ),
+            None,
+        );
+        spec.cache_key = Some("k".into());
+        let err = build_workload_spec(&forge_id, &spec)
+            .expect_err("a native forge must refuse a build cache");
+        assert!(
+            matches!(err, RemoteForgeError::InvalidSpec(ref m) if m.contains("mount namespace")),
+            "{err:?}"
         );
     }
 
@@ -1931,6 +2073,7 @@ mod remote {
             label: None,
             initiator: Initiator::Human { camp: "test-camp".into() },
             mesh_access: velveteen::MeshAccess::None,
+            cache_key: None,
         }
     }
 
@@ -2427,6 +2570,7 @@ mod executor_surface {
                 camp: "test-camp".into(),
             },
             mesh_access: velveteen::MeshAccess::None,
+            cache_key: None,
         }
     }
 

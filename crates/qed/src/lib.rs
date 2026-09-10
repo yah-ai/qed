@@ -282,6 +282,7 @@
 //! @yah:severity(low)
 //! @yah:gotcha("Filed 2026-08-11 from R719-F7, from the outside - I did not touch either file. yah-qed tests::desktop_release_matrix_routes_each_row_to_its_own_platform fails: it asserts three matrix rows over the REAL checked-in recipe, and .yah/qed/desktop-release.toml now declares one. The row removal is UNCOMMITTED and carries a long in-file rationale (both Linux rows published nothing in two waves, publish-desktop.sh exits 0 off Darwin, and the matrix parents AND-of-rows status reported a good 0.8.22 release as failed). So the recipe change looks deliberate and the test is the stale half.")
 //! @yah:next("Decide, then make the two agree. Either the one-row matrix is the intended shape (drop the two Linux entries from the assertion at oss/qed/crates/qed/src/lib.rs, keeping the Windows-stays-absent rationale), or the rows come back WITH the publish leg that consumes them (a Linux branch in publish-desktop.sh writing appimage/deb into the manifest). It is a product call about what desktop-release ships, which is why R719-F7 did not just edit the assertion green.")
+//! @yah:gotcha("THE SYMPTOM CHANGED, 2026-09-08 — the row-count assertion is no longer what fails, so do not go looking for it. `tests::desktop_release_matrix_routes_each_row_to_its_own_platform` now panics at oss/qed/crates/qed/src/lib.rs:602 with `desktop-release pipeline loads: NotFound(\"desktop-release\")`. Cause: `.yah/qed/desktop-release.toml` was DELETED in commit 9e454f03 and the recipe now lives at `.yah/qed/yah-desktop-release.toml`; the test still calls `.load(\"desktop-release\")`. Confirmed pre-existing and unrelated to the caller who found it (R560-B12, which touched only the qed runner's produced-artifact path): `git cat-file -e HEAD:.yah/qed/desktop-release.toml` fails. THIS DOES NOT RETIRE THE PRODUCT CALL in the next-step below — it stacks on top of it. Renaming the load target green would make the test load a ONE-row recipe and then assert three rows, i.e. it would land you back at exactly the mismatch this ticket was filed for. Fix the name and the row question together, or neither.")
 
 pub mod artifact_local;
 pub mod artifact_retrieval;
@@ -314,7 +315,11 @@ pub mod staleness;
 pub mod toolchain;
 pub mod transform;
 pub mod types;
-pub mod waitfor;
+
+/// The wait-for probe/backoff primitive itself lives in the standalone
+/// `pleasehold` crate (split out so a caller that only wants "wait for this
+/// thing to materialize" doesn't have to pull in qed's scheduler stack).
+pub use pleasehold as waitfor;
 
 pub use config::{ConfigError, GhaWorkflowEntry, LoaderSubPipelineResolver, PipelineLoader};
 pub use dag::{DagError, DEFAULT_MAX_PARALLEL};

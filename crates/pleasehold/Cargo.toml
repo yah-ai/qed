@@ -1,0 +1,18 @@
+[package]
+name = "pleasehold"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Protocol-pluggable poll-until-healthy primitive with backoff (http/tcp/shell probes)"
+
+[lib]
+name = "pleasehold"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["time", "net", "io-util", "process"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "time", "net", "io-util", "process"] }

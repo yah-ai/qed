@@ -553,6 +553,7 @@ mod tests {
             bucket: "yah-releases".into(),
             prefix: None,
             base_url: None,
+            require_explicit_version: false,
         }];
         let r = export_pipeline(&p);
         assert!(!r.shimmed, "subprocess-only steps still render faithfully");

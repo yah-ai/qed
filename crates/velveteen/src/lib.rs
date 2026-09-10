@@ -427,6 +427,22 @@ pub struct ForgeSpec {
     /// How the run may reach mirror services over the cluster mesh.
     #[serde(default)]
     pub mesh_access: MeshAccess,
+
+    /// R876-F4 — key of the host-persistent build cache this run may reuse, or
+    /// `None` for the default cold-every-time behaviour.
+    ///
+    /// The driver lowers it to a bind of `workload_spec::forge_cache::HOST_ROOT
+    /// /<key>` onto `forge_cache::CONTAINER_DIR`, so a step's build scratch
+    /// outlives the container kamaji reaps. Only a
+    /// [`ForgeCommand::Subprocess`] accepts one: a `Workload` forge carries its
+    /// own volumes and a `BuildImage` forge's caching belongs to BuildKit.
+    ///
+    /// The key is DERIVED by the dispatcher (`forge_cache::key_from_parts`),
+    /// never written by hand — two runs sharing a cargo target dir that should
+    /// not is a correctness bug, and a derived key makes the collision
+    /// impossible rather than merely unlikely.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_key: Option<String>,
 }
 
 // ─── IntegrationForgeSpec ─────────────────────────────────────────────────────
@@ -519,6 +535,7 @@ mod types {
             label: Some("ci-check".into()),
             initiator: Initiator::Human { camp: "my-camp".into() },
             mesh_access: MeshAccess::None,
+            cache_key: None,
         }
     }
 
