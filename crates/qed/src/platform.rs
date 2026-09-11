@@ -256,6 +256,12 @@ pub fn preflight_line(name: &str, platform: &Platform, resolution: &Resolution) 
 /// exactly one [`Resolution`], so the mac-vs-linux behaviour is *specified and
 /// tested* rather than emergent.
 ///
+/// It is **toolchain-blind on purpose** (W235 §4): branch 1 asks whether a pair
+/// is *crossable*, never whether this box has the cross toolchain installed.
+/// That Capability question is an input to Derivation one layer up, in
+/// [`resolve_placement`] — putting a filesystem probe in here would cost the
+/// purity that makes this a spec.
+///
 /// The decision order (cross-first):
 /// 1. **Host-native crossable target → [`NativeCross`](Resolution::NativeCross).**
 ///    Wins even if the recipe declares a foreign container — that container is
@@ -359,7 +365,44 @@ pub fn resolve(host: &str, target: Option<&str>, container_platform: Option<&str
 /// is the `rusty-v8-musl` forcing case — a gn/ninja C++ build that OOMs under
 /// QEMU, so it must land on the x86 build-worker (`us-west-002`) rather than
 /// emulate on an arm64 host.
+///
+/// # Capability folds in here, not in [`resolve`]
+///
+/// R555-B10 / W235 §6: Derivation answers *what does physics allow*, and it is
+/// host-relative but toolchain-blind — `host_native_crossable` says a pair is
+/// crossable, not that this box has the cross toolchain installed. The
+/// **Capability** axis (W235 §4) is an *input* to Derivation, not a peer of it,
+/// so this entry point takes the probed `capability` and demotes a
+/// [`NativeCross`](Resolution::NativeCross) verdict this host cannot actually
+/// carry to [`Offload`](Resolution::Offload) — see [`capability_demotion`]. [`resolve`]
+/// and [`derive_placement`] stay pure decision tables over the declaration; the
+/// probing (and its caching) belongs to the caller.
 pub fn resolve_placement(
+    host: &str,
+    target: Option<&str>,
+    container_platform: Option<&str>,
+    native: bool,
+    capability: &crate::nativecross::ToolAvailability,
+) -> Resolution {
+    let derived = derive_placement(host, target, container_platform, native);
+    match capability_demotion(host, target, container_platform, &derived, capability) {
+        Some(gap) => Resolution::Offload { target: gap.target },
+        None => derived,
+    }
+}
+
+/// The Derivation half of [`resolve_placement`] — pure over the *declaration*
+/// (host, target, container, `native`), with no tool-availability input.
+///
+/// Split out under R555-B10 so the two W235 §4 axes are separately nameable:
+/// this is "what does physics allow on a host of this shape", and it is the
+/// verdict the NativeCross-tier machinery must gate on (a step whose derivation
+/// is NativeCross still routes its argv through
+/// [`plan_native_cross`](crate::nativecross::plan_native_cross) when forced
+/// local, so it fails with the toolchain's install hint rather than a raw linker
+/// error). Callers deciding *where a step runs* want [`resolve_placement`],
+/// which folds Capability in on top of this.
+pub fn derive_placement(
     host: &str,
     target: Option<&str>,
     container_platform: Option<&str>,
@@ -383,11 +426,91 @@ pub fn resolve_placement(
     }
 }
 
+/// The Capability gap in a Derivation verdict (R555-B10, W235 §4/§6):
+/// `Some(gap)` when `resolution` is [`NativeCross`](Resolution::NativeCross) for
+/// a target that needs a *foreign* host toolchain which `capability` says is not
+/// installed. `None` means this host can carry the verdict as derived.
+///
+/// Pure — the probe that produced `capability` is the caller's. This is exactly
+/// the predicate `execute_step_local` already applies at *execution* time (it
+/// selects the tool and hard-fails on
+/// [`CrossToolUnavailable`](crate::nativecross::CrossToolUnavailable)); asking it
+/// at resolution time is the whole of the fix, because by execution time the
+/// step has already been placed on this box.
+///
+/// The returned error carries the tool it would have used and its install hint,
+/// which is the payload a demotion warning must name — W235 §6's deliberate
+/// non-goal is a *silent* demotion.
+///
+/// A gap is necessary but not sufficient for a demotion: see
+/// [`capability_demotion`], which is what callers should ask.
+fn capability_gap(
+    host: &str,
+    target: Option<&str>,
+    resolution: &Resolution,
+    capability: &crate::nativecross::ToolAvailability,
+) -> Option<crate::nativecross::CrossToolUnavailable> {
+    if !matches!(resolution, Resolution::NativeCross) {
+        return None;
+    }
+    let target = target.map(str::trim).filter(|t| !t.is_empty())?;
+    // A host-platform target needs no foreign toolchain at all (plain `cargo
+    // build`), so there is nothing for a probe to be missing.
+    if !crate::nativecross::is_native_cross_target(host, target) {
+        return None;
+    }
+    crate::nativecross::select_cross_tool(host, Some(target), capability).err()
+}
+
+/// Whether [`resolve_placement`] demotes this
+/// [`NativeCross`](Resolution::NativeCross) verdict to
+/// [`Offload`](Resolution::Offload), and why (R555-B10, W235 §6).
+///
+/// `Some(gap)` means the demotion fires and `gap` names the missing tool and its
+/// install command — the payload every warning about it must carry. Callers that
+/// need to *report* a demotion (the runner's preflight, the CLI's `--where=auto`
+/// notice) ask this rather than diffing two resolutions, so the report and the
+/// routing can never disagree.
+///
+/// The measured failure this exists for: `qed run 690455c1` (2026-08-19) lost 2
+/// of `mesofact-build`'s 4 matrix legs because the coordinator Mac had no
+/// `cargo-zigbuild`, while an idle x86 build-worker sat in the same camp. An
+/// under-provisioned coordinator should ship the build to a box that can do it,
+/// not hard-fail the release.
+///
+/// Two deliberate non-demotions, both of which would otherwise trade a clear
+/// error for a wrong one:
+///
+/// - **A declared `container_platform` is left alone.** The container supplies
+///   its own toolchain, and the host probe knows nothing about what is inside
+///   it, so "this box lacks zig" is not evidence the step cannot build here —
+///   `mesofact-musl`'s arm64 leg (`native = true`, `container_platform =
+///   "linux/arm64"`) builds through Colima's Linux VM on this Mac and must keep
+///   resolving NativeCross. A step on the container path that *does* need a host
+///   toolchain keeps the pre-R555-B10 behaviour: an install-hint failure at
+///   execution time.
+/// - **An unrecognized target arch is left alone**, matching [`resolve`]'s
+///   branch 3: there is no build-worker tag to name for it (see
+///   [`build_worker_mesh_tags`]), so offloading would route into the void.
+pub fn capability_demotion(
+    host: &str,
+    target: Option<&str>,
+    container_platform: Option<&str>,
+    derived: &Resolution,
+    capability: &crate::nativecross::ToolAvailability,
+) -> Option<crate::nativecross::CrossToolUnavailable> {
+    if container_platform.is_some() {
+        return None;
+    }
+    capability_gap(host, target, derived, capability)
+        .filter(|gap| is_known_arch(arch_of(&gap.target)))
+}
+
 /// True when `target`'s OS differs from `host`'s *and both are recognized*.
 ///
 /// The both-known guard is what keeps a bare-metal / unrecognized triple from
 /// being routed to a build-worker that could never be tagged for it — see
-/// [`resolve_placement`], the only caller.
+/// [`derive_placement`], the only caller.
 fn foreign_os(host: &str, target: &str) -> bool {
     let (host_os, target_os) = (os_tag_of(host), os_tag_of(target));
     host_os != "unknown" && target_os != "unknown" && host_os != target_os
@@ -917,7 +1040,7 @@ mod tests {
         }
     }
 
-    // ── resolve_placement() native policy (R590-F4) ─────────────────────────
+    // ── derive_placement() native policy (R590-F4) ─────────────────────────
 
     #[test]
     fn native_false_defers_to_the_full_decision_table() {
@@ -925,11 +1048,11 @@ mod tests {
         // the mesofact target still cross-compiles, a foreign container still
         // emulates a non-crossable target.
         assert_eq!(
-            resolve_placement(ARM_MAC, Some("x86_64-unknown-linux-musl"), None, false),
+            derive_placement(ARM_MAC, Some("x86_64-unknown-linux-musl"), None, false),
             resolve(ARM_MAC, Some("x86_64-unknown-linux-musl"), None),
         );
         assert_eq!(
-            resolve_placement(ARM_MAC, Some("x86_64-pc-windows-msvc"), Some("linux/amd64"), false),
+            derive_placement(ARM_MAC, Some("x86_64-pc-windows-msvc"), Some("linux/amd64"), false),
             resolve(ARM_MAC, Some("x86_64-pc-windows-msvc"), Some("linux/amd64")),
         );
     }
@@ -940,7 +1063,7 @@ mod tests {
         // native this is NativeCross (zig); WITH native it MUST Offload to the
         // x86 build-worker (the C++ build can't cross/emulate here).
         assert_eq!(
-            resolve_placement(ARM_MAC, Some("x86_64-unknown-linux-musl"), None, true),
+            derive_placement(ARM_MAC, Some("x86_64-unknown-linux-musl"), None, true),
             Resolution::Offload {
                 target: "x86_64-unknown-linux-musl".into()
             }
@@ -952,7 +1075,7 @@ mod tests {
         // A foreign container_platform would send resolve() to Emulate (branch
         // 2). native=true overrides that — no emulation, offload to real silicon.
         assert_eq!(
-            resolve_placement(
+            derive_placement(
                 ARM_MAC,
                 Some("x86_64-unknown-linux-musl"),
                 Some("linux/amd64"),
@@ -969,12 +1092,12 @@ mod tests {
         // Same arch AND same OS → the native build runs right here; no offload
         // even under native=true. (`-musl` vs `-gnu` is a libc tail, not an OS.)
         assert_eq!(
-            resolve_placement(ARM_MAC, Some("aarch64-apple-darwin"), None, true),
+            derive_placement(ARM_MAC, Some("aarch64-apple-darwin"), None, true),
             Resolution::NativeCross
         );
         // The x86 build-worker running its own x86 musl build: local native.
         assert_eq!(
-            resolve_placement(X64_LINUX, Some("x86_64-unknown-linux-musl"), None, true),
+            derive_placement(X64_LINUX, Some("x86_64-unknown-linux-musl"), None, true),
             Resolution::NativeCross
         );
     }
@@ -988,13 +1111,13 @@ mod tests {
     fn native_same_arch_foreign_os_offloads() {
         // The live case: the Linux rows of desktop-release, from an arm64 Mac.
         assert_eq!(
-            resolve_placement(ARM_MAC, Some("aarch64-unknown-linux-gnu"), None, true),
+            derive_placement(ARM_MAC, Some("aarch64-unknown-linux-gnu"), None, true),
             Resolution::Offload {
                 target: "aarch64-unknown-linux-gnu".into()
             }
         );
         assert_eq!(
-            resolve_placement(ARM_MAC, Some("aarch64-unknown-linux-musl"), None, true),
+            derive_placement(ARM_MAC, Some("aarch64-unknown-linux-musl"), None, true),
             Resolution::Offload {
                 target: "aarch64-unknown-linux-musl".into()
             }
@@ -1002,7 +1125,7 @@ mod tests {
         // The mirror: the darwin row from an arm64 Linux coordinator, which is
         // exactly what must reach us-west-015 (R631 tags it `os:darwin`).
         assert_eq!(
-            resolve_placement(
+            derive_placement(
                 "aarch64-unknown-linux-gnu",
                 Some("aarch64-apple-darwin"),
                 None,
@@ -1021,7 +1144,7 @@ mod tests {
     #[test]
     fn native_container_step_is_not_os_constrained() {
         assert_eq!(
-            resolve_placement(
+            derive_placement(
                 ARM_MAC,
                 Some("aarch64-unknown-linux-musl"),
                 Some("linux/arm64"),
@@ -1036,7 +1159,7 @@ mod tests {
     #[test]
     fn native_unknown_os_target_does_not_offload_on_os_alone() {
         assert_eq!(
-            resolve_placement(X64_LINUX, Some("x86_64-unknown-none"), None, true),
+            derive_placement(X64_LINUX, Some("x86_64-unknown-none"), None, true),
             Resolution::NativeCross
         );
     }
@@ -1044,11 +1167,232 @@ mod tests {
     #[test]
     fn native_absent_or_empty_target_builds_locally() {
         assert_eq!(
-            resolve_placement(ARM_MAC, None, None, true),
+            derive_placement(ARM_MAC, None, None, true),
             Resolution::NativeCross
         );
         assert_eq!(
-            resolve_placement(ARM_MAC, Some("  "), None, true),
+            derive_placement(ARM_MAC, Some("  "), None, true),
+            Resolution::NativeCross
+        );
+    }
+
+    // ── resolve_placement() = Derivation ∘ Capability (R555-B10, W235 §6) ────
+    //
+    // Every case below is driven by a hand-built ToolAvailability, never a real
+    // probe: the point of taking Capability as an argument is that the whole
+    // table is specified without touching a toolchain.
+
+    use crate::nativecross::ToolAvailability;
+
+    const NO_ZIG: ToolAvailability = ToolAvailability {
+        zigbuild: false,
+        musl_cross: false,
+    };
+
+    #[test]
+    fn capability_full_is_pure_derivation() {
+        // With every toolchain present, the composition must be byte-identical
+        // to the derivation table — no demotion anywhere in the space the
+        // native-policy tests above cover.
+        for (host, target, container, native) in [
+            (ARM_MAC, Some("x86_64-unknown-linux-musl"), None, false),
+            (ARM_MAC, Some("x86_64-unknown-linux-gnu"), None, false),
+            (ARM_MAC, Some("aarch64-unknown-linux-gnu"), None, false),
+            (ARM_MAC, Some("x86_64-unknown-linux-musl"), None, true),
+            (ARM_MAC, Some("aarch64-apple-darwin"), None, true),
+            (X64_LINUX, Some("aarch64-apple-darwin"), None, false),
+            (ARM_MAC, None, None, false),
+            (
+                ARM_MAC,
+                Some("x86_64-pc-windows-msvc"),
+                Some("linux/amd64"),
+                false,
+            ),
+        ] {
+            assert_eq!(
+                resolve_placement(host, target, container, native, &ToolAvailability::FULL),
+                derive_placement(host, target, container, native),
+                "FULL capability must not perturb {host} → {target:?}"
+            );
+        }
+    }
+
+    /// The measured incident (qed run 690455c1, 2026-08-19): `mesofact-build`'s
+    /// gnu legs derive NativeCross from this arm64 Mac — the foreign-arch one
+    /// through `resolve` branch 1, the same-arch/foreign-OS one through branch 4
+    /// — and both need `cargo-zigbuild`. Without it they must reach the idle
+    /// build-worker, not hard-fail the release.
+    #[test]
+    fn missing_zigbuild_demotes_native_cross_to_offload() {
+        for target in ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"] {
+            assert_eq!(
+                derive_placement(ARM_MAC, Some(target), None, false),
+                Resolution::NativeCross,
+                "{target} derives NativeCross (that is the defect's premise)"
+            );
+            assert_eq!(
+                resolve_placement(ARM_MAC, Some(target), None, false, &NO_ZIG),
+                Resolution::Offload {
+                    target: target.into()
+                }
+            );
+        }
+    }
+
+    /// The demotion asks the same question the *execution* path asks, so it
+    /// honors the same fallback ladder: a musl target still builds here off a
+    /// musl-cross toolchain when zig is absent, and only a target no installed
+    /// tool can carry leaves the box.
+    #[test]
+    fn musl_cross_fallback_is_not_a_capability_gap() {
+        let musl_only = ToolAvailability {
+            zigbuild: false,
+            musl_cross: true,
+        };
+        assert_eq!(
+            resolve_placement(
+                ARM_MAC,
+                Some("x86_64-unknown-linux-musl"),
+                None,
+                false,
+                &musl_only
+            ),
+            Resolution::NativeCross
+        );
+        // …while the gnu leg of the same pipeline has no such fallback.
+        assert_eq!(
+            resolve_placement(
+                ARM_MAC,
+                Some("x86_64-unknown-linux-gnu"),
+                None,
+                false,
+                &musl_only
+            ),
+            Resolution::Offload {
+                target: "x86_64-unknown-linux-gnu".into()
+            }
+        );
+    }
+
+    #[test]
+    fn host_platform_target_never_demotes() {
+        // A plain host build needs no foreign toolchain, so an empty
+        // ToolAvailability is irrelevant to it — demoting here would ship a
+        // five-second local build to the fleet for no reason at all.
+        for (host, target) in [
+            (ARM_MAC, Some("aarch64-apple-darwin")),
+            (ARM_MAC, None),
+            (ARM_MAC, Some("   ")),
+            (X64_LINUX, Some("x86_64-unknown-linux-gnu")),
+            // darwin↔darwin cross-arch: Apple's SDK ships both slices, so
+            // `select_cross_tool` answers CargoNative without zig.
+            (ARM_MAC, Some("x86_64-apple-darwin")),
+        ] {
+            assert_eq!(
+                resolve_placement(host, target, None, false, &NO_ZIG),
+                Resolution::NativeCross,
+                "{host} → {target:?} must not demote"
+            );
+        }
+    }
+
+    /// A declared container carries its own toolchain and the host probe can see
+    /// nothing inside it, so a missing host tool is not evidence the step cannot
+    /// build here. `mesofact-musl`'s arm64 leg is the live case.
+    #[test]
+    fn container_step_is_never_demoted() {
+        assert_eq!(
+            resolve_placement(
+                ARM_MAC,
+                Some("aarch64-unknown-linux-musl"),
+                Some("linux/arm64"),
+                true,
+                &NO_ZIG
+            ),
+            Resolution::NativeCross
+        );
+    }
+
+    /// Only NativeCross is demotable: the other tiers are not claims about a
+    /// host cross toolchain, so a capability gap must leave them exactly alone
+    /// (an Emulate turned Offload would route around R560's emulation gate).
+    #[test]
+    fn other_tiers_are_not_demotable() {
+        // Emulate: foreign-arch container, non-crossable target.
+        assert!(matches!(
+            resolve_placement(
+                ARM_MAC,
+                Some("x86_64-pc-windows-msvc"),
+                Some("linux/amd64"),
+                false,
+                &NO_ZIG
+            ),
+            Resolution::Emulate { .. }
+        ));
+        // Offload stays Offload (the derived kind, with its own target).
+        assert_eq!(
+            resolve_placement(X64_LINUX, Some("aarch64-apple-darwin"), None, false, &NO_ZIG),
+            Resolution::Offload {
+                target: "aarch64-apple-darwin".into()
+            }
+        );
+        // Skip stays Skip — no toolchain question was ever asked of it.
+        assert!(matches!(
+            resolve_placement(ARM_MAC, Some("mos-unknown-none"), None, false, &NO_ZIG),
+            Resolution::Skip { .. }
+        ));
+    }
+
+    /// `capability_demotion` is what the CLI notice and the runner preflight
+    /// read, so it must agree with `resolve_placement` exactly — and it must
+    /// carry the missing tool's install hint, because W235 §6's non-goal is a
+    /// silent demotion.
+    #[test]
+    fn capability_demotion_names_the_missing_tool_and_matches_the_verdict() {
+        let target = "x86_64-unknown-linux-gnu";
+        let derived = derive_placement(ARM_MAC, Some(target), None, false);
+        let gap = capability_demotion(ARM_MAC, Some(target), None, &derived, &NO_ZIG)
+            .expect("a zigbuild-less mac cannot carry the gnu leg");
+        assert_eq!(gap.target, target);
+        assert_eq!(gap.preferred, crate::nativecross::CrossTool::CargoZigbuild);
+        let rendered = gap.to_string();
+        assert!(
+            rendered.contains("cargo install cargo-zigbuild"),
+            "the demotion must name the install command, got: {rendered}"
+        );
+        // Agreement with the routing verdict, in both directions.
+        assert_eq!(
+            resolve_placement(ARM_MAC, Some(target), None, false, &NO_ZIG),
+            Resolution::Offload {
+                target: target.into()
+            }
+        );
+        assert!(
+            capability_demotion(
+                ARM_MAC,
+                Some(target),
+                None,
+                &derived,
+                &ToolAvailability::FULL
+            )
+            .is_none()
+        );
+    }
+
+    /// An unrecognized target arch has no build-worker tag to name, so it keeps
+    /// the derived verdict rather than offloading into the void — the same
+    /// discipline as `resolve`'s branch 3. `powerpc64` is known and crossable
+    /// (linux), so it demotes; a made-up arch does not.
+    #[test]
+    fn unknown_arch_is_not_offloaded_into_the_void() {
+        assert_eq!(
+            resolve_placement(ARM_MAC, Some("powerpc64-unknown-linux-gnu"), None, false, &NO_ZIG),
+            Resolution::Offload {
+                target: "powerpc64-unknown-linux-gnu".into()
+            }
+        );
+        assert_eq!(
+            resolve_placement(ARM_MAC, Some("fictional-unknown-linux-gnu"), None, false, &NO_ZIG),
             Resolution::NativeCross
         );
     }

@@ -472,6 +472,27 @@
 //! @yah:handoff("LEADER DECISION MID-TICKET, recorded because the first shape was wrong and the reasoning should outlive it. The courier's initial gate refused on ANY build skew and extended to `serve_build.rs`, so `yah serve` builds would have refused too. I overruled that and had it narrowed to outcome-keyed: refuse only when the resolved pipeline declares an outward-facing terminal outcome. The asymmetry is the argument — this camp is skewed most of the working day by construction (`cargo build` does not touch the installed binary and `cargo xtask install` is rare), so a blanket refusal would have armed a camp-wide `yah serve` outage on the next install, trading a contained hazard (an accidental CDN publish) for a broader one. A gate whose failure mode is \"nobody can work\" gets disarmed by whoever hits it first, and then it protects nothing.")
 //! @yah:verify("MEASURED BLAST RADIUS OF THE NARROWED GATE: exactly four pipelines in the camp declare any terminal outcome (mesofact-musl, oss-binaries, yah-cli-release, yah-release — all `publish`), and there are zero `on_fail` outcome blocks, so everything else proceeds with only the pre-existing warning. Proven live as an acceptance pair against the real stale daemon, same skew, opposite verdicts: a purpose-built publish-carrying probe REFUSED at exit 1 naming the outcome, and `node-pin-smoke` PROCEEDED green. `cargo test -p yah --lib` 1488 passed / 0 failed (from a 1478/1 baseline whose single failure was @Ashguard:hydra's R877-F4, since fixed).")
 //! @yah:gotcha("THE COURIER'S FIRST PROOF ATTEMPT WAS INVALID AND IT CAUGHT THAT ITSELF — worth knowing because the same trap is live for anyone else building here. `target/debug/yah` reported `0.8.32+6f193f90-dirty` with zero `allow-build-skew` matches after cargo printed `Finished`: a three-versions-stale artifact on the shared target dir. Per CLAUDE.md it checked `cargo orphan-gc log` BEFORE rebuilding; orphan-gc deleted 0 artifacts and is EXONERATED here, not implicated (likely a hardlink relink race). The real proofs ran against a snapshot verified on two independent axes. That failed attempt is also why the probe pipeline was guarded three ways — the test target has to be safe in the case where the gate FAILS, not merely where it works; aiming that attempt at mesofact-musl would have caused the very incident R876-F6 exists to prevent.")
+//!
+//! @yah:ticket(R605-B19, "A manual step's advance predicate gets no run-scoped state, so per-run gating has to be smuggled through a file on disk")
+//! @yah:status(review)
+//! @yah:at(2026-09-10T08:15:39Z)
+//! @yah:assignee(agent:bundle-anthropic-miravel)
+//! @yah:parent(R605)
+//! @yah:severity(medium)
+//! @yah:next("Tier: Cleric — a small, well-bounded plumbing change in one function plus its call site, with a unit test. The design question (what run-scoped values to expose) is the only judgement, and R605-B17's handoff already argues for the minimum viable set.")
+//! @yah:verify("A manual step's `advance` can gate on the current run without any file under `.yah/jit/`, demonstrated by a qed unit test at the `probe_manual_advance` level. Bonus, not required: R605-B17's nonce-file mechanism in `.yah/qed/yah-release-wizard.toml` collapses to a one-line predicate.")
+//! @yah:gotcha("ESTABLISHED BY READING THE CODE during R605-B17, then paid for in R605-B18: `substituted_step` rewrites only argv/env/produces and leaves `manual.advance` untouched, so `${{ steps.*.outputs.* }}` cannot carry state into a predicate; and `probe_manual_advance` execs a plain `sh -c` with no injected env — not even a run id. Net effect: an advance predicate can only ask questions about durable repo/remote state, and has no way to ask 'did THIS run do it?'. That is the root cause behind R605-B17, where commit-and-tag's predicate was satisfied by the tag a PRIOR run cut and silently auto-advanced forever.")
+//! @yah:next("THE WORKAROUND IS THE EVIDENCE — read it before designing the fix. R605-B17 could not express 'this run re-froze' in a predicate, so it added a mechanical step that writes a `date+pid` nonce to `.yah/jit/qed/release-wizard-run-token` and made advance a `diff -q` of that against an operator-written ack file. It works, and B17's handoff records why four cleaner alternatives were rejected — but a pipeline author should not have to invent a nonce protocol on disk to ask 'did this run do the thing'. Injecting a run id (and plausibly the step id) into `probe_manual_advance`'s `sh -c` env is the smallest change that removes the whole class.")
+//! @yah:handoff("DECISION TAKEN, matching the pre-made call: `probe_manual_advance` (oss/qed/crates/qed/src/runner.rs) now injects two env vars into the `sh -c` subprocess it evaluates `advance` in: `QED_RUN_ID` (= `self.run_id`, already existed on `PipelineRunner`, just wasn't exposed) and `QED_STEP_NAME` (the manual step's own name). Two new public consts in types.rs, `ENV_MANUAL_RUN_ID`/`ENV_MANUAL_STEP_NAME` = \"QED_RUN_ID\"/\"QED_STEP_NAME\", following the existing `ENV_PARTICIPANTS`/`ENV_PARTICIPANT_SELF` naming precedent in participants.rs. Signature change: `probe_manual_advance(&self, cond, cwd)` -> `probe_manual_advance(&self, cond, cwd, step_name)`; updated all 3 production call sites in `execute_step_manual`/`park_on_human` (they all already had `step` in scope, no new plumbing needed there) plus the 3 test call sites from R605-B18's push-tag test.")
+//! @yah:handoff("SCOPE DISCIPLINE, as instructed: this is the whole ticket, not a start on the bonus. I evaluated collapsing R605-B17's nonce-file mechanism in yah-release-wizard.toml down to `echo \"$QED_RUN_ID\" > ack-file` / `advance = '[ \"$(cat ack-file)\" = \"$QED_RUN_ID\" ]'` and did NOT do it — naming why rather than leaving it silently undone. The blocker: `QED_RUN_ID` is injected only into `probe_manual_advance`'s OWN subprocess (the qed-internal read-only probe), never into the human's actual TERMINAL session where `manual.terminal` commands run — that's a real, separate interactive shell spawned by the desktop (`RunInTerminalButton.tsx` -> `TerminalView`), with no plumbing today to inherit qed's run-scoped env. So the human's prefilled `cp`/`echo` command has no way to see `$QED_RUN_ID` at all; making it see it means touching the desktop terminal-spawn path, which is exactly the 'second migration' I was told to leave and name rather than pull in. B17's nonce-file mechanism (date+pid token, written by a MECHANICAL step the daemon runs, not by the human) stays as the wizard's actual per-run signal for the reason above — it was never blocked on this ticket, it was blocked on a different plumbing gap.")
+//! @yah:handoff("NEW regression test, `runner::tests::probe_manual_advance_lets_a_predicate_gate_on_this_run_with_no_file`, placed directly after R605-B17's nonce-file test for narrative contrast (there's the workaround; here's the primitive that makes it possible to avoid one going forward). Uses ZERO files under `.yah/jit/` or anywhere else — two separate `PipelineRunner::new()` instances stand in for two separate `qed run` invocations (each gets its own random `run_id` by construction, confirmed distinct), and a predicate comparing `$QED_RUN_ID` against a baked-in expected value is satisfied by the matching run and refused by the other — directly modeling R605-B17's exact failure mode (a PRIOR run's artifact must not satisfy THIS run's gate) but resolved via env instead of disk. A second assertion pair covers `QED_STEP_NAME` distinguishing two differently-named manual steps.")
+//! @yah:handoff("FOUND AND FIXED A REAL BUG IN MY OWN FIRST DRAFT before running tests: the two new `pub const` doc comments were originally spliced INTO `ManualConfig`'s own doc comment (inserted between two of its paragraphs with no code boundary between them), which in Rust means the whole `ManualConfig`-describing preamble would have silently become the doc comment for `ENV_MANUAL_RUN_ID` instead, and `ManualConfig` itself would have ended up documented only by the trailing paragraph. Moved both consts to their own complete doc-commented items BEFORE the `ManualConfig` block starts; intra-doc `[ENV_MANUAL_RUN_ID]` links resolve fine regardless of declaration order within the module. Caught by re-reading the diff, not by a compiler error — cargo doesn't lint doc-comment attachment by default.")
+//! @yah:handoff("Shared-tree check per the leader's instructions: confirmed my target functions (`probe_manual_advance` at runner.rs:5683, `execute_step_manual` at :5747, both pre-edit line numbers) sit well clear of the three regions named as R555-F6/Coffee's live territory (`execute_step_remote` ~8126, `resume_terminal_publish_for_remote_step` ~4699, the run() remote arm ~4301-4321) — confirmed by grepping current line numbers before editing, not assumed from the leader's cited numbers (which had already drifted from concurrent peer edits by the time I read the file). Used Edit exclusively, never a whole-file Write or any git restore/checkout. Did not party.chat session:396fae7b since my edits never entered their regions.")
+//! @yah:verify("cargo test --manifest-path oss/qed/crates/qed/Cargo.toml --lib probe_manual_advance_lets_a_predicate_gate_on_this_run_with_no_file: 1 pass / 0 fail")
+//! @yah:verify("cargo test --manifest-path oss/qed/crates/qed/Cargo.toml --lib runner::tests::manual: 9 pass / 0 fail (no regressions in the manual-step-gate test group after the signature change)")
+//! @yah:verify("cargo test --manifest-path oss/qed/crates/qed/Cargo.toml --lib: 948 pass / 1 fail (baseline qed lib 943 pass / 1 fail from R605-B18's handoff, +5 from concurrent peer test additions to this shared crate during this session, same pre-existing failure: R577-B5 tests::desktop_release_matrix_routes_each_row_to_its_own_platform)")
+//! @yah:verify("cargo test -p yah --lib every_camp_pipeline_loads_and_validates: 1 pass / 0 fail (wizard toml, untouched by this ticket, still loads)")
+//! @yah:verify("cargo test -p yah --lib r325_f1: 42 pass / 0 fail (baseline 42/42, confirms no cross-crate breakage from the probe_manual_advance signature change or the ManualConfig doc-comment restructure)")
 
 use std::sync::Arc;
 
@@ -755,6 +776,30 @@ pub enum RunWhere {
     Remote,
 }
 
+/// One step's row in [`PipelineRunner::fleet_portability_report`] (R555-F11):
+/// the two independent facts an operator needs to read together, plus the third
+/// that decides which of them is the *actionable* one.
+#[derive(Debug, Clone)]
+pub struct StepPortability {
+    /// The step's declared name.
+    pub step: String,
+    /// Would THIS run dispatch it to a build worker? Folds the `--where`
+    /// force-mode, the step's own placement resolution (including the R555-B10
+    /// capability demotion), and its kind — only `kind = "subprocess"` steps are
+    /// ever dispatched, so a sub-pipeline under `--where=remote` reads `false`.
+    pub dispatched_to_fleet: bool,
+    /// What stands between the step and a build worker, blocking and advisory.
+    /// Empty ⇒ fleet-portable with nothing worth remarking on.
+    pub gaps: Vec<crate::fleet_portability::PortabilityGap>,
+    /// Set when the step is headed for the fleet **because this host lacks a
+    /// cross toolchain** (R555-B10), not because the recipe or the operator
+    /// asked. Carries the missing tool and its install hint. The one input that
+    /// turns "not portable" from a recipe problem into a
+    /// this-can-run-nowhere problem — see
+    /// [`PipelineRunner::fleet_portability_gate`].
+    pub capability_demotion: Option<crate::nativecross::CrossToolUnavailable>,
+}
+
 /// Pure placement policy (R590-F4): fold the operator's `--where` force-mode
 /// together with a step's platform [`Resolution`] into a concrete
 /// [`Local`](RunWhere::Local) / [`Remote`](RunWhere::Remote) decision. Never
@@ -815,25 +860,90 @@ pub fn pipeline_has_node_bound_participant(pipeline: &Pipeline) -> bool {
 /// exactly that: "no remote dispatcher is wired", from `--where=auto`, on a
 /// pipeline whose whole content is a rendezvous. Placement is a property of the
 /// *binding* there, not of the target triple.
-pub fn pipeline_needs_offload(pipeline: &Pipeline, host: &str) -> bool {
+///
+/// R555-B10: `capability` is the third reason, and threading it here is the
+/// non-obvious half of that fix. This question is answered from pipeline + host
+/// *before* a runner exists, so a per-step Capability demotion the runner makes
+/// but this cannot see produces a step resolving `Offload` with no dispatcher
+/// wired — the `InvalidConfig` "no remote dispatcher" below, which trades a
+/// clear "install cargo-zigbuild" for a confusing one. Callers on the local box
+/// pass [`ToolAvailability::probe`](crate::nativecross::ToolAvailability::probe);
+/// a caller reasoning about a *remote* host's pipeline passes that host's known
+/// set (or `FULL`), exactly as it would to
+/// [`PipelineRunner::with_cross_availability`].
+pub fn pipeline_needs_offload(
+    pipeline: &Pipeline,
+    host: &str,
+    capability: &crate::nativecross::ToolAvailability,
+) -> bool {
     pipeline_has_node_bound_participant(pipeline)
-        || pipeline.steps.iter().any(|step| {
+        || pipeline
+            .steps
+            .iter()
+            .any(|step| matches!(step_placement(step, host, capability), crate::platform::Resolution::Offload { .. }))
+}
+
+/// One step's placement resolution against `host` and `capability` — the
+/// pipeline-level (pre-runner) mirror of
+/// [`PipelineRunner::resolve_step`](PipelineRunner::resolve_step), shared by
+/// [`pipeline_needs_offload`], [`pipeline_is_fully_offloaded`] and
+/// [`pipeline_capability_demotions`] so the up-front questions and the runner's
+/// per-step routing cannot drift apart (R555-B10).
+fn step_placement(
+    step: &crate::types::QedStep,
+    host: &str,
+    capability: &crate::nativecross::ToolAvailability,
+) -> crate::platform::Resolution {
+    let p =
+        crate::platform::Platform::compose(host, step.platform.as_ref(), step.triple.as_deref());
+    let native = step.platform.as_ref().map(|s| s.native).unwrap_or(false);
+    crate::platform::resolve_placement(
+        &p.host,
+        p.target.as_deref(),
+        p.container_platform.as_deref(),
+        native,
+        capability,
+    )
+}
+
+/// Every step of `pipeline` that `host` cannot carry as derived (R555-B10) —
+/// `(step name, gap)`, the pre-runner mirror of
+/// [`PipelineRunner::capability_demotions`].
+///
+/// The CLI's `--where=auto` notice reads this so the operator is told *which
+/// tool to install* at the moment their build is being shipped off-box. W235
+/// §6's non-goal: the demotion must never be silent.
+pub fn pipeline_capability_demotions(
+    pipeline: &Pipeline,
+    host: &str,
+    capability: &crate::nativecross::ToolAvailability,
+) -> Vec<(String, crate::nativecross::CrossToolUnavailable)> {
+    pipeline
+        .steps
+        .iter()
+        .filter_map(|step| {
             let p = crate::platform::Platform::compose(
                 host,
                 step.platform.as_ref(),
                 step.triple.as_deref(),
             );
             let native = step.platform.as_ref().map(|s| s.native).unwrap_or(false);
-            matches!(
-                crate::platform::resolve_placement(
-                    &p.host,
-                    p.target.as_deref(),
-                    p.container_platform.as_deref(),
-                    native,
-                ),
-                crate::platform::Resolution::Offload { .. }
-            )
+            let derived = crate::platform::derive_placement(
+                &p.host,
+                p.target.as_deref(),
+                p.container_platform.as_deref(),
+                native,
+            );
+            let gap = crate::platform::capability_demotion(
+                &p.host,
+                p.target.as_deref(),
+                p.container_platform.as_deref(),
+                &derived,
+                capability,
+            )?;
+            Some((step.name.clone(), gap))
         })
+        .collect()
 }
 
 /// True when **every** step in `pipeline` resolves to
@@ -848,22 +958,15 @@ pub fn pipeline_needs_offload(pipeline: &Pipeline, host: &str) -> bool {
 ///
 /// An empty pipeline is **not** fully offloaded — `all()` over nothing is
 /// vacuously true, which would quietly hand a no-op pipeline the fleet lane.
-pub fn pipeline_is_fully_offloaded(pipeline: &Pipeline, host: &str) -> bool {
+pub fn pipeline_is_fully_offloaded(
+    pipeline: &Pipeline,
+    host: &str,
+    capability: &crate::nativecross::ToolAvailability,
+) -> bool {
     !pipeline.steps.is_empty()
         && pipeline.steps.iter().all(|step| {
-            let p = crate::platform::Platform::compose(
-                host,
-                step.platform.as_ref(),
-                step.triple.as_deref(),
-            );
-            let native = step.platform.as_ref().map(|s| s.native).unwrap_or(false);
             matches!(
-                crate::platform::resolve_placement(
-                    &p.host,
-                    p.target.as_deref(),
-                    p.container_platform.as_deref(),
-                    native,
-                ),
+                step_placement(step, host, capability),
                 crate::platform::Resolution::Offload { .. }
             )
         })
@@ -1252,6 +1355,14 @@ pub struct PipelineRunner {
     /// (the `yah qed run --allow-emulate` confirmation) and inherited by
     /// SubPipeline children.
     allow_emulate: bool,
+    /// The operator's `--force` (R555-F11): bypass the fleet-portability gate.
+    ///
+    /// Same escape hatch as the W155 environment gate's `force`, deliberately —
+    /// [`crate::placement_gate::evaluate`] already spells "I know, run it
+    /// anyway" that way, and inventing a second flag for the same sentence is
+    /// how a CLI grows two words for one idea. Defaults `false`; set per-run via
+    /// [`Self::with_force`] and inherited by SubPipeline children.
+    force: bool,
     /// R823-F2 — the pipeline's allocated participant set, or `None` when it
     /// declares none (which is every pipeline that isn't a multi-host case).
     ///
@@ -1441,6 +1552,32 @@ struct BackgroundTask {
     remote: Option<RemoteSidecar>,
 }
 
+/// What [`PipelineRunner::execute_step_remote`] hands back (R555-F6).
+///
+/// The step's outcome and the workload's existence are separate questions, and
+/// collapsing them is what let every finished remote step leak. `Ok(forge_id) /
+/// Err(_)` could only name the workload on the success leg, so a step that
+/// dispatched and then exited non-zero was unreapable — the caller held an
+/// error and no ident.
+///
+/// Same distinction [`RemoteSidecar::forge_id`] draws for participants: a
+/// `None` here means dispatch never happened (no dispatcher wired, a spec the
+/// runner refused, a source-context publish that failed), so there is nothing
+/// on any node to tear down. That is meaningfully different from a run that
+/// exists and failed, and only the second one owes a reap.
+struct RemoteStepOutcome {
+    /// `Some` from the moment `RemoteForgeDriver::start_with_context` returns.
+    forge_id: Option<ObsForgeId>,
+    result: Result<(), RunnerError>,
+}
+
+impl RemoteStepOutcome {
+    /// The step never reached a worker, so there is no record to reap.
+    fn never_dispatched(err: RunnerError) -> Self {
+        Self { forge_id: None, result: Err(err) }
+    }
+}
+
 /// R823-F2 — what reaping a *remote* participant sidecar needs that reaping a
 /// local one does not.
 ///
@@ -1536,16 +1673,14 @@ struct StepOutcome {
 /// attribute.
 ///
 /// @yah:ticket(R823-B4, "Participant teardown is a no-op on the shipped fleet: destroy answers &quot;destroyed&quot; and leaves the container running on 0.8.28")
-/// @yah:at(2026-09-04T09:53:46Z)
+/// @yah:status(review)
+/// @yah:at(2026-09-10T23:57:49Z)
 /// @yah:assignee(agent:bundle-anthropic-ashguard)
 /// @yah:parent(R823)
 /// @yah:severity(high)
 /// @yah:depends_on(R854)
 /// @yah:gotcha("MEASURED 2026-09-03 (R823-T3), five participant runs against us-west-003. Every green run left its responder RUNNING on the node, holding port 34500, after `yah qed run participant-smoke` reported Success. Proved at the RPC, not inferred: `curl -X POST http://100.64.0.9:7443/workloads/forge.87802530-1aae-4521-98cb-77644ff228f1/destroy` — the exact dotted mesh ident RemoteForgeDriver::kill sends — returned {\"ident\":...,\"revoked\":false,\"status\":\"destroyed\"} while `sudo ctr -n yah tasks ls` still showed the task RUNNING and `ss -ltnp` still showed its python holding 0.0.0.0:34500. Nothing is wrong with the client-side teardown call.")
 /// @yah:gotcha("A LEAK DOES NOT JUST HOLD A MACHINE — IT MAKES THE NEXT RUN PASS. The second run of participant-smoke succeeded on its FIRST dial with no retry, because the FIRST run's leaked responder was still listening at the same address; every run of a given set is handed the same address and the same assigned port, so a leftover is indistinguishable from a healthy peer. Runs that dispatch a fresh responder need one `Connection refused` retry while the container comes up — that retry's absence is the tell. This is the specific reason the leak had to be made loud before anything else was built on participant sets.")
-/// @yah:next("THE FIX IS ALREADY WRITTEN — THIS IS A ROLL, NOT A CODE TICKET. The fleet is on yubaba/kamaji 0.8.28 (GET /health on 100.64.0.9:7443). R854's kamaji-containerd-core `reap_task` — which kills, WAITS on the shim exit event, deletes and re-probes, instead of firing a delete and discarding the result — first appears in-tree at commit aeb0f08c (v0.8.31, 2026-09-03) and has never been on a node. R854's own gotcha says the same thing from the other end: \"the two-deploys-on-a-node assertion needs a kamaji rebuild shipped to us-west-001, which is an operator action\".")
-/// @yah:next("DO NOT ASSUME THE ROLL FIXES IT — that is this ticket's whole job. R854 fixed the DEPLOY-path collision; what was measured here is the DESTROY path answering success on a live task, and pre-R854 reap_container did at least fire a SIGKILL, which plainly did not reach this container. Same fix probably covers both (destroy routes to reap_container), but \"probably\" is why this is a ticket. ACCEPTANCE: roll one node carrying R854 (us-west-003 is the one with the pre-pulled image), point .yah/qed/participant-smoke.toml's responder at it, run `yah qed run participant-smoke --in-process`, and require BOTH — the run passes AND no `qed: teardown: ... did not stop within 20s` line appears AND `sudo ctr -n yah tasks ls` shows no RUNNING task and `ss -ltnp` shows port 34500 free. The teardown line is now emitted by reap_background (R823-T3), so its absence is a real signal rather than the old silence.")
-/// @yah:next("Tier: Cleric — no design left; it is a fleet roll plus a re-run of two pipelines that already exist, with a pass/fail condition stated above. Also worth folding in while on the box: `oss/yubaba/crates/yubaba/src/lib.rs:190` already carries \"DESTROY SEMANTICS BUG: a destroy that reaps the produced dir but leaves the container running is incoherent\" — that note predates this and describes the same shipped behaviour; retire it or point it here once the roll proves the fix.")
 /// @yah:notify_on(R854, "R854 carries the kamaji reap_task fix this ticket is waiting on. When it lands, the roll is unblocked: ship a kamaji/yubaba carrying it to us-west-003 and re-run `yah qed run participant-smoke --in-process`, requiring no `qed: teardown: ... did not stop within 20s` line and a clean `ctr -n yah tasks ls` afterwards.")
 /// @yah:handoff("ROOT CAUSE FOUND, AND IT IS NOT R854. The roll would NOT have fixed this — the ticket's own warning was right. `KamajiSibling::deploy_workload` (oss/kamaji/crates/kamaji/src/sibling.rs:709) names the container from `spec.name`; `teardown_workload` (sibling.rs:813) has only a MeshIdent and sends THAT as the Stop id. For every workload whose name and mesh identity agree those are the same string, so nothing was ever wrong. A forge run is the one shape where they differ — `WorkloadSpec::for_forge` is `name = forge-<uuid>` (DNS-label safe, no dots) against `expose.mesh.identity = forge.<uuid>` (R590-B9, oss/yah-base/crates/workload-spec/src/lib.rs:2485). So Stop probed a container id that had never existed, kamaji-bin `reap_container` took its `probe.is_err() -> return Ok(())` early return (oss/kamaji/crates/kamaji-bin/src/containerd.rs:714), and yubaba answered {\"status\":\"destroyed\"} over a RUNNING container. R854's reap_task never ran at all: the reap is three lines below the early return.")
 /// @yah:handoff("PROVEN ON THE LIVE BOX, not inferred. `sudo ctr -n yah containers info forge-87802530-1aae-4521-98cb-77644ff228f1` on us-west-003 returns labels {yah.ident: forge-87802530-..., yah.name: forge-87802530-..., yah.mesh-ident: forge.87802530-..., yah.tier: infra} — the dotted mesh-ident the destroy RPC was sent with is stamped on the container whose DASHED id Stop was looking for. Both keys are right there; nothing joined them.")
@@ -1556,8 +1691,6 @@ struct StepOutcome {
 /// @yah:gotcha("THE PUBLISHED 0.8.31 DOES NOT CONTAIN R854. This ticket's plan assumed \"roll to the released 0.8.31\" would put reap_task on a node; it would not, and anyone acting on that plan would have measured a still-broken box and blamed the fix. Proven by CONTENT, not by version string (which is exactly what roll-node.sh's header warns about): downloaded https://cdn.yah.dev/yubaba/0.8.31/x86_64-unknown-linux-musl/yubaba-x86_64-unknown-linux-musl.tar.gz, sha256 a4e1fbf82e33db4a4e820d05a6d36e7bbd941803e3dbd6a58f53219127c4c292 matching the manifest, and `strings kamaji | grep \"task reap did not complete\"` = 0 hits, while other strings from the same function (\"kamaji: containerd workload torn down\", \"resuming recorded bundle deploy after restart (R755-B5)\") ARE present. Timing agrees: the tarball's inner mtime is 2026-09-02 23:59 and commit aeb0f08c (\"v0.8.31\", the first commit carrying reap_task) is 2026-09-03 11:04. The release was cut from a pre-fix tree that already carried the version bump.")
 /// @yah:gotcha("CURRENT us-west-003 STATE, snapshotted 2026-09-03 before any change (ssh -i ~/.ssh/yah yah@192.168.10.32; that key is required, the default keys are refused). kamaji 0.8.28 / yubaba 0.8.28. `ctr -n yah tasks ls` shows 8 forge tasks, ALL STOPPED — the RUNNING responders R823-T3 measured have since died — and `ss -ltnp` shows port 34500 FREE. So the ticket's own trap (\"a leaked responder makes the next run pass on its first dial\") is NOT armed right now: a fresh participant-smoke will need its Connection-refused retry and is currently an honest test. What survives is 9 forge CONTAINER records and 8 orphan task records that destroy never removed — the residue of the same bug. LEFT IN PLACE DELIBERATELY: it is the evidence, and reaping it before the fix is proven destroys the before-picture. `sudo ctr -n yah containers rm forge-<uuid>` cleans it once the roll lands.")
 /// @yah:gotcha("SHARED-TREE NOTE: oss/kamaji has heavy uncommitted work from live peers — @Ashguard:eclipse (R844-T13) and @Ashguard:libra (R844-F16) on ports.rs (+1062), sibling.rs, kamaji-proto, and server.rs, plus a named_ports/spec_digest hunk at kamaji-bin/src/containerd.rs:844-854 (R844-F2 / R852-B4). My hunks in that file are disjoint from theirs (teardown at ~663-690, the resolver free functions after spawn_forwarder, and the new tests) and I changed nothing in `list()`, so no seam is owed. Verify by content before assuming any part of oss/kamaji is mine.")
-/// @yah:next("LIVE ACCEPTANCE IS STILL OPEN AND NOW NEEDS A RELEASE, not just a roll. roll-node.sh installs only from the published manifest by design (no upload-a-local-binary flag, and there should never be one), publish-yubaba-release.sh refuses to republish an existing version, and published 0.8.31 carries neither R854 nor this fix. So the sequence is: bump 0.8.31 -> 0.8.32 in lockstep across the root and oss/ workspaces (/release skill), `scripts/publish-yubaba-release.sh --publish`, `scripts/roll-node.sh us-west-003 --to 0.8.32`, then `yah qed run participant-smoke --in-process`. REQUIRE ALL FOUR: the run passes; no `qed: teardown: ... did not stop within 20s` line; `sudo ctr -n yah tasks ls` shows no RUNNING task; `ss -ltnp` shows 34500 free. Then reap the 9 stale forge container records and retire the R603-B6 note.")
-/// @yah:next("THAT SAME 0.8.32 RELEASE UNPARKS TWO OTHER TICKETS, which is the argument for cutting it rather than waiting: R854's headline verify (two back-to-back deploys on us-west-001, both 200) and R848's end-to-end verify are both blocked on exactly \"a kamaji carrying reap_task reaches a node\", and both were filed believing 0.8.31 would deliver it. Roll us-west-001 in the same wave and all three close together. ORDERING per roll-node.sh's header: us-west-003 is a non-voter with no serving workloads, so roll it first as the cheap proof; us-west-001 carries workloads and needs `yah cloud apply` planned into the roll.")
 /// @yah:handoff("STATE AS OF 2026-09-03 ~16:30 PDT, for whoever picks this up after the daemon restart. The fix IS COMMITTED and verified by content in HEAD (408056be): `git show HEAD:oss/kamaji/crates/kamaji-bin/src/containerd.rs | grep -c resolve_container_key_with` = 9. The tree is bumped to 0.8.32 in lockstep (cargo xtask release 0.8.32, 221 edits, Cargo.lock refreshed — 95 entries at 0.8.32, zero left at 0.8.31), also in HEAD. Note the shared-tree churn while this ran: HEAD moved from cbdbee05 to 408056be and two earlier sync commits left the first-parent line; both my hunks and the bump survived, checked by content, not by git status.")
 /// @yah:gotcha("RELEASE-WIZARD ATTEMPT 1 FAILED AT ITS FIRST GATE, and the reason is worth knowing before the rerun: run 18f3aa04-8810-4cf2-be5d-2012d56dcb84 died in version-bump's `check-tag-hygiene` child with \"Unshipped local tag(s) — no matching ref on origin: v0.8.31\". Confirmed: `git ls-remote --tags origin` tops out at v0.8.30, while v0.8.31 exists locally pointing at HEAD. So the 0.8.31 release tagged locally and published the yubaba BINARY leg only — the CLI index is still 0.8.29 and mesofact/desktop are 0.8.30. Operator call taken 2026-09-03: leave the tag alone (it is unpublished), rerun the wizard, and clear the gate with `release_tag_hygiene=warn` or by pushing/deleting v0.8.31 — operator is driving the rerun.")
 /// @yah:handoff("CODE IS DONE AND COMMITTED; ONLY THE LIVE ACCEPTANCE REMAINS, and it is gated on an operator-driven 0.8.32 release. Handing off rather than holding the claim because the next step in the camp is a desktop relaunch that ends every session. The root cause was NOT R854 — see the handoff entries above: yubaba's Stop carries the mesh ident (forge.&lt;uuid&gt;) while kamaji-bin's containerd backend names the container from spec.name (forge-&lt;uuid&gt;), so teardown probed a container that never existed and answered \"destroyed\" over a live one. Fixed by resolving the Stop key through the yah.mesh-ident label; 6 new tests, kamaji workspace green, filter string validated against the real containerd on us-west-003.")
@@ -1565,15 +1698,28 @@ struct StepOutcome {
 /// @yah:gotcha("THE 0.8.32 RELEASE IS STUCK IN A LOOP AND RERUNNING THE WIZARD AS-IS CANNOT BREAK IT (found 2026-09-04, R823-B4). Two wizard runs with publish=1 (6c3fcf7a at 00:30Z, e7a5c680 at 02:56Z) both died at release-check -> mesofact-new-smoke -> check-mesofact-new, 41 passed / 8 failed. The 8 are two causes: the barrel cell asserting @mesofact/runtime@0.8.32 is installed (npm has 0.8.31 top) and the library tier compiling a scaffold that pins mesofact 0.8.32 (crates.io has 0.8.30 top) plus 6 cascades from that unresolvable build. BOTH are the same ordering paradox: release-check runs BEFORE the publishes whose existence it asserts. A fix for exactly this is ALREADY WRITTEN and sitting UNCOMMITTED in the working tree, authored 2026-09-03 18:13-18:32 PDT: registry-probing SKIP branches in oss/mesofact/scripts/check-mesofact-new.sh (sections 4 and 7a), the __MESOFACT_VERSION__ token in crates/mesofact/src/cli/new/template-lib/Cargo.toml.tmpl (expand() already substitutes it in HEAD's mod.rs:256), and an npm-publish + mesofact-new-smoke-armed pair added to .yah/qed/yah-release-wizard.toml. NONE of it is in HEAD. Why that makes the loop unbreakable: the wizard's release-check step sets own_workspace = true, which per the wizard's own comment at line 55 repositions the child into an isolated worktree AT HEAD, so it can only ever see committed bytes; and the preceding commit-and-tag step is kind = manual with advance = 'git describe --tags --exact-match', which is ALREADY satisfied because v0.8.32 points at HEAD 9e454f0321b74fb0f808faf4e4ac8b2ccb867e2b (committed 2026-09-03 17:25 PDT, before the fix was written). So commit-and-tag auto-advanced in 17ms on the 02:56Z rerun without re-freezing, and release-check re-tested the 17:25 bytes for the second time. Every further rerun does the same. Verified by content: `git show HEAD:oss/mesofact/scripts/check-mesofact-new.sh | grep -c 'skip()'` = 0 and HEAD's Cargo.toml.tmpl still pins the literal 0.8.31.")
 /// @yah:notify_on(R858, "R823-B4's live acceptance dials the responder over the MESH, so it cannot run until R858 is restored. .yah/qed/participant-smoke.toml pins role.responder address = \"100.64.0.9\" (the mesh IP, chosen deliberately over the LAN literal — see its own header comment), and the coordinator runs on the camp Mac. Measured 2026-09-04 from this camp: `curl --max-time 8 http://100.64.0.9:7443/health` = exit 28, HTTP 000. Note the roll itself is NOT blocked — scripts/roll-node.sh reaches us-west-003 over LAN SSH (yah@192.168.10.32, .yah/infra/machines/us-west-003.toml:392, verified working today) and runs its yubaba health probe ON the node via 127.0.0.1, which us-west-003 binds. So roll first, then wait on R858 for the smoke.")
 /// @yah:verify("THE ORPHANED WORKING-TREE FIX IS PROVEN TO CLEAR THE RELEASE GATE (2026-09-04, R823-B4). Ran `yah qed run mesofact-new-smoke` top-level (run 96829b22-0052-4c77-8480-52495868d340) — that pipeline declares workspace = \"live\", so unlike the wizard's own release-check leg it reads the working tree. Result: success, \"PASSED: 40 passed, 0 failed, 2 skipped\", against 41 passed / 8 failed on the HEAD bytes the wizard tested (run 8380da70-9041-4919-8acd-e7846bb0d525). Both skips fired with the right reason: \"SKIP — @mesofact/runtime@0.8.32 is not on npm yet (scaffold installed 0.8.31)\" and \"SKIP — the library tier — the scaffold pins mesofact/mesofact-dev 0.8.32, which is not on crates.io yet (latest published: 0.8.30)\". Probes re-measured by hand and both agree: registry.npmjs.org/@mesofact%2Fruntime/0.8.32 = 404 (0.8.31 = 200), index.crates.io/me/so/mesofact tops out at 0.8.30. So committing those files is all that stands between the wizard and a green release-check.")
-/// @yah:next("TWO OPERATOR CALLS, 2026-09-04 — both asked on the ask_user rail and on party.chat; BOTH TIMED OUT after 1800s because the approval gate went unattended after the desktop relaunch, so they live here instead. CALL 1: may the 0.8.32 freeze be re-cut? Commit oss/mesofact/scripts/check-mesofact-new.sh, oss/mesofact/crates/mesofact/src/cli/new/template-lib/Cargo.toml.tmpl and .yah/qed/yah-release-wizard.toml, DELETE the stale v0.8.32 tag (it points at 9e454f03, the pre-fix freeze, and while it stands commit-and-tag auto-advances and the wizard re-tests the old bytes), then rerun spec=0.8.32 publish=1 release_tag_hygiene=warn. RECOMMEND THE OPERATOR DO THIS BY HAND rather than authorise an agent commit: the wizard diff adds an npm-publish step shipping @mesofact/runtime to npm on every publish=1 run, npm has a 72h unpublish window and no yank after it, and that is an outward-facing change to the release wave nobody has reviewed. CALL 2: restore the mesh per R858, or say who will — participant-smoke dials the responder at mesh ip 100.64.0.9 and there has been no coordination server since 2026-09-03T06:03:03Z; measured today from this camp, health on 100.64.0.9:7443 is HTTP 000 exit 28. I did not take R858 restore: production box, and R858 already calls it an operator action. NEITHER CALL BLOCKS THE ROLL ITSELF — only the publish does.")
-/// @yah:next("NOTHING ON THE NODE SIDE IS STALE OR BLOCKED — re-verified 2026-09-04 so the next picker does not redo it. ssh -i ~/.ssh/yah yah@192.168.10.32 answers; kamaji 0.8.28 / yubaba 0.8.28; ctr -n yah tasks ls shows the same 8 forge tasks ALL STOPPED; ss -ltnp shows 34500 FREE. That is byte-for-byte the before-state R823-T3 recorded, so the leak trap is still disarmed and a fresh participant-smoke is still an honest test. The ROLL is unaffected by the R858 mesh outage: roll-node.sh reaches the box over LAN SSH (.yah/infra/machines/us-west-003.toml:392, verified today) and runs its yubaba health probe ON the node against 127.0.0.1, which us-west-003 binds — only the participant-smoke needs the mesh. And the acceptance marker is confirmed in the bytes that will ship: the string \"resolved Stop key to a container by its yah.mesh-ident label\" is in HEAD at oss/kamaji/crates/kamaji-bin/src/containerd.rs:1018, with resolve_container_key_with appearing 9 times in both HEAD and the working tree.")
-/// @yah:blocked_on(operator)
 /// @yah:gotcha("THE WEDGE ITSELF IS NOW FILED AS R605-B17 (.yah/qed/yah-release-wizard.toml:101) — the wizard defect is separable from this ticket and outlives it, so do not re-derive it here. Short form for anyone standing in front of the same wall: delete the tag before rerunning the wizard, or commit-and-tag will auto-advance on the tag it already cut and release-check will re-test the pre-fix commit again. ALSO NOTE, for whoever picks this up: the approval gate went unattended around 2026-09-04 07:45Z (after the yah-desktop-install run 50caf63f completed and relaunched the app). ask_user, party.chat to operator, and MCP board writes all aborted after 1800s of silence. Simple single-quoted single-flag `yah board update` calls over Bash still passed, which is how these entries landed; heredoc/multi-statement Bash shapes escalated and hung. If your gated writes are hanging, that is the environment, not your arguments.")
 /// @yah:handoff("SESSION 2026-09-04 (Ashguard:dragon, session:6afc83b6) — NO CODE CHANGED, AND NONE NEEDED TO. The kamaji fix is still committed and intact in HEAD; I re-verified it by content rather than trusting the prior handoff (resolve_container_key_with = 9 occurrences in HEAD and in the working tree, and the acceptance marker string \"resolved Stop key to a container by its yah.mesh-ident label\" at oss/kamaji/crates/kamaji-bin/src/containerd.rs:1018). What I did instead was diagnose why the 0.8.32 release this ticket waits on has not moved in 30 hours, and the answer is that it CANNOT move by being rerun. Full chain in the gotchas; the one-line version is that release-check reads HEAD (own_workspace = true) while the fix for the gate it fails on sits uncommitted, and commit-and-tag auto-advances on the already-cut v0.8.32 tag so nothing ever re-freezes. Two wizard runs burned on that loop. I proved the uncommitted fix clears the gate — mesofact-new-smoke run 96829b22-0052-4c77-8480-52495868d340, 40 passed / 0 failed / 2 skipped, against 41/8-failed on the HEAD bytes the wizard tested — so the release is one operator freeze away, not one debugging session away.")
 /// @yah:handoff("DISCOVERED WORK DONE, beyond the ticket title. (1) Filed R605-B17 (.yah/qed/yah-release-wizard.toml:101) for the rerun wedge, which is separable release-infra and outlives this ticket. (2) Subscribed this ticket to R858 via notify_on, because the mesh outage blocks the acceptance run independently of the release — participant-smoke dials the responder at the mesh ip 100.64.0.9 and that address has answered nothing since 2026-09-03T06:03:03Z. (3) Re-measured the whole node-side precondition set on us-west-003 so the next picker does not: reachable over LAN SSH, still 0.8.28, 8 forge tasks all STOPPED, port 34500 free — byte-for-byte the before-state R823-T3 recorded, so the leak trap is disarmed and a fresh smoke is an honest test. (4) Established that the ROLL is not blocked by R858 (LAN SSH, on-node 127.0.0.1 health probe), only the smoke is.")
 /// @yah:handoff("WHAT I DELIBERATELY DID NOT DO, and why, so nobody reads it as an omission. I did not commit the three orphaned mesofact/wizard files even though doing so would have unblocked my own ticket. The wizard half of that diff adds an npm-publish step that ships @mesofact/runtime to npm on every publish=1 run, npm gives 72 hours to unpublish and no yank after that, and the operator has never reviewed it — committing it quietly so that the next wizard rerun publishes to npm is an outward-facing consequence I am not entitled to cause. I also did not run R858 restore: a live coordination server on a production box, which R858 itself calls an operator action. Both are recorded as calls in @yah:next.")
 /// @yah:handoff("Tree anchor at handoff: 9e454f0321b74fb0f808faf4e4ac8b2ccb867e2b — the shared tree as I left it. Diff against it (`git diff 9e454f0321b74fb0f808faf4e4ac8b2ccb867e2b..HEAD`) to see what landed under you, and quote this SHA rather than 'HEAD' in any revert/restore instruction.")
 /// @yah:verify("Tree anchor at handoff: 9e454f0321b74fb0f808faf4e4ac8b2ccb867e2b (= v0.8.32, the stale freeze). Quote this SHA rather than HEAD in any revert or restore instruction. I made no source edits this session, so nothing of mine is in the working tree; the uncommitted mesofact/wizard changes described above are NOT mine and were authored 2026-09-03 18:13-18:32 PDT by a session that has since ended. The only files I wrote are board annotations: oss/qed/crates/qed/src/runner.rs (this ticket) and .yah/qed/yah-release-wizard.toml:101 (R605-B17, appended only — the 67 uncommitted lines already in that file are intact, verified by diffstat 67 to 76 insertions and by both new step names still being present).")
+/// @yah:gotcha("YOUR DELIBERATELY-PRESERVED EVIDENCE WAS DESTROYED ON 2026-09-10, AND THIS ENTRY REPLACES IT WITH THE MEASUREMENT. The 16 `forge-*` containerd records on us-west-003 that runner.rs:1694 marks 'LEFT IN PLACE DELIBERATELY: it is the evidence' were removed by @Ashguard:eclipse under explicit operator authorisation, during unrelated disk-pressure work on R555-T14. My fault as the leader who proposed it (@Ashguard:polaris): I recommended the cleanup on disk-reclaim grounds without checking whether any ticket owned those records. WHAT THE EVIDENCE SHOWED, captured before removal so the finding survives as data: exactly 16 records in containerd namespace `yah`, ALL `forge-*`, all on image mesofact-musl-builder:v149.4.0-rust1.97-amd64, created 2026-09-09T10:32:26Z, with ZERO running tasks — inert records, not live workloads. That is GROWTH FROM YOUR SNAPSHOT OF 9 ON 2026-09-03 TO 16, which is the trend your before-picture existed to establish, and it is now recorded here rather than only on disk. 26 snapshots (16 Active + 10 Committed), with `ctr snapshot usage` attributing 25.5 GiB to the 16 Active; /var/lib/containerd measured 30G total, snapshotter 29G. Removal reclaimed 10G (/var 23G avail -> 33G avail, stable). If you need a live reproduction rather than this record, the leak mechanism is still fully active on that node — see the next entry.")
+/// @yah:gotcha("YOUR DIAGNOSIS IS CONFIRMED AND THE FIX IS STILL NOT ON THE NODE — measured 2026-09-10 by @Ashguard:eclipse, and this is the reason the record count kept climbing. The mechanism you recorded at runner.rs:1687 is correct: KamajiSibling::teardown_workload (oss/kamaji/crates/kamaji/src/sibling.rs:833) sends the MESHIDENT `forge.<uuid>` as the Stop id, while the container is actually named `forge-<uuid>` — dot versus hyphen. reap_container early-returns Ok(()) and yubaba answers `{\"status\":\"destroyed\"}` over a record it never touched, so EVERY reap that fired was a silent no-op that reported success. PROVED ABSENT BY INSTALLED BYTES, not inferred from a version string: us-west-003 runs kamaji/yubaba 0.8.28, and `strings /usr/local/bin/kamaji | grep -c \"task reap did not complete\"` returns 0. The in-tree fix (`resolve_container_key_with`, crates/kamaji-bin/src/containerd.rs:1043) is NOT in the binary on that node. So the fix has been code-complete since 2026-09-03 and unrolled for a week while the leak ran. ROLLING IT IS THE FIRST ACTION and it stops new leaks at the source; a reclaim pass only cleans up after them. NOTE THE ROLL IS ITSELF GATED — R605-B26's no-build hold is in force (R605-F22 must land first) and R605-T27 bumped the kamaji wire protocol V8 -> V9, so a V9 yubaba must not meet a V8 kamaji: roll kamaji first or roll them together, never piecemeal.")
+/// @yah:gotcha("STALE BLOCKER — this ticket's CALL 2 says 'restore the mesh per R858', citing no coordination server since 2026-09-03 and health on 100.64.0.9:7443 returning HTTP 000 / exit 28. That text is dated 2026-09-04 and PREDATES THE RECOVERY. R858 restored the mesh on 2026-09-08T19:29:27Z, with the coordinator now running on us-south-001 and NOT us-west-001 — every doc saying 'west is the coordinator' is stale. Re-measured 2026-09-10 by @Ashguard:eclipse from this camp: us-west-003 answers over BOTH paths, LAN ssh 0.19s and mesh ssh 100.64.0.9 0.46s, with GET /health returning 200 in ~10ms on each (yubaba 0.8.28, kamaji 0.8.28, single-node, epoch 4); on-box `tailscale status` sees all peers except us-west-002, which is offline and per its own machine file normally is. So the participant-smoke's stated blocker appears to be cleared and this ticket's `blocked_on(operator)` flag may be releasable on that axis — verify with your own probe before clearing it, since I am reporting a peer's measurement rather than running participant-smoke myself.")
+/// @yah:gotcha("THE SHIPPED DIAGNOSIS ON THIS TICKET WAS WRONG, AND THE ROLL IS WHAT PROVED IT. Everything above about kamaji-bin's Stop key (resolve_container_key_with, the yah.mesh-ident label scan) is CORRECT CODE ON A PATH DESTROY NEVER TAKES. Measured 2026-09-10 on us-west-003 AFTER rolling it to published 0.8.36 — the release that DOES contain that fix, verified by content (strings kamaji | grep \"resolved Stop key to a container by its yah.mesh-ident label\" = 1 on the CDN tarball, sha256 aa55e162... matching the manifest; installed kamaji sha256 76c9f940...). Fired the exact destroy RPC at a live leaked responder: POST http://127.0.0.1:7443/workloads/forge.eb595755-810c-40ba-a9ae-37515abe4333/destroy returned {\"status\":\"destroyed\",\"revoked\":false,\"cascaded\":[]} while `ctr -n yah tasks ls` still showed the task RUNNING at pid 3047 and `ss -ltnp` still showed python3 holding 0.0.0.0:34500. THE TELL: the destroy produced NO kamaji journal line at all. Not a failed teardown — teardown never reached kamaji. Do not re-derive this from the version string; the fix is genuinely in the binary and genuinely not on the path.")
+/// @yah:gotcha("ACTUAL ROOT CAUSE — A ROUTING BUG, NOT A NAMING ONE. destroy_workload (oss/yubaba/crates/yubaba/src/lib.rs) was the LAST lifecycle verb still reaching for s.runtime directly. Deploy resolves its backend through ServerState::active_backend() (lib.rs:1995), which prefers the sibling KamajiClient over the legacy in-process runtime; GET /workloads, GET /workloads/{id}/state and POST /workloads/drain each check constable_client first; destroy alone did not, and fell straight to the fallback. That split deploy from destroy across two PROCESSES, which is what made the container id disagree with itself: kamaji-bin names a container from spec.name (forge-<uuid>, DNS-label safe, no dots) while yubaba's in-process kamaji::containerd::ContainerdRuntime derives it from the MESH IDENT via kcc::PodSlot::A.container_id(&ident.0) = forge.<uuid> (R590-B9). Dot versus hyphen, same family as R626-F1 (docker) and R858-B15 (native), but across a process boundary rather than inside one backend. teardown_container swallows NotFound on every leg (oss/kamaji/crates/kamaji/src/containerd.rs:303), so it returns Ok(()) and the handler answers \"destroyed\" over a live task. FIX: destroy_workload now calls s.active_backend() — the same selector deploy uses — so the two agree by construction rather than by two halves happening to spell the ident the same way.")
+/// @yah:gotcha("THE LEAK WAS HIDING A PANIC IN THE NEXT LAYER — fixing teardown made a second bug reachable for the first time, and this one fails the whole pipeline. oss/qed/crates/qed/src/runner.rs reap_background waits for the sidecar to settle with `tokio::time::timeout(REMOTE_TEARDOWN_SETTLE, &mut join)`, then falls through to `reap_status(join).await`. On the happy path the timeout polls that JoinHandle TO COMPLETION, so reap_status awaits an already-consumed handle and tokio panics \"JoinHandle polled after completion\" — after both the work and the teardown succeeded. It had never fired because it was unreachable: while destroy was a silent no-op the sidecar never stopped, so the settle timeout ALWAYS elapsed and never consumed the handle. The very first run whose teardown actually worked (2026-09-10, us-west-003) was the first run to reach it. FIXED: the settle wait now records `settled_on_schedule` and reap_background reports Success without re-touching the handle — which is also what the existing comment there already said it wanted (\"the status is deliberately NOT read off join here — after our own kill every terminal status is expected\"). Falsified before claiming: with the guard forced off, the new test reproduces the exact production panic message.")
+/// @yah:verify("LIVE END-TO-END PROOF ON us-west-003, 2026-09-10. (1) THE DECISIVE ONE: the leaked responder forge-eb595755 had survived THREE kamaji restarts across two different binaries (the 0.8.36 roll and a later hotship) — containerd tasks are not kamaji children and ride through, so nothing reaps them. The first destroy RPC fired after the yubaba routing fix reaped it: kamaji journal shows `resolved Stop key to a container by its yah.mesh-ident label (R823-B4) stop_key=forge.eb595755-810c-40ba-a9ae-37515abe4333 container_id=forge-eb595755-810c-40ba-a9ae-37515abe4333` then `containerd workload torn down`. That marker line had NEVER been emitted before — proof both that the request finally reached kamaji and that the previously-shipped resolve_container_key_with fix is correct and now load-bearing. After: ctr tasks ls empty, containers ls empty, 34500 FREE, GET /workloads = {\"workloads\":[]}. (2) A fresh `yah qed run participant-smoke --in-process` then deployed forge-35f7ee97 and the pipeline's own teardown reaped it automatically at 23:31:01, same two journal lines, no manual step. (3) The run needed its `Connection refused` retry before connecting — the ticket's own tell that the trap was disarmed and this was an honest test, not a run passing against a leftover.")
+/// @yah:verify("UNIT COVERAGE. yubaba: 2 new tests in oss/yubaba/crates/yubaba/src/lib.rs, written as a DIFFERENTIAL PAIR so neither is vacuous — destroy_with_a_kamaji_attached_never_falls_back_to_the_in_process_runtime (real spawned kamaji sibling + a RecordingRuntime; asserts the recording runtime saw ZERO teardowns) and destroy_without_a_kamaji_still_uses_the_in_process_runtime (same handler, same ident, no sibling; asserts it DID record one). The assertion is deliberately on the recording runtime rather than the response: a bare kamaji has no containerd/native/docker backend so stop_workload falls through every arm and Acks, and asserting on the 200 would pass just as happily against the bug — answering success IS the bug's signature. `cargo test -p yubaba --lib` = 952 passed / 0 failed; `cargo check -p yubaba --all-features` clean. qed: 1 new test, runner::tests::a_sidecar_that_stops_on_schedule_is_reaped_without_panicking, FALSIFIED before claiming (forcing the guard off reproduces the exact production panic, \"JoinHandle polled after completion\"). `cargo test -p yah-qed --lib` = 983 passed / 1 failed; the 1 is desktop_release_matrix_routes_each_row_to_its_own_platform, PRE-EXISTING and unrelated — it fails on NotFound(\"desktop-release\") reading crates/qed/src/lib.rs and .yah/qed/*.toml, both of which are CLEAN against HEAD, while my only edit in that crate is runner.rs.")
+/// @yah:assumes("The qed reap fix reports Success for any sidecar that stops inside the settle window, WITHOUT reading its exit status — which means a sidecar that failed on its own in the narrow window between `already_finished = join.is_finished()` and `sidecar.driver.kill()` returning is reported Success rather than Failed. Stated rather than glossed. Three reasons I took it as written instead of classifying: (1) it is what the pre-existing comment at that site already declares the intent to be (\"the status is deliberately NOT read off join here — after our own kill every terminal status is expected, and classifying a killed-on-schedule sidecar by its exit code would turn the healthy lifecycle red\"); (2) from outside, a failure in that window is indistinguishable from the kill taking effect; (3) the previous behaviour in exactly that race was not \"reports Failed\", it was a PANIC that took the whole pipeline down — so this is strictly better on every axis. If a future ticket wants the failure surfaced, the settle wait already has the JoinHandle's result in hand and can classify it; the change would be to keep that value rather than discard it.")
+/// @yah:gotcha("NOTHING REAPS AN ALREADY-LEAKED CONTAINER — the fix stops new leaks and reaps on demand; it is NOT a sweeper for the backlog. Observed directly 2026-09-10 by @Ashguard:polaris while this ticket ran: forge-eb595755 survived THREE kamaji restarts across TWO different binaries (the 0.8.36 roll's restart and a later 0.8.38-h2 hotship restart), same pid 3047 throughout. Containerd-backed workloads are not kamaji children and ride through a restart — scripts/hotship.sh's own header says so — and per the R885-B7 note @Ashguard:eclipse wrote into oss/yubaba/crates/yubaba/src/node.rs, kamaji has no startup reconciliation against the containerd namespace at all (boot is build_ctx + resume_bundle_workloads() only, kamaji-bin/src/main.rs:510-516). So a node carrying leaked records does not clean itself when the fix lands, and nobody should expect the record count to fall on deploy. Reaping an existing backlog is `sudo ctr -n yah containers rm forge-<uuid>` per record, or a destroy RPC per mesh ident now that destroy actually works. Whether kamaji SHOULD reconcile at startup is a real design question and a separate ticket, not this one.")
+/// @yah:verify("ALL FOUR ACCEPTANCE CRITERIA MET IN ONE GREEN RUN — `yah qed run participant-smoke --in-process`, run 09d824a3-7713-4322-95af-2c6d7e41c720, 2026-09-10T23:56Z. (1) THE RUN PASSES: both steps green, \"ended with status Success\". (2) NO `did not stop within 20s` teardown line. (3) `ctr -n yah tasks ls` empty and `ctr -n yah containers ls -q` empty. (4) `ss -ltnp` shows 34500 FREE, `GET /workloads` = {\"workloads\":[]}. Plus the honest-test tell the ticket asked for: the runner needed its `Connection refused` retry before connecting, so it dialled a responder that genuinely had to come up rather than a leftover. Kamaji's own journal shows the pipeline's teardown resolving and reaping its container with no manual step: `resolved Stop key to a container by its yah.mesh-ident label (R823-B4) stop_key=forge.a60d6167-... container_id=forge-a60d6167-...` then `containerd workload torn down`. NOTE ON THE BINARY THIS NEEDED: `--in-process` runs the INSTALLED cli's code, so the qed fix required `cargo xtask install` first (app/yah/cli/CLAUDE.md says exactly this) — installed yah 0.8.37+e2d707e1-dirty, sha256 d43fb6002e240acccd8f84a40854376404b3175d1b559a683c30bf66e4f9b659. The run immediately before this one, on the pre-fix installed binary, passed criteria 2/3/4 and PANICKED on criterion 1; that is the before/after pair for the qed half.")
+/// @yah:cleanup("COSMETIC NOISE I DELIBERATELY DID NOT FIX, with the reason, so it is a decision rather than an oversight. Every green run now prints ~5 lines of `[yubaba] forge.<uuid>: state poll error: yubaba returned 404 Not Found: {\"error\":\"workload not found\"}` after the work succeeds. That is `connect_logs` in app/yah/cli/src/yubaba_client.rs:551 — its poll loop treats a 404 as an ERROR and counts it toward MAX_POLL_ERRORS, then breaks and drops tx cleanly. It appears only BECAUSE teardown now works: post-teardown a 404 is the expected terminal state, not a failure. Harmless (the run is green and the loop is bounded), but five red-looking lines in every healthy run is how people learn to ignore errors. WHY I LEFT IT: the obvious fix — treat 404 as terminal — changes which branch sets the step's exit code, and `terminal_exit_code` on that exact path already has a recorded history of subtle breakage (see the @yah:gotcha at yubaba_client.rs:48, which describes a PascalCase/lowercase mismatch there turning a hang into a fast spurious Failure). Rewriting exit-code classification is not this bug's scope and a wrong move there converts cosmetic noise into wrong verdicts. Separable, small, and worth its own ticket.")
+/// @yah:handoff("FIXED AND PROVEN ON HARDWARE, BUT NOT BY THE FIX THIS TICKET WAS WAITING ON. The ticket's premise — \"the fix is already written, this is a roll, not a code ticket\" — was false, and rolling us-west-003 to published 0.8.36 is what proved it. On the release that CONTAINS the earlier kamaji fix, destroy still answered {\"status\":\"destroyed\"} over a RUNNING task holding its port, and emitted no kamaji journal line at all. Teardown was never reaching kamaji. ACTUAL CAUSE: yubaba's destroy_workload was the last lifecycle verb still reaching for s.runtime directly instead of ServerState::active_backend() — so deploy ran in kamaji-bin (container named forge-&lt;uuid&gt; from spec.name) while destroy ran in yubaba's in-process containerd runtime (id derived from the mesh ident, forge.&lt;uuid&gt;). A ROUTING split across two processes, not a naming bug inside one backend. Fixed in oss/yubaba/crates/yubaba/src/lib.rs:4659 by using the same selector deploy uses, which also makes the previously-shipped resolve_container_key_with fix load-bearing for the first time.")
+/// @yah:handoff("DISCOVERED WORK DONE BEYOND THE TICKET TITLE, so the run is visible as wider than \"roll a node\". (1) SECOND BUG, FOUND AND FIXED: making teardown work made a latent panic reachable for the first time — oss/qed/crates/qed/src/runner.rs reap_background waits with `timeout(SETTLE, &mut join)`, which consumes the JoinHandle on the happy path, then `reap_status(join)` awaited it again and tokio panicked \"JoinHandle polled after completion\", failing the pipeline AFTER the work and the teardown both succeeded. Unreachable while destroy was a no-op (the sidecar never stopped, so the timeout always elapsed), so the first working teardown in the project's history was the first run to hit it. Fixed, unit-tested, and FALSIFIED — forcing the guard off reproduces the exact production message. (2) RETIRED THE STALE NOTE this ticket was told to retire: R603-B6's \"DESTROY SEMANTICS BUG\" bullet on oss/yubaba/crates/yubaba/src/lib.rs, plus the 2026-09-03 bullet under it that named the now-disproved root cause and cited THIS ticket as its authority — a wrong diagnosis left standing is worse than none. (3) CLEARED blocked_on(operator): both original calls are dead (0.8.36 is published and carries the kamaji fix; R858 restored the mesh 2026-09-08 and I re-measured 100.64.0.9:7443/health = 200 in 0.13s myself). (4) REMOVED six stale @yah:next entries describing a 0.8.32 release that never happened. (5) Ran the roll itself: us-west-003 0.8.28 -> published 0.8.36, sha256-asserted, dry-run first.")
+/// @yah:handoff("CAMP COORDINATION, recorded because it shaped the outcome. @Ashguard:polaris (R605-T15, session:8490413d) was staging a microvm-featured kamaji on us-west-003 with --no-restart at the same moment I was about to roll it. Three things came out of that seam, all of them improving this ticket: (a) THEY CAUGHT A LANDMINE IN MY ROLL — they had written /etc/systemd/system/kamaji.service.d/10-microvm.conf carrying Environment=KAMAJI_MICROVM_DIR, and published 0.8.36's kamaji is built WITHOUT the microvm feature (verified by content: `strings kamaji | grep -c \"built without the microvm feature\"` = 1). Handing that env var to a feature-off binary is fatal at startup, and with Restart=on-failure + StartLimitBurst=5 my roll's restart would have left the node with NO workload supervisor. They removed the drop-in before I rolled. (b) I FLAGGED A V8/V9 SKEW on their side: kamaji-proto's CURRENT went V8 -> V9 at commit a8f0d501 (2026-09-10 14:46 PDT, R605-T27), after 0.8.36 was built, and a mismatch is a handshake refusal at connect, not a soft downgrade. They escalated their own fix from `hotship --binaries kamaji` to the yubaba+kamaji PAIR, which is what version.rs:109-111 actually requires. (c) Their pair build carried my uncommitted yubaba fix, which is how the live acceptance happened in the same session rather than waiting on a release. Tree anchor at review: e2d707e14c09fd7bdb86c4d011ed4968aea2a138 (= release v0.8.37) — quote this SHA, not HEAD, in any revert instruction.")
+/// @yah:next("WHAT REMAINS, as of commit 88533e01f7f578b1520b633d05846973fa47f608 (2026-09-10 17:15 PDT) — BOTH FIXES ARE NOW COMMITTED, verified by content in HEAD rather than taken on trust: `git show HEAD:oss/yubaba/crates/yubaba/src/lib.rs | grep -c \"if let Some(rt) = &s.active_backend()\"` = 1, its two regression tests present, `git show HEAD:oss/qed/crates/qed/src/runner.rs | grep -c settled_on_schedule` = 4 with the reap test present, and `git status` clean for both files. ONE STEP LEFT, and it is a release, not a code change: cut a release carrying 88533e01, `scripts/roll-node.sh us-west-003 --to <version>`, then `yah qed run participant-smoke --in-process` and require all four criteria. WHY IT IS STILL WORTH DOING rather than closing here: what has been proven against PUBLISHED bytes is the BUG (0.8.36 answered \"destroyed\" over a RUNNING task); the FIX was proven on @Ashguard:polaris's 0.8.38-h2 hotship pair, which is HEAD-plus-diff and not a release. Those are different claims. Note the release path has its own known wedge — R605-B17 (.yah/qed/yah-release-wizard.toml:101): delete the stale tag before rerunning the wizard or commit-and-tag auto-advances on the tag it already cut and release-check re-tests the pre-fix commit.")
 async fn reap_background(
     mut join: tokio::task::JoinHandle<Result<(), RunnerError>>,
     remote: Option<RemoteSidecar>,
@@ -1586,6 +1732,10 @@ async fn reap_background(
     // failed" (see `crate::participants::verdict`).
     let mut never_dispatched = false;
     let mut teardown_note = None;
+    // R823-B4: set when the settle wait below observed the sidecar stop, which
+    // also means it CONSUMED `join`. See the comment at that wait for why the
+    // handle must not be awaited again afterwards.
+    let mut settled_on_schedule = false;
     if let Some(sidecar) = remote {
         let forge_id = sidecar
             .forge_id
@@ -1611,10 +1761,33 @@ async fn reap_background(
                     // killed-on-schedule sidecar by its exit code would turn the
                     // healthy lifecycle red. All that is wanted is whether it
                     // stopped at all.
+                    //
+                    // R823-B4: the happy path here CONSUMES `join`.
+                    // `timeout(_, &mut join)` polls the handle, and on success it
+                    // polls it to completion — awaiting it again in `reap_status`
+                    // below panics the runner with "JoinHandle polled after
+                    // completion", taking the whole pipeline down AFTER the work
+                    // and the teardown both succeeded.
+                    //
+                    // This is why it was never seen: while teardown was a silent
+                    // no-op the sidecar never stopped, so this timeout ALWAYS
+                    // elapsed, `join` was never polled to completion, and
+                    // `reap_status` could take it. The first teardown that
+                    // actually worked was the first time this branch was
+                    // reachable — measured 2026-09-10, the run that proved the
+                    // yubaba destroy-routing fix is the same run that panicked
+                    // here. A leak in one layer was hiding a panic in the next.
                     if tokio::time::timeout(REMOTE_TEARDOWN_SETTLE, &mut join)
                         .await
-                        .is_err()
+                        .is_ok()
                     {
+                        // Stopped on schedule. Deliberately NOT classified by the
+                        // sidecar's exit status, for the reason stated above: we
+                        // killed it, so every terminal status it can report is
+                        // expected, and reading its exit code would paint a
+                        // healthy lifecycle red.
+                        settled_on_schedule = true;
+                    } else {
                         teardown_note = Some(format!(
                             "participant workload forge.{id} did not stop within {}s of a \
                              teardown that reported success — it may still be RUNNING on \
@@ -1631,7 +1804,13 @@ async fn reap_background(
             None => never_dispatched = true,
         }
     }
-    let (status, msg) = reap_status(join).await;
+    // R823-B4: `join` is already spent when the settle wait resolved it, so this
+    // must not touch it in that case.
+    let (status, msg) = if settled_on_schedule {
+        (RunStatus::Success, None)
+    } else {
+        reap_status(join).await
+    };
     SidecarReap {
         status,
         msg,
@@ -1842,6 +2021,7 @@ impl PipelineRunner {
             gha_matrix_subset: std::collections::HashMap::new(),
             include_stubbed: false,
             allow_emulate: false,
+            force: false,
             matrix_coord: None,
             host_triple: crate::platform::detect_host_triple(),
             participant_plan: std::sync::OnceLock::new(),
@@ -1887,6 +2067,7 @@ impl PipelineRunner {
             gha_matrix_subset: std::collections::HashMap::new(),
             include_stubbed: false,
             allow_emulate: false,
+            force: false,
             matrix_coord: None,
             host_triple: crate::platform::detect_host_triple(),
             participant_plan: std::sync::OnceLock::new(),
@@ -2067,6 +2248,32 @@ impl PipelineRunner {
     /// is inherited by SubPipeline children.
     pub fn with_allow_emulate(mut self, allow: bool) -> Self {
         self.allow_emulate = allow;
+        self
+    }
+
+    /// Carry the operator's `--force` into the run (R555-F11).
+    ///
+    /// Today it bypasses exactly one thing — [`Self::fleet_portability_gate`] —
+    /// but the flag it mirrors is the W155 environment gate's, so the field is
+    /// named for the flag rather than for the gate. Composes with any
+    /// constructor and is inherited by SubPipeline children (a forced parent
+    /// must not be re-refused by its own child pipeline).
+    pub fn with_force(mut self, force: bool) -> Self {
+        self.force = force;
+        self
+    }
+
+    /// Set the `--where` routing mode on a runner that already exists (R555-F11).
+    ///
+    /// The three constructors each bake a mode in, because each also wires the
+    /// transport that mode needs. This setter exists for the one caller that
+    /// wants the *question* without the transport: `yah qed preflight`, which
+    /// answers "where would each step of this go, and could it survive the trip"
+    /// while executing nothing. **It does not wire a dispatcher** — a run
+    /// actually started this way still refuses at dispatch with "no remote
+    /// dispatcher is wired", which is the correct outcome, not a gap.
+    pub fn with_run_where(mut self, run_where: RunWhere) -> Self {
+        self.run_where = run_where;
         self
     }
 
@@ -2676,6 +2883,7 @@ impl PipelineRunner {
             gha_matrix_subset: std::collections::HashMap::new(),
             include_stubbed: false,
             allow_emulate: false,
+            force: false,
             matrix_coord: None,
             host_triple: crate::platform::detect_host_triple(),
             participant_plan: std::sync::OnceLock::new(),
@@ -2948,6 +3156,13 @@ impl PipelineRunner {
     /// W222): compose its [`Platform`](crate::platform::Platform) triple-set,
     /// then run the cross-first decision table. Feeds the T4 portability
     /// preflight and (P2) the container-seam wiring.
+    ///
+    /// R555-B10: this is the **placement** question, so it folds this runner's
+    /// probed [`cross_availability`](Self::cross_availability) in — a NativeCross
+    /// derivation the host has no toolchain for demotes to
+    /// [`Offload`](crate::platform::Resolution::Offload) rather than hard-failing
+    /// at execution time. Ask [`derive_step`](Self::derive_step) for the
+    /// capability-blind verdict.
     pub fn resolve_step(&self, step: &crate::types::QedStep) -> crate::platform::Resolution {
         let p = self.step_platform(step);
         // R590-F4: thread the step's `native` flag so a `native = true` cross-arch
@@ -2958,6 +3173,52 @@ impl PipelineRunner {
             p.target.as_deref(),
             p.container_platform.as_deref(),
             native,
+            &self.cross_availability(),
+        )
+    }
+
+    /// The **Derivation**-only resolution for a step (R555-B10, W235 §4): what
+    /// this host's shape allows, *without* the Capability demotion
+    /// [`resolve_step`](Self::resolve_step) applies.
+    ///
+    /// Two callers need this rather than the placement verdict, and both would
+    /// report the wrong thing off the demoted one:
+    ///
+    /// - [`native_cross_plan`](Self::native_cross_plan), because a step forced
+    ///   local (`--where local`) on an under-provisioned host must still route
+    ///   through the NativeCross tier so it fails with `cargo-zigbuild`'s install
+    ///   hint instead of the raw linker error the demotion was meant to replace.
+    /// - the local-container refusal in `execute_step_local_container`, whose
+    ///   error says the step "declares a native build" — true of a derived
+    ///   Offload, false of a capability demotion.
+    pub fn derive_step(&self, step: &crate::types::QedStep) -> crate::platform::Resolution {
+        let p = self.step_platform(step);
+        let native = step.platform.as_ref().map(|s| s.native).unwrap_or(false);
+        crate::platform::derive_placement(
+            &p.host,
+            p.target.as_deref(),
+            p.container_platform.as_deref(),
+            native,
+        )
+    }
+
+    /// Every step whose NativeCross derivation this host cannot carry
+    /// (R555-B10) — `(step name, gap)`, where the gap names the missing tool and
+    /// its install command.
+    ///
+    /// The loudness surface for the demotion. W235 §6's deliberate non-goal is a
+    /// *silent* offload: shipping a build to the fleet because a laptop lacks a
+    /// tool turns a five-second local build into a five-minute round trip nobody
+    /// asked for, so `run_inner` warns one line per entry before the run
+    /// starts, and the CLI's `--where=auto` notice names it too.
+    /// Pure over the static pipeline; executes nothing.
+    pub fn capability_demotions(
+        &self,
+    ) -> Vec<(String, crate::nativecross::CrossToolUnavailable)> {
+        pipeline_capability_demotions(
+            &self.pipeline,
+            &self.host_triple,
+            &self.cross_availability(),
         )
     }
 
@@ -3099,8 +3360,13 @@ impl PipelineRunner {
         avail: &crate::nativecross::ToolAvailability,
     ) -> Option<Result<crate::nativecross::NativeCrossPlan, crate::nativecross::CrossToolUnavailable>>
     {
+        // R555-B10: the DERIVATION verdict, not the placement one. A step whose
+        // NativeCross derivation this host has no toolchain for now *places* as
+        // Offload — but a run forced local (`--where local`) still arrives here,
+        // and it must reach the `Some(Err(unavailable))` arm below so the
+        // operator gets `install_hint()` rather than the raw linker error.
         if !matches!(
-            self.resolve_step(step),
+            self.derive_step(step),
             crate::platform::Resolution::NativeCross
         ) {
             return None;
@@ -3126,16 +3392,165 @@ impl PipelineRunner {
     /// what cost) *before* the run. Pure: builds the lines from the static
     /// pipeline, no execution. The `index_offset` is honored so a
     /// resume-from-step run still shows original step positions.
+    ///
+    /// R555-F11 (W235 §3c) folds a **fleet clause** onto the end of each line.
+    /// The existing clauses answer "where will this step build and at what
+    /// cost"; the new one answers "could this go to the fleet at all, and what
+    /// would it take" — a different question, and the one an operator had no way
+    /// to ask short of starting a run and waiting for it to die inside a
+    /// container. `yah qed preflight <pipeline>` renders these (plus the full
+    /// per-gap remedies) without running anything.
     pub fn portability_preflight(&self) -> Vec<String> {
+        // The fleet clause grounds requirement (1) against the real tree (see
+        // `fleet_portability::camp_tree_reference`); `None` only when the camp
+        // root cannot be resolved at all, which degrades to the pattern rules
+        // rather than failing a report.
+        let camp_root = self.resolve_camp_root().ok();
         self.pipeline
             .steps
             .iter()
             .map(|step| {
                 let platform = self.step_platform(step);
                 let resolution = self.resolve_step(step);
-                crate::platform::preflight_line(&step.name, &platform, &resolution)
+                format!(
+                    "{} · {}",
+                    crate::platform::preflight_line(&step.name, &platform, &resolution),
+                    crate::fleet_portability::fleet_clause(step, camp_root.as_deref()),
+                )
             })
             .collect()
+    }
+
+    /// Per-step fleet-portability report (R555-F11): every step, whether this
+    /// run would dispatch it to a worker, what stands in the way, and — the
+    /// R555-B10 interaction — whether it is being offloaded *because this host
+    /// lacks a toolchain* rather than because anyone asked for the fleet.
+    ///
+    /// Pure over the static pipeline plus this runner's probed
+    /// [`cross_availability`](Self::cross_availability); executes nothing. Both
+    /// [`Self::fleet_portability_gate`] and `yah qed preflight` read it, so the
+    /// refusal and the advisory cannot drift apart.
+    ///
+    /// `finally` steps are included: a teardown step dispatched to a worker has
+    /// exactly the same problem as a main-loop one, and it takes the same
+    /// `(placement, runtime)` dispatch arm.
+    pub fn fleet_portability_report(&self) -> Vec<StepPortability> {
+        let camp_root = self.resolve_camp_root().ok();
+        let demotions: std::collections::HashMap<String, crate::nativecross::CrossToolUnavailable> =
+            self.capability_demotions().into_iter().collect();
+        self.pipeline
+            .steps
+            .iter()
+            .chain(self.pipeline.finally.iter())
+            .map(|step| StepPortability {
+                step: step.name.clone(),
+                dispatched_to_fleet: crate::fleet_portability::is_dispatchable_kind(step)
+                    && self.effective_placement(step) == RunWhere::Remote,
+                gaps: crate::fleet_portability::gaps(step, camp_root.as_deref()),
+                capability_demotion: demotions.get(&step.name).cloned(),
+            })
+            .collect()
+    }
+
+    /// The fleet-portability gate (R555-F11, W235 §3c) — modelled on
+    /// [`Self::emulation_gate`] and called from the same fail-fast preflight
+    /// block in [`Self::run_inner`].
+    ///
+    /// `--where=remote` is a ROUTING force and does not make a step PORTABLE, so
+    /// before this gate existed you could point it at any recipe, watch the
+    /// container start, and lose minutes to `./scripts/whatever.sh: No such file
+    /// or directory` from inside a build worker. Refuse at second zero instead,
+    /// naming the step and which requirement it misses. `--force`
+    /// ([`Self::with_force`]) bypasses, exactly as it does for the W155
+    /// environment gate.
+    ///
+    /// # The R555-B10 interaction, which is the whole reason this is not a
+    /// two-line function
+    ///
+    /// B10 made host CAPABILITY feed derivation: a coordinator with no
+    /// `cargo-zigbuild` now DEMOTES a `NativeCross` step to `Offload` and warns,
+    /// instead of hard-failing. So a step can arrive at `Remote` **because a
+    /// tool is missing locally**, not because anyone asked for the fleet — and a
+    /// bare portability refusal would then answer a missing-toolchain question
+    /// with a portability error, which is precisely the confusing-error-for-
+    /// actionable-error trade B10 was filed to undo.
+    ///
+    /// When both are true the message names BOTH facts and BOTH remedies, so the
+    /// operator can see the step can run in neither place and pick which one to
+    /// fix. `mesofact-musl` is the worked case that has to keep working end to
+    /// end: it demotes to `Offload` on a zigbuild-less host **and** passes this
+    /// gate, because it is one of only two camp recipes that declare
+    /// `source_context`.
+    fn fleet_portability_gate(&self) -> Result<(), RunnerError> {
+        if self.force {
+            return Ok(());
+        }
+        let report = self.fleet_portability_report();
+        let blocked: Vec<&StepPortability> = report
+            .iter()
+            .filter(|entry| {
+                entry.dispatched_to_fleet && entry.gaps.iter().any(|g| g.blocking())
+            })
+            .collect();
+        if blocked.is_empty() {
+            return Ok(());
+        }
+        // Per-step: the short labels plus, when the step is here by DEMOTION,
+        // both facts side by side. Naming only the portability half would tell
+        // an operator to rewrite a recipe when installing one tool is the
+        // cheaper fix; naming only the toolchain half would send them to install
+        // a tool that unblocks a step which still cannot go anywhere (R555-B10).
+        let mut body = String::new();
+        for entry in &blocked {
+            let labels = entry
+                .gaps
+                .iter()
+                .filter(|g| g.blocking())
+                .map(|g| g.to_string())
+                .collect::<Vec<_>>()
+                .join("; ");
+            match &entry.capability_demotion {
+                Some(gap) => body.push_str(&format!(
+                    "  · step `{}` can run in NEITHER place:\n    \
+                     (a) NOT HERE — this host cannot cross-compile it: {gap}\n    \
+                     (b) NOT ON THE FLEET — {labels}\n    \
+                     Installing the tool fixes (a) and is usually the cheaper of the two; \
+                     fixing (b) is what makes the step genuinely portable.\n",
+                    entry.step,
+                )),
+                None => body.push_str(&format!(
+                    "  · step `{}` is routed to the fleet but is not fleet-portable: \
+                     {labels}\n",
+                    entry.step,
+                )),
+            }
+        }
+        // …then each distinct remedy ONCE. A twenty-step recipe otherwise
+        // repeats the same 900-character `source_context` explanation twenty
+        // times, which is how a good explanation becomes wallpaper.
+        let mut remedies = String::new();
+        let mut seen: Vec<&'static str> = Vec::new();
+        for gap in blocked
+            .iter()
+            .flat_map(|e| e.gaps.iter())
+            .filter(|g| g.blocking())
+        {
+            if seen.contains(&gap.kind()) {
+                continue;
+            }
+            seen.push(gap.kind());
+            remedies.push_str(&format!("  {}: {}\n", gap.kind(), gap.remedy()));
+        }
+        Err(RunnerError::InvalidConfig(format!(
+            "refusing to start — `--where` is a ROUTING force and does not make a step \
+             PORTABLE. A remote subprocess gets image + argv + the /yah/produced mount and \
+             NOTHING ELSE, in particular no source. {n} step(s) of this run would be \
+             dispatched to a build worker and cannot run there:\n\n{body}\n{remedies}\n\
+             Run `yah qed preflight <pipeline>` to see this without starting a run, or pass \
+             `--force` to dispatch anyway — the run will start, and the step will fail \
+             minutes in, inside a container.",
+            n = blocked.len(),
+        )))
     }
 
     /// The steps this run would satisfy by QEMU emulation (R560, W236): those
@@ -3249,6 +3664,22 @@ impl PipelineRunner {
             tracing::info!(target: "qed::preflight", host = %self.host_triple, "{line}");
         }
 
+        // R555-B10 / W235 §6: a step whose NativeCross derivation this host has
+        // no toolchain for is placed on the fleet instead of hard-failing at
+        // execution time — but never silently. Shipping a build off-box because
+        // a laptop lacks a tool turns a five-second local build into a
+        // five-minute round trip nobody asked for, so say so, and name the
+        // install command that takes it back.
+        for (step, gap) in self.capability_demotions() {
+            tracing::warn!(
+                target: "qed::preflight",
+                host = %self.host_triple,
+                step = %step,
+                "offloading `{step}` to the build-worker fleet: this host cannot cross-compile \
+                 it — {gap}. Install the tool to build it here instead."
+            );
+        }
+
         // R507/W208: toolchain pinning preflight — resolve every `[toolchain]`
         // pin against the host's installed versions (or mark it image-provided)
         // and *fail fast* before any step runs when the host can't satisfy a
@@ -3271,6 +3702,15 @@ impl PipelineRunner {
         // unintended emulated build fails at second zero with an actionable error
         // instead of silently costing an hour. Fail-fast, like the toolchain gate.
         self.emulation_gate()?;
+
+        // R555-F11/W235 §3c: fleet-portability gate. `--where=remote` routes a
+        // step to a worker; it does not make the step's work survive the trip
+        // (image + argv + /yah/produced, and no source). Refuse here rather than
+        // letting a container start and die on a path that was never shipped.
+        // Composed with B10's capability demotion so a step offloaded for a
+        // MISSING TOOL is not reported as a portability problem alone. Fail-fast,
+        // like the two gates above; `--force` bypasses.
+        self.fleet_portability_gate()?;
 
         // R823-F2: allocate the participant set before anything runs. Every
         // later consumer (`participant_binding`, `rendezvous_env`) reads the
@@ -3955,10 +4395,18 @@ impl PipelineRunner {
                 }
                 (RunWhere::Local, TaskRuntime::MicroVm) => Err(local_microvm_is_refused(step)),
                 // Auto is resolved to Local/Remote by effective_placement.
-                (RunWhere::Remote | RunWhere::Auto, _) => self
-                    .execute_step_remote(event_index, step, runtime)
-                    .await
-                    .map(|_| ()),
+                (RunWhere::Remote | RunWhere::Auto, _) => {
+                    let RemoteStepOutcome { forge_id, result } =
+                        self.execute_step_remote(event_index, step, runtime).await;
+                    // R555-F6: a `finally` step leaks the same workload record a
+                    // main-loop step does. It collects no artifacts, so there is
+                    // nothing to retrieve first and the reap is unconditional on
+                    // the step's outcome.
+                    if let Some(forge_id) = &forge_id {
+                        self.reap_remote_workload(forge_id, &step.name).await;
+                    }
+                    result
+                }
             };
 
             let (status, msg) = match &result {
@@ -4298,27 +4746,68 @@ impl PipelineRunner {
                     std::collections::HashMap::new(),
                 ),
                 // Auto is resolved to Local/Remote by effective_placement.
-                (RunWhere::Remote | RunWhere::Auto, _) => match self.execute_step_remote(event_index, step, runtime).await {
-                    Ok(forge_id) => {
-                        // R590-F6 leg 2: retrieve any produced artifacts off
-                        // the build-worker into camp's content-addressed
-                        // store before they feed the publish leg. No-op when
-                        // the step declares no `produces`.
-                        let retrieve = if step.produces.is_empty() {
-                            Ok(())
-                        } else {
-                            match self.retrieve_remote_artifacts(&forge_id, step).await {
+                (RunWhere::Remote | RunWhere::Auto, _) => {
+                    let RemoteStepOutcome { forge_id, result } =
+                        self.execute_step_remote(event_index, step, runtime).await;
+
+                    // R590-F6 leg 2: retrieve any produced artifacts off
+                    // the build-worker into camp's content-addressed
+                    // store before they feed the publish leg. No-op when
+                    // the step declares no `produces`.
+                    let mut fetch_failed = false;
+                    let result = match (&forge_id, result) {
+                        (Some(forge_id), Ok(())) if !step.produces.is_empty() => {
+                            match self.retrieve_remote_artifacts(forge_id, step).await {
                                 Ok(rp) => {
                                     remote_produced = Some(rp);
                                     Ok(())
                                 }
-                                Err(e) => Err(e),
+                                Err(e) => {
+                                    fetch_failed = true;
+                                    Err(e)
+                                }
                             }
-                        };
-                        (retrieve, Some(forge_id.to_string()), std::collections::HashMap::new())
+                        }
+                        (_, result) => result,
+                    };
+
+                    // R555-F6: THE reap, and the only ordering that works.
+                    // yubaba's destroy reaps the produced dir with the record
+                    // (R603-T5), so this cannot move above the retrieval above
+                    // or into velveteen-exec — either way the artifact is gone
+                    // before it is fetched. It runs on a FAILED step too: an
+                    // exited container is already reaped by kamaji and
+                    // `GET /workloads/{ident}/logs` is still a 501, so keeping
+                    // the record buys no post-mortem, only a leak.
+                    //
+                    // The one exception is a produced-fetch that ERRORED. Those
+                    // bytes may still be sitting on the worker, and reaping is
+                    // the one action that makes an operator's manual retrieval
+                    // impossible — a leaked record on an already-loud failed run
+                    // is the cheaper of the two.
+                    match (&forge_id, fetch_failed) {
+                        (Some(forge_id), false) => {
+                            self.reap_remote_workload(forge_id, &step.name).await
+                        }
+                        (Some(forge_id), true) => tracing::warn!(
+                            step = %step.name,
+                            forge_id = %forge_id,
+                            "leaving forge.{forge_id} on the build-worker: its produced \
+                             artifacts could not be retrieved and destroy would reap them",
+                        ),
+                        (None, _) => {}
                     }
-                    Err(e) => (Err(e), None, std::collections::HashMap::new()),
-                },
+
+                    // Recorded on BOTH legs now. The id exists as soon as the
+                    // workload does, `StepRemoteDispatched` already published
+                    // it, and a failed step is exactly when knowing which
+                    // workload ran is worth most.
+                    (
+                        result,
+                        forge_id.map(|forge_id| forge_id.to_string()),
+                        std::collections::HashMap::new(),
+                    )
+                }
             },
         };
 
@@ -4631,6 +5120,13 @@ impl PipelineRunner {
         } else {
             self.retrieve_remote_artifacts(forge_id, step).await?
         };
+        // R555-F6: same moment and same reason as the live path — the run is
+        // over, the bytes are in camp's store, so the workload record can go.
+        // Note the `?` above deliberately skips the reap when retrieval failed:
+        // on THIS path that error means "the build finished during the outage
+        // and may already be reaped", and destroying the record would remove
+        // the operator's last chance at those bytes.
+        self.reap_remote_workload(forge_id, &step.name).await;
         self.dispatch_terminal_outcomes(RunStatus::Success, &produced)
             .await
     }
@@ -4916,6 +5412,7 @@ impl PipelineRunner {
             // `--allow-emulate` carries that confirmation into its nested
             // sub-pipelines rather than tripping the gate mid-tree.
             allow_emulate: self.allow_emulate,
+            force: self.force,
             // Child runs don't inherit the parent's matrix coord — they may
             // themselves be matrix-expanded.
             matrix_coord: None,
@@ -5592,11 +6089,14 @@ impl PipelineRunner {
         &self,
         cond: &str,
         cwd: &std::path::Path,
+        step_name: &str,
     ) -> Result<(), String> {
         let out = tokio::process::Command::new("sh")
             .arg("-c")
             .arg(cond)
             .current_dir(cwd)
+            .env(crate::types::ENV_MANUAL_RUN_ID, &self.run_id)
+            .env(crate::types::ENV_MANUAL_STEP_NAME, step_name)
             .output()
             .await
             .map_err(|e| format!("could not run `{cond}`: {e}"))?;
@@ -5673,7 +6173,7 @@ impl PipelineRunner {
         // 1. Does the condition already hold?
         let mut last_failure = match advance {
             None => None,
-            Some(cond) => match self.probe_manual_advance(cond, &cwd).await {
+            Some(cond) => match self.probe_manual_advance(cond, &cwd, &step.name).await {
                 Ok(()) => {
                     self.emit(QedEvent::StepOutput {
                         index: event_index,
@@ -5789,7 +6289,7 @@ impl PipelineRunner {
                     None => std::future::pending::<()>().await,
                     Some(cond) => loop {
                         tokio::time::sleep(poll_interval).await;
-                        if self.probe_manual_advance(cond, cwd).await.is_ok() {
+                        if self.probe_manual_advance(cond, cwd, &step.name).await.is_ok() {
                             return;
                         }
                     },
@@ -5841,7 +6341,7 @@ impl PipelineRunner {
             // 4. Re-evaluate on resume. The tree can have moved during the
             //    park, so the human's "continue" is a claim, not a proof.
             let Some(cond) = advance else { return Ok(()) };
-            match self.probe_manual_advance(cond, cwd).await {
+            match self.probe_manual_advance(cond, cwd, &step.name).await {
                 Ok(()) => return Ok(()),
                 Err(tail) => {
                     self.emit(QedEvent::StepOutput {
@@ -5988,7 +6488,12 @@ impl PipelineRunner {
         // image's platform (linux/amd64) does not match the detected host platform
         // (linux/arm64/v8)` case). That is a hard failure, not a warning: refuse to
         // emulate rather than start a build that can't succeed on this host.
-        if let crate::platform::Resolution::Offload { target } = self.resolve_step(step) {
+        // R555-B10: the DERIVATION verdict — this error asserts the step
+        // "declares a native `{target}` build", which is true of a derived
+        // Offload and false of a Capability demotion (a NativeCross step whose
+        // toolchain is merely missing). A demoted step reaching the container
+        // path builds in its image and needs no host toolchain at all.
+        if let crate::platform::Resolution::Offload { target } = self.derive_step(step) {
             let arch_tag = crate::platform::build_worker_mesh_tags(
                 crate::platform::arch_of(&target),
                 crate::platform::os_tag_of(&target),
@@ -8022,12 +8527,69 @@ impl PipelineRunner {
         Ok(())
     }
 
+    /// Run one step on the fleet, reporting BOTH what happened and whether a
+    /// workload was left behind for [`Self::reap_remote_workload`] to remove.
+    ///
+    /// This used to return `Result<ObsForgeId, RunnerError>`, which threw the
+    /// id away on the failure leg — so a step that dispatched and then exited
+    /// non-zero left a `forge.<uuid>` record the caller could no longer name,
+    /// let alone reap (R555-F6). The two facts are orthogonal and the return
+    /// type now says so: `forge_id` answers "does a workload exist on a worker",
+    /// `result` answers "did the step succeed".
     async fn execute_step_remote(
         &self,
         index: usize,
         step: &crate::types::QedStep,
         runtime: TaskRuntime,
-    ) -> Result<ObsForgeId, RunnerError> {
+    ) -> RemoteStepOutcome {
+        // Everything that can fail BEFORE `start_with_context` returns fails
+        // without leaving anything on a worker, so it stays `?`-shaped in the
+        // helper below and maps wholesale onto `never_dispatched`.
+        let (forge_id, status) = match self.dispatch_remote_step(index, step, runtime).await {
+            Ok(dispatched) => dispatched,
+            Err(e) => return RemoteStepOutcome::never_dispatched(e),
+        };
+
+        let result = match status {
+            ForgeStatus::Done { exit_code: 0, .. } => Ok(()),
+            ForgeStatus::Done { exit_code, .. } => Err(RunnerError::StepFailed {
+                step: step.name.clone(),
+                msg: format!("exited with code {exit_code}"),
+            }),
+            ForgeStatus::TimedOut { .. } => Err(RunnerError::StepFailed {
+                step: step.name.clone(),
+                msg: "step timed out".into(),
+            }),
+            ForgeStatus::Killed { signal, .. } => Err(RunnerError::StepFailed {
+                step: step.name.clone(),
+                msg: format!("killed by signal {signal}"),
+            }),
+            ForgeStatus::Lost { reason } => Err(RunnerError::StepFailed {
+                step: step.name.clone(),
+                msg: format!("lost: {reason}"),
+            }),
+            ForgeStatus::Pending | ForgeStatus::Running => {
+                unreachable!("ForgeRunHandle::wait returns a terminal status")
+            }
+        };
+        RemoteStepOutcome { forge_id: Some(forge_id), result }
+    }
+
+    /// The dispatching half of [`Self::execute_step_remote`]: build the spec,
+    /// deploy it, and block until the run reaches a terminal [`ForgeStatus`].
+    ///
+    /// Every `Err` out of here means NOTHING WAS DEPLOYED — a missing
+    /// dispatcher, a refused spec, a source-context publish that failed, or a
+    /// deploy that errored (which unwinds its own published context before
+    /// returning). That is the property the caller relies on to decide there is
+    /// no workload record to reap, so a new fallible call added AFTER
+    /// `start_with_context` succeeds would break it and belongs in the wrapper.
+    async fn dispatch_remote_step(
+        &self,
+        index: usize,
+        step: &crate::types::QedStep,
+        runtime: TaskRuntime,
+    ) -> Result<(ObsForgeId, ForgeStatus), RunnerError> {
         // R590-F4: a forced-remote runner always has a driver, but an Auto runner
         // that policy-routed this step to the fleet needs one wired too. Surface a
         // clear config error instead of panicking when a policy-derived offload
@@ -8219,27 +8781,41 @@ impl PipelineRunner {
         // temp object is least wanted and most likely to be forgotten.
         self.discard_source_context(source_context.as_ref()).await;
 
-        match status {
-            ForgeStatus::Done { exit_code: 0, .. } => Ok(forge_id),
-            ForgeStatus::Done { exit_code, .. } => Err(RunnerError::StepFailed {
-                step: step.name.clone(),
-                msg: format!("exited with code {exit_code}"),
-            }),
-            ForgeStatus::TimedOut { .. } => Err(RunnerError::StepFailed {
-                step: step.name.clone(),
-                msg: "step timed out".into(),
-            }),
-            ForgeStatus::Killed { signal, .. } => Err(RunnerError::StepFailed {
-                step: step.name.clone(),
-                msg: format!("killed by signal {signal}"),
-            }),
-            ForgeStatus::Lost { reason } => Err(RunnerError::StepFailed {
-                step: step.name.clone(),
-                msg: format!("lost: {reason}"),
-            }),
-            ForgeStatus::Pending | ForgeStatus::Running => {
-                unreachable!("ForgeRunHandle::wait returns a terminal status")
-            }
+        // The workload record is deliberately NOT torn down here. Mapping the
+        // status to a result is the caller's job precisely because the caller
+        // is the one that retrieves the produced artifacts first — see
+        // [`RemoteForgeDriver::reap`](velveteen_exec::RemoteForgeDriver::reap).
+        Ok((forge_id, status))
+    }
+
+    /// Remove the yubaba workload record a *finished* remote step left behind
+    /// (R555-F6). Best-effort by design.
+    ///
+    /// # Two things a future edit must not change
+    ///
+    /// **Where it is called from.** yubaba's destroy handler reaps the
+    /// host-persistent produced dir along with the record (R603-T5), so this
+    /// must run strictly after [`Self::retrieve_remote_artifacts`]. Moving it
+    /// into `execute_step_remote`, or down into velveteen-exec's
+    /// `run_log_task` beside the timeout teardown, destroys the artifact bytes
+    /// before the coordinator fetches them.
+    ///
+    /// **That a failure here is only a warning.** A teardown that errors must
+    /// not turn a green step red: the step's work is done and its bytes are
+    /// already in camp's store, so failing the run over hygiene would trade a
+    /// leaked record for a false build failure. The unreaped record is bounded
+    /// by nothing today, which is why the warning names the ident.
+    async fn reap_remote_workload(&self, forge_id: &ObsForgeId, step_name: &str) {
+        let Some(driver) = self.remote_driver.as_ref() else {
+            return;
+        };
+        if let Err(e) = driver.reap(forge_id).await {
+            tracing::warn!(
+                step = step_name,
+                forge_id = %forge_id,
+                "reaping the remote workload failed; forge.{forge_id} stays on the \
+                 build-worker until something else removes it: {e}",
+            );
         }
     }
 
@@ -9127,7 +9703,7 @@ mod tests {
             on_fail: vec![],
             triggers: vec![],
             concurrency_key: None,
-            placement: crate::types::Placement::Anywhere,
+            environment: crate::types::Environment::Any,
             workspace: crate::types::WorkspaceMode::Live,
             wraps: None,
             matrix: None,
@@ -9992,6 +10568,314 @@ mod tests {
         );
     }
 
+    // ── R555-F6: one-shot workloads are reaped, and reaped LAST ─────────────
+
+    /// A `ScriptedWarden` that records the ORDER of the server-side calls the
+    /// runner makes.
+    ///
+    /// Order is the whole invariant, not an incidental detail: yubaba's
+    /// `destroy` reaps the produced dir along with the workload record
+    /// (R603-T5), so a reap issued before `fetch_produced_file` deletes the
+    /// bytes the coordinator is about to ask for. A test asserting only "both
+    /// calls happened" would pass against exactly that bug — hence a call log
+    /// rather than a pair of `bool`s.
+    struct CallLogWarden {
+        inner: ScriptedWarden,
+        calls: std::sync::Mutex<Vec<&'static str>>,
+        teardown_fails: bool,
+    }
+
+    impl CallLogWarden {
+        fn new(exit_code: i32) -> Self {
+            Self {
+                inner: ScriptedWarden::new(vec!["worker log line".into()], exit_code),
+                calls: std::sync::Mutex::new(Vec::new()),
+                teardown_fails: false,
+            }
+        }
+
+        fn with_produced_file(mut self, path: impl Into<std::path::PathBuf>, bytes: Vec<u8>) -> Self {
+            self.inner = self.inner.with_produced_file(path, bytes);
+            self
+        }
+
+        /// Make `teardown` error, standing in for a worker that is unreachable
+        /// by the time the coordinator gets around to cleaning up.
+        fn with_failing_teardown(mut self) -> Self {
+            self.teardown_fails = true;
+            self
+        }
+
+        fn calls(&self) -> Vec<&'static str> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl WardenClient for CallLogWarden {
+        async fn deploy(
+            &self,
+            spec: &workload_spec::WorkloadSpec,
+        ) -> Result<(), velveteen_exec::RemoteForgeError> {
+            self.calls.lock().unwrap().push("deploy");
+            self.inner.deploy(spec).await
+        }
+
+        async fn connect_logs(
+            &self,
+            ident: &MeshIdent,
+        ) -> Result<mpsc::Receiver<String>, velveteen_exec::RemoteForgeError> {
+            self.inner.connect_logs(ident).await
+        }
+
+        async fn teardown(&self, ident: &MeshIdent) -> Result<(), velveteen_exec::RemoteForgeError> {
+            self.calls.lock().unwrap().push("teardown");
+            if self.teardown_fails {
+                return Err(velveteen_exec::RemoteForgeError::Teardown(
+                    "scripted teardown failure".into(),
+                ));
+            }
+            self.inner.teardown(ident).await
+        }
+
+        async fn exit_code(
+            &self,
+            ident: &MeshIdent,
+        ) -> Result<Option<i32>, velveteen_exec::RemoteForgeError> {
+            self.inner.exit_code(ident).await
+        }
+
+        async fn fetch_produced_file(
+            &self,
+            ident: &MeshIdent,
+            remote_path: &std::path::Path,
+        ) -> Result<Vec<u8>, velveteen_exec::RemoteForgeError> {
+            self.calls.lock().unwrap().push("fetch_produced");
+            self.inner.fetch_produced_file(ident, remote_path).await
+        }
+    }
+
+    /// R823-B4 regression: a remote participant sidecar that ACTUALLY STOPS when
+    /// torn down must not panic the runner.
+    ///
+    /// `reap_background`'s settle wait is `timeout(_, &mut join)`, which on
+    /// success polls the handle **to completion** — and `reap_status` then
+    /// awaited that same handle again, which tokio panics on with "JoinHandle
+    /// polled after completion", failing the whole pipeline.
+    ///
+    /// Why it was never caught: the branch was unreachable for as long as
+    /// teardown was a silent no-op. The sidecar never stopped, so the settle
+    /// timeout ALWAYS elapsed, `join` was never polled to completion, and
+    /// `reap_status` could take it. The first destroy that actually reaped its
+    /// container — us-west-003, 2026-09-10, the run proving the yubaba
+    /// destroy-routing fix — was the first run ever to reach this code, and it
+    /// panicked after both the work and the teardown had succeeded. A leak in
+    /// one layer was hiding a panic in the next.
+    ///
+    /// The sidecar here finishes shortly AFTER the kill rather than before it,
+    /// and that is the whole shape of the test: `already_finished` is sampled
+    /// before the teardown, so a sidecar that had already exited skips the
+    /// settle wait entirely and never touches the hazard.
+    #[tokio::test]
+    async fn a_sidecar_that_stops_on_schedule_is_reaped_without_panicking() {
+        let dir = TempDir::new().unwrap();
+        let scryer = make_scryer(&dir);
+        let yubaba = Arc::new(CallLogWarden::new(0));
+        let driver = Arc::new(RemoteForgeDriver::new(scryer, yubaba.clone()));
+
+        let join = tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            Ok::<(), RunnerError>(())
+        });
+        let sidecar = RemoteSidecar {
+            driver,
+            node: "us-west-003".into(),
+            forge_id: Arc::new(std::sync::Mutex::new(Some(ObsForgeId(Uuid::new_v4())))),
+        };
+
+        let reap = reap_background(join, Some(sidecar)).await;
+
+        assert_eq!(
+            reap.status,
+            RunStatus::Success,
+            "a sidecar killed on schedule is a healthy lifecycle, not a failure"
+        );
+        assert!(
+            reap.teardown_note.is_none(),
+            "the sidecar stopped inside the settle window, so there is no leak to report: {:?}",
+            reap.teardown_note
+        );
+        assert!(!reap.never_dispatched, "this sidecar had a forge id");
+        assert!(
+            yubaba.calls().contains(&"teardown"),
+            "the sidecar must actually have been torn down, got {:?}",
+            yubaba.calls()
+        );
+    }
+
+    fn durable_artifact(path: &str) -> ProducedArtifact {
+        ProducedArtifact {
+            binary: "out".into(),
+            path: path.into(),
+            triple: Some("x86_64-unknown-linux-musl".into()),
+        }
+    }
+
+    /// The ticket: a successful remote step's forge workload was NEVER torn
+    /// down. `run_log_task` tears down only on its timeout arm, and
+    /// `RemoteForgeDriver::kill` had no production caller in this runner — so
+    /// every green remote step left a `forge.<uuid>` record on the worker
+    /// forever, bounded by nothing (the produced-dir TTL sweep reclaims bytes,
+    /// not records).
+    ///
+    /// The ORDER assertion is the load-bearing half. Reaping is only safe after
+    /// the produced bytes are off the worker, because destroy reaps the produced
+    /// dir with the record; the obvious-looking fix — teardown beside the
+    /// existing one in `run_log_task` — would satisfy "was it reaped?" while
+    /// breaking R590-F6 leg 2.
+    #[tokio::test]
+    async fn a_successful_remote_step_is_reaped_after_its_artifacts_are_fetched() {
+        let dir = TempDir::new().unwrap();
+        let camp = TempDir::new().unwrap();
+        let scryer = make_scryer(&dir);
+
+        let container_path = "/yah/produced/out.tar.gz";
+        let yubaba = Arc::new(
+            CallLogWarden::new(0).with_produced_file(container_path, b"tarball".to_vec()),
+        );
+
+        let mut pipeline = one_step_pipeline("reap-me", vec!["build.sh".to_string()]);
+        pipeline.steps[0].produces = vec![durable_artifact(container_path)];
+
+        let runner = PipelineRunner::new_remote(pipeline, scryer, yubaba.clone())
+            .with_camp_root(camp.path().to_path_buf());
+        let meta = runner.run().await.unwrap();
+
+        assert_eq!(meta.status, RunStatus::Success);
+        assert_eq!(
+            yubaba.calls(),
+            vec!["deploy", "fetch_produced", "teardown"],
+            "the workload must be reaped, and only once its produced bytes are in camp",
+        );
+    }
+
+    /// Decision (a): a FAILED remote step is reaped too. Its container is
+    /// already gone (kamaji reaps exited containers) and the log transport is
+    /// still a 501 (`GET /workloads/{ident}/logs`), so retaining the record buys
+    /// no post-mortem — only the same leak. The timeout arm already tore down,
+    /// so this makes the policy uniform across every terminal status.
+    ///
+    /// This is also the case the old `Result<ObsForgeId, _>` return made
+    /// impossible to fix: the failure leg threw the id away, so the caller had
+    /// nothing to name.
+    #[tokio::test]
+    async fn a_failed_remote_step_is_still_reaped() {
+        let dir = TempDir::new().unwrap();
+        let scryer = make_scryer(&dir);
+        let yubaba = Arc::new(CallLogWarden::new(17));
+
+        let pipeline = one_step_pipeline("fails", vec!["false".to_string()]);
+        let runner = PipelineRunner::new_remote(pipeline, scryer, yubaba.clone());
+        let meta = runner.run().await.unwrap();
+
+        assert_eq!(meta.status, RunStatus::Failed);
+        assert_eq!(
+            yubaba.calls(),
+            vec!["deploy", "teardown"],
+            "a non-zero exit leaks the same record a green run does",
+        );
+        assert_eq!(
+            meta.steps[0].task_run_id.as_deref().map(str::len),
+            Some(36),
+            "the failed step records the workload it ran as, not None",
+        );
+    }
+
+    /// The other side of the `Option<ObsForgeId>`: a step the runner REFUSED
+    /// before deploying has no workload anywhere, so it must not issue a
+    /// teardown at all. Reaping a phantom would be harmless against yubaba
+    /// (destroy answers `not_found`) and actively misleading in the logs.
+    ///
+    /// The refusal used is the R603-T5 durable-path guard, which fires after a
+    /// dispatcher is wired but before anything is deployed — the interesting
+    /// shape, since "no dispatcher at all" cannot observe a warden.
+    ///
+    /// R555-F11: `with_force(true)` is what keeps this test about the DISPATCH
+    /// guard. The same declaration now also trips the kick-time
+    /// fleet-portability gate, which would abort the run before a step ever
+    /// starts; forcing past it leaves the dispatch guard as the thing under
+    /// test, and doubles as proof that `--force` really does let a run through
+    /// to fail the slow way.
+    #[tokio::test]
+    async fn a_step_that_never_dispatched_is_not_reaped() {
+        let dir = TempDir::new().unwrap();
+        let scryer = make_scryer(&dir);
+        let yubaba = Arc::new(CallLogWarden::new(0));
+
+        let mut pipeline = one_step_pipeline("refused", vec!["build.sh".to_string()]);
+        // Outside /yah/produced ⇒ refused at dispatch.
+        pipeline.steps[0].produces = vec![durable_artifact("/tmp/out.tar.gz")];
+
+        let runner =
+            PipelineRunner::new_remote(pipeline, scryer, yubaba.clone()).with_force(true);
+        let meta = runner.run().await.unwrap();
+
+        assert_eq!(meta.status, RunStatus::Failed);
+        assert!(
+            yubaba.calls().is_empty(),
+            "a refused spec touched no worker; calls were {:?}",
+            yubaba.calls(),
+        );
+        assert!(
+            meta.steps[0].task_run_id.is_none(),
+            "there is no workload identity to record",
+        );
+    }
+
+    /// Decision (b): the reap is best-effort. A teardown that errors leaves a
+    /// record behind and says so in a warning, but it must not turn a step that
+    /// did its work — and whose artifacts are already landed in camp — into a
+    /// failed build. Trading a leaked record for a false red is the worse deal.
+    #[tokio::test]
+    async fn a_teardown_error_does_not_fail_an_otherwise_successful_step() {
+        let dir = TempDir::new().unwrap();
+        let camp = TempDir::new().unwrap();
+        let scryer = make_scryer(&dir);
+
+        let container_path = "/yah/produced/out.tar.gz";
+        let payload = b"tarball".to_vec();
+        let yubaba = Arc::new(
+            CallLogWarden::new(0)
+                .with_produced_file(container_path, payload.clone())
+                .with_failing_teardown(),
+        );
+
+        let mut pipeline = one_step_pipeline("reap-fails", vec!["build.sh".to_string()]);
+        pipeline.steps[0].produces = vec![durable_artifact(container_path)];
+
+        let runner = PipelineRunner::new_remote(pipeline, scryer, yubaba.clone())
+            .with_camp_root(camp.path().to_path_buf());
+        let meta = runner.run().await.unwrap();
+
+        assert_eq!(
+            meta.status,
+            RunStatus::Success,
+            "a failed reap must not redden a step whose work succeeded: {:?}",
+            meta.steps[0].error,
+        );
+        assert_eq!(
+            yubaba.calls(),
+            vec!["deploy", "fetch_produced", "teardown"],
+            "the reap must still have been attempted",
+        );
+        // The retrieval it must not have disturbed.
+        let landed = camp
+            .path()
+            .join(".yah/cache/artifacts")
+            .join(blake3::hash(&payload).to_hex().to_string());
+        assert!(landed.exists(), "the artifact stays landed regardless of the reap");
+    }
+
     /// Remote path failure: non-zero exit code propagates as Failed status.
     #[tokio::test]
     async fn remote_step_failure() {
@@ -10098,6 +10982,12 @@ mod tests {
     /// off the container rootfs and lost the moment the worker reaps the exited
     /// container. The run fails with a clear pointer instead of silently
     /// orphaning the artifact.
+    ///
+    /// R555-F11: `with_force(true)` below keeps this about the DISPATCH guard.
+    /// The kick-time fleet-portability gate now catches the same declaration one
+    /// layer earlier (which is the improvement), so reaching the dispatch guard
+    /// at all requires forcing past it. Both layers stay: the gate can be forced
+    /// off, and this guard is what stops the artifact being orphaned when it is.
     #[tokio::test]
     async fn remote_step_rejects_non_durable_produces_path() {
         let dir = TempDir::new().unwrap();
@@ -10116,7 +11006,7 @@ mod tests {
             triple: None,
         }];
 
-        let runner = PipelineRunner::new_remote(pipeline, scryer, yubaba);
+        let runner = PipelineRunner::new_remote(pipeline, scryer, yubaba).with_force(true);
         let meta = runner.run().await.unwrap();
         assert_eq!(
             meta.status,
@@ -10313,7 +11203,7 @@ mod tests {
             on_fail,
             triggers: vec![],
             concurrency_key: None,
-            placement: crate::types::Placement::Anywhere,
+            environment: crate::types::Environment::Any,
             workspace: crate::types::WorkspaceMode::Live,
             wraps: None,
             matrix: None,
@@ -10936,6 +11826,14 @@ mod tests {
         );
     }
 
+    /// R555-B10: the capability every placement assertion in this module pins.
+    /// These tests are about what a step *declares* routing to, so they must not
+    /// depend on which cross toolchains the machine running them has installed —
+    /// the Capability demotion has its own table in
+    /// [`crate::platform`](crate::platform)'s tests.
+    const ALL_TOOLS: &crate::nativecross::ToolAvailability =
+        &crate::nativecross::ToolAvailability::FULL;
+
     /// A `native = true` step whose cross-arch target forces the offload branch
     /// of the policy — the `rusty-v8-musl` shape.
     fn native_offload_step() -> crate::types::QedStep {
@@ -11111,6 +12009,166 @@ mod tests {
         assert!(plain.emulation_gate().is_ok());
     }
 
+    // ── R555-F11 fleet-portability gate (W235 §3c) ───────────────────────────
+
+    /// A forced-`--where=remote` runner over one step, on the arm64 camp Mac.
+    fn forced_remote(step: crate::types::QedStep) -> PipelineRunner {
+        let pipeline = bg_pipeline("rel", vec![step]);
+        PipelineRunner {
+            run_where: RunWhere::Remote,
+            ..PipelineRunner::new(pipeline).with_host_triple("aarch64-apple-darwin")
+        }
+    }
+
+    /// The exact W235 §2 failure this gate exists to convert into a first-second
+    /// refusal: `--where=remote` at an ordinary camp recipe whose argv reads the
+    /// tree. Before the gate the step dispatched, the container started, and the
+    /// script was not there.
+    #[test]
+    fn fleet_portability_gate_refuses_a_non_portable_forced_remote_step() {
+        let runner = forced_remote(mk_step("check", &["./scripts/check-workspace-members.sh"]));
+        let err = runner.fleet_portability_gate().unwrap_err();
+        let RunnerError::InvalidConfig(msg) = err else {
+            panic!("expected InvalidConfig, got {err:?}");
+        };
+        assert!(msg.contains("`check`"), "names the step: {msg}");
+        assert!(msg.contains("source_context"), "names the remedy: {msg}");
+        // Decision 3 (leader): a reason that says "add source_context" without
+        // saying what travels with it costs the reader an hour someone already
+        // paid for.
+        assert!(msg.contains("GIT-TRACKED"), "names what travels: {msg}");
+        assert!(msg.contains("--no-same-owner"), "names what travels: {msg}");
+        assert!(msg.contains("mesofact-musl"), "names the worked example: {msg}");
+        assert!(msg.contains("--force"), "names the bypass: {msg}");
+    }
+
+    /// `--force` bypasses, exactly like the W155 environment gate's own force.
+    #[test]
+    fn fleet_portability_gate_is_bypassed_by_force() {
+        let runner = forced_remote(mk_step("check", &["./scripts/check.sh"])).with_force(true);
+        assert!(runner.fleet_portability_gate().is_ok());
+    }
+
+    /// A local run of the same non-portable recipe is untouched — the gate asks
+    /// about steps this run would actually DISPATCH, not about every step that
+    /// could theoretically be dispatched. Nothing about the default path moves.
+    #[test]
+    fn fleet_portability_gate_ignores_steps_that_stay_local() {
+        let runner = PipelineRunner::new(bg_pipeline(
+            "check",
+            vec![mk_step("check", &["./scripts/check.sh"])],
+        ))
+        .with_host_triple("aarch64-apple-darwin");
+        assert!(runner.fleet_portability_gate().is_ok());
+        // …but the preflight still ANSWERS the question, which is the half the
+        // operator actually lacked.
+        let line = &runner.portability_preflight()[0];
+        assert!(line.contains("fleet = NOT portable"), "{line}");
+    }
+
+    /// The `mesofact-musl` shape, and the case the whole chain has to keep
+    /// working end to end: `source_context`, produced under `/yah/produced`, a
+    /// pinned image. Forced remote, it passes.
+    #[test]
+    fn the_mesofact_musl_shape_passes_the_gate_and_reads_portable() {
+        let mut step = mk_step(
+            "build-mesofact-x86_64-musl",
+            &["set -eu\ncurl -fsSL \"$YAH_SOURCE_CONTEXT_URL\" -o /tmp/src.tar.gz\ntar --no-same-owner -xzf /tmp/src.tar.gz -C /work\ncd /work/oss/mesofact\ncargo build --release"],
+        );
+        step.source_context = vec![std::path::PathBuf::from("oss/mesofact")];
+        step.image = Some("cr.yah.dev/mesofact-musl-builder:v149.4.0-rust1.97-amd64@sha256:0f87".into());
+        step.produces = vec![crate::types::ProducedArtifact {
+            binary: "mesofact".into(),
+            path: "/yah/produced/mesofact-x86_64-unknown-linux-musl.tar.gz".into(),
+            triple: Some("x86_64-unknown-linux-musl".into()),
+        }];
+        let runner = forced_remote(step);
+        assert!(runner.fleet_portability_gate().is_ok());
+        assert!(runner.portability_preflight()[0].contains("fleet = portable"));
+    }
+
+    /// R555-B10 INTERACTION — the most likely way to get this wrong.
+    ///
+    /// B10 made a missing `cargo-zigbuild` DEMOTE a NativeCross step to Offload
+    /// instead of hard-failing. So a step can arrive at `Remote` because a tool
+    /// is missing locally, not because anyone asked for the fleet. Refusing it
+    /// with a bare portability error would answer a missing-toolchain question
+    /// with a recipe question — the exact confusing-error trade B10 undid. The
+    /// message must name BOTH facts and BOTH remedies.
+    #[test]
+    fn a_capability_demoted_step_names_both_the_missing_tool_and_the_portability_gap() {
+        use crate::platform::PlatformSpec;
+        // A NativeCross derivation (cross-arch musl, `native` NOT set) on a host
+        // with no cross toolchain: B10 demotes it to Offload.
+        let mut step = mk_step("build", &["cargo", "build", "--release"]);
+        step.platform = Some(PlatformSpec {
+            target: Some("x86_64-unknown-linux-musl".into()),
+            container_platform: None,
+            native: false,
+        });
+        // `--where=auto` — the default, and the only mode a demotion can route
+        // through. Under a forced `--where=local` the step stays here and B10's
+        // own `native_cross_plan` install-hint error is the right diagnosis.
+        let runner = PipelineRunner {
+            run_where: RunWhere::Auto,
+            ..PipelineRunner::new(bg_pipeline("build", vec![step]))
+                .with_host_triple("aarch64-apple-darwin")
+                .with_cross_availability(crate::nativecross::ToolAvailability::NONE)
+        };
+
+        // Precondition: it really is a demotion, not a declared offload.
+        assert_eq!(
+            runner.derive_step(&runner.pipeline.steps[0]),
+            crate::platform::Resolution::NativeCross,
+        );
+        assert!(matches!(
+            runner.resolve_step(&runner.pipeline.steps[0]),
+            crate::platform::Resolution::Offload { .. }
+        ));
+        assert_eq!(runner.capability_demotions().len(), 1);
+
+        let err = runner.fleet_portability_gate().unwrap_err();
+        let RunnerError::InvalidConfig(msg) = err else {
+            panic!("expected InvalidConfig, got {err:?}");
+        };
+        // Fact + remedy #1: the missing toolchain, with its install hint.
+        assert!(msg.contains("cargo-zigbuild"), "names the missing tool: {msg}");
+        assert!(msg.contains("cargo install cargo-zigbuild"), "install hint: {msg}");
+        // Fact + remedy #2: the portability gap.
+        assert!(msg.contains("source_context"), "names the portability gap: {msg}");
+        // And says plainly that neither place works.
+        assert!(msg.contains("NEITHER"), "names both at once: {msg}");
+    }
+
+    /// `rusty-v8-musl`'s remote step is genuinely self-sufficient — image +
+    /// argv, no camp tree. It is one of only two pipelines that actually
+    /// offloads today, so a gate keyed on "declares `source_context`" would
+    /// break a working fleet pipeline. It must pass.
+    #[test]
+    fn a_self_sufficient_offload_step_is_not_refused() {
+        let mut step = native_offload_step();
+        step.argv = vec![
+            "build-v8.sh 'x86_64-unknown-linux-musl' '/yah/produced/rusty-v8-x86_64-unknown-linux-musl.tar.gz'"
+                .to_string(),
+        ];
+        step.image = Some("cr.yah.dev/rusty-v8-musl-builder:v149.4.0-amd64@sha256:7e9f".into());
+        step.produces = vec![crate::types::ProducedArtifact {
+            binary: "rusty-v8".into(),
+            path: "/yah/produced/rusty-v8-x86_64-unknown-linux-musl.tar.gz".into(),
+            triple: Some("x86_64-unknown-linux-musl".into()),
+        }];
+        // `--where=auto` on the arm64 camp Mac: `native = true` + cross arch ⇒
+        // this really is dispatched to the fleet.
+        let runner = PipelineRunner {
+            run_where: RunWhere::Auto,
+            ..PipelineRunner::new(bg_pipeline("v8", vec![step]))
+                .with_host_triple("aarch64-apple-darwin")
+        };
+        let report = runner.fleet_portability_report();
+        assert!(report[0].dispatched_to_fleet, "{report:?}");
+        assert!(runner.fleet_portability_gate().is_ok());
+    }
+
     // ── R590-F4 policy routing ───────────────────────────────────────────────
 
     /// `policy_placement` folds the `--where` force-mode with a step's
@@ -11207,14 +12265,26 @@ mod tests {
     #[test]
     fn pipeline_needs_offload_detects_native_cross_step() {
         let with_native = bg_pipeline("v8", vec![native_offload_step()]);
-        assert!(pipeline_needs_offload(&with_native, "aarch64-apple-darwin"));
+        assert!(pipeline_needs_offload(
+            &with_native,
+            "aarch64-apple-darwin",
+            ALL_TOOLS
+        ));
         // Same step on the matching host: host-arch build, no offload.
-        assert!(!pipeline_needs_offload(&with_native, "x86_64-unknown-linux-gnu"));
+        assert!(!pipeline_needs_offload(
+            &with_native,
+            "x86_64-unknown-linux-gnu",
+            ALL_TOOLS
+        ));
 
         let mut plain = native_offload_step();
         plain.platform.as_mut().unwrap().native = false;
         let no_native = bg_pipeline("plain", vec![plain]);
-        assert!(!pipeline_needs_offload(&no_native, "aarch64-apple-darwin"));
+        assert!(!pipeline_needs_offload(
+            &no_native,
+            "aarch64-apple-darwin",
+            ALL_TOOLS
+        ));
     }
 
     /// R823-T3, measured on hardware: a participant set's steps declare no
@@ -11244,8 +12314,16 @@ mod tests {
         // True on EITHER host: the binding names a box, so there is no host this
         // could resolve to a local run on — unlike a cross-arch build, which
         // stops needing the fleet the moment you run it on the matching arch.
-        assert!(pipeline_needs_offload(&pipeline, "aarch64-apple-darwin"));
-        assert!(pipeline_needs_offload(&pipeline, "x86_64-unknown-linux-gnu"));
+        assert!(pipeline_needs_offload(
+            &pipeline,
+            "aarch64-apple-darwin",
+            ALL_TOOLS
+        ));
+        assert!(pipeline_needs_offload(
+            &pipeline,
+            "x86_64-unknown-linux-gnu",
+            ALL_TOOLS
+        ));
 
         // A set whose every role is local still needs nothing: those steps run
         // as local subprocesses, rendezvous env and all.
@@ -11258,7 +12336,11 @@ mod tests {
         "#,
         ));
         assert!(!pipeline_has_node_bound_participant(&local_only));
-        assert!(!pipeline_needs_offload(&local_only, "aarch64-apple-darwin"));
+        assert!(!pipeline_needs_offload(
+            &local_only,
+            "aarch64-apple-darwin",
+            ALL_TOOLS
+        ));
     }
 
     /// R719-F3: the dual of the above. `needs_offload` answers "do I need fleet
@@ -11269,7 +12351,8 @@ mod tests {
         let all_remote = bg_pipeline("v8", vec![native_offload_step()]);
         assert!(pipeline_is_fully_offloaded(
             &all_remote,
-            "aarch64-apple-darwin"
+            "aarch64-apple-darwin",
+            ALL_TOOLS
         ));
 
         // One local step is enough to keep the run in a local lane — the
@@ -11277,16 +12360,21 @@ mod tests {
         let mut local = native_offload_step();
         local.platform.as_mut().unwrap().native = false;
         let mixed = bg_pipeline("mixed", vec![native_offload_step(), local]);
-        assert!(pipeline_needs_offload(&mixed, "aarch64-apple-darwin"));
+        assert!(pipeline_needs_offload(
+            &mixed,
+            "aarch64-apple-darwin",
+            ALL_TOOLS
+        ));
         assert!(
-            !pipeline_is_fully_offloaded(&mixed, "aarch64-apple-darwin"),
+            !pipeline_is_fully_offloaded(&mixed, "aarch64-apple-darwin", ALL_TOOLS),
             "a mixed run still competes for local resources"
         );
 
         // Same steps on the matching host: nothing offloads at all.
         assert!(!pipeline_is_fully_offloaded(
             &all_remote,
-            "x86_64-unknown-linux-gnu"
+            "x86_64-unknown-linux-gnu",
+            ALL_TOOLS
         ));
     }
 
@@ -11295,11 +12383,131 @@ mod tests {
     #[test]
     fn an_empty_pipeline_is_not_fully_offloaded() {
         let empty = bg_pipeline("nothing", vec![]);
-        assert!(!pipeline_is_fully_offloaded(&empty, "aarch64-apple-darwin"));
+        assert!(!pipeline_is_fully_offloaded(
+            &empty,
+            "aarch64-apple-darwin",
+            ALL_TOOLS
+        ));
+    }
+
+    // ── R555-B10: Capability feeds the PRE-RUNNER question too ───────────────
+
+    /// The half of R555-B10 that makes it more than a one-line change (W235 §6).
+    /// `needs_fleet` is computed from pipeline + host *before* a runner exists;
+    /// if it cannot see a per-step Capability demotion, the run takes the
+    /// driverless local path and the demoted step dies on "no remote dispatcher
+    /// is wired" — strictly worse than the "install cargo-zigbuild" hard-fail
+    /// this ticket replaced.
+    #[test]
+    fn pipeline_needs_offload_sees_a_capability_demotion() {
+        const MAC: &str = "aarch64-apple-darwin";
+        const NO_TOOLS: &crate::nativecross::ToolAvailability =
+            &crate::nativecross::ToolAvailability::NONE;
+
+        // A plain cross-compiled step: `native = false`, foreign-arch crossable
+        // target — the `mesofact-build` / `release-build` shape.
+        let mut cross = native_offload_step();
+        cross.platform.as_mut().unwrap().native = false;
+        let pipeline = bg_pipeline("cross-build", vec![cross]);
+
+        // Fully provisioned: it cross-compiles right here, no fleet wiring at all.
+        assert!(!pipeline_needs_offload(&pipeline, MAC, ALL_TOOLS));
+        assert!(!pipeline_is_fully_offloaded(&pipeline, MAC, ALL_TOOLS));
+        assert!(pipeline_capability_demotions(&pipeline, MAC, ALL_TOOLS).is_empty());
+
+        // Under-provisioned: the SAME pipeline now needs a dispatcher, and the
+        // up-front question is the one that has to say so.
+        assert!(pipeline_needs_offload(&pipeline, MAC, NO_TOOLS));
+        assert!(pipeline_is_fully_offloaded(&pipeline, MAC, NO_TOOLS));
+
+        // …and it is never silent: the demotion names the step and the tool.
+        let demotions = pipeline_capability_demotions(&pipeline, MAC, NO_TOOLS);
+        assert_eq!(demotions.len(), 1);
+        assert_eq!(demotions[0].0, "build-v8");
+        assert!(
+            demotions[0].1.to_string().contains("cargo-zigbuild"),
+            "the warning must name the missing tool, got: {}",
+            demotions[0].1
+        );
+    }
+
+    /// The routing half: an `Auto` runner on an under-provisioned host sends the
+    /// demoted step to the fleet, while its *derivation* is still NativeCross —
+    /// that separation is what keeps the forced-local path (next test) honest.
+    #[test]
+    fn an_under_provisioned_auto_runner_routes_the_demoted_step_remote() {
+        let mut cross = native_offload_step();
+        cross.platform.as_mut().unwrap().native = false;
+        let pipeline = bg_pipeline("cross-build", vec![cross]);
+        let auto = PipelineRunner {
+            run_where: RunWhere::Auto,
+            ..PipelineRunner::new(pipeline)
+                .with_host_triple("aarch64-apple-darwin")
+                .with_cross_availability(crate::nativecross::ToolAvailability::NONE)
+        };
+        let step = &auto.pipeline.steps[0];
+
+        assert_eq!(
+            auto.derive_step(step),
+            crate::platform::Resolution::NativeCross,
+            "derivation is toolchain-blind — physics still allows the cross-compile"
+        );
+        assert_eq!(
+            auto.resolve_step(step),
+            crate::platform::Resolution::Offload {
+                target: "x86_64-unknown-linux-musl".into()
+            },
+            "placement folds capability in and demotes"
+        );
+        assert_eq!(auto.effective_placement(step), RunWhere::Remote);
+        assert_eq!(auto.capability_demotions().len(), 1);
+
+        // The same runner with the toolchain present keeps the step at home.
+        let provisioned = PipelineRunner {
+            run_where: RunWhere::Auto,
+            ..PipelineRunner::new(bg_pipeline("cross-build", vec![auto.pipeline.steps[0].clone()]))
+                .with_host_triple("aarch64-apple-darwin")
+                .with_cross_availability(crate::nativecross::ToolAvailability::FULL)
+        };
+        assert_eq!(
+            provisioned.effective_placement(&provisioned.pipeline.steps[0]),
+            RunWhere::Local
+        );
+        assert!(provisioned.capability_demotions().is_empty());
+    }
+
+    /// R555-B10 regression guard: `--where local` is the operator saying "not the
+    /// fleet", so the demotion must not swallow the diagnosis. A forced-local
+    /// runner still routes the step through the NativeCross tier — which fails
+    /// with `install_hint()` — rather than shelling out the recipe's raw
+    /// `cross build` argv to a linker that cannot serve it. This is why
+    /// `native_cross_plan` gates on `derive_step`, not `resolve_step`.
+    #[test]
+    fn a_forced_local_runner_still_fails_with_the_install_hint() {
+        let mut cross = native_offload_step();
+        cross.platform.as_mut().unwrap().native = false;
+        let pipeline = bg_pipeline("cross-build", vec![cross]);
+        let local = PipelineRunner::new(pipeline)
+            .with_host_triple("aarch64-apple-darwin")
+            .with_cross_availability(crate::nativecross::ToolAvailability::NONE);
+        let step = &local.pipeline.steps[0];
+
+        assert_eq!(local.effective_placement(step), RunWhere::Local);
+        let err = local
+            .native_cross_plan(step, &crate::nativecross::ToolAvailability::NONE)
+            .expect("a NativeCross derivation still reaches the tier when forced local")
+            .expect_err("with no toolchain installed the plan must fail, not silently pass");
+        assert_eq!(err.target, "x86_64-unknown-linux-musl");
+        assert!(err.to_string().contains("cargo install cargo-zigbuild"));
     }
 
     /// An Auto runner that policy-routes a step to Offload but has no dispatcher
     /// wired fails with a clear config error instead of panicking.
+    ///
+    /// R555-F6 also reads the second half of the outcome here: `forge_id` is
+    /// `None`, which is how the caller knows there is nothing to reap. A
+    /// dispatch that never happened and a dispatch that happened and failed are
+    /// the two states this return type exists to keep apart.
     #[tokio::test]
     async fn offload_without_dispatcher_errors_cleanly() {
         let pipeline = bg_pipeline("v8", vec![native_offload_step()]);
@@ -11308,11 +12516,12 @@ mod tests {
             ..PipelineRunner::new(pipeline).with_host_triple("aarch64-apple-darwin")
         };
         let step = auto.pipeline.steps[0].clone();
-        let err = auto
-            .execute_step_remote(0, &step, TaskRuntime::Container)
-            .await
-            .expect_err("no dispatcher wired must error, not panic");
-        match err {
+        let outcome = auto.execute_step_remote(0, &step, TaskRuntime::Container).await;
+        assert!(
+            outcome.forge_id.is_none(),
+            "nothing was deployed, so nothing may be named as reapable",
+        );
+        match outcome.result.expect_err("no dispatcher wired must error, not panic") {
             RunnerError::InvalidConfig(m) => {
                 assert!(m.contains("Offload"), "message: {m}");
                 assert!(m.contains("no remote dispatcher"), "message: {m}");
@@ -12122,6 +13331,139 @@ mod tests {
         )));
     }
 
+    /// R605-B17 regression. `commit-and-tag`'s real `advance` predicate
+    /// (`diff -q <run-token> <freeze-ack> && git describe --tags --exact-match`,
+    /// `.yah/qed/yah-release-wizard.toml`) must not be satisfiable by an ack
+    /// left over from a PRIOR run — only one written during THIS run. Before
+    /// this fix `advance` was just `git describe --tags --exact-match`, which
+    /// a tag cut by an EARLIER run satisfies forever after, so the very
+    /// probe-before-park optimization exercised by
+    /// `manual_advance_already_satisfied_skips_the_park` above skipped the
+    /// human entirely on every rerun and release-check re-tested stale bytes
+    /// — exactly what happened to the 0.8.32 release (tree fix authored
+    /// 18:13-18:32 PDT, freeze commit 17:25 PDT, rerun at 02:56Z tested the
+    /// 17:25 bytes a second time with nothing on screen saying why).
+    #[tokio::test]
+    async fn manual_advance_ignores_an_ack_left_by_a_prior_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let token = tmp.path().join("release-wizard-run-token");
+        let ack = tmp.path().join("release-wizard-freeze-ack");
+        // A prior run: it wrote its own token, a human copied it into the ack
+        // file, and that run went green. Both files still hold that value.
+        std::fs::write(&token, b"prior-run-17").unwrap();
+        std::fs::write(&ack, b"prior-run-17").unwrap();
+        let cond = format!(
+            "diff -q {} {} >/dev/null 2>&1",
+            token.display(),
+            ack.display()
+        );
+        let step = mk_manual("commit-and-tag", manual_cfg("Tag it.", Some(&cond)));
+
+        // What `snapshot-pre-freeze-token` does mechanically, unconditionally,
+        // before this step is ever probed: overwrite the token with a value
+        // unique to THIS run. Now `token` and `ack` disagree even though a
+        // human already froze a release here once before — the disagreement
+        // is the whole fix.
+        std::fs::write(&token, b"this-run-42").unwrap();
+
+        // Only the poll can resolve this park (never_answers) — proves the
+        // human genuinely has to act again this run, not just click through.
+        let mut gate = ScriptedGate::new(vec![]);
+        gate.never_answers = true;
+        let gate = Arc::new(gate);
+        let parks = Arc::clone(&gate.parks);
+
+        // Simulate the human running the prefilled `cp run-token freeze-ack`
+        // terminal command once they've seen the park.
+        let watch = Arc::clone(&parks);
+        let ack_path = ack.clone();
+        tokio::spawn(async move {
+            loop {
+                if !watch.lock().unwrap().is_empty() {
+                    std::fs::write(&ack_path, b"this-run-42").unwrap();
+                    return;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        });
+
+        let meta = PipelineRunner::new(bg_pipeline("m-rerun", vec![step]))
+            .with_manual_gate(gate)
+            .run()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            parks.lock().unwrap().len(),
+            1,
+            "a mismatched ack from a prior run must still surface the gate to a human, \
+             not auto-advance the way `git describe --tags --exact-match` alone did"
+        );
+        assert_eq!(
+            meta.status,
+            RunStatus::Success,
+            "once the human's ack matches THIS run's token, it still advances normally"
+        );
+    }
+
+    /// R605-B19. `probe_manual_advance` now injects `QED_RUN_ID`/
+    /// `QED_STEP_NAME` into `advance`'s environment, so a predicate can ask
+    /// "did THIS run do it" directly — the primitive the test above's
+    /// workaround (a hand-rolled nonce file under `.yah/jit/qed/`) had to
+    /// invent because neither a run id nor `${{ steps.*.outputs.* }}`
+    /// substitution reached `advance` before this. No file anywhere in this
+    /// test: two [`PipelineRunner`]s stand in for two separate `qed run`
+    /// invocations of the same pipeline (R605-B17's exact rerun scenario),
+    /// and the predicate tells them apart purely from the injected env.
+    #[tokio::test]
+    async fn probe_manual_advance_lets_a_predicate_gate_on_this_run_with_no_file() {
+        let run_a = PipelineRunner::new(make_pipeline("p", vec![]));
+        let run_b = PipelineRunner::new(make_pipeline("p", vec![]));
+        assert_ne!(
+            run_a.run_id(),
+            run_b.run_id(),
+            "fixture sanity: each run gets its own id"
+        );
+
+        let cwd = std::env::temp_dir();
+        // Stands in for "a human recorded THIS run's id somewhere durable" —
+        // a git commit message, an annotated tag, anything but a jit file.
+        let cond = format!(r#"[ "$QED_RUN_ID" = "{}" ]"#, run_a.run_id());
+
+        assert!(
+            run_a
+                .probe_manual_advance(&cond, &cwd, "commit-and-tag")
+                .await
+                .is_ok(),
+            "run_a's own id satisfies a predicate written for run_a"
+        );
+        assert!(
+            run_b
+                .probe_manual_advance(&cond, &cwd, "commit-and-tag")
+                .await
+                .is_err(),
+            "run_b must not satisfy a predicate naming run_a's id — a PRIOR \
+             run's artifact silently satisfying THIS run's gate is exactly \
+             the R605-B17 failure mode"
+        );
+
+        // QED_STEP_NAME distinguishes multiple manual steps in one pipeline
+        // (commit-and-tag vs push-tag) using similarly-shaped predicates.
+        let step_cond = r#"[ "$QED_STEP_NAME" = "push-tag" ]"#;
+        assert!(
+            run_a
+                .probe_manual_advance(step_cond, &cwd, "push-tag")
+                .await
+                .is_ok()
+        );
+        assert!(
+            run_a
+                .probe_manual_advance(step_cond, &cwd, "commit-and-tag")
+                .await
+                .is_err()
+        );
+    }
+
     /// The ordinary path: no `advance` to check, so the step parks, the human
     /// says continue, and the run goes green. The concurrency key is released
     /// for the park and reacquired before the step loop resumes.
@@ -12335,6 +13677,98 @@ mod tests {
         assert!(
             err.contains("camp daemon") && err.contains("manual.advance"),
             "the error names both ways out; got {err:?}"
+        );
+    }
+
+    /// R605-B18. `push-tag`'s real `advance` predicate (`.yah/qed/
+    /// yah-release-wizard.toml`) must compare the OBJECT origin's tag
+    /// resolves to against the local tag's object, not just that a
+    /// same-named ref exists on origin. Before this fix `advance` was
+    /// `git ls-remote --exit-code --tags origin "$(git describe --tags
+    /// --exact-match)"` — a name-only check. R605-B17 made `commit-and-tag`
+    /// instruct a delete-and-recut under the SAME version name whenever a
+    /// rerun's tag no longer matches a fresh HEAD, and a stale same-named tag
+    /// already on origin from the attempt being recut away from satisfies
+    /// the old predicate, auto-skipping the push and leaving origin on
+    /// pre-fix bytes while every later step believes the release shipped.
+    /// Exercised with an ANNOTATED tag deliberately — the named trap is that
+    /// an annotated tag's plain `refs/tags/<name>` row on `git ls-remote` is
+    /// the tag OBJECT's id, not the commit it points at (the commit is a
+    /// separate `refs/tags/<name>^{}` row), so a naive comparison against
+    /// that plain row would mismatch on every annotated tag and false-block
+    /// every push, not just the recut case this test is about. MEASURED
+    /// while building this fix (git 2.50.1, no `-d`/`--dereference` flag on
+    /// this `ls-remote` at all): passing the tag name as a query pattern
+    /// (`git ls-remote --tags origin "$name"`) suppresses the peeled `^{}`
+    /// row entirely — an unfiltered query (`git ls-remote --tags origin`,
+    /// no name arg) is what actually returns both rows, matched client-side.
+    #[tokio::test]
+    async fn push_tag_advance_rejects_a_recut_annotated_tag_until_force_pushed() {
+        // The real predicate string from yah-release-wizard.toml's push-tag
+        // step, verbatim — this test is only meaningful if it stays in sync.
+        const ADVANCE: &str = r#"
+name="$(git describe --tags --exact-match)" || exit 1
+local_sha="$(git rev-parse "refs/tags/${name}^{commit}")" || exit 1
+remote_sha="$(git ls-remote --tags origin | awk -v peeled="refs/tags/${name}^{}" -v plain="refs/tags/${name}" '$2==peeled{print $1; f=1; exit} $2==plain{c=$1} END{if(!f && c!="") print c}')"
+[ -n "$remote_sha" ] && [ "$remote_sha" = "$local_sha" ]
+"#;
+
+        let remote = tempfile::tempdir().unwrap();
+        run_git(remote.path(), &["init", "--bare", "-q"]).unwrap();
+
+        let local = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| run_git(local.path(), args).unwrap();
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@t.t"]);
+        git(&["config", "user.name", "t"]);
+        std::fs::write(local.path().join("f.txt"), "A").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "A"]);
+        git(&[
+            "remote",
+            "add",
+            "origin",
+            remote.path().to_str().unwrap(),
+        ]);
+        git(&["push", "-q", "origin", "main"]);
+        // Annotated tag at A, pushed — a prior, successful attempt.
+        git(&["tag", "-a", "v1.0.0", "-m", "release A"]);
+        git(&["push", "-q", "origin", "v1.0.0"]);
+
+        let runner = PipelineRunner::new(make_pipeline("p", vec![]));
+        assert!(
+            runner
+                .probe_manual_advance(ADVANCE, local.path(), "push-tag")
+                .await
+                .is_ok(),
+            "sanity: a freshly pushed annotated tag must satisfy advance"
+        );
+
+        // R605-B17's delete-and-recut path: same name, new commit B, NOT
+        // pushed yet. Origin still has the stale tag pointing at A.
+        std::fs::write(local.path().join("f.txt"), "B").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-q", "-m", "B"]);
+        git(&["tag", "-d", "v1.0.0"]);
+        git(&["tag", "-a", "v1.0.0", "-m", "release B"]);
+
+        assert!(
+            runner
+                .probe_manual_advance(ADVANCE, local.path(), "push-tag")
+                .await
+                .is_err(),
+            "a same-named tag still on origin from the PRIOR commit must not \
+             satisfy advance — the old name-only check wrongly passed here"
+        );
+
+        // Recutting a tag origin already has requires --force.
+        git(&["push", "-q", "--force", "origin", "v1.0.0"]);
+        assert!(
+            runner
+                .probe_manual_advance(ADVANCE, local.path(), "push-tag")
+                .await
+                .is_ok(),
+            "once origin's tag object matches the local recut, advance must pass"
         );
     }
 
@@ -13072,7 +14506,7 @@ mod tests {
             on_fail: vec![],
             triggers: vec![],
             concurrency_key: None,
-            placement: crate::types::Placement::Anywhere,
+            environment: crate::types::Environment::Any,
             workspace: crate::types::WorkspaceMode::Live,
             wraps: None,
             matrix: None,
@@ -13341,7 +14775,7 @@ description = "smoke test image"
             on_fail: vec![],
             triggers: vec![],
             concurrency_key: None,
-            placement: crate::types::Placement::Anywhere,
+            environment: crate::types::Environment::Any,
             workspace: crate::types::WorkspaceMode::Live,
             wraps: None,
             matrix: None,
@@ -13617,7 +15051,7 @@ produces    = ["native-tarball"]
             on_fail: vec![],
             triggers: vec![],
             concurrency_key: None,
-            placement: crate::types::Placement::Anywhere,
+            environment: crate::types::Environment::Any,
             workspace: crate::types::WorkspaceMode::Live,
             wraps: None,
             matrix: None,
@@ -13800,7 +15234,7 @@ produces    = ["native-tarball"]
             on_fail: vec![],
             triggers: vec![],
             concurrency_key: None,
-            placement: crate::types::Placement::Anywhere,
+            environment: crate::types::Environment::Any,
             workspace: crate::types::WorkspaceMode::Live,
             wraps: None,
             matrix: None,
@@ -13870,7 +15304,7 @@ produces    = ["native-tarball"]
             on_fail: vec![],
             triggers: vec![],
             concurrency_key: None,
-            placement: crate::types::Placement::Anywhere,
+            environment: crate::types::Environment::Any,
             workspace: crate::types::WorkspaceMode::Live,
             wraps: None,
             matrix: None,
@@ -14503,7 +15937,7 @@ produces    = ["native-tarball"]
             on_fail: vec![],
             triggers: vec![],
             concurrency_key: None,
-            placement: crate::types::Placement::Anywhere,
+            environment: crate::types::Environment::Any,
             // Test fixtures run in throwaway tempdirs that aren't real git
             // checkouts, so use Live (build the tree as-is) — the default
             // Checkout mode would try `git checkout main` and fail. Workspace
@@ -15524,7 +16958,7 @@ jobs:
             on_fail: vec![],
             triggers: vec![],
             concurrency_key: None,
-            placement: Default::default(),
+            environment: Default::default(),
             workspace: crate::types::WorkspaceMode::Live, // test fixture isn't a git checkout
             wraps: None,
             matrix: None,
@@ -15807,7 +17241,7 @@ jobs:
             on_fail: vec![],
             triggers: vec![],
             concurrency_key: None,
-            placement: Default::default(),
+            environment: Default::default(),
             workspace: crate::types::WorkspaceMode::Live, // test fixture isn't a git checkout
             wraps: None,
             matrix: None,
@@ -17218,7 +18652,7 @@ jobs:
             on_fail: vec![],
             triggers: vec![],
             concurrency_key: None,
-            placement: crate::types::Placement::Anywhere,
+            environment: crate::types::Environment::Any,
             workspace: crate::types::WorkspaceMode::Live,
             wraps: None,
             matrix: None,
@@ -17260,7 +18694,7 @@ jobs:
             on_fail: vec![],
             triggers: vec![],
             concurrency_key: None,
-            placement: crate::types::Placement::Anywhere,
+            environment: crate::types::Environment::Any,
             workspace: crate::types::WorkspaceMode::Live,
             wraps: None,
             matrix: None,
@@ -17298,7 +18732,7 @@ jobs:
             on_fail: vec![],
             triggers: vec![],
             concurrency_key: None,
-            placement: crate::types::Placement::Anywhere,
+            environment: crate::types::Environment::Any,
             workspace: crate::types::WorkspaceMode::Live,
             wraps: None,
             matrix: None,
@@ -17339,7 +18773,7 @@ jobs:
             on_fail: vec![],
             triggers: vec![],
             concurrency_key: None,
-            placement: crate::types::Placement::Anywhere,
+            environment: crate::types::Environment::Any,
             workspace: crate::types::WorkspaceMode::Live,
             wraps: None,
             matrix: None,
@@ -17379,7 +18813,7 @@ jobs:
             on_fail: vec![],
             triggers: vec![],
             concurrency_key: None,
-            placement: crate::types::Placement::Anywhere,
+            environment: crate::types::Environment::Any,
             workspace: crate::types::WorkspaceMode::Live,
             wraps: None,
             matrix: None,
@@ -17426,7 +18860,7 @@ jobs:
             on_fail: vec![],
             triggers: vec![],
             concurrency_key: None,
-            placement: crate::types::Placement::Anywhere,
+            environment: crate::types::Environment::Any,
             workspace: crate::types::WorkspaceMode::Live,
             wraps: None,
             matrix: None,
@@ -17467,7 +18901,7 @@ jobs:
             on_fail: vec![],
             triggers: vec![],
             concurrency_key: None,
-            placement: crate::types::Placement::Anywhere,
+            environment: crate::types::Environment::Any,
             workspace: crate::types::WorkspaceMode::Live,
             wraps: None,
             matrix: None,
@@ -17519,7 +18953,7 @@ jobs:
             on_fail: vec![],
             triggers: vec![],
             concurrency_key: None,
-            placement: crate::types::Placement::Anywhere,
+            environment: crate::types::Environment::Any,
             workspace: crate::types::WorkspaceMode::Live,
             wraps: None,
             matrix: None,
@@ -17689,7 +19123,7 @@ jobs:
             on_fail: vec![],
             triggers: vec![],
             concurrency_key: None,
-            placement: crate::types::Placement::Anywhere,
+            environment: crate::types::Environment::Any,
             workspace: crate::types::WorkspaceMode::Live,
             wraps: None,
             matrix: None,
@@ -17726,7 +19160,7 @@ jobs:
             on_fail: vec![],
             triggers: vec![],
             concurrency_key: None,
-            placement: crate::types::Placement::Anywhere,
+            environment: crate::types::Environment::Any,
             workspace: crate::types::WorkspaceMode::Live,
             wraps: None,
             matrix: None,
@@ -17758,7 +19192,7 @@ jobs:
             on_fail: vec![],
             triggers: vec![],
             concurrency_key: None,
-            placement: crate::types::Placement::Anywhere,
+            environment: crate::types::Environment::Any,
             workspace: crate::types::WorkspaceMode::Live,
             wraps: None,
             matrix: None,
@@ -17790,7 +19224,7 @@ jobs:
             on_fail: vec![],
             triggers: vec![],
             concurrency_key: None,
-            placement: crate::types::Placement::Anywhere,
+            environment: crate::types::Environment::Any,
             workspace: crate::types::WorkspaceMode::Live,
             wraps: None,
             matrix: None,
@@ -17822,7 +19256,7 @@ jobs:
             on_fail: vec![],
             triggers: vec![],
             concurrency_key: None,
-            placement: crate::types::Placement::Anywhere,
+            environment: crate::types::Environment::Any,
             workspace: crate::types::WorkspaceMode::Live,
             wraps: None,
             matrix: None,

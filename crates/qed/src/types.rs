@@ -451,27 +451,37 @@ pub enum Trigger {
     Pipeline { id: String, status: RunStatus },
 }
 
-/// Where a recipe is allowed to run (W155 principle 2). The runner consults
-/// this at kick time to refuse out-of-place runs before any step executes —
-/// e.g. CLI refuses `CiOnly` from a developer laptop unless `--force`. The
-/// recipe itself never branches on the runner; placement is the contract that
-/// keeps recipes environment-agnostic.
+/// Which *class of host* a recipe is allowed to run on (W155 principle 2). The
+/// runner consults this at kick time to refuse out-of-place runs before any
+/// step executes — e.g. CLI refuses `Ci` from a developer laptop unless
+/// `--force`. The recipe itself never branches on the runner; this is the
+/// contract that keeps recipe bodies host-agnostic.
 ///
-/// Default is [`Placement::Anywhere`] so existing recipes keep working when
-/// the field is omitted.
+/// **This is the PERMISSION axis, never the ROUTING axis** (W235 §Verdict §4).
+/// It answers *may this recipe run on this class of host at all*, and it has
+/// nothing to say about local-vs-fleet — that is `--where` / [`crate::runner::RunWhere`].
+/// It was spelled `placement` until R555-T7, which is precisely the collision
+/// that made the two readable as one thing: `QedRunParams::run_where` below is
+/// the wire `where`, i.e. routing, and carried the same name.
+///
+/// Default is [`Environment::Any`] so a recipe that declares nothing keeps
+/// working.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
-pub enum Placement {
+pub enum Environment {
     /// Runs on a dev machine; meaningless on CI. The output is "yah.app
     /// installed in /Applications", "files written to the camp tree", etc.
-    LocalOnly,
+    ///
+    /// Spelled `workstation`, not `local-only`, deliberately: `local` is the
+    /// one word that collides with `--where=local`, which is routing.
+    Workstation,
     /// Needs secrets, signing identity, or a clean runner that don't exist
     /// locally. Publishing, codesigning, notarization.
-    CiOnly,
+    Ci,
     /// Pure verification — lint, typecheck, smoke. The gold standard.
     #[default]
-    Anywhere,
+    Any,
 }
 
 /// How the runner positions the on-disk tree a pipeline's steps build against,
@@ -628,11 +638,11 @@ pub struct Pipeline {
     /// resolve to a chain, and a chain never has two ready steps.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_parallel: Option<usize>,
-    /// Where this recipe is allowed to run (W170). Defaults to
-    /// [`Placement::Anywhere`]. The runner enforces this at kick time
-    /// (R435-F2) — the recipe body itself remains environment-agnostic.
+    /// Which class of host this recipe is allowed to run on (W170). Defaults to
+    /// [`Environment::Any`]. The runner enforces this at kick time
+    /// (R435-F2) — the recipe body itself remains host-agnostic.
     #[serde(default)]
-    pub placement: Placement,
+    pub environment: Environment,
     /// How the runner positions the on-disk tree this pipeline builds against
     /// (W224). Defaults to [`WorkspaceMode::Checkout`] (switch to the run's
     /// ref, bail if dirty). Releases set `workspace = "isolated"` so a tag is
@@ -705,8 +715,8 @@ pub struct Pipeline {
     /// Orthogonal to every neighbouring knob, and worth stating why, because
     /// three of them look adjacent:
     ///
-    /// - [`placement`](Self::placement) is a *permission* gate — may this run
-    ///   happen here at all.
+    /// - [`environment`](Self::environment) is a *permission* gate — may this
+    ///   run happen on this class of host at all.
     /// - [`matrix`](Self::matrix) fans steps into rows that are **independent
     ///   jobs**; no row can address another, which is precisely what a
     ///   rendezvous needs.
@@ -1924,6 +1934,20 @@ impl Default for WaitForConfig {
     }
 }
 
+/// Env var carrying this run's id, set in a [`StepKind::Manual`] step's
+/// `advance` environment (`probe_manual_advance`, qed runner.rs) alongside
+/// [`ENV_MANUAL_STEP_NAME`] (R605-B19). Lets a predicate distinguish "a tag
+/// this SAME run cut" from "a tag a PRIOR run cut and left lying around" —
+/// the gap that forced R605-B17's on-disk nonce file to exist in the first
+/// place. Not injected into ordinary (non-manual) subprocess steps; those
+/// already have `${{ steps.*.outputs.* }}` for carrying values forward.
+pub const ENV_MANUAL_RUN_ID: &str = "QED_RUN_ID";
+
+/// Env var naming the manual step itself, alongside [`ENV_MANUAL_RUN_ID`] —
+/// distinguishes multiple manual steps in one pipeline (e.g. `commit-and-tag`
+/// vs `push-tag`) that might otherwise reuse a similarly-shaped predicate.
+pub const ENV_MANUAL_STEP_NAME: &str = "QED_STEP_NAME";
+
 /// Step-level config for [`StepKind::Manual`] (R622, W282). Describes the
 /// human's half of a pipeline: what they must accomplish, what to put in front
 /// of them, and how the pipeline confirms they did it.
@@ -1944,6 +1968,13 @@ impl Default for WaitForConfig {
 /// With it the pipeline *confirms the human actually did the thing* before
 /// spending an irreversible step on it. Treat it as strongly encouraged; a
 /// manual step without one should be rare and deliberate.
+///
+/// [`ENV_MANUAL_RUN_ID`] and [`ENV_MANUAL_STEP_NAME`] are set in `advance`'s
+/// environment (R605-B19) so a predicate can ask "did THIS run do the thing"
+/// directly, rather than smuggling that question through a file on disk —
+/// R605-B17 had to invent exactly such a nonce-file protocol before this
+/// existed, because neither a run id nor `${{ steps.*.outputs.* }}`
+/// substitution reached `advance` at all.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct ManualConfig {
@@ -1964,8 +1995,9 @@ pub struct ManualConfig {
     /// continue. On a non-zero exit after a human answer the step re-parks
     /// carrying the failing command and its stderr.
     ///
-    /// Run through `sh -c` in the pipeline workspace. `None` ⇒ honour-system
-    /// advance on the human's word alone.
+    /// Run through `sh -c` in the pipeline workspace, with
+    /// [`ENV_MANUAL_RUN_ID`]/[`ENV_MANUAL_STEP_NAME`] in its environment
+    /// (R605-B19). `None` ⇒ honour-system advance on the human's word alone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub advance: Option<String>,
     /// Advisory checkboxes on the card. Purely informational — they gate
@@ -3167,10 +3199,15 @@ pub struct QedRunLaunch {
     /// the wire name stays `ref` via `#[serde(rename)]`.
     #[serde(default, rename = "ref", skip_serializing_if = "Option::is_none")]
     pub git_ref: Option<String>,
-    /// Placement override — `"auto"` / `"local"` / `"remote"`.
+    /// Routing override — `"auto"` / `"local"` / `"remote"` / `"node:<name>"`.
+    ///
+    /// Named `run_where` rather than `placement` since R555-T7: this is the
+    /// ROUTING axis (where does the run actually go) and [`Pipeline::environment`]
+    /// is the PERMISSION axis, and the two carrying one name in one file is the
+    /// confusion W235 §Verdict was written to end. The wire name stays `where`.
     #[serde(default, rename = "where", skip_serializing_if = "Option::is_none")]
-    pub placement: Option<String>,
-    /// Whether the placement gate was bypassed with `force`.
+    pub run_where: Option<String>,
+    /// Whether the environment gate was bypassed with `force`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub force: Option<bool>,
 }
@@ -3486,7 +3523,7 @@ mod tests {
             on_fail: vec![],
             triggers: vec![],
             concurrency_key: None,
-            placement: Placement::default(),
+            environment: Environment::default(),
             workspace: crate::types::WorkspaceMode::default(),
             wraps: None,
             matrix: None,
@@ -4429,18 +4466,18 @@ checklist = ["Diff reviewed"]
         step.validate().unwrap();
     }
 
-    // ── R435-F1 placement enum serde round-trip ────────────────────────────
+    // ── R435-F1 / R555-T7 environment enum serde round-trip ────────────────
 
     #[test]
-    fn placement_round_trip_each_variant() {
+    fn environment_round_trip_each_variant() {
         for (variant, kebab) in [
-            (Placement::LocalOnly, "local-only"),
-            (Placement::CiOnly, "ci-only"),
-            (Placement::Anywhere, "anywhere"),
+            (Environment::Workstation, "workstation"),
+            (Environment::Ci, "ci"),
+            (Environment::Any, "any"),
         ] {
             let json = serde_json::to_string(&variant).unwrap();
             assert_eq!(json, format!("\"{kebab}\""), "serialize {variant:?}");
-            let parsed: Placement = serde_json::from_str(&json).unwrap();
+            let parsed: Environment = serde_json::from_str(&json).unwrap();
             assert_eq!(parsed, variant, "deserialize {kebab}");
         }
     }
@@ -4474,33 +4511,36 @@ checklist = ["Diff reviewed"]
     }
 
     #[test]
-    fn placement_defaults_to_anywhere_when_omitted() {
+    fn environment_defaults_to_any_when_omitted() {
         let toml_src = r#"
             name = "p"
             label = "p"
             steps = []
         "#;
         let pipeline: Pipeline = toml::from_str(toml_src).unwrap();
-        assert_eq!(pipeline.placement, Placement::Anywhere);
+        assert_eq!(pipeline.environment, Environment::Any);
     }
 
     #[test]
-    fn placement_parses_each_kebab_value_from_toml() {
+    fn environment_parses_each_kebab_value_from_toml() {
         for (kebab, expected) in [
-            ("local-only", Placement::LocalOnly),
-            ("ci-only", Placement::CiOnly),
-            ("anywhere", Placement::Anywhere),
+            ("workstation", Environment::Workstation),
+            ("ci", Environment::Ci),
+            ("any", Environment::Any),
         ] {
             let toml_src = format!(
                 r#"
                 name = "p"
                 label = "p"
-                placement = "{kebab}"
+                environment = "{kebab}"
                 steps = []
                 "#
             );
             let pipeline: Pipeline = toml::from_str(&toml_src).unwrap();
-            assert_eq!(pipeline.placement, expected, "TOML placement = \"{kebab}\"");
+            assert_eq!(
+                pipeline.environment, expected,
+                "TOML environment = \"{kebab}\"",
+            );
         }
     }
 
@@ -4888,7 +4928,7 @@ checklist = ["Diff reviewed"]
             on_fail: vec![],
             triggers: vec![],
             concurrency_key: None,
-            placement: Placement::default(),
+            environment: Environment::default(),
             workspace: crate::types::WorkspaceMode::default(),
             wraps: None,
             matrix: None,

@@ -75,6 +75,12 @@ description = "Expensive-leg builder for the rusty-v8-musl transform recipe (V8 
 tools       = ["bash", "git", "curl", "cargo", "rustc", "gn", "samurai", "clang-22", "lld", "python3", "build-v8.sh"]
 
 [[image]]
+name        = "yah-musl-builder"
+base        = "alpine:3.22"
+description = "Builder for yah-cli-release's x86_64-unknown-linux-musl leg — Alpine + rustup musl HOST toolchain 1.98.0 + nasm. NOT a variant of mesofact-musl-builder: that one pins Rust 1.97.0, bakes a 152 MB librusty_v8.a `-p yah` never links, and ships no nasm (which mozjpeg-sys and rav1e both need at `--features all-image`). Per-arch, no cross-compile."
+tools       = ["bash", "git", "curl", "cargo", "rustc", "nasm", "cmake", "clang", "gawk"]
+
+[[image]]
 name        = "mesofact-musl-builder"
 base        = "alpine:3.22"
 description = "Builder for the mesofact-musl fleet pipeline (R560-T7) — Alpine + rustup musl HOST toolchain 1.97.0 + the prebuilt musl librusty_v8 archive baked in. Consumes rusty-v8-musl-builder's output; it is NOT a fork of it (that image is a V8 toolbox on apk rust 1.96 and bakes V8_FROM_SOURCE, both disqualifying here). Per-arch, no cross-compile."

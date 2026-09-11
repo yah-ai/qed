@@ -825,7 +825,7 @@ target = ["x86_64", "aarch64"]
             on_fail: Default::default(),
             triggers: Default::default(),
             concurrency_key: None,
-            placement: Default::default(),
+            environment: Default::default(),
             workspace: crate::types::WorkspaceMode::default(),
             wraps: None,
             matrix,

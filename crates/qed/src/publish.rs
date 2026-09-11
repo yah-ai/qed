@@ -339,6 +339,28 @@ pub struct IndexTriple {
 ///    publishing. That is the right trade for a permanent record — a stale entry
 ///    is a visible wrong URL, a vanished one is a download that silently stops
 ///    existing — and removing one is a deliberate hand-edit of the object.
+///
+/// @yah:ticket(R330-T52, "Normalize the legacy-digest residue out of yah/index.json and make the no-bare-digest invariant hold by construction")
+/// @yah:at(2026-09-10T18:07:27Z)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
+/// @yah:parent(R330)
+/// @yah:next("Operator authorized the cleanup on 2026-09-10, reversing the leave-it call recorded on R330-B50 an hour earlier: hand-editing the published object is permitted IF it makes future work cleaner. It does — see the gotcha. Amend R330-B50's closed-decision handoff and the publish.rs:368-374 comment, both of which currently say the residue is permanent by decision.")
+/// @yah:verify("yah.dev/releases still renders all five versions after the write.")
+/// @yah:next("THE GATE MUST NOT PUT A NETWORK DEPENDENCY IN THE CAMP-WIDE `check` BAR — an offline laptop must not turn the whole camp red. Prefer a post-write assertion inside the release publish path, or a standalone deliberately-run `scripts/check-*.sh` in the style of its siblings. Implementer's judgment, but say which and why.")
+/// @yah:gotcha("WHY THIS IS NOT COSMETICS, which is what the earlier leave-it call assumed. While the live `yah/index.json` violates `the_index_carries_no_bare_digest_at_all`, no gate can be pointed at the LIVE object — it would be red on day one and stay red — so the invariant can only ever be checked against a fixture. That is precisely the dead-writer pathology R330-B50 spent a pass eliminating: a guard reading a generated fixture while the real object drifts. Scrubbing the residue is what unlocks a gate on the thing that actually matters.")
+/// @yah:assumes("Tier: Warrior — small diff, but it writes a permanent public record and wants someone who verifies against the CDN rather than against a green build.")
+/// @yah:handoff("LEG 1 — THE INVARIANT NOW HOLDS BY CONSTRUCTION. `merge_index` (oss/qed/crates/qed/src/publish.rs) strips legacy bare digests from the WHOLE merged object, history included, not just the incoming update: one `strip_legacy_digests(&mut prior)` immediately before serialize. `IndexTriple::without_legacy_digests` became the in-place `strip_legacy_digests`, since the strip now runs over `values_mut()`. The 356-374 comment block is rewritten: it records BOTH rulings in order and dated (2026-09-10 first ruling, 2026-09-10 REVERSED), states the reasoning that changed — the leave-it call priced the residue as cosmetics and missed that a violated live object makes a live gate impossible, which is the dead-guard pathology R330-B50 removed one layer up — and KEEPS the still-true part: the strip is at the index boundary and not in `index_triples_from_manifest` because that function also builds the install pointer, which must keep the field.")
+/// @yah:handoff("LEG 2 — THE REPAIR IS A SUBCOMMAND, `yah qed normalize-index`, DRY-RUN BY DEFAULT. Chosen over a flag on an existing command (the release path must not grow a mode that skips publishing) and over a #[test]-gated helper (an operator cannot run a test against a bucket, and this needs to be re-runnable in a year). Blast radius is bounded in code, not by convention, four ways: (1) it computes its own bytes via `yah_qed::normalize_index` — there is no input that makes it write something else; (2) `removal_only_diff` REFUSES unless deleting exactly the forbidden keys from the input yields a document EQUAL to the output, so a reordered version list, a restamped timestamp or an unknown field eaten by the typed round-trip all abort instead of shipping; (3) an already-clean object is not PUT at all, so re-running is free and leaves Last-Modified alone; (4) an ABSENT key is an error, never a create. It reuses `cas_rewrite_index` — the ETag-then-body, IfMatch, 5-attempt retry loop `cas_merge_index` was refactored into — so it inherits the CAS and `CACHE_CONTROL_NO_CACHE` rather than re-deriving them, and re-normalizes whatever each attempt actually read so a racing publisher is re-merged, not clobbered. `normalize_index` deliberately does NOT restamp `updated_at` and does NOT re-sort: a repair is not a publish, and preserving both is what makes it byte-idempotent.")
+/// @yah:handoff("THE LIVE WRITE, WITH ITS PROOF. Pre-flight: re-fetched cdn.yah.dev/yah/index.json and it was BYTE-IDENTICAL to app/yah/cli/tests/fixtures/yah-index-live-2026-09-10.json (10601 bytes, `diff` empty) — no re-snapshot needed. Dry run with `--dump` then diffed mechanically, not by eye: 32 removed lines / 16 added, of which 16 removals are exactly a bare `\"sha256\"` key and the other 16 removed + 16 added are the same `bootstrap_hash` lines differing only by a trailing comma (JSON reflow); ZERO changed lines mention any other field. Asserted separately: updated_at, name, schema identical; version list AND ORDER identical; every pub_date, manifest_url, triple-key order, url, size_bytes, hash, bootstrap_hash, filename, platform, bundle_url identical. Then wrote for real. AFTER: live bytes (9193) are byte-identical to the dry run's predicted output; zero bare digest keys; all five versions with 4/4/4/4/1 triples; updated_at still 2026-09-10T02:33:13.491095+00:00 (proof it was not restamped); `curl -sSI` now answers `cache-control: no-cache, max-age=0` where it previously had NO Cache-Control at all. https://yah.dev/releases renders all five history articles (v0.8.36, v0.8.33, v0.8.32, v0.8.29, v0.8.21) with their per-asset blake3 hashes. The install pointer `yah/latest.json` was NOT touched — Last-Modified still 02:33:13 and all four triples keep their bare `sha256`, so the deliberate asymmetry holds. NO OTHER CDN OR BUCKET WRITE OF ANY KIND WAS PERFORMED.")
+/// @yah:handoff("LEG 3 — THE GATE IS BOTH SHAPES THE TICKET OFFERED, because they catch different things and neither alone is the payoff. (a) A PRE-WRITE REFUSAL on the publish path: `cas_rewrite_index` probes the bytes it is about to PUT with `yah_qed::index_legacy_bare_digest_paths` and returns Err naming the offending paths rather than writing. Pre-write, not post-write — post-write is a diagnosis of a public record you have already ruined. It needs no network, runs on every release, and cannot be bypassed by adding another index writer because there is exactly one door. (b) `scripts/check-yah-index-live.sh` reads the LIVE object off the CDN — the only guard that catches drift arriving from OUTSIDE this codebase (a hand-rolled PUT, a restored backup, an older binary), which no unit test can. It asserts four things: no legacy bare digest anywhere, every hash blake3:-tagged and every bootstrap_hash sha256:-tagged, a well-formed newest-first multi-version history with pub_date/manifest_url/url on every entry (a tripwire against a \"repair\" that satisfies the invariant by losing the contents), and cache-control containing no-cache. DELIBERATELY NOT in .yah/qed/yah-check.toml — a network dependency in the camp-wide bar turns an offline laptop red for the whole camp, and a gate that goes red for reasons unrelated to the change gets muted, which is how the fixture guards came to mean nothing. It takes an optional URL argument SO IT CAN BE MUTATION-TESTED, and was: against the repaired object 5 passed / 0 failed; against a file:// copy with one bare sha256 spliced back in it FAILS and names the exact path; against the live object BEFORE the write it failed on both the 16 keys and the missing Cache-Control. shellcheck -S warning and bash -n clean. I did not wire it into yah-cli-release.toml: every .yah/qed/*.toml is dirty in this tree and the ticket asked for one of the two shapes, not a recipe edit.")
+/// @yah:handoff("THE FIXTURE TEST: KEPT, ARGUED, AND ITS COMMENT MADE TRUTHFUL. `the_index_carries_no_bare_digest_at_all` (oss/mesofact/crates/almanac/tests/producer_shapes.rs:157) stays. It is NOT the same false assurance it was flagged as, because what it now uniquely covers is that release.yml's `del(.sha256, .blake3)` still does what it claims — that workflow is dead as a publisher but live as the REFERENCE for the index's JSON shape, it is the only artifact stating the invariant in a form a non-Rust reader can check, and THE TWO PRODUCERS AGREEING is a property nothing else asserts. Deleting it would lose that for no gain. Its comment is rewritten to a three-guard table naming what each of the three sees that the others cannot (this test → the workflow; qed's two unit tests → merge_index output, fixture-free; check-yah-index-live.sh → the live object) and ending with the one thing it must never again be read as: a green here says NOTHING about what the CDN is serving.")
+/// @yah:handoff("THE ONE TEST ASSERTION I CHANGED, AND WHY IT IS NOT A WEAKENING. `merging_the_next_release_preserves_all_five_historical_entries` (app/yah/cli/src/qed_publish.rs) asserted `now == old` for every prior entry after a merge. With the strip widened to history that is false BY DESIGN, so it now asserts `now == old-minus-the-forbidden-keys` — every pub_date, manifest_url, triple key and remaining field still compared exactly, so a merge that drops a pub_date or a triple still fails it. Two assertions were ADDED alongside to stop it degrading: the fixture must still CARRY residue (otherwise the comparison is vacuously the old equality test, and the failure message says to delete the assertion and lean on qed's fixture-free `merging_strips_a_prior_entrys_legacy_bare_digest_too`), and the merged object must probe clean. Note `the_one_triple_0_8_21_entry_is_left_exactly_as_it_is` — the obvious candidate — needed NO change: 0.8.21 has no bare sha256 and no bootstrap_hash at all, so the strip is a no-op on it. It still passes untouched.")
+/// @yah:verify("ALL FOUR NAMED BASELINES MET. `cargo test -p yah-qed --lib` (from oss/qed) → 982 passed / 1 failed / 1 ignored against the 979/1/1 baseline: +3, all mine, all passing. The single failure is still `tests::desktop_release_matrix_routes_each_row_to_its_own_platform`, confirmed by name, untouched. `cargo test -p yah --lib qed_publish` → 14 passed / 0 failed against the 9/9 baseline: +5, all mine. `cargo test -p yah-object-store` (from oss/yah-base) → 49 passed / 0 failed, exactly baseline. `cd app/yah/web/marketing && bun test` → 25 pass / 0 fail, exactly baseline. Also `cargo test -p yah-almanac` (from oss/mesofact) → 132 + 5 + 10 passed / 0 failed / 1 ignored, unchanged by the comment edit. `cargo build -p yah` clean. No orphan-gc symptom at any point — no missing-extern, no vanished OUT_DIR file — so nothing was cleaned and R770 has nothing new from this pass.")
+/// @yah:verify("LIVE, AFTER THE WRITE: `curl https://cdn.yah.dev/yah/index.json` → 9193 bytes, 0 bare sha256/blake3 keys, versions [0.8.36:4, 0.8.33:4, 0.8.32:4, 0.8.29:4, 0.8.21:1], updated_at unchanged at 2026-09-10T02:33:13.491095+00:00. `curl -sSI` → `cache-control: no-cache, max-age=0` (previously absent entirely). `curl https://yah.dev/releases` → history articles v0.8.36, v0.8.33, v0.8.32, v0.8.29, v0.8.21, each with its assets and blake3 hashes. `scripts/check-yah-index-live.sh` → 5 passed / 0 failed (it was 3 passed / 2 failed before the write). `curl https://cdn.yah.dev/yah/latest.json` → untouched, Last-Modified still 02:33:13, all four triples keep their bare sha256.")
+/// @yah:gotcha("THE COMMITTED FIXTURE IS NOW THE PRE-REPAIR SNAPSHOT ON PURPOSE. app/yah/cli/tests/fixtures/yah-index-live-2026-09-10.json no longer matches what the CDN serves, and must not be \"refreshed\" as hygiene: it is the only real, drifted object in the repo, which makes it the only thing that can exercise the history strip and the repair against something other than a tidy synthetic index. Its doc comment in qed_publish.rs says so, and two assertions fail loudly with instructions if someone refreshes it anyway. The CURRENT object is asserted by scripts/check-yah-index-live.sh instead.")
+/// @yah:gotcha("THE REPAIR WAS RUN FROM target/debug/yah, NOT FROM AN INSTALLED BINARY, and I did NOT run `cargo xtask install`. Deliberate: the subcommand is brand new so only the freshly-built binary has it, and installing over ~/.local/bin/yah would push a build made from a tree carrying ~180 other sessions' uncommitted edits onto the operator's shell and every QED step's `argv = [\"yah\", ...]`. If you want `yah qed normalize-index` on PATH, that install is yours to run (per app/yah/cli/CLAUDE.md), and note the desktop's copy at /Applications/yah.app/Contents/MacOS/yah is a separate target.")
+/// @yah:verify("Leader-verified post-write (@Ashguard:eclipse): live index 0 bare digests / 5 versions / triple counts and pub_dates preserved / cache-control now present; latest.json untouched and still carries its bare sha256 fallback for install.sh; yah.dev/releases renders all five versions; scripts/check-yah-index-live.sh 5/5; yah-qed --lib 982/1/1 (baseline 979/1/1, same single pre-existing failure); yah --lib qed_publish 14/0 (baseline 9/0).")
+/// @yah:gotcha("THIS TICKET IS DONE AND ITS COLUMN IS LYING. It reads `handoff`, which means \"a baton is waiting for a picker\" — there is no baton and nothing to pick up. All three legs landed, the live write is performed, and the leader independently re-verified every claim (see the appended verify entry). It could not be moved to `review` because `arch.review_ticket` refuses every ticket anchored under a non-subcamp `oss/` workspace with `conflict: ticket not found`, while `board.show` and `board.update` resolve the same id fine — reproducible from the MCP verb, from `yah board review`, with `--path oss/qed`, and from inside oss/qed. Filed as R511-B7 with the diagnosis. **Do not claim this ticket.** Treat it as review-pending and sign it off directly.")
 pub fn merge_index(
     existing: Option<&str>,
     binary: &str,
@@ -385,6 +407,45 @@ pub fn merge_index(
             .then_with(|| b.version.cmp(&a.version))
     });
 
+    // THE INDEX BOUNDARY (R330-B50, widened by R330-T52). Every legacy bare
+    // digest is stripped here, at the one choke point every index write passes
+    // through — see [`IndexTriple::strip_legacy_digests`]. Doing it here rather
+    // than in `index_triples_from_manifest` is deliberate and still
+    // load-bearing: that function also builds the install POINTER
+    // (`<binary>/latest.json`), which MUST keep the bare `sha256` because every
+    // `install.sh` already on someone's machine reads it as a fallback.
+    //
+    // Applied to the WHOLE object — the incoming update AND every prior entry.
+    // That is a REVERSAL, made on purpose, and the reasoning it replaces was
+    // sound under the ruling it was written for. Both rulings, in order:
+    //
+    //   2026-09-10, first ruling. The strip covered the incoming update only.
+    //   `merge_index` re-serializes every historical entry on every merge, so
+    //   stripping `prior` too would rewrite already-published history as a side
+    //   effect of the next release — and the 16 bare `sha256` keys the live
+    //   `yah/index.json` had accumulated were ruled permanent, a public record
+    //   not to be edited.
+    //
+    //   2026-09-10, REVERSED (R330-T52). The operator authorised the cleanup and
+    //   the live object was normalized the same day, through this same code, by
+    //   `yah qed normalize-index`. What the first ruling weighed as "rewriting
+    //   history for cosmetics" had a cost it did not price: while the live
+    //   object violated the invariant, no gate could be pointed AT the live
+    //   object — it would be red on day one and stay red — so the invariant
+    //   could only ever be asserted against a fixture emitted by a producer that
+    //   has never published a release. That is the exact dead-guard pathology
+    //   R330-B50 spent a pass removing.
+    //
+    // So the invariant now holds BY CONSTRUCTION rather than only for new
+    // entries: a regression in any other producer of this object cannot leave
+    // permanent residue, because the next release normalizes it away. The strip
+    // is lossless and is a REMOVAL only — every entry it touches keeps the same
+    // digest in its tagged `bootstrap_hash`, and no published value is ever
+    // edited. `cas_merge_index` (app/yah/cli/src/qed_publish.rs) refuses to PUT
+    // bytes that still carry one, so a future edit that bypasses this line fails
+    // the publish instead of publishing the violation.
+    strip_legacy_digests(&mut prior);
+
     serde_json::to_string_pretty(&ReleaseIndex {
         name: binary.to_string(),
         schema: 1,
@@ -392,6 +453,83 @@ pub fn merge_index(
         versions: prior,
     })
 }
+
+/// Strip every legacy bare digest out of an index's version list, in place.
+///
+/// The whole-object half of the index boundary — see [`merge_index`] and
+/// [`IndexTriple::strip_legacy_digests`].
+fn strip_legacy_digests(versions: &mut [IndexVersion]) {
+    for version in versions.iter_mut() {
+        for entry in version.triples.values_mut() {
+            entry.strip_legacy_digests();
+        }
+    }
+}
+
+/// Rewrite an EXISTING index object so it satisfies the no-bare-digest
+/// invariant, changing nothing else (R330-T52).
+///
+/// The repair half of the index boundary. [`merge_index`] holds the invariant
+/// for every write a release makes; this holds it for an object that already
+/// drifted, without inventing a version to hang the write on.
+///
+/// Two things it deliberately does NOT do, both of which [`merge_index`] does
+/// and both of which would make this something other than a repair:
+///
+/// - **It does not restamp `updated_at`.** Normalizing removes keys that were
+///   never supposed to be published; it does not publish anything. Restamping
+///   would report a release that did not happen, and — more usefully — leaving
+///   it alone makes this function byte-idempotent, so a second run produces
+///   input-identical bytes and the caller can skip the write entirely.
+/// - **It does not re-sort.** The version order is part of what the caller
+///   promised not to touch, so the only difference between input and output is
+///   removed keys. A caller that wants to *prove* that (and the repair command
+///   does, before it will write anything) can diff the two directly.
+pub fn normalize_index(existing: &str) -> Result<String, serde_json::Error> {
+    let mut index: ReleaseIndex = serde_json::from_str(existing)?;
+    strip_legacy_digests(&mut index.versions);
+    serde_json::to_string_pretty(&index)
+}
+
+/// Every JSON path in an index object that carries a legacy bare digest key.
+///
+/// Empty is the invariant, stated once so a producer, a repair and a live gate
+/// can all ask the same question of the same bytes rather than each
+/// re-deriving it. See [`IndexTriple::strip_legacy_digests`] for why the index
+/// answers "no" here while the install pointer answers "yes".
+///
+/// Reads the raw JSON rather than [`ReleaseIndex`], deliberately: deserializing
+/// into the typed shape silently drops any key the struct has no field for —
+/// there is no `blake3` field at all — so a typed probe would report clean on
+/// bytes that are not.
+pub fn index_legacy_bare_digest_paths(index_json: &str) -> Result<Vec<String>, serde_json::Error> {
+    let doc: serde_json::Value = serde_json::from_str(index_json)?;
+    let mut found = Vec::new();
+    let Some(versions) = doc.get("versions").and_then(|v| v.as_array()) else {
+        return Ok(found);
+    };
+    for version in versions {
+        let label = version
+            .get("version")
+            .and_then(|v| v.as_str())
+            .unwrap_or("<unversioned>");
+        let Some(triples) = version.get("triples").and_then(|t| t.as_object()) else {
+            continue;
+        };
+        for (triple, entry) in triples {
+            for legacy in LEGACY_BARE_DIGEST_KEYS {
+                if entry.get(legacy).is_some() {
+                    found.push(format!("$.versions[{label}].triples.{triple}.{legacy}"));
+                }
+            }
+        }
+    }
+    Ok(found)
+}
+
+/// The bare-digest key names the index forbids, mirroring the
+/// `del(.sha256, .blake3)` in `.github/workflows/release.yml`'s index step.
+pub const LEGACY_BARE_DIGEST_KEYS: [&str; 2] = ["sha256", "blake3"];
 
 /// Bucket key for a binary's accumulating index.
 pub fn index_key(prefix: Option<&str>, binary: &str) -> String {
@@ -416,6 +554,44 @@ pub struct IndexUpdate {
     pub pub_date: String,
     pub manifest_url: Option<String>,
     pub triples: BTreeMap<String, IndexTriple>,
+}
+
+impl IndexTriple {
+    /// Drop the legacy bare digests before this entry enters the **index**.
+    ///
+    /// [`IndexTriple`] is deliberately shared by two published shapes, and they
+    /// disagree about exactly this field:
+    ///
+    /// - the **install pointer** (`<binary>/latest.json`, [`TriplesManifest`])
+    ///   MUST keep bare `sha256`. Every `install.sh` already on someone's
+    ///   machine falls back to it when `bootstrap_hash` is absent, which is why
+    ///   `$.triples.*.sha256` is grandfathered in almanac's
+    ///   `LEGACY_BARE_HEX_PATHS`. Removing it there breaks installs we cannot
+    ///   reach.
+    /// - the **index** (`<binary>/index.json`) must NOT. It is a permanent
+    ///   accumulating record with no in-the-wild consumer, so there has never
+    ///   been anything to grandfather — the answer is no from its first byte.
+    ///
+    /// `.github/workflows/release.yml:1930` has always drawn that line in the
+    /// same place, building each index entry from the pointer's own per-triple
+    /// data through `map_values(del(.sha256, .blake3))`. This is that `del()`,
+    /// in Rust, at the same boundary.
+    ///
+    /// R330-B50 found the two producers had drifted: the workflow stripped and
+    /// this crate did not, so the live `yah/index.json` accumulated 16 bare
+    /// `sha256` keys while the invariant's own test stayed green — it reads a
+    /// fixture generated from the workflow, i.e. from the producer that has
+    /// never published. There is no `blake3` field on this type, so `sha256` is
+    /// the whole of the strip; [`index_legacy_bare_digest_paths`] checks the raw
+    /// JSON for both, because an untyped key is exactly what this type cannot
+    /// see.
+    ///
+    /// In place rather than by value (R330-T52) because the strip now runs over
+    /// the whole merged object, historical entries included — see
+    /// [`merge_index`].
+    fn strip_legacy_digests(&mut self) {
+        self.sha256 = None;
+    }
 }
 
 impl IndexUpdate {
@@ -1050,6 +1226,247 @@ mod tests {
 
     fn triple_entry(url: &str) -> BTreeMap<String, IndexTriple> {
         one_triple("darwin-aarch64", url)
+    }
+
+    /// A triple entry carrying BOTH legacy bare digests and their tagged
+    /// spellings — the shape `index_triples_from_manifest` really produces,
+    /// since it copies `sha256` straight off the staged channel bundle.
+    fn legacy_laden_triple(triple: &str) -> BTreeMap<String, IndexTriple> {
+        let mut m = BTreeMap::new();
+        m.insert(
+            triple.to_string(),
+            IndexTriple {
+                url: format!("https://cdn.yah.dev/yah/1.0.0/{triple}/yah.tar.gz"),
+                platform: Some(triple.to_string()),
+                filename: Some("yah.tar.gz".into()),
+                size_bytes: Some(42),
+                hash: Some(format!("blake3:{}", "a".repeat(64))),
+                bootstrap_hash: Some(format!("sha256:{}", "b".repeat(64))),
+                sha256: Some("b".repeat(64)),
+                bundle_url: Some("https://cdn.yah.dev/x.sigstore.json".into()),
+            },
+        );
+        m
+    }
+
+    /// THE LIVE-PRODUCER GUARD for the index's tagged-only invariant (R330-B50).
+    ///
+    /// `oss/mesofact/crates/almanac/tests/producer_shapes.rs` asserts the same
+    /// property, but against `cli-index.json` — a fixture
+    /// `scripts/check-producer-fixtures.sh` generates by executing the
+    /// `.github/workflows/release.yml` step. GitHub Actions publishes nothing in
+    /// this repo, so that guard was green for weeks while THIS producer, the one
+    /// that actually writes `cdn.yah.dev/yah/index.json`, emitted 16 bare
+    /// `sha256` keys into the live object. This test is here, next to the code,
+    /// with no fixture in between, so the next drift cannot hide the same way.
+    #[test]
+    fn the_index_never_carries_a_legacy_bare_digest() {
+        let merged = merge_index(
+            None,
+            "yah",
+            "1.0.0",
+            "2026-09-10T00:00:00Z",
+            Some("https://cdn.yah.dev/yah/1.0.0/manifest.json".into()),
+            legacy_laden_triple("aarch64-apple-darwin"),
+        )
+        .expect("merge");
+
+        let doc: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        for version in doc["versions"].as_array().unwrap() {
+            for (triple, entry) in version["triples"].as_object().unwrap() {
+                for legacy in ["sha256", "blake3"] {
+                    assert!(
+                        entry.get(legacy).is_none(),
+                        "{triple} carries a bare `{legacy}` — strip it at the index \
+                         boundary in merge_index, do not widen LEGACY_BARE_HEX_PATHS"
+                    );
+                }
+                // The tagged spellings must SURVIVE the strip; dropping the
+                // digest entirely would be a far worse fix than leaving it bare.
+                assert!(
+                    entry["hash"].as_str().unwrap().starts_with("blake3:"),
+                    "the strip took the tagged hash with it"
+                );
+                assert!(
+                    entry["bootstrap_hash"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("sha256:"),
+                    "the strip took the tagged bootstrap_hash with it"
+                );
+            }
+        }
+    }
+
+    /// The invariant holds for HISTORY too, not just for the entry being
+    /// published (R330-T52). This is what makes it self-healing: a bare digest
+    /// that reached the object by any route — an older build of this producer,
+    /// the workflow, a hand-written PUT — is normalized away by the next
+    /// release rather than becoming permanent.
+    ///
+    /// The residue this reverses was real: `cdn.yah.dev/yah/index.json` carried
+    /// 16 bare `sha256` keys across four historical versions until 2026-09-10.
+    #[test]
+    fn merging_strips_a_prior_entrys_legacy_bare_digest_too() {
+        let residual = merge_index(
+            None,
+            "yah",
+            "1.0.0",
+            "2026-09-10T00:00:00Z",
+            None,
+            legacy_laden_triple("aarch64-apple-darwin"),
+        )
+        .expect("seed");
+        // Put the residue back by hand — the shape the live object was in.
+        let mut doc: serde_json::Value = serde_json::from_str(&residual).unwrap();
+        doc["versions"][0]["triples"]["aarch64-apple-darwin"]["sha256"] =
+            serde_json::json!("b".repeat(64));
+        let dirty = serde_json::to_string_pretty(&doc).unwrap();
+        assert_eq!(
+            index_legacy_bare_digest_paths(&dirty).unwrap(),
+            ["$.versions[1.0.0].triples.aarch64-apple-darwin.sha256"],
+            "the fixture must actually be dirty or this test proves nothing"
+        );
+
+        // Publishing an UNRELATED version must clean it.
+        let merged = merge_index(
+            Some(&dirty),
+            "yah",
+            "1.1.0",
+            "2026-09-11T00:00:00Z",
+            None,
+            legacy_laden_triple("x86_64-apple-darwin"),
+        )
+        .expect("merge");
+        assert!(
+            index_legacy_bare_digest_paths(&merged).unwrap().is_empty(),
+            "history kept its bare digest through a merge: {merged}"
+        );
+        // And the historical entry is otherwise untouched — the strip removes,
+        // it does not rewrite.
+        let after: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        let old = after["versions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["version"] == "1.0.0")
+            .expect("1.0.0 was DROPPED");
+        let entry = &old["triples"]["aarch64-apple-darwin"];
+        assert_eq!(old["pub_date"], "2026-09-10T00:00:00Z");
+        assert_eq!(entry["bootstrap_hash"], format!("sha256:{}", "b".repeat(64)));
+        assert_eq!(entry["hash"], format!("blake3:{}", "a".repeat(64)));
+        assert_eq!(entry["size_bytes"], 42);
+    }
+
+    /// `normalize_index` is a REMOVAL and nothing else: same versions, same
+    /// order, same `updated_at`, minus the keys the invariant forbids. That is
+    /// what makes the repair command's blast radius bounded — see
+    /// `yah qed normalize-index`.
+    #[test]
+    fn normalize_index_removes_the_bare_digests_and_touches_nothing_else() {
+        let seeded = merge_index(
+            None,
+            "yah",
+            "1.0.0",
+            "2026-09-10T00:00:00Z",
+            Some("https://cdn.yah.dev/yah/1.0.0/manifest.json".into()),
+            legacy_laden_triple("aarch64-apple-darwin"),
+        )
+        .expect("seed");
+        let mut doc: serde_json::Value = serde_json::from_str(&seeded).unwrap();
+        doc["updated_at"] = serde_json::json!("2020-01-01T00:00:00+00:00");
+        doc["versions"][0]["triples"]["aarch64-apple-darwin"]["sha256"] =
+            serde_json::json!("b".repeat(64));
+        let dirty = serde_json::to_string_pretty(&doc).unwrap();
+
+        let clean = normalize_index(&dirty).expect("normalize");
+        assert!(index_legacy_bare_digest_paths(&clean).unwrap().is_empty());
+
+        // The ONLY difference: delete the forbidden keys from the input and the
+        // two documents must be equal. This is the property the repair command
+        // re-checks against the live bytes before it will write.
+        let mut expected: serde_json::Value = serde_json::from_str(&dirty).unwrap();
+        expected["versions"][0]["triples"]["aarch64-apple-darwin"]
+            .as_object_mut()
+            .unwrap()
+            .remove("sha256");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&clean).unwrap(),
+            expected,
+            "normalize changed something other than the forbidden keys"
+        );
+        // Specifically: it did not restamp the object.
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&clean).unwrap()["updated_at"],
+            "2020-01-01T00:00:00+00:00",
+            "normalize restamped updated_at — it is a repair, not a publish"
+        );
+
+        // Byte-idempotent, which is what lets the caller skip a second write.
+        assert_eq!(normalize_index(&clean).expect("re-normalize"), clean);
+    }
+
+    /// The probe must read the RAW bytes. `ReleaseIndex` has no `blake3` field,
+    /// so a typed round-trip drops such a key silently and would report clean on
+    /// an object that is not.
+    #[test]
+    fn the_bare_digest_probe_sees_keys_the_typed_shape_cannot() {
+        let seeded = merge_index(
+            None,
+            "yah",
+            "1.0.0",
+            "2026-09-10T00:00:00Z",
+            None,
+            legacy_laden_triple("aarch64-apple-darwin"),
+        )
+        .expect("seed");
+        let mut doc: serde_json::Value = serde_json::from_str(&seeded).unwrap();
+        doc["versions"][0]["triples"]["aarch64-apple-darwin"]["blake3"] =
+            serde_json::json!("a".repeat(64));
+        let raw = serde_json::to_string_pretty(&doc).unwrap();
+
+        assert_eq!(
+            index_legacy_bare_digest_paths(&raw).unwrap(),
+            ["$.versions[1.0.0].triples.aarch64-apple-darwin.blake3"]
+        );
+        assert!(
+            index_legacy_bare_digest_paths(&normalize_index(&raw).unwrap())
+                .unwrap()
+                .is_empty(),
+            "the typed round-trip must drop it, and the probe must agree it is gone"
+        );
+    }
+
+    /// The other half of the asymmetry: the INSTALL POINTER keeps the bare
+    /// field. `install.sh` copies already in the wild read `.triples[t].sha256`
+    /// as their fallback when `bootstrap_hash` is absent, so stripping it there
+    /// breaks installs on machines we cannot reach. If this test and the one
+    /// above ever agree, one of the two shapes has been broken.
+    #[test]
+    fn the_install_pointer_keeps_the_legacy_bare_sha256() {
+        let manifest: ChannelManifest = serde_json::from_str(
+            r#"{
+              "version": "1.0.0",
+              "pub_date": "2026-09-10T00:00:00Z",
+              "host": { "bundle": { "aarch64-apple-darwin": {
+                "url": "https://cdn.yah.dev/yah/1.0.0/aarch64-apple-darwin/yah.tar.gz",
+                "hash": "blake3:aaaa",
+                "bootstrap_hash": "sha256:bbbb",
+                "sha256": "bbbb",
+                "bundle_url": "https://cdn.yah.dev/x.sigstore.json",
+                "size": 42
+              } } }
+            }"#,
+        )
+        .expect("parse channel manifest");
+
+        let pointer = triples_manifest("yah", &manifest).expect("pointer projects");
+        let entry = pointer.triples.get("aarch64-apple-darwin").unwrap();
+        assert_eq!(
+            entry.sha256.as_deref(),
+            Some("bbbb"),
+            "the install pointer lost its legacy bare sha256 — install.sh in the wild reads it"
+        );
     }
 
     /// One platform leg's contribution — what a matrix job actually stages.

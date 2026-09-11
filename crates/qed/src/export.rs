@@ -28,13 +28,13 @@
 //!   degradation.
 //!
 //! Outcomes ([`Outcome::Publish`] and friends), pipeline-chain triggers,
-//! `LocalOnly` placement, `OnFail::Retry`, and step `produces` are recorded as
+//! `Workstation` environment, `OnFail::Retry`, and step `produces` are recorded as
 //! degradations in *either* mode — a portable workflow still builds and tests,
 //! it just doesn't publish (content-addressed release stays native; the note
 //! points the operator at `yah qed run <name>`).
 
 use crate::types::{
-    Outcome, OnFail, Pipeline, Placement, QedStep, StepKind, Trigger,
+    Environment, Outcome, OnFail, Pipeline, QedStep, StepKind, Trigger,
 };
 
 /// One feature that did not survive the QED → GHA export. The `feature` tag is
@@ -42,7 +42,7 @@ use crate::types::{
 /// `detail` is the human explanation that also rides the YAML as a comment.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Degradation {
-    /// Where the loss occurred — a step name, or `"triggers"` / `"placement"` /
+    /// Where the loss occurred — a step name, or `"triggers"` / `"environment"` /
     /// `"on_success"` / `"on_fail"`.
     pub site: String,
     /// Stable short tag for the lossy feature.
@@ -58,7 +58,7 @@ pub struct ExportReport {
     /// best-effort fallback CI, **never a faithful mirror** of the pipeline.
     pub yaml: String,
     /// Every feature that did not map. Empty only for a fully-portable pipeline
-    /// with no outcomes, no special triggers, and `Anywhere` placement.
+    /// with no outcomes, no special triggers, and `Any` environment.
     pub degradations: Vec<Degradation>,
     /// `true` when the pipeline degraded to the wholesale `yah qed run <name>`
     /// shim (it had native-only step kinds), `false` when steps rendered
@@ -79,14 +79,15 @@ impl ExportReport {
 pub fn export_pipeline(pipeline: &Pipeline) -> ExportReport {
     let mut degradations: Vec<Degradation> = Vec::new();
 
-    // Triggers + placement degrade identically in both modes.
+    // Triggers + environment degrade identically in both modes.
     let on_block = render_on(&pipeline.triggers, &mut degradations);
-    if pipeline.placement == Placement::LocalOnly {
+    if pipeline.environment == Environment::Workstation {
         degradations.push(Degradation {
-            site: "placement".into(),
-            feature: "placement:local-only".into(),
-            detail: "pipeline is local-only (its output is meaningless on a clean CI runner); \
-                     exported anyway, but a GitHub run likely produces nothing useful"
+            site: "environment".into(),
+            feature: "environment:workstation".into(),
+            detail: "pipeline is environment = workstation (its output is meaningless on a \
+                     clean CI runner); exported anyway, but a GitHub run likely produces \
+                     nothing useful"
                 .into(),
         });
     }
@@ -484,7 +485,7 @@ mod tests {
             on_fail: Vec::new(),
             triggers: Vec::new(),
             concurrency_key: None,
-            placement: Placement::Anywhere,
+            environment: Environment::Any,
             workspace: crate::types::WorkspaceMode::default(),
             wraps: None,
             matrix: None,
@@ -589,11 +590,11 @@ mod tests {
     }
 
     #[test]
-    fn local_only_placement_is_a_degradation() {
+    fn workstation_environment_is_a_degradation() {
         let mut p = pipeline("install", vec![step("Install", &["./install.sh"])]);
-        p.placement = Placement::LocalOnly;
+        p.environment = Environment::Workstation;
         let r = export_pipeline(&p);
-        assert!(r.degradations.iter().any(|d| d.feature == "placement:local-only"));
+        assert!(r.degradations.iter().any(|d| d.feature == "environment:workstation"));
     }
 
     #[test]

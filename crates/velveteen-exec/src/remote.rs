@@ -327,6 +327,36 @@ impl RemoteForgeDriver {
         self.yubaba.teardown(&forge_mesh_ident(forge_id)).await
     }
 
+    /// Reap the server-side state a *terminated* forge run left behind (R555-F6).
+    ///
+    /// Nothing tore a completed one-shot workload down before this existed, so
+    /// every finished remote qed step left a `forge.<uuid>` record on the build
+    /// worker forever — the produced-dir TTL sweep reclaims bytes, not records.
+    ///
+    /// # Call this only AFTER the produced bytes have been retrieved
+    ///
+    /// This posts the same `POST /workloads/{ident}/destroy` [`kill`](Self::kill)
+    /// does, and yubaba's destroy handler ALSO REAPS THE PRODUCED DIR
+    /// (`/var/lib/yah/qed/produced/<forge_id>/…`, the R603-T5 reap-on-destroy).
+    /// So a reap moved earlier — beside the step's terminal status, or into
+    /// `run_log_task` next to the timeout teardown — deletes the very bytes
+    /// [`fetch_produced_file`](WardenClient::fetch_produced_file) is about to
+    /// ask for, and the run lands Success-but-unpublished (R590-F6 leg 2). The
+    /// qed runner therefore calls this from `run()`, strictly after
+    /// `retrieve_remote_artifacts`. Ordering is the invariant; idempotence is
+    /// not the problem — yubaba answers 200 `{destroyed|not_found}`, so reaping
+    /// twice, or reaping a run that is already gone, is a no-op.
+    ///
+    /// Kept separate from [`kill`](Self::kill) rather than folded into it
+    /// because the two mean different things to a reader: `kill` aborts a
+    /// RUNNING container and its background log task then resolves the run to
+    /// `Lost`; this is post-terminal hygiene on a run that already reached a
+    /// terminal [`ForgeStatus`]. They send the same RPC today, and a future
+    /// asymmetry (a grace period on kill) has somewhere to land.
+    pub async fn reap(&self, forge_id: &ForgeId) -> Result<(), RemoteForgeError> {
+        self.yubaba.teardown(&forge_mesh_ident(forge_id)).await
+    }
+
     /// Retrieve the bytes of a file the finished forge container produced
     /// (R590-F6 leg 2). Resolves the run's mesh identity and delegates to
     /// [`WardenClient::fetch_produced_file`]. Call after [`ForgeRunHandle::wait`]
@@ -2536,6 +2566,56 @@ mod remote {
         assert!(
             *teardown_called.lock().unwrap(),
             "yubaba.teardown must be called on timeout"
+        );
+    }
+
+    /// R555-F6: `reap` reaches yubaba's destroy RPC, and does so on a run that
+    /// already reached a terminal status — the case `kill` was never called for
+    /// and which therefore leaked a workload record per finished remote step.
+    ///
+    /// The fetch-then-reap sequence here is the ordering contract in miniature:
+    /// destroy reaps the produced dir, so the bytes have to come off the worker
+    /// first. Reversed, this test's `expect` would fail — which is exactly the
+    /// production failure it stands in for.
+    #[tokio::test]
+    async fn reap_tears_down_a_terminated_run_after_its_bytes_are_fetched() {
+        let dir = TempDir::new().unwrap();
+        let scryer = make_scryer(&dir);
+
+        let payload = b"produced tarball".to_vec();
+        let remote_path = PathBuf::from("/yah/produced/out.tar.gz");
+        let yubaba = ScriptedWardenClient::with_produced_file(
+            vec!["build done".into()],
+            0,
+            remote_path.clone(),
+            payload.clone(),
+        );
+        let teardown_called = yubaba.teardown_called.clone();
+
+        let driver = RemoteForgeDriver::new(scryer, yubaba);
+        let spec = subprocess_spec(remote_any_infra(), None);
+        let handle = driver.start(spec).await.unwrap();
+        let forge_id = handle.id.clone();
+        let status = handle.wait().await;
+        assert!(
+            matches!(status, ForgeStatus::Done { exit_code: 0, .. }),
+            "expected a terminal Done, got {status:?}",
+        );
+        assert!(
+            !*teardown_called.lock().unwrap(),
+            "a clean exit must not have torn anything down on its own — that is the leak",
+        );
+
+        let got = driver
+            .fetch_produced_file(&forge_id, &remote_path)
+            .await
+            .expect("the produced bytes must still be there before the reap");
+        assert_eq!(got, payload);
+
+        driver.reap(&forge_id).await.expect("reap must reach yubaba");
+        assert!(
+            *teardown_called.lock().unwrap(),
+            "reap must issue the destroy that removes the workload record",
         );
     }
 }

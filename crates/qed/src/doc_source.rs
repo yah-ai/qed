@@ -496,7 +496,7 @@ impl DocSource {
                     .unwrap_or_else(|| self.default_concurrency_key(params)),
             ),
             max_parallel: None,
-            placement: Default::default(),
+            environment: Default::default(),
             // R717-S13 Q1 — `live`, not the `Checkout` default. See the module docs.
             workspace: self.config.workspace.unwrap_or(WorkspaceMode::Live),
             wraps: None,

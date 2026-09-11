@@ -293,6 +293,7 @@ pub mod doc_source;
 pub mod eject;
 pub mod events;
 pub mod export;
+pub mod fleet_portability;
 pub mod globals;
 pub mod image_overlay;
 pub mod images;
@@ -330,6 +331,10 @@ pub use eject::{
     GeneratedHeader, ValidateError as EjectValidateError,
 };
 pub use export::{export_pipeline, Degradation, ExportReport};
+pub use fleet_portability::{
+    build_tool_head, camp_tree_reference, fleet_clause, fleet_portable,
+    gaps as fleet_portability_gaps, is_dispatchable_kind, PortabilityGap,
+};
 pub use globals::{CampGlobals, ReleaseGlobals, TagHygiene};
 pub use import::{content_hash, expand_import, ImportExpansion, ImportFreshness};
 pub use native::{
@@ -344,8 +349,9 @@ pub use nativecross::{
 pub use peers::{PeerConfig, PeerConfigError, PeerEntry};
 pub use placement_gate::{evaluate as evaluate_placement_gate, GateOutcome, RunnerEnv};
 pub use platform::{
-    arch_of, detect_host_triple, gha_runner_arch, host_native_crossable, preflight_line,
-    resolve as resolve_platform, resolve_placement, Platform, PlatformSpec, Resolution,
+    arch_of, capability_demotion, derive_placement, detect_host_triple, gha_runner_arch,
+    host_native_crossable, preflight_line, resolve as resolve_platform, resolve_placement,
+    Platform, PlatformSpec, Resolution,
 };
 pub use ports::{
     workflow_ports, PortError, PortInput, PortOutput, PortSecret, WorkflowPorts,
@@ -359,9 +365,10 @@ pub use provider::{
     ProviderRegistry, ProviderReport, ReleaseProvider, SecretSource, EVENT_LOG_PROVIDER,
 };
 pub use publish::{
-    index_key, merge_index, resolve_release_version, stage_release, ChannelManifest, IndexTriple,
-    IndexUpdate, IndexVersion, LoggingReleasePublisher, PublishRequest,
-    PublishingOutcomeDispatcher, ReleaseIndex, ReleasePublisher, StageReport,
+    index_key, index_legacy_bare_digest_paths, merge_index, normalize_index,
+    resolve_release_version, stage_release, ChannelManifest, IndexTriple, IndexUpdate, IndexVersion,
+    LoggingReleasePublisher, PublishRequest, PublishingOutcomeDispatcher, ReleaseIndex,
+    ReleasePublisher, StageReport, LEGACY_BARE_DIGEST_KEYS,
 };
 /// Re-exported so daemon/UI glue can match on workflow step shapes without
 /// taking a direct `qed-gha` dep edge — the catalog converter in
@@ -369,13 +376,13 @@ pub use publish::{
 pub use yah_qed_gha;
 pub use registries::{extract_registry_host, RegistryConfig, RegistryConfigError, RegistryEntry};
 pub use runner::{
-    pipeline_has_node_bound_participant, pipeline_is_fully_offloaded, pipeline_needs_offload,
-    sub_pipeline_admission_gap,
+    pipeline_capability_demotions, pipeline_has_node_bound_participant,
+    pipeline_is_fully_offloaded, pipeline_needs_offload, sub_pipeline_admission_gap,
     AdmissionControl, AdmissionGap, AdmissionLane,
     ChildEventFactory, ChildRunInfo,
     LoggingOutcomeDispatcher,
     ManualAnswer, ManualGate, ManualParkHandle, ManualParkRequest, OutcomeDispatcher,
-    PipelineRunner, RunWhere, RunnerError,
+    PipelineRunner, RunWhere, RunnerError, StepPortability,
 };
 /// Re-exported so daemon glue (camp.rs boot-reconcile, R603-T4) can parse a
 /// persisted bare-uuid `task_run_id` back into the workload identity that
@@ -401,9 +408,9 @@ pub use transform::{
 };
 pub use types::{
     new_run_id, param_fingerprint, sub_pipeline_ref_token, validate_sub_pipeline_graph, CellRef,
+    Environment,
     GhaWorkflowConfig,
     ImportConfig, JobRow, ManifestStitchConfig, ManualConfig, Outcome, OutputDecl, Pipeline,
-    Placement,
     PipelineClass,
     ProducedArtifact, QedRunId, QedRunLaunch, QedRunMeta, QedStep, RunStatus, StepActivation,
     StepKind,
@@ -647,8 +654,11 @@ mod tests {
                 );
             }
 
-            let on_mac = crate::platform::resolve_placement(ARM_MAC, Some(&target), None, true);
-            let on_linux = crate::platform::resolve_placement(ARM_LINUX, Some(&target), None, true);
+            // R555-B10: the *derivation*, deliberately — this asserts what the
+            // recipe declares routes to, and must not depend on which cross
+            // toolchains the machine running the test has installed.
+            let on_mac = crate::platform::derive_placement(ARM_MAC, Some(&target), None, true);
+            let on_linux = crate::platform::derive_placement(ARM_LINUX, Some(&target), None, true);
             match crate::platform::os_tag_of(&target) {
                 "darwin" => {
                     assert_eq!(

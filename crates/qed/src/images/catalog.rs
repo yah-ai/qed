@@ -251,6 +251,7 @@ mod tests {
         "yah-miniflare",
         "rusty-v8-musl-builder",
         "mesofact-musl-builder",
+        "yah-musl-builder",
     ];
 
     #[test]

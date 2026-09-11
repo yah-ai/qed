@@ -122,11 +122,13 @@ fn main() -> ExitCode {
             let machine_id = parse_arg(&args, "--machine-id")
                 .or_else(|| std::env::var("YAH_MACHINE_ID").ok())
                 .or_else(|| std::env::var("HOSTNAME").ok())
+                .or_else(os_hostname)
                 .unwrap_or_default();
             if machine_id.is_empty() {
                 eprintln!(
                     "yah-scryer: long tier requires a machine id — pass --machine-id \
-                     or set $YAH_MACHINE_ID / $HOSTNAME"
+                     (a systemd drop-in should use `--machine-id %H`), or set \
+                     $YAH_MACHINE_ID, or give this host a readable hostname"
                 );
                 return ExitCode::from(1);
             }
@@ -214,6 +216,35 @@ fn main() -> ExitCode {
         }
         ExitCode::SUCCESS
     })
+}
+
+/// Last-resort machine id: this host's kernel hostname, read from the
+/// filesystem so the binary keeps its zero-C-dependency posture.
+///
+/// WHY THIS EXISTS — the `$HOSTNAME` link above is a lie in the one place that
+/// matters. `HOSTNAME` is a variable an interactive **shell** exports; systemd
+/// does not put it in a unit's environment. So `yah-scryer.service`'s own
+/// comment, and R556-F6's mirror prose, both promised "machine-id defaults from
+/// $HOSTNAME" for a daemon that could never see it, and the first drop-in
+/// written against that promise crash-looped on us-east-001 (2026-09-10) with
+/// the error two lines up. A drop-in should still pass `--machine-id %H`
+/// explicitly — systemd's own specifier is clearer than an implicit fallback,
+/// and it works on the releases already on the fleet — but a daemon whose doc
+/// comment claims a default should actually have one.
+///
+/// Linux-only by construction, which is the whole deployment surface: these
+/// units run on musl fleet nodes. A dev box that somehow reaches this arm gets
+/// the explicit error rather than a wrong id.
+fn os_hostname() -> Option<String> {
+    for path in ["/proc/sys/kernel/hostname", "/etc/hostname"] {
+        if let Ok(s) = std::fs::read_to_string(path) {
+            let s = s.trim();
+            if !s.is_empty() {
+                return Some(s.to_string());
+            }
+        }
+    }
+    None
 }
 
 fn parse_arg(args: &[String], name: &str) -> Option<String> {

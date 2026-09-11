@@ -37,7 +37,7 @@ use std::path::{Path, PathBuf};
 
 use crate::import::content_hash;
 use crate::transform::{transform_workflow, FlagKind, TransformReport};
-use crate::types::{Pipeline, Placement};
+use crate::types::{Environment, Pipeline};
 use yah_qed_gha::Workflow;
 
 /// Marker beginning the provenance comment line. The whole header is a run of
@@ -211,7 +211,7 @@ fn report_to_pipeline(header: &GeneratedHeader, report: &TransformReport) -> Pip
         triggers: Vec::new(),
         concurrency_key: None,
         max_parallel: None,
-        placement: Placement::default(),
+        environment: Environment::default(),
         workspace: crate::types::WorkspaceMode::default(),
         // Record that this pipeline exists *because* it composes a workflow, so
         // the daemon suppresses the source's auto-ingest (no double catalog

@@ -40,7 +40,7 @@
 use crate::peers::PeerConfig;
 use crate::registries::{extract_registry_host, RegistryConfig, RegistryConfigError};
 use crate::types::{
-    GhaWorkflowConfig, ParamDef, Pipeline, Placement, QedStep, StepKind,
+    Environment, GhaWorkflowConfig, ParamDef, Pipeline, QedStep, StepKind,
     StepValidationError, SubPipelineRef, SubPipelineResolver,
 };
 use serde::Deserialize;
@@ -77,7 +77,7 @@ fn find_pipeline_file(dir: &Path, name: &str) -> Option<PathBuf> {
 ///   non-blank line that isn't a comment ends it, so a comment above a step is
 ///   never mistaken for a readme.
 /// - `@yah:` / `@arch:` annotation lines end it too. Board annotations live in
-///   these headers (see `.yah/qed/check.toml`) and are metadata, not prose —
+///   these headers (see `.yah/qed/yah-check.toml`) and are metadata, not prose —
 ///   they'd otherwise show up mid-readme in the UI. A prose line that merely
 ///   *mentions* one mid-sentence is unaffected; the match is line-initial.
 /// - A `#:schema …` taplo directive is skipped, not treated as a terminator:
@@ -157,6 +157,21 @@ pub enum ConfigError {
     /// connection refusal several layers from its cause.
     #[error("Invalid participant set: {0}")]
     InvalidParticipants(#[from] crate::participants::ParticipantError),
+    /// R555-T7 tombstone — the recipe still spells the pre-rename permission
+    /// key. `[pipeline]` has no `deny_unknown_fields`, so the alternative to
+    /// this error is not a warning, it is *silence*: the key is dropped and the
+    /// recipe defaults to [`crate::types::Environment::Any`], which takes a
+    /// `ci-only` signing recipe local and unsigned without a word. Fail the
+    /// load instead. Delete this variant once every camp has migrated.
+    #[error(
+        "pipeline '{name}': `placement = {value}` was renamed to `environment` (R555-T7). \
+         Spell it `environment = \"workstation\"` (was \"local-only\"), \
+         `environment = \"ci\"` (was \"ci-only\"), or `environment = \"any\"` (was \"anywhere\"). \
+         This is a hard error and not a warning because [pipeline] accepts unknown keys, so a \
+         silently-dropped `placement` would downgrade a ci-only recipe to any-host without \
+         saying so. Rationale: .yah/docs/working/W235-remote-qed.md section Verdict (R555-S9)."
+    )]
+    RenamedPlacementKey { name: String, value: String },
     /// R751-F2: a specialization whose `alias_of` names a pipeline that doesn't
     /// exist. Separate from [`Self::NotFound`] because the name the operator
     /// asked for *did* resolve — it's the file's own reference that dangles,
@@ -315,7 +330,20 @@ pub struct PipelineConfig {
     #[serde(default)]
     max_parallel: Option<usize>,
     #[serde(default)]
-    placement: Placement,
+    environment: Environment,
+    /// R555-T7 tombstone. `environment` was spelled `placement` until the W235
+    /// §Verdict rename; `[pipeline]` carries no `deny_unknown_fields`, so
+    /// without this field an un-migrated recipe would silently drop its key and
+    /// default to [`Environment::Any`] — a *silent permission downgrade* on
+    /// exactly the `ci-only` recipes that are CI-only because they hold signing
+    /// identity. Typed `Option<toml::Value>` so any spelling of the old key
+    /// parses and then fails loudly in [`PipelineConfig::into_pipeline_parts`].
+    ///
+    /// This is a migration error with a fixed lifetime, not an alias and not a
+    /// shim: delete it once every camp that authors QED recipes has migrated.
+    #[serde(default)]
+    #[cfg_attr(feature = "json-schema", schemars(skip))]
+    placement: Option<toml::Value>,
     #[serde(default)]
     workspace: crate::types::WorkspaceMode,
     #[serde(default)]
@@ -557,6 +585,15 @@ impl PipelineLoader {
         chain: &mut Vec<String>,
     ) -> Result<Pipeline, ConfigError> {
         let parsed: PipelineToml = toml::from_str(content)?;
+        // R555-T7: refuse the pre-rename key before anything else looks at this
+        // document, so both the specialization branch below and the normal path
+        // are covered by one check.
+        if let Some(value) = &parsed.pipeline.placement {
+            return Err(ConfigError::RenamedPlacementKey {
+                name: parsed.pipeline.name.clone(),
+                value: value.to_string(),
+            });
+        }
         // R751-F2: a specialization has no body of its own — it takes the
         // base's and rebrands it. Everything below this point would be
         // operating on an empty `steps`, so branch before building it.
@@ -582,7 +619,7 @@ impl PipelineLoader {
             triggers: parsed.pipeline.triggers,
             concurrency_key: parsed.pipeline.concurrency_key,
             max_parallel: parsed.pipeline.max_parallel,
-            placement: parsed.pipeline.placement,
+            environment: parsed.pipeline.environment,
             workspace: parsed.pipeline.workspace,
             wraps: parsed.pipeline.wraps,
             matrix: parsed.pipeline.matrix,
@@ -608,7 +645,7 @@ impl PipelineLoader {
     ///
     /// What comes from where:
     /// - **body** (steps, params, finally, matrix, toolchain, triggers,
-    ///   placement, workspace, outcomes, binds, …) — entirely the base's. The
+    ///   environment, workspace, outcomes, binds, …) — entirely the base's. The
     ///   alias is forbidden from declaring any of it, so a key that would
     ///   silently do nothing is an error instead.
     /// - **identity** (name, label, description, tags) — the alias's own. This
@@ -657,8 +694,8 @@ impl PipelineLoader {
         if cfg.max_parallel.is_some() {
             body_keys.push("max_parallel");
         }
-        if cfg.placement != Placement::default() {
-            body_keys.push("placement");
+        if cfg.environment != Environment::default() {
+            body_keys.push("environment");
         }
         if cfg.workspace != crate::types::WorkspaceMode::default() {
             body_keys.push("workspace");
@@ -1011,7 +1048,7 @@ fn synthesise_gha_pipeline(entry: &GhaWorkflowEntry) -> Pipeline {
         triggers: Vec::new(),
         concurrency_key: None,
         max_parallel: None,
-        placement: Placement::default(),
+        environment: Environment::default(),
         workspace: crate::types::WorkspaceMode::default(),
         wraps: None,
         matrix: None,
@@ -1119,7 +1156,7 @@ impl SubPipelineResolver for LoaderSubPipelineResolver {
                     triggers: Vec::new(),
                     on_success: Vec::new(),
                     on_fail: Vec::new(),
-                    placement: crate::types::Placement::default(),
+                    environment: crate::types::Environment::default(),
                     workspace: crate::types::WorkspaceMode::default(),
                     wraps: None,
                     matrix: None,
@@ -1529,6 +1566,63 @@ argv = ["true"]
         }
     }
 
+    // ── R555-T7 tombstone: the pre-rename permission key ───────────────────
+
+    /// A recipe still spelling `placement =` must fail to LOAD, naming the new
+    /// spelling. The alternative is not a warning but silence — `[pipeline]`
+    /// accepts unknown keys, so the key would be dropped and the recipe would
+    /// default to `Environment::Any`, taking a `ci-only` signing recipe local
+    /// and unsigned. Delete this test with the tombstone.
+    #[test]
+    fn the_pre_rename_placement_key_fails_to_load_naming_environment() {
+        let (_d, loader) = camp(&[(
+            "stale",
+            r#"
+[pipeline]
+name = "stale"
+label = "l"
+placement = "ci-only"
+
+[[pipeline.steps]]
+name = "s"
+argv = ["true"]
+"#,
+        )]);
+        let err = loader.load("stale").expect_err("placement is a dead key");
+        match &err {
+            ConfigError::RenamedPlacementKey { name, value } => {
+                assert_eq!(name, "stale");
+                assert!(value.contains("ci-only"), "got: {value}");
+            }
+            other => panic!("expected RenamedPlacementKey, got {other:?}"),
+        }
+        let msg = err.to_string();
+        assert!(msg.contains("renamed to `environment`"), "got: {msg}");
+        assert!(msg.contains("W235-remote-qed.md"), "got: {msg}");
+    }
+
+    /// The check sits ahead of the `alias_of` branch on purpose: a
+    /// specialization returns early, so a check placed after it would let a
+    /// stale `placement` through on exactly the files that inherit their body.
+    #[test]
+    fn the_tombstone_also_fires_on_a_specialization() {
+        let (_d, loader) = camp(&[(
+            "stale-alias",
+            r#"
+[pipeline]
+name = "stale-alias"
+label = "l"
+alias_of = "local-install"
+placement = "local-only"
+"#,
+        )]);
+        let err = loader.load("stale-alias").expect_err("placement is a dead key");
+        assert!(
+            matches!(err, ConfigError::RenamedPlacementKey { .. }),
+            "expected RenamedPlacementKey, got {err:?}",
+        );
+    }
+
     /// The base name is a reference like any other and can dangle. Reported as
     /// its own error rather than a bare `NotFound`: the name the operator asked
     /// for did resolve, so "pipeline not found: local-instal" would send them
@@ -1834,7 +1928,7 @@ workspace = \"live\"
 
     /// The board annotations that live in these headers are metadata, not
     /// prose — they end the readme rather than appearing inside it. See
-    /// `.yah/qed/check.toml`, where twenty lines of `@yah:` follow the prose.
+    /// `.yah/qed/yah-check.toml`, where twenty lines of `@yah:` follow the prose.
     #[test]
     fn description_stops_at_board_annotations() {
         let toml = "\
@@ -3111,7 +3205,7 @@ push    = false
 [pipeline]
 name  = "rusty-v8-musl"
 label = "Build rusty_v8 static lib for x86_64-unknown-linux-musl"
-placement = "anywhere"
+environment = "any"
 
 [[pipeline.steps]]
 name     = "build-v8-musl"
@@ -3139,14 +3233,18 @@ timeout  = 9000
         assert!(plat.native, "native flag must round-trip from the inline table");
 
         // On an arm64 host the native x86 step offloads → the CLI needs the fleet.
+        // R555-B10: capability is pinned FULL so this asserts the *declaration's*
+        // routing, not the toolchains of whoever runs the test.
         assert!(crate::runner::pipeline_needs_offload(
             &pipeline,
-            "aarch64-apple-darwin"
+            "aarch64-apple-darwin",
+            &crate::nativecross::ToolAvailability::FULL,
         ));
         // On the x86 build-worker it's host-arch → no offload (runs there).
         assert!(!crate::runner::pipeline_needs_offload(
             &pipeline,
-            "x86_64-unknown-linux-gnu"
+            "x86_64-unknown-linux-gnu",
+            &crate::nativecross::ToolAvailability::FULL,
         ));
     }
 
