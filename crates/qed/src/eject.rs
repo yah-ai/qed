@@ -200,6 +200,7 @@ fn flag_summary(flag: &FlagKind) -> String {
 /// Build a native [`Pipeline`] from a transform report — the ejected body.
 fn report_to_pipeline(header: &GeneratedHeader, report: &TransformReport) -> Pipeline {
     Pipeline {
+        allow_late_operator_block: false,
         description: None,
         name: report.name.clone(),
         label: report.label.clone(),

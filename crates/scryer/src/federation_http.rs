@@ -7,6 +7,7 @@
 //! Routes:
 //!   - `POST /federate/events`    `{filter, scopes?}` → `{events: [{scope, event}]}`
 //!   - `POST /federate/aggregate` `{filter, group_by, since_ms, scopes?}` → `{buckets}`
+//!   - `POST /federate/hops`      `{from_unix_nanos, to_unix_nanos}` → `{hops}`
 //!   - `GET  /scopes?limit=N`     → `{scopes}`
 //!   - `GET  /health`             → `{status:"ok"}`
 //!
@@ -62,7 +63,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     routing::{get, post},
 };
-use observation::EventScope;
+use observation::{EventScope, HopRollup};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -110,6 +111,41 @@ impl From<AggregateBucket> for BucketDto {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FederateAggregateResp {
     pub buckets: Vec<BucketDto>,
+}
+
+/// `POST /federate/hops` request — R893-F19.
+///
+/// A half-open nanosecond range, not a `since_ms` like the aggregate route.
+/// Spans are stamped in `start_unix_nanos` and rolled up into 60s windows
+/// aligned on that same clock (`observation::rollup_window_start`), so a
+/// relative window would have to be re-based against the peer's clock on the
+/// peer's side — which silently changes the answer when two nodes disagree
+/// about now. The caller owns the range it asked for; the peer only aligns it.
+/// `bucket_nanos` splits the range into consecutive sub-windows instead of
+/// merging it into one cell per key, so a caller can see a hop's latency
+/// *shape* move over the window rather than only its endpoint quantiles. Each
+/// returned [`HopRollup`] carries the sub-window it covers in its own
+/// `window_start_unix_nanos` / `window_end_unix_nanos`, so the grid is
+/// self-describing and the caller re-merges to totals with an exact histogram
+/// add. `None` = one cell per key over the whole range.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FederateHopsReq {
+    pub from_unix_nanos: u64,
+    pub to_unix_nanos: u64,
+    #[serde(default)]
+    pub bucket_nanos: Option<u64>,
+}
+
+/// `{hops: [HopRollup]}` — one cell per `(scope, peer, kind)` on this node,
+/// already merged across the window's 60s rollup buckets.
+///
+/// The full [`HopRollup`] crosses the wire, histogram included, rather than
+/// pre-computed quantiles. A caller federating several nodes must merge
+/// histograms element-wise; averaging two nodes' p95 is not the p95 of their
+/// union (R893-F15).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FederateHopsResp {
+    pub hops: Vec<HopRollup>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -166,6 +202,7 @@ pub fn router(state: Arc<FederationState>) -> Router {
     Router::new()
         .route("/federate/events", post(handle_events))
         .route("/federate/aggregate", post(handle_aggregate))
+        .route("/federate/hops", post(handle_hops))
         .route("/scopes", get(handle_scopes))
         .route("/health", get(handle_health))
         .with_state(state)
@@ -287,6 +324,19 @@ async fn handle_aggregate(
     }))
 }
 
+async fn handle_hops(
+    State(state): State<Arc<FederationState>>,
+    headers: HeaderMap,
+    Json(req): Json<FederateHopsReq>,
+) -> Result<Json<FederateHopsResp>, (StatusCode, Json<ErrorBody>)> {
+    ensure_authorized(&state, &headers)?;
+    let hops = state
+        .scryer
+        .hop_rollups(req.from_unix_nanos, req.to_unix_nanos, req.bucket_nanos)
+        .map_err(scryer_err)?;
+    Ok(Json(FederateHopsResp { hops }))
+}
+
 fn scryer_err(err: crate::service::ScryerError) -> (StatusCode, Json<ErrorBody>) {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -371,6 +421,44 @@ impl HttpFederationPeer {
             .await
             .map_err(|e| FederationError::Rpc(e.to_string()))?;
         Ok(body.buckets)
+    }
+
+    /// Hop-matrix query — the same "convenience for hub callers" shape as
+    /// [`Self::aggregate`], and off the `FederationPeer` trait for the same
+    /// reason: the trait is events-only by design, and a span rollup is a
+    /// different signal with a different time base.
+    ///
+    /// Returns whole [`HopRollup`]s so the caller can merge histograms across
+    /// nodes exactly (R893-F15). The window is nanoseconds since the Unix
+    /// epoch, half-open.
+    pub async fn hop_rollups(
+        &self,
+        from_unix_nanos: u64,
+        to_unix_nanos: u64,
+        bucket_nanos: Option<u64>,
+    ) -> Result<Vec<HopRollup>, FederationError> {
+        let req = FederateHopsReq { from_unix_nanos, to_unix_nanos, bucket_nanos };
+        let url = format!("{}/federate/hops", self.base_url.trim_end_matches('/'));
+        let resp = self
+            .client
+            .post(&url)
+            .header(OPERATOR_TAG_HEADER, &self.operator_tag)
+            .json(&req)
+            .send()
+            .await
+            .map_err(|e| FederationError::Rpc(e.to_string()))?;
+        if !resp.status().is_success() {
+            return Err(FederationError::Rpc(format!(
+                "hops http {}: {}",
+                resp.status(),
+                resp.text().await.unwrap_or_default()
+            )));
+        }
+        let body: FederateHopsResp = resp
+            .json()
+            .await
+            .map_err(|e| FederationError::Rpc(e.to_string()))?;
+        Ok(body.hops)
     }
 }
 

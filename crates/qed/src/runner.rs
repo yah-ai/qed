@@ -493,6 +493,70 @@
 //! @yah:verify("cargo test --manifest-path oss/qed/crates/qed/Cargo.toml --lib: 948 pass / 1 fail (baseline qed lib 943 pass / 1 fail from R605-B18's handoff, +5 from concurrent peer test additions to this shared crate during this session, same pre-existing failure: R577-B5 tests::desktop_release_matrix_routes_each_row_to_its_own_platform)")
 //! @yah:verify("cargo test -p yah --lib every_camp_pipeline_loads_and_validates: 1 pass / 0 fail (wizard toml, untouched by this ticket, still loads)")
 //! @yah:verify("cargo test -p yah --lib r325_f1: 42 pass / 0 fail (baseline 42/42, confirms no cross-crate breakage from the probe_manual_advance signature change or the ManualConfig doc-comment restructure)")
+//!
+//! @yah:relay(R906, "Agent-supervised QED runs: qed.await with tree-wide wake, manual-step audience, and the operator-gate position rule")
+//! @yah:at(2026-09-14T17:49:53Z)
+//! @yah:status(open)
+//! @yah:assignee(agent:bundle-anthropic-glimmerstone)
+//! @yah:next("Design was settled in conversation with the operator 2026-09-14; the full brief is in this relay's handoff entries. Read them before opening a child.")
+//! @yah:handoff("THE PROBLEM. An agent can start a QED run (`yah qed run …` over Bash) but cannot supervise one. There is no `qed_*` MCP tool at all — the agent surface is board/camp/party/subagent/inbox/sql and nothing else — so an agent that launches a release wave must either block a shell for hours or poll, and polling costs a full-context API call per poll. The operator's ask: run a QED, park, and let the camp daemon wake the agent for failures, for a periodic liveness tick, and for gates the agent itself can answer. The daemon already holds everything needed: `QedEventWire` carries RunQueued/RunStarted/StepStarted/StepFinished/StepAwaitingHuman/SubPipelineStarted/SubPipelineFinished/RunFinished, there is a ring buffer plus append-only JSONL at `.yah/jit/qed/<run-id>.events.jsonl`, and `yah qed` already proxies to the camp daemon. This is a tool surface over an existing event rail, NOT a new daemon subsystem.")
+//! @yah:handoff("THE FOUR WAKE REASONS, and the rule that generated them: a wake reason must map to a DISTINCT agent action, or it is not a wake reason. `finished` -> report, release the park. `errored` -> diagnose at the deepest failing step, patch the live tree, rerun. `blocked_on_operator` -> the run is alive and waiting on a human the agent may not impersonate; notify and re-park. `needs_agent` -> a manual gate the agent IS allowed to answer; do the work, satisfy `advance`, ack. `ticked` -> the periodic liveness return; confirm the tree moved, re-park. Everything else (step started, step succeeded, sub-pipeline entered) maps to NO action and is therefore NOT a wake — waking on green progress costs one full-context API call to learn nothing, and the release wizard has 19 steps. The predicate is declared at park time: `qed.await {run_id, wake_on: [...], max_wait_secs}`. Precedent for the enum shape is in-house: `subagent.wait_for_idle`'s `IdleReason` (assistant_final | user_required | released | budget_exhausted | timeout | terminated), which already treats `timeout` as a named reason rather than an error and already splits `user_required` out from the rest.")
+//! @yah:handoff("TREE-WIDE IS A FLOOR, NOT A REFINEMENT — operator was explicit (\"no never do this\" to watching top-level only). Two consequences. (1) LIVENESS: the only timestamp that means anything is the deepest transition ANYWHERE in the run tree. `release-wizard -> release-check -> yah-check -> cargo-build` is three levels; an agent watching top-level steps sees the wave frozen for an hour while cargo-build runs normally. (2) PAYLOAD: `qed.await` must resolve the tree daemon-side and return the current route through the nested pipelines, plus — on `errored` — the deepest FAILING step with its output attached. It must never hand back a run_id to chase. Measured cost of the alternative, from this very session: finding out why the wizard failed took THREE full-context calls — `qed status <parent>` said \"child step check (run_id=f2afafef…)\", `qed status <that>` said \"child step cluster-epoch-drift-guard (run_id=1e71223d…)\", and only parsing that child's events.jsonl gave the actual assertion. Each level answers with a pointer instead of a fact. The daemon has every level in hand (`ChildEventFactory` / `with_child_event_factory` give each child its own channel — they exist precisely because children were once created with `events: None` and silently discarded everything they ran, which is how 0.8.22 through 0.8.26 all failed with no recoverable reason).")
+//! @yah:handoff("THE 55m TICK IS A LIVENESS CHECK, NOT A CACHE TRICK — build it for the first reason or it will be built wrong. A park that only ever wakes on an event inherits the failure mode this repo has already paid for: silence from an event stream is indistinguishable from silence from a DEAD event stream (see the `events: None` history above). So the tick re-reads AUTHORITATIVE state and reconciles it against what the bus claimed, rather than pinging to stay warm. The cache refresh is a real but second-order side effect (a cache hit refreshes TTL, so a tick costs ~0.1N against ~1.25N for a lapsed prefix) and it is CONDITIONAL on the harness process surviving the park — unverified, worth measuring before anyone tunes the interval, and `api_calls` from `party.agent_status` is the field to measure with, not `fillFraction`/`ring_depth`, which both under-report on this runner. OPERATOR'S RULE, adopted: 55m with no transition anywhere in the tree is a hard concern — \"if we have a 55m step we've written a poor pipeline that needs finer milestones\". The `ticked` payload must therefore carry the deepest-transition TIMESTAMP, not just current state, so \"same as when I went to sleep\" is a one-glance comparison rather than a diff to eyeball. A tick whose deepest transition has not moved is the `ps aux | grep` trigger.")
+//! @yah:handoff("MANUAL-STEP `audience`, DEFAULT \"agent\". New field on ManualConfig: `audience = \"operator\" | \"agent\"`, DEFAULTING TO AGENT — the inversion matters, because today's implicit default is operator and that is how the release wizard accumulated three of them. Classifying rule, from the operator: an agent may answer a gate that asks \"is this done / is this right\"; it may NEVER answer one that asks \"may I\". The second kind authorizes the irreversible work that follows, and a thing cannot authorize itself. This makes `kind = \"manual\"` mean something precise for the first time — a step whose body is JUDGEMENT rather than a command, gated by a predicate proving the judgement landed. Today the only difference between manual and mechanical is who is expected to type. `terminal` stops being \"commands to copy\" and becomes the starting kit. OPERATOR'S CONVENTION, adopted verbatim: \"an operator step beyond step 1 should be an error… 'operator step' means 'did you mean to run this QED, here are some facts'; beyond that it should be agent all the way down or the operator shouldn't have run it.\"")
+//! @yah:handoff("THE POSITION RULE, AND WHY IT IS STRUCTURAL RATHER THAN TIMED. Enforce: at most ONE `audience = \"operator\"` step per pipeline; it must be the FIRST manual step; and NO STEP BEFORE IT MAY INVOKE A COMPILER. That last clause is the real content — it is checkable from argv alone, on a machine that has never run the pipeline, and it is the actual reason the operator's \"first 0-5 minutes\" number is right: every sub-5m step in this camp is I/O or a shell, and every step that blew past it was a build. DO NOT justify this rule with measured durations. QED HAS NO TIMINGS — no duration model, no per-step history API, no way to tell anyone a step is overdue. Every number in this relay was mined by hand with a python script over 802 JSONL files and is NOT available to a validator, an agent, or the runner. QED probably should not get a duration model either: the measured spread is p50 6 seconds / p99 46 minutes / p99.9 93 minutes, four orders of magnitude driven by cache state and camp contention rather than step identity, so per-step prediction would be noise with a confidence interval. A flat tree-transition timeout beats a learned one for the same reason a fuse beats a model of your wiring. The one place an author's estimate helps is the EXEMPTION: a step declaring `expect_slow` in the recipe (the only legitimate case found is `build-v8-musl`, measured 56-60m three times) — a declaration, reviewable in a diff, not a measurement.")
+//! @yah:handoff("WARN AT AUTHORING, FAIL AT RUNTIME — the pairing is what makes either half credible. A warning that says \"this might be slow\" gets ignored; one that says \"this WILL fail, here is the flag if you meant it\" gets answered. Runtime: a `blocked_on_operator` past the ack FAILS the run rather than parking it, with an explicit per-pipeline opt-out (`allow_late_operator_block`). Authoring: warn, do not hard-error — a pipeline nobody intends to run unattended is legitimate, and a hard error would force the opt-out into every one of them as boilerplate, which is how an opt-out stops meaning anything. Keeping it a warning keeps the flag rare enough that seeing it in a diff is informative. The warning must NOT cite measured medians (see the no-timings entry); the honest form is that NOTHING IS KNOWN about how long the step takes, i.e. \"this parks on a human at an unknown depth into an unbounded run\".")
+//! @yah:gotcha("THE EVIDENCE, mined 2026-09-14 by hand from 802 files in `.yah/jit/qed/*.events.jsonl` (pair step-started/step-finished by name per run). Reproduce it rather than trusting these numbers; nothing in QED serves them. 2,279 completed steps. ONLY 18 EVER EXCEEDED 55m, AND 6 OF THOSE ARE HUMAN PARKS: roll-the-fleet 543m/421m/278m, commit-and-tag 324m/208m, push-tag 55m. Mechanical steps only (n=2233): p50 6s, p90 12m, p99 46m, p99.9 93m — so 55m sits near p99.5 and fires on roughly one step in two hundred. THE TWO LONGEST MECHANICAL STEPS ARE BOTH FAILURES — mcp-sidecar failed after 8.9 HOURS, containers-and-linux after 2.2 — and nothing does 8.9 hours of work and then fails; those are hangs, and they are exactly what the tick catches. Separately, the 46 completed HUMAN parks are bimodal and the median (0.8m) is a lie: ~15 of them sit at 0.0m, which is not a fast answer but the gate NOT FIRING (R605-B17's auto-advance bug, timed at 17ms and 13ms in its own gotcha), while 6 sat 55m-543m genuinely unattended. So a late operator gate is a coin flip between abandoned-for-five-hours and silently-skipped. Neither is \"paused briefly\", and that is the empirical case for failing rather than parking.")
+//! @yah:gotcha("SHARED-TREE STATE AT FILING (2026-09-14, @Glimmerstone:eclipse). Two files carry UNCOMMITTED R605-B20 work that this relay's children will edit — `.yah/qed/yah-release-wizard.toml` (the whole manual-gate retirement: authorize-release added, commit-and-tag/push-tag/roll-the-fleet made mechanical, sovereign param + options) and `xtask/tests/fleet_sovereign_groups.rs` (the new options-vs-declared-groups test, plus a camp_root() helper machines_dir() now derives from). Also uncommitted and UNRELATED to this relay: `oss/yubaba/crates/yubaba/cluster-epochs.json`, a cluster_protocol_surface re-record that the 0.8.39 release is waiting on. Verify by CONTENT before editing, not by git status — anchor SHA at filing is 0e4fda27 (= tag v0.8.39), but the freeze commit for 0.8.39 will move it. R906-T5 in particular rewrites steps this uncommitted work just created, so read the file rather than the last commit.")
+//! @yah:gotcha("ANCHOR CORRECTION — quote bae81d65930fc91672d954b7cc25a9ab6ac1c890, not the 0e4fda27 named in the shared-tree gotcha above. 0e4fda27 was HEAD when this relay was filed minutes earlier; the tree moved before dispatch. bae81d65 is the dispatch anchor for @Ashguard:polaris (session:fe2a19de) and is the SHA to diff against: `git diff --stat bae81d65..HEAD`. Contention check at dispatch was clean — 5 dirty paths, none contended, no peer holding the three task paths (xtask/tests/fleet_sovereign_groups.rs, oss/qed/crates/qed/src/runner.rs, oss/yubaba/crates/yubaba/cluster-epochs.json).")
+//! @yah:next("NEXT AGENT STARTS AT R906-F2. F1 is in review (qed.await + qed.resume shipped uncommitted; tree anchor at my start was bae81d65). F2 is now HALF DONE — the `audience` field, its wire plumbing and the schema regen landed under F1, so F2 is the validator only; its own gotcha names exactly what remains. Then B3, F4, T5 in ID order. Nothing is blocked on an operator. Handed off at ~250k context fill after 130 API calls, not because the work stalled.")
+//! @yah:handoff("LEADER PASS 2026-09-14 (@Ashguard:eclipse, session:24101295): all five children at review. F2: `operator_gate_is_late` is one shared check used by both the load-time lint (`Pipeline::lint_operator_gates`, warn-only, on `load_and_validate_graph`) and three runtime checks in `execute_step_manual` (child run; resumed or name-subset run, now `with_step_selection` replacing the deleted `with_index_offset`; otherwise the check itself). `allow_late_operator_block` is the only escape. yah-qed 1000/0/1; my independent re-run matched. B3: `apply_params` now substitutes into manual prompt, terminal[], advance and checklist[]; 1001/0/1, confirmed by a second session. F4: `agent` button beside `run` starts the run, then hands `WireQedRun.id` + `.params` to a new `QED_SUPERVISE` job; the shared params helper also feeds `QED_TRIAGE`. packages/yah/ui full suite 2299/14 before, 2301/15 after, same failures both times (one flaky perf ratio); none are F4's. T5: `authorize-release` (the one operator-audience step) is at index 1 ahead of `version-bump`, a new `verify-authorized-version` assert follows it, and `roll-the-fleet` is manual with agent audience. A read-only check found nothing that compiles before the gate and no opt-out flag. After the stash restore: every_camp 1/0, r325_f1 43/0, yah-qed 1003/0/1. B6: per-server `timeout` of 3900000ms on mcpServers.yah (`agent_process.rs`), plus a `park_shortened` guard in `qed_tools.rs`. After the stash restore: desktop 11/0, qed_tools 8/0, workspace check exit 0.")
+//! @yah:handoff("CAMP FINDINGS FROM THIS PASS, not R906 work and nothing filed: (a) `party.chat` returned `delivered: false` six times, and every one of those messages was later delivered and acted on. That caused one duplicate courier (B3). (b) Couriers that start a cargo build in the background and end their turn to wait get auto-released and are not reliably woken when it finishes; running the build in the foreground with a long Bash timeout fixed it. (c) No Thief-class character is bookable (all four availableForWork=false), so Thief-tier tickets run as Cleric. (d) Pre-existing packages/yah/ui failures that look like real bugs: `StatusPill` renders an empty body (Pill.test.tsx:14), and the onboarding wizard's `onboarding-step-claude-cli` step is gone (CampOnboardingWizard.test.tsx). (e) An unattributed `git stash` wiped the tree 13:09-13:14 and the operator restored it; T5's annotation in `runner.rs` briefly showed `open` because of it.")
+//! @yah:handoff("RELAY DELIVERED, all five children at review, awaiting operator sign-off. Final checks: (1) An independent sniffer re-ran B6 (session:5f6fd91d): desktop write_claude_settings 11/0, yah-agent-tools qed_tools 8/0 (exit 0), cargo check --workspace --all-targets exit 0. It matches the courier; every symbol was found at its line, and no @yah:assumes about the harness cap remains in runner.rs. (2) Comment-only cleanup for T5 landed (session:87385a02): 10 stale comments in yah-release-wizard.toml (manual-step counts, publish-binaries index 13, prose step labels, a note at both version-awk sites that they read by position while xtask reads by key), plus oss/qed/crates/qed/src/types.rs:2071 and crates/yah/rpc/src/lib.rs:7620 (19 changed to 20 steps). cargo test -p yah --lib r325_f1 43/0. Left alone deliberately: app/yah/cli/src/camp.rs:12570 still says 19 steps, because @Ashguard:rune and @Miravel:polaris were live in that uncommitted file. Minor: runner.rs now carries the harness-cap measured facts twice, as @yah:gotcha at :529 and inside R906-B6's own gotcha at :544; both are accurate.")
+//!
+//! @yah:ticket(R906-F1, "qed.run / qed.await MCP tools — tree-resolved wake with finished|errored|blocked_on_operator|needs_agent|ticked")
+//! @yah:status(review)
+//! @yah:at(2026-09-14T18:24:12Z)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R906)
+//! @yah:next("Include `expect_slow` as a step-level declaration so the tick predicate can exempt a step whose author has said it is legitimately long. Only known case today is build-v8-musl (56-60m, three occurrences). Everything else over 55m in camp history was either a human park or a hang.")
+//! @yah:gotcha("Tier: Wizard — new tool surface, typed wire additions across rpc + agent-tools + camp daemon, and a parking loop whose failure mode is an agent that never wakes.")
+//! @yah:handoff("SHIPPED (uncommitted; tree anchor at start bae81d65). `qed.await` + `qed.resume` exist end to end. rpc: QedWakeReason {finished|errored|blocked_on_operator|needs_agent|ticked}, QedAwaitParams{run_id, wake_on, timeout_secs}, QedAwaitResult{reason, run, route[], deepest_transition_at, expect_slow, failing, gate}, QedRouteNodeWire/QedFailingStepWire/QedGateWire, method::QED_AWAIT, DEFAULT_QED_AWAIT_TIMEOUT_SECS=3300 / MAX=3600. camp daemon: qed_resolve_tree + qed_await_handler + dispatch arm; qed_parked_gate + qed_step_output_tail helpers; QED_AWAIT_POLL=500ms. agent-tools: QedAwait (is_write=false) and QedResume (is_write=true), both registered in qed_tools() AND published in mcp/tools.rs (catalog budget re-checked green — published_catalog_stays_within_token_budget passes with both entries). daemon_client::timeout_for_method gains a QED_AWAIT arm at MID_TIMEOUT.")
+//! @yah:handoff("TREE-WIDE IS ENFORCED, not decorative. `qed_resolve_tree` walks `state.qed_runs` down the live spine via `parent_run_id` (children are already registered there by `child_event_factory`, so no new daemon state was needed) and is DEEPEST-WINS on every field: the failing step reported for `release-wizard -> release-check -> yah-check` is the grandchild's own step and its own error string, not the parent's \"sub-pipeline failed\" propagation. `deepest_transition_at` is the max transition anywhere in the subtree — pinned by `liveness_counts_a_grandchilds_transition_while_the_root_is_quiet`, where the root has not moved since second 1 and a grandchild moved at 900. `failing`/`gate` are dropped from the payload unless the reason that fired owns them, so a `finished` wake cannot hand back a park the run already left.")
+//! @yah:handoff("DISCOVERED WORK, done in this pass and NOT in the ticket title. (1) `needs_agent` HAD NO ANSWER DOOR. `qed.resume` has existed as an RPC since R622 and had ZERO callers — no CLI subcommand, no agent tool (verified by grep for QED_RESUME across app/ and crates/: only rpc and camp.rs). So the wake reason mapped to no action an agent could take, which by the ticket's own generating rule makes it not a wake reason. Added the `qed.resume` agent tool. (2) THE AUDIENCE RULE IS NOW ENFORCED, not advisory: `QedResumeParams.as_agent` (set only by the MCP tool; a human at the CLI or the desktop Continue button leaves it unset) makes `qed_resume_handler` REFUSE a park whose live gate declares `audience = \"operator\"`, with a message naming the rule. Without this, `audience` would have been a comment. (3) `RunStatus::is_terminal()` added to the qed crate — it did not exist and three call sites were hand-rolling it; AwaitingHuman is deliberately NOT terminal, which is what stops a supervisor reporting a release \"done\" while it waits on a person.")
+//! @yah:handoff("SCOPE NOTE FOR R906-F2, read before claiming it. F1 landed the `ManualConfig.audience` FIELD and `ManualAudience {Agent(default), Operator}` in oss/qed/crates/qed/src/types.rs, because `qed.await` cannot split needs_agent from blocked_on_operator without it — that is F2's first bullet, already done. F2 is now the VALIDATOR half only: at most one operator step, it must be the first manual step, no step before it may invoke a compiler (checkable from argv alone), warn-at-authoring / fail-at-runtime, and the per-pipeline `allow_late_operator_block` opt-out. The schema (.yah/schema/qed-pipeline.toml.schema.json) is already regenerated and `scripts/check-schema-drift.sh` reports in sync — do not re-derive that. `QedStep.expect_slow` also landed (F1's own @yah:next), carried to the daemon on `QedEvent::StepStarted` rather than on StepStatus, because for a sub-pipeline child the daemon cannot locate the recipe the declaration came from.")
+//! @yah:verify("cargo test -p yah --lib -- camp::r906_f1: 10 passed / 0 failed. Covers the three-level failure attribution, grandchild liveness while the root is quiet, a nested park resolving to the CHILD run_id (the id qed.resume needs), re-park reporting the current form not the first, expect_slow tracking the running step and not a finished one, a stepless failure still carrying failure_reason, is_terminal's park arm, a terminal run resolving immediately even when wake_on excludes it, and the ticked payload carrying the liveness clock.")
+//! @yah:verify("cargo test -p yah --lib -- mcp::tools::tests: 161 passed / 0 failed, INCLUDING published_catalog_stays_within_token_budget with both qed.await and qed.resume published — R649's ratchet holds, so neither had to go the unadvertised route (which R721-T13 measured as OFF, not deferred: 60 sessions, 0 calls). cargo test -p yah --lib -- r325_f1: 43/43. cargo test -p yah-agent-tools --lib -- qed_tools: 4/4 new. cargo check --workspace: clean. ./scripts/check-schema-drift.sh: in sync.")
+//! @yah:gotcha("PRE-EXISTING FAILURE, NOT MINE, do not chase it: `cargo test -p yah-qed --lib` (from oss/qed) reports 983 passed / 1 failed / 1 ignored, the failure being `tests::desktop_release_matrix_routes_each_row_to_its_own_platform` with `NotFound(\"desktop-release\")`. That is R577-B5, already filed with the full diagnosis at oss/qed/crates/qed/src/lib.rs:285 — the recipe was renamed to .yah/qed/yah-desktop-release.toml in 9e454f03 and the test still loads \"desktop-release\". R577-B5 explicitly says fixing the name alone lands you back at its row-count mismatch, which is an operator product call about what desktop-release ships, so I left it. My change cannot produce a NotFound on a name lookup.")
+//! @yah:gotcha("THE TIMEOUT PARAM IS NAMED `timeout_secs`, NOT `max_wait_secs` as the relay brief wrote it, and the rename is load-bearing. `agent-tools`' `wire_timeout_for` (daemon_client.rs) reads exactly that key off the SERIALIZED params to stretch the socket read timeout past the method floor. Spelled anything else, a 55m park aborts at the 10s MID_TIMEOUT floor as EAGAIN while the daemon goes on waiting — the R477-F11 failure, on the one verb whose entire job is to wait. Pinned by `the_wait_budget_is_visible_to_the_wire_timeout`. Same reason the field is not `Option`.")
+//! @yah:gotcha("MEASURED AND FIXED (R906-B6, 2026-09-14) — this supersedes the @yah:assumes this ticket used to carry about the harness-side cap, which has been removed now that it has an answer. claude-cli 2.1.270 (/Users/leif/.local/share/claude/versions/2.1.270, read via `strings -a`): the DEFAULT per-call MCP tool timeout is 300000ms = 5 MINUTES, the hard ceiling is 2147483647ms (i32 max, so 3300s was always permitted), values under 1000ms are ignored, and its own doc string reads \"Hard wall-clock limit per call; progress notifications do not extend it\" — the daemon cannot keep a call alive by emitting progress, so there is no daemon-side workaround. Before R906-B6 that meant every 55m park was aborted at 5m and the 55m-no-tree-transition liveness tick never fired. The fix is the per-server `\"timeout\"` key on mcpServers.yah in the generated .yah/claude-spawn-settings.json (agent_process.rs::YAH_MCP_CALL_TIMEOUT_MS = (MAX_QED_AWAIT_TIMEOUT_SECS + 300) * 1000 = 3900000), NOT a global MCP_TOOL_TIMEOUT — a global would also hold the approval gate open. Takes effect on the next desktop rebuild + session spawn; sessions spawned from a pre-fix settings file still get 5m, which is what qed.await's new park_within_budget guard detects and reports.")
+//!
+//! @yah:ticket(R906-T5, "Adopt audience in yah-release-wizard: roll-the-fleet back to a gate, authorize-release ahead of version-bump")
+//! @yah:status(review)
+//! @yah:at(2026-09-14T20:29:13Z)
+//! @yah:assignee(agent:bundle-anthropic-miravel)
+//! @yah:parent(R906)
+//! @yah:next("TWO edits to .yah/qed/yah-release-wizard.toml once R906-F2 lands. (1) roll-the-fleet goes back to kind = manual with audience = \"agent\" — R605-B20 made it mechanical-with-failure, which is safe but converts the wave's one real judgement call into a stoppage; its own retired comment said a roll \"can legitimately stop mid-way and hand you a quorum decision\", and `yah cloud rollout step` returns a typed StepOutcome JSON that is exactly what an agent would read. Keep the member-set resolution and the two-plan voter/non-voter split as-is. (2) authorize-release moves ahead of version-bump and resolves the target version by shell arithmetic over spec + [workspace.package] version, so nothing compiles before the human says go; version-bump then ASSERTS the tree landed on the acked version and fails if not.")
+//! @yah:gotcha("Tier: Cleric — TOML plus a small shell block, but it touches the release path, so re-run `cargo test -p yah --lib r325_f1` and `every_camp_pipeline_loads_and_validates`. COST OF (2), stated so it is not discovered later: resolving patch|minor|major in shell is a SECOND implementation of what xtask/src/release.rs means by those words, and the two could drift. Contained by the assert, which fires well before anything irreversible — but it is real duplication. Today's placement (index 2, after version-bump) measures median 16s / max 3.7m to the ack, so it already satisfies the 0-5m convention; this ticket is about making that structural rather than lucky, since the whole budget is one cold `cargo run -p xtask` away from blowing.")
+//! @yah:handoff("Two edits to .yah/qed/yah-release-wizard.toml (tree anchor bae81d65, survived an unrelated 13:09-13:14 tree-wide git-stash/restore incident, verified by content after restore): (1) authorize-release moved ahead of version-bump (now step index 1, version-bump index 2), with audience = \"operator\" declared inside [pipeline.steps.manual] (not at step level -- ManualConfig.audience lives there per oss/qed/crates/qed/src/types.rs:2139). Its terminal/advance now compute the target version via shell arithmetic over {{spec}} and Cargo.toml's current [workspace.package].version -- since nothing has been bumped yet at this point -- mirroring xtask::release::resolve_target (xtask/src/release.rs), cited in-file as the canonical semantics. New step verify-authorized-version runs immediately after version-bump and asserts the tree landed on the acked version, failing before anything irreversible if not. Only step before authorize-release is verify-credentials (argv = yah keys doctor), which is not in COMPILER_PROGRAMS -- confirmed by reading the reordered recipe, so the R906-F2 operator-gate rule (first manual step, nothing compiling ahead of it) holds structurally. Did NOT use allow_late_operator_block. (2) roll-the-fleet reverted from mechanical bash to kind = \"manual\" with audience = \"agent\" (also inside [pipeline.steps.manual]), keeping the member-set resolution and voter/non-voter two-plan split unchanged in its terminal script; advance generalizes R741-B1's original single-plan predicate to check both legs.")
+//! @yah:handoff("Updated the header doc block, the --from-step rehearsal numbers (publish-binaries is now flat index 13, was 12), and the flat-index recount comment to match the new step order -- all in the same target file.")
+//! @yah:verify("cargo test -p yah every_camp_pipeline_loads_and_validates -- fresh run started 2026-09-14 13:22:04 PDT (after the 13:14 tree restore): 1 passed / 0 failed, matches baseline.")
+//! @yah:verify("cargo test -p yah --lib r325_f1 -- fresh run started 2026-09-14 13:27:45 PDT, no skew warning: 43 passed / 0 failed, matches the R605-B20 baseline (incl. release_wizard_composes_and_gates_on_advance and every_camp_pipeline_loads_and_validates).")
+//! @yah:verify("cd oss/qed && cargo test -p yah-qed -- fresh run started 2026-09-14 13:26:45 PDT, no skew warning: 1003 passed / 0 failed / 1 ignored (baseline was 1001/0/1; the 2 extra are concurrent unrelated landings, not a regression).")
+//! @yah:handoff("Comment-only cleanup pass (anchor 30c2c02c). In .yah/qed/yah-release-wizard.toml: fixed the two @yah:verify entries (publish-binaries 12->13, \"exactly one manual step\" -> \"two manual steps, exactly one audience=operator gate\"; manual-step-loop wording -> \"covers both manual steps\"); \"step 6\"->\"step 5\" (crates.io token preflight); added a one-line comment at both awk version-read sites (:431/:450) noting the Cargo.toml/xtask::workspace_version duplication verify-authorized-version guards; \"step 7\"->\"step 3\" and \"step 9\"->\"step 3\" (freeze-commit refs); \"steps 2-2c\"->\"steps 2-2d\" (pin-sync range now includes sync-workspace-hack); \"step 6\"->\"step 7\" (publish-cli/publish-mesofact sibling refs, both confirmed against context), \"step 7\"->\"step 8\" (site build ref), \"step 5's note\"->\"step 6's note\" (judgment-calls ref, corrected after confirming oss-publish's own comment never discusses judgment calls while push-tag's trailing note does). Also corrected oss/qed/crates/qed/src/types.rs:2071 and crates/yah/rpc/src/lib.rs:7620 (19->20 steps). app/yah/cli/src/camp.rs:12570 still says \"19 steps\" (now 20); left untouched because @Ashguard:rune and @Miravel:polaris were live in that uncommitted file.")
+//! @yah:verify("cargo test -p yah --lib r325_f1: 43 passed / 0 failed, matching the 43/0 baseline exactly (foreground, anchor 30c2c02c).")
+//!
+//! @yah:ticket(R906-B6, "qed.await's 3300s default is silently truncated to 5 minutes by claude-cli's MCP_TOOL_TIMEOUT default")
+//! @yah:status(review)
+//! @yah:at(2026-09-14T20:26:12Z)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R906)
+//! @yah:severity(high)
+//! @yah:gotcha("MEASURED 2026-09-14, resolving the @yah:assumes R906-F1 left at runner.rs:529 (\"whether the claude-cli harness will hold an MCP tool call open for 3300s at all… the harness-side cap is simply unknown to me\"). It is knowable and it is not unbounded. Read out of the installed harness binary (/Users/leif/.local/share/claude/versions/2.1.270, a Mach-O arm64; `strings -a` + grep): (1) DEFAULT per-call MCP tool timeout is 300000ms = 5 MINUTES. (2) The HARD CEILING is 2147483647ms (~24.8 days, i32 max), so 3300s is permitted — the problem is purely that it is not the default. (3) The binary's own doc string says \"Hard wall-clock limit per call; progress notifications do not extend it\" — so the daemon CANNOT keep the call alive by emitting progress, which rules out the obvious workaround. (4) Values below 1000ms are ignored. Net effect today: an agent asking for a 55m park gets aborted at 5m, wakes 11x more often than designed, and the 55m-no-tree-transition rule this relay is built around NEVER FIRES. Ashguard's mitigation note is still correct as far as it goes — qed.await is a pure read, so an abort costs one wasted call — but 11x the wake cost at full context is exactly the spend this relay exists to avoid.")
+//! @yah:next("THE FIX IS PER-SERVER, NOT A GLOBAL ENV VAR. The harness binary carries a per-MCP-server `\"timeout\"` (ms) config key — its own help text reads: `\"timeout\" (ms) to allow longer silent runs for just this server`. Set it on the yah server entry in `.yah/claude-spawn-settings.json`, which the desktop already writes (it is where `mcpServers.yah.command` is rendered — see app/yah/cli/CLAUDE.md, agent_process.rs::yah_mcp_command). Prefer that over exporting MCP_TOOL_TIMEOUT for the whole session: a global raises the cap for EVERY yah tool, including the approval gate, and approval.rs:466 already carries a standing @yah:next warning against exactly that (\"NOT a blunt global MCP_TOOL_TIMEOUT — that would also abort deliberate reviews and slow board/arch scans\"). Raising it per-server keeps the long hold scoped to the one tool that wants it.")
+//! @yah:handoff("CODE LANDED (uncommitted, tree anchor bae81d65930fc91672d954b7cc25a9ab6ac1c890), two files. (1) app/yah/desktop/src/agent_process.rs — new `const YAH_MCP_CALL_TIMEOUT_MS: u64 = (rpc::MAX_QED_AWAIT_TIMEOUT_SECS as u64 + 300) * 1_000` = 3_900_000ms, emitted as `\"timeout\"` on the mcpServers.yah entry by yah_mcp_entry(). Sized off MAX (3600s), NOT the 3300s default, because timeout_secs accepts up to the ceiling and a budget sized to the default would still kill `timeout_secs: 3600`; +300s is slack for the daemon's reply after the park resolves. The whole measurement (300000ms default, i32-max ceiling, \"progress notifications do not extend it\", per-server not global, approval.rs's standing warning) is written into the const's doc comment at the site. New test write_claude_settings_budgets_the_longest_legal_qed_await_park asserts timeout > MAX*1000 and that no global `env` block appeared. (2) crates/yah/agent-tools/src/qed_tools.rs — the guard. harness_call_budget_secs(camp_root) reads mcpServers.yah.timeout out of the very file claude-cli was pointed at (<camp>/.yah/claude-spawn-settings.json), so it is not a second source of truth; a file present with no `timeout` key answers HARNESS_DEFAULT_CALL_BUDGET_SECS=300 (the pre-fix camp), a missing/unparseable file answers None (not under a yah-generated claude spawn — absence is not evidence of a cap). Pure half park_within_budget(requested, budget) shortens the park to budget-30s, floored at 60s, never above the request, and returns None when it would shorten nothing. On a shortened park QedAwait::execute adds a `park_shortened` key to the result explaining the budget and naming the fix — so the agent is told rather than being cut off mid-call.")
+//! @yah:handoff("DEPLOYMENT CAVEAT: the new mcpServers.yah.timeout only applies to claude sessions spawned AFTER write_claude_settings regenerates .yah/claude-spawn-settings.json (every session start, on a desktop build carrying this change). Sessions already running keep claude-cli's 300s default for their whole life. That is exactly the case qed.await's guard covers: harness_call_budget_secs reads a settings file with no `timeout` key as a 300s budget, park_within_budget shortens the park to 270s, and the result carries `park_shortened` saying why, instead of the call being cut off. Stale-assumption discharge: R906-F1's @yah:assumes (\"the harness-side cap is simply unknown to me\") is removed from oss/qed/crates/qed/src/runner.rs and replaced by a gotcha with the measured facts (300000ms default, i32-max ceiling, progress does not extend it, fixed per-server in agent_process.rs), confirmed present by content at 13:17.")
+//! @yah:verify("All runs STARTED AFTER the 13:14 tree restore (the 13:09:46 git-stash wipe invalidates anything earlier): `cargo test -p desktop --lib -- write_claude_settings` started 13:18:07, 11 passed / 0 failed, including write_claude_settings_budgets_the_longest_legal_qed_await_park; daemon skew verdict flagged 3 peer inputs mid-run, none of them files this ticket touched. `cargo test -p yah-agent-tools --lib -- qed_tools` started 13:25:05, 8 passed / 0 failed, including the four R906-B6 tests (a_budgeted_spawn_file_leaves_the_default_park_alone, an_unbudgeted_spawn_file_shortens_the_park_to_the_harness_default, no_spawn_file_means_no_opinion_about_the_budget, a_shortened_park_stays_between_the_floor_and_the_request); no skew. `cargo check --workspace --all-targets` started 13:25:11, exit 0. yah-qed tests not re-run: the only qed-crate change is an annotation doc comment.")
 
 use std::sync::Arc;
 
@@ -751,6 +815,14 @@ pub enum RunnerError {
     /// report from [`crate::toolchain::ToolchainPreflight::error_report`].
     #[error("{0}")]
     ToolchainUnsatisfied(String),
+    /// A run's cancellation took effect while this step (or a nested
+    /// sub-pipeline child of it) was in flight — `qed.cancel <run_id>` on
+    /// this run or on a descendant registered under it. Distinguished from
+    /// `StepFailed` so the step loop hard-stops (ignoring `on_fail =
+    /// "continue"`) and reports `RunStatus::Cancelled` rather than `Failed`:
+    /// an operator-requested stop is not a defect to recover from.
+    #[error("run was cancelled")]
+    Cancelled,
 }
 
 /// Where pipeline steps execute.
@@ -1200,6 +1272,16 @@ pub struct ChildRunInfo {
 pub type ChildEventFactory =
     Arc<dyn Fn(&ChildRunInfo) -> Option<UnboundedSender<QedEvent>> + Send + Sync>;
 
+/// Host hook invoked right after a sub-pipeline child's task is spawned,
+/// handed the child's run id and its `AbortHandle` so the embedder can
+/// register it for independent cancellation — `qed.cancel <child_run_id>`
+/// stops just that nested child (and, by the same recursive construction,
+/// anything nested under IT) without touching the parent. See
+/// [`PipelineRunner::with_child_abort_hook`]. Returning `None` from
+/// `with_child_abort_hook` (the default) leaves a nested child cancellable
+/// only via the parent's own task-abort, same as before this hook existed.
+pub type ChildAbortHook = Arc<dyn Fn(&str, tokio::task::AbortHandle) + Send + Sync>;
+
 pub struct PipelineRunner {
     pipeline: Pipeline,
     run_id: QedRunId,
@@ -1311,6 +1393,13 @@ pub struct PipelineRunner {
     /// handing back a distinct channel per child run rather than a clone.
     /// Returning `None` restores the old silent behaviour.
     child_event_factory: Option<ChildEventFactory>,
+    /// Host hook that registers a sub-pipeline child's `AbortHandle` right
+    /// after it's spawned (see [`ChildAbortHook`]). `None` (the default, and
+    /// what `yah qed run` without a daemon leaves it at) means a nested
+    /// child has no independent abort path — cancelling it falls back to
+    /// cancelling the whole run, exactly as before this field existed.
+    /// Inherited by children so a grandchild registers too.
+    child_abort_hook: Option<ChildAbortHook>,
     /// Mirrors [`crate::types::SubPipelineConfig::own_workspace`] onto the
     /// child runner (R755). `false` on every top-level runner (there is
     /// nothing to opt out of — a top-level run always positions its own
@@ -1320,12 +1409,27 @@ pub struct PipelineRunner {
     /// (`self.parent_run_id.is_some()`) additionally check `!own_workspace`
     /// — so an opted-in child repositions per its OWN [`WorkspaceMode`]
     /// instead of building from the parent's already-positioned tree.
+    ///
+    /// Flattened from the config's `Option<bool>` (R887): unset means
+    /// inherit here, because by the time a `Pipeline` reaches a runner the
+    /// loader's [`crate::types::validate_sub_pipeline_graph`] has already
+    /// refused the one composition where that default would silently discard
+    /// the child's own declared mode.
     own_workspace: bool,
     /// Added to every emitted step `index` so that a resume-from-step run
     /// (where the pipeline had its leading steps drained) still shows the
     /// original step position in the UI (e.g. step 6 of 6 instead of 1 of 1).
-    /// Set via [`Self::with_index_offset`] in callers that drain steps.
+    /// Set via [`Self::with_step_selection`] in callers that drain steps.
     index_offset: usize,
+    /// R906-F2 — a name-subset selection (`selected_steps`) removed arbitrary
+    /// steps from [`Self::pipeline`] before the runner was handed it.
+    ///
+    /// The sibling of [`Self::index_offset`], and it needs its own field
+    /// because the two truncations are independent: a resume drops a *prefix*
+    /// (describable by a count), a subset drops *arbitrary* steps (not
+    /// describable at all), and one run can do both. Set via
+    /// [`Self::with_step_selection`].
+    steps_are_subset: bool,
     /// R499-F3 phase 2: per-step gha-workflow matrix subset. Keyed by
     /// qed step name; the inner set is the chosen
     /// [`yah_qed_gha::graph::JobInstance::key`] values (`<job>` for
@@ -1993,6 +2097,27 @@ async fn reap_status(
 /// @yah:handoff("SHIPPED AND PROVEN ON THE LIVE APEX. The mesofact hot-ship loop closes end to end on real hardware: `yah qed run mesofact-musl` (x86 leg, 11m16s) -> `scripts/hotship.sh --nodes us-east-001 --binaries mesofact` (seconds) -> three serve processes re-forked onto the freshly built binary, verified by pid, inode and sha256 of /proc/<pid>/exe. us-east-001 now runs mesofact 0.8.35 bytes under the 0.8.32 runtime label, attributably: serve.hotship carries hotship_version=0.8.36-h9, sha256=7201cbbc..., release_version=0.8.32, installed_at=2026-09-09T04:39:10Z, with serve.prehotship beside it as the rollback anchor. \"Bring the fleet current\" is one node for this tier by construction - us-east-001 is the only machine with a runtimes/mesofact tree at all.")
 /// @yah:verify("Three independent facts, each measured rather than reasoned: (1) new pids 611259/611260/611273 replaced 610120/610121/610763, all starting 04:39:17Z; (2) their /proc/<pid>/exe hashes to 7201cbbc..., the artifact's sha256, and resolves to inode 531343, the installed file; (3) idle runtime versions 0.8.23 and 0.8.31 kept their original hashes, so the running-versions-only filter held on both the staged and the activating path.")
 /// @yah:verify("FINAL AVAILABILITY FIGURE, superseding the interim 34-of-36 above: 150 probes at 1/s across 04:38:59-04:42:16Z, 148 x 200/44242 and exactly 2 x 502/0 at 04:39:16 and 04:39:17. No blip after recovery — the apex ran clean for 2m58s on the hot-shipped bytes. TOOLING NOTE, and a correction to a path cited earlier in this ticket: the probe was first written to .yah/cache/hotship/apex-probe.sh, which `git check-ignore` shows is covered by .yah/.gitignore:8 (/cache) — a measurement tool nobody can re-run turns a measurement back into a claim. It now lives at scripts/hotship-probe.sh beside hotship.sh and hotship-version.sh, takes an optional count and URL, and records bytes alongside the status code deliberately (a door answering 200 with a different body is a failure a code-only probe calls success). hotship.sh's header points at it so the ~2s figure can be disagreed with rather than inherited.")
+///
+/// @yah:relay(R887, "yah-cli-release stamp-build-id: workspace=isolated dirty check mirrored the live camp tree, not an isolated worktree")
+/// @yah:status(review)
+/// @yah:at(2026-09-15T17:54:37Z)
+/// @yah:assignee(agent:bundle-anthropic-miravel)
+/// @yah:severity(high — undermines the isolation guarantee every workspace=isolated release pipeline depends on)
+/// @yah:next("If a daemon restart alone fixes it, this is purely R833/R766-adjacent version skew — note which commit range between 74874f3e and HEAD actually changed prepare_workspace/positioned_workspace and close as stale-binary. If it reproduces on a freshly built daemon, trace resolve_camp_root()'s actual cwd for the stamp-build-id subprocess step on a live run (add a debug log or attach) rather than re-reading the source again.")
+/// @yah:verify("Scanned $TMPDIR for qed-worktree-* at diagnosis time: 5 present, all clean, all at older HEADs (e2d707e1 x2, f91f8a10, c7af3fc6, 5826ca13) — NONE named for run 3c867d09's run_id, even though R766 says a FAILED Isolated run should retain its worktree. Confirm by rerunning yah-cli-release after restarting the daemon (forces current runner.rs) and checking (a) whether the dirty check now passes on a clean camp tree, and (b) whether a failed isolated run's worktree actually appears under $TMPDIR/qed-worktree-{run_id} afterward.")
+/// @yah:gotcha("Run 3c867d09-3a5c-4fd1-9a34-9bce31ce5b43 (yah-cli-release, 2026-09-11) failed stamp-build-id's `git status --porcelain` dirty check inside what should be a fresh `git worktree add` checkout. The 38 modified + 2 untracked files it reported are an EXACT match to the live camp root's own `git status` at the time — not plausible for an independently checked-out worktree, which cannot inherit uncommitted edits at all. `yah qed status` flagged the run as `executed by: 0.8.36+74874f3e-dirty (NOT this binary: 0.8.36+4740623c-dirty)` — a stale desktop-daemon proxy, several commits behind even the locally built CLI.")
+/// @yah:assumes("Not proven which layer leaked: either the Isolated worktree was never created and the dirty-check step ran with cwd=camp_root, or it was created and torn down without ever being checked. Reading runner.rs at both HEAD and the stale binary's commit (74874f3e), prepare_workspace's Isolated arm and resolve_camp_root's OnceLock plumbing both look correct in isolation — so \"stale binary\" alone doesn't fully explain it and this may be live on HEAD too. Not confirmed by instrumenting an actual run, only by static reading + circumstantial evidence.")
+/// @arch:see(R874)
+/// @yah:handoff("ROOT CAUSE FOUND, AND IT IS NOT THE STALE BINARY. Run 3c867d09's own meta names it: .yah/jit/qed/3c867d09-3a5c-4fd1-9a34-9bce31ce5b43.json carries `parent_run_id: 86dbd588-bb77-4fe5-a395-84639bfcad2f` — the run was a SUB-PIPELINE CHILD of yah-release-wizard, not a standalone `yah qed run yah-cli-release`. The wizard is `workspace = \"live\"`, and runner.rs:4024 skips workspace positioning entirely for a child (`parent_run_id.is_some() && !own_workspace`), so yah-cli-release.toml:146's `workspace = \"isolated\"` was discarded and stamp-build-id ran with cwd = the live camp root. That is why the 38 modified + 2 untracked files matched the camp tree exactly, and why $TMPDIR held no qed-worktree-{run_id}: no worktree was ever created, so R766's failed-run retention had nothing to retain. Both circumstantial facts in the ticket are explained by one mechanism. The 0.8.36+74874f3e-dirty executor skew is real but unrelated — prepare_workspace/resolve_camp_root were correct at both commits, exactly as the ticket's `assumes` suspected.")
+/// @yah:handoff("FIXED AT THE MECHANISM, NOT THE CALL SITE. The wizard's `publish-cli` step was simply missing `own_workspace = true` — the same one-line omission that was fixed by hand on `desktop-channel` (2026-09-04) and on `oss-publish` (R755). Three occurrences of one silent default is a design defect, so the fix is in qed: `SubPipelineConfig::own_workspace` is now `Option<bool>` (types.rs), and `validate_sub_pipeline_graph` REFUSES a recipe where a child declares `workspace = \"isolated\"` but would inherit something else and the step says neither `true` nor `false` (new `SubPipelineError::WorkspaceInheritanceUnstated`, whose message names both trees and both repairs). The walk threads the EFFECTIVE inherited mode down the graph, so a grandchild under an `own_workspace = true` parent is correctly silent and one under an inheriting parent is correctly caught. The runner is unchanged in behaviour: `cfg.own_workspace.unwrap_or(false)` at runner.rs:5570, because by the time a Pipeline reaches a runner the loader has already had its say.")
+/// @yah:handoff("SCOPE NOTE — the new gate immediately found a SECOND live instance nobody had filed: .yah/qed/oss-binaries.toml's `yah` step composes yah-release.toml (isolated) while declaring no workspace of its own (so it inherits the serde default, `checkout`), meaning the binaries it stages to R2 were built from the live camp tree. Set `own_workspace = true`. Three recipes edited in total: oss-binaries `yah` -> true; release-wizard `publish-cli` -> true (the R887 bug); release-wizard `npm-publish` -> explicit `false`, which is the counterexample that makes this a statement rather than a default — npm-publish runs BEFORE commit-and-tag, so it must publish the uncommitted version-bump and isolating it would ship the PREVIOUS release. Also replaced the hand-enumerated allowlist in app/yah/cli/src/camp.rs (`for release_child in [\"release-check\", \"oss-publish\", \"desktop-channel\"]`) that was supposed to catch this: `publish-cli` was added to the wizard and never added to that list. It now asserts the four true-cases plus the npm-publish false-case AND its ordering justification, with the general rule derived by the loader for every recipe.")
+/// @yah:handoff("Verified this session (2026-09-15) rather than re-diagnosing: the fix described in the prior handoff (SubPipelineConfig::own_workspace: Option<bool>, validate_sub_pipeline_graph's WorkspaceInheritanceUnstated gate, and the three recipe fixes — oss-binaries `yah` step, release-wizard `publish-cli` and `npm-publish`) is already committed on main (present as of 39ab4dc3), not just staged. Confirmed by content, not by trusting the prior session's notes.")
+/// @yah:handoff("Ran the full test set that exercises this bug end to end: `cargo test -p yah-qed --lib -- sub_pipeline` (28/28 ok, including sub_pipeline_own_workspace_true_isolates_from_live_parent / _false_inherits_live_parent), `cargo test -p yah --lib camp::r325_f1_tests::release_wizard_composes_and_gates_on_advance` (asserts publish-cli/oss-publish/desktop-channel all own_workspace=true and npm-publish=false with correct step ordering — this is the exact assertion that would have caught the R887 bug), and `cargo test -p yah --lib camp::r325_f1_tests::every_camp_pipeline_loads_and_validates` (every camp recipe, including oss-binaries.toml's now-fixed `yah` step, loads through validate_sub_pipeline_graph clean). All three pass.")
+/// @yah:next("A live end-to-end rerun of yah-cli-release under the wizard (to directly observe stamp-build-id's dirty check pass in a real isolated worktree) was NOT attempted here — that's an outward-facing release action (crates.io/npm/R2 publish), out of blast radius for this session. If the operator wants that belt-and-suspenders confirmation, it's the one thing this pass didn't cover; the static validation + targeted tests above already prove the mechanism is fixed and regression-guarded.")
+/// @yah:verify("cargo test -p yah-qed --lib -- sub_pipeline -> 28 passed, 0 failed (oss/qed)")
+/// @yah:verify("cargo test -p yah --lib camp::r325_f1_tests::release_wizard_composes_and_gates_on_advance -> 1 passed")
+/// @yah:verify("cargo test -p yah --lib camp::r325_f1_tests::every_camp_pipeline_loads_and_validates -> 1 passed")
+/// @yah:verify("git log confirms the fix (types.rs own_workspace field, camp.rs allowlist replacement, oss-binaries.toml/yah-release-wizard.toml own_workspace stamps) is on main, not just working-tree state")
 impl PipelineRunner {
     /// Local execution — steps run as subprocesses on this machine.
     pub fn new(pipeline: Pipeline) -> Self {
@@ -2017,7 +2142,9 @@ impl PipelineRunner {
             // Top-level runs have no factory until a host installs one via
             // `with_child_event_factory`; children inherit it below.
             child_event_factory: None,
+            child_abort_hook: None,
             index_offset: 0,
+            steps_are_subset: false,
             gha_matrix_subset: std::collections::HashMap::new(),
             include_stubbed: false,
             allow_emulate: false,
@@ -2063,7 +2190,9 @@ impl PipelineRunner {
             // Top-level runs have no factory until a host installs one via
             // `with_child_event_factory`; children inherit it below.
             child_event_factory: None,
+            child_abort_hook: None,
             index_offset: 0,
+            steps_are_subset: false,
             gha_matrix_subset: std::collections::HashMap::new(),
             include_stubbed: false,
             allow_emulate: false,
@@ -2108,6 +2237,17 @@ impl PipelineRunner {
     /// behaviour.
     pub fn with_child_event_factory(mut self, factory: ChildEventFactory) -> Self {
         self.child_event_factory = Some(factory);
+        self
+    }
+
+    /// Install the hook that lets a host register a sub-pipeline child's
+    /// `AbortHandle`, so a nested child can be cancelled independently of
+    /// its ancestors. Composes with `with_child_event_factory`; inherited by
+    /// children so a grandchild
+    /// three levels deep (`release-wizard → release-check → check →
+    /// cargo-test`) still gets its own independently-cancellable task.
+    pub fn with_child_abort_hook(mut self, hook: ChildAbortHook) -> Self {
+        self.child_abort_hook = Some(hook);
         self
     }
 
@@ -2387,23 +2527,55 @@ impl PipelineRunner {
                 // vanished path (evicted by retention, or a source run that
                 // predates this field) degrades to an ordinary fresh
                 // `Isolated` run below rather than failing the resume.
+                //
+                // R874-B2: the SOURCE run's meta keeps tracking this path for
+                // the whole resume, so the daemon's retention sweep would
+                // otherwise evict it out from under the live build. The lock
+                // is what tells the sweep a run is in here — its liveness
+                // check is by run id and the resume has a new one. A lock that
+                // will not take means another run (a concurrent resume of the
+                // same source) already holds the tree; sharing it would be two
+                // builds in one directory, so position a fresh one instead.
                 if let Some(existing) = self.resume_workspace.as_ref() {
                     if existing.is_dir() {
-                        tracing::info!(
+                        match lock_worktree(camp_root, existing, &self.run_id) {
+                            // Re-checked under the lock: a sweep whose remove
+                            // started before the lock landed may have taken it.
+                            Ok(()) if existing.is_dir() => {
+                                tracing::info!(
+                                    path = %existing.display(),
+                                    "qed: resuming isolated run into its retained worktree"
+                                );
+                                let guard = WorktreeGuard {
+                                    camp_root: camp_root.to_path_buf(),
+                                    worktree: existing.clone(),
+                                    retain: std::cell::Cell::new(false),
+                                    locked: true,
+                                };
+                                return Ok((existing.clone(), Some(guard)));
+                            }
+                            Ok(()) => {
+                                let _ = run_git(
+                                    camp_root,
+                                    &["worktree", "unlock", &existing.to_string_lossy()],
+                                );
+                                tracing::warn!(
+                                    path = %existing.display(),
+                                    "qed: retained worktree was removed while it was being locked; positioning a fresh one"
+                                );
+                            }
+                            Err(e) => tracing::warn!(
+                                path = %existing.display(),
+                                error = %e,
+                                "qed: could not lock the retained worktree for resume (held by another run?); positioning a fresh one"
+                            ),
+                        }
+                    } else {
+                        tracing::warn!(
                             path = %existing.display(),
-                            "qed: resuming isolated run into its retained worktree"
+                            "qed: resume requested a retained worktree that no longer exists on disk; positioning a fresh one"
                         );
-                        let guard = WorktreeGuard {
-                            camp_root: camp_root.to_path_buf(),
-                            worktree: existing.clone(),
-                            retain: std::cell::Cell::new(false),
-                        };
-                        return Ok((existing.clone(), Some(guard)));
                     }
-                    tracing::warn!(
-                        path = %existing.display(),
-                        "qed: resume requested a retained worktree that no longer exists on disk; positioning a fresh one"
-                    );
                 }
                 let worktree = std::env::temp_dir().join(format!("qed-worktree-{}", self.run_id));
                 // A prior crashed run may have left this path registered; clear
@@ -2420,10 +2592,28 @@ impl PipelineRunner {
                 .map_err(|e| {
                     RunnerError::InvalidConfig(format!("git worktree add at {git_ref}: {e}"))
                 })?;
+                // R874-B2: a fresh worktree is locked for the same reason a
+                // resumed one is — it is how a prune in another process (a
+                // daemonless `yah qed prune`, which has no live run map) sees
+                // that a build is in here. Unlike the resume, nothing else can
+                // hold this brand-new path, so a failed lock degrades to an
+                // unlocked build rather than failing the run.
+                let locked = match lock_worktree(camp_root, &worktree, &self.run_id) {
+                    Ok(()) => true,
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %worktree.display(),
+                            error = %e,
+                            "qed: could not lock the isolated worktree; building in it unlocked"
+                        );
+                        false
+                    }
+                };
                 let guard = WorktreeGuard {
                     camp_root: camp_root.to_path_buf(),
                     worktree: worktree.clone(),
                     retain: std::cell::Cell::new(false),
+                    locked,
                 };
                 Ok((worktree, Some(guard)))
             }
@@ -2879,7 +3069,9 @@ impl PipelineRunner {
             // Top-level runs have no factory until a host installs one via
             // `with_child_event_factory`; children inherit it below.
             child_event_factory: None,
+            child_abort_hook: None,
             index_offset: 0,
+            steps_are_subset: false,
             gha_matrix_subset: std::collections::HashMap::new(),
             include_stubbed: false,
             allow_emulate: false,
@@ -3004,13 +3196,37 @@ impl PipelineRunner {
         self
     }
 
-    /// Offset added to every emitted step `index`. Use this when the
-    /// pipeline's leading steps were drained for a resume-from-step run so
-    /// that events still carry the original positions (e.g. step 5 of 6
-    /// instead of step 0 of 1 after a `drain(0..5)`).
-    pub fn with_index_offset(mut self, offset: usize) -> Self {
-        self.index_offset = offset;
+    /// Declare how the step list this runner was handed relates to the
+    /// pipeline as AUTHORED. Call it from anywhere that trims `pipeline.steps`
+    /// before construction; the default (never calling it) means "complete".
+    ///
+    /// - `resumed_from` — how many leading steps a resume-from-step run
+    ///   `drain(0..n)`-ed off. Added to every emitted step `index` so events
+    ///   still carry the original positions (step 5 of 6, not step 0 of 1).
+    /// - `subset` — whether a name-subset selection (`selected_steps`) removed
+    ///   arbitrary steps. Carries no index consequence; it exists because
+    ///   "these steps are not all the steps" is a fact no offset can express.
+    ///
+    /// R906-F2 widened this from the old `with_index_offset(usize)`. The two
+    /// facts travel together because they answer one question —
+    /// [`Self::steps_are_complete`] — and a caller that trimmed the list must
+    /// not be able to report the half of it that affects UI indices while
+    /// silently omitting the half that affects whether an operator gate can be
+    /// shown to be first.
+    pub fn with_step_selection(mut self, resumed_from: usize, subset: bool) -> Self {
+        self.index_offset = resumed_from;
+        self.steps_are_subset = subset;
         self
+    }
+
+    /// Whether [`Self::pipeline`]'s steps are the authored list, whole and in
+    /// order (R906-F2). False after any resume drain or name-subset filter.
+    ///
+    /// Only a complete list can prove an operator gate was the run's first
+    /// manual step: a trimmed one is missing exactly the steps whose absence
+    /// would make a late gate look early.
+    fn steps_are_complete(&self) -> bool {
+        self.index_offset == 0 && !self.steps_are_subset
     }
 
     /// R499-F3 phase 2: per-step gha-workflow matrix subset. Each entry
@@ -3620,9 +3836,27 @@ impl PipelineRunner {
     /// so it can roll the child's `produced` into its own collection. Public
     /// `run()` discards it (callers that need artifacts go through
     /// `Outcome::Publish`, not the meta).
-    pub(crate) async fn run_inner(
+    // Returns an explicitly-boxed `dyn Future + Send` rather than plain
+    // `async fn` sugar. This is NOT decoration — a
+    // sub-pipeline child is now spawned via `tokio::spawn` (so `qed.cancel
+    // <child_run_id>` has a real task to abort), which requires the spawned
+    // future to be provably `Send`. `run_inner` calls itself recursively
+    // (through `execute_step_sub_pipeline`), and rustc's auto-trait inference
+    // cannot resolve a `Send` bound on a self-recursive `async fn` — it needs
+    // an explicit trait-object bound to break the cycle. The body is
+    // otherwise unchanged; only the signature and the `Box::pin(async move
+    // { ... })` wrapper around it are new.
+    pub(crate) fn run_inner(
         &self,
-    ) -> Result<(QedRunMeta, Vec<crate::types::ProducedArtifact>), RunnerError> {
+    ) -> std::pin::Pin<
+        Box<
+            dyn std::future::Future<
+                    Output = Result<(QedRunMeta, Vec<crate::types::ProducedArtifact>), RunnerError>,
+                > + Send
+                + '_,
+        >,
+    > {
+        Box::pin(async move {
         let created_at = Utc::now();
         let mut overall_status = RunStatus::Success;
         // Artifacts declared by steps that *succeed* — handed to an
@@ -3723,7 +3957,7 @@ impl PipelineRunner {
         // R605-F3: resolve the step dependency graph once, before anything
         // runs. `Missing::Satisfied` because a resume-from-step run is handed a
         // pipeline whose leading steps were `drain`ed (see
-        // [`Self::with_index_offset`]) — a surviving `needs` that names one of
+        // [`Self::with_step_selection`]) — a surviving `needs` that names one of
         // them names a step that genuinely already ran. Typos are still caught,
         // at load time, by `PipelineLoader::validate_dag` against the undrained
         // file; this is the only place that leniency is applied.
@@ -3923,6 +4157,18 @@ impl PipelineRunner {
         // whatever is already running finish, then leave the loop. The old
         // code's `break` with nothing in flight is the same thing.
         let mut aborting = false;
+        // R560-F15: a per-leg publish outcome scopes that abort to the failing
+        // step's LEG ([`crate::dag::legs`]) — the leg stops admitting, every
+        // other leg runs on, and terminal dispatch publishes the legs that came
+        // through whole. Without one, the whole run is the leg, as before.
+        let leg_scoped = self
+            .pipeline
+            .on_success
+            .iter()
+            .any(|o| matches!(o, Outcome::Publish { per_leg: true, .. }));
+        let leg_of = crate::dag::legs(&step_preds);
+        let mut leg_aborted: Vec<bool> = vec![false; total];
+        let mut leg_failed: Vec<bool> = vec![false; total];
         let mut inflight = futures_util::stream::FuturesUnordered::new();
 
         loop {
@@ -3930,6 +4176,7 @@ impl PipelineRunner {
             while !aborting && inflight.len() < max_parallel {
                 let ready = (0..total).find(|&i| {
                     !dispatched[i]
+                        && !leg_aborted[leg_of[i]]
                         && step_preds[i].iter().all(|&p| done[p])
                         && match &self.pipeline.steps[i].resource {
                             Some(key) => !held_resources.iter().any(|h| h == key),
@@ -3950,7 +4197,16 @@ impl PipelineRunner {
                 // any) *before* emitting StepStarted so a skipped step's
                 // lifecycle pair carries a Skipped terminal status with no
                 // "Running" intermediate state on the wire.
-                let skip_reason = self.resolve_skip_reason(step, &step_context, overall_status);
+                // R560-F15: under leg scoping `success()` / `failure()` answer
+                // for this step's own leg; another leg's failure is not its gate.
+                let gate_status = if !leg_scoped {
+                    overall_status
+                } else if leg_failed[leg_of[index]] {
+                    RunStatus::Failed
+                } else {
+                    RunStatus::Success
+                };
+                let skip_reason = self.resolve_skip_reason(step, &step_context, gate_status);
 
                 let started_at = Utc::now();
                 self.emit(QedEvent::StepStarted {
@@ -3958,6 +4214,7 @@ impl PipelineRunner {
                     name: step.name.clone(),
                     argv: step.argv.clone(),
                     env_keys: crate::events::credential_env_keys(std::env::vars()),
+                    expect_slow: step.expect_slow,
                     at: started_at,
                 });
 
@@ -4173,8 +4430,19 @@ impl PipelineRunner {
                 step_context.insert(outcome.name.clone(), outcome.outputs.clone());
             }
             produced_by_index[index] = outcome.produced;
-            if outcome.row.status == RunStatus::Failed {
+            // Failed beats Cancelled (matches `RunStatus::aggregate`'s
+            // priority for the same reason: a concurrent sibling step's real
+            // tool failure is more informative than "an operator also asked
+            // this run to stop", so it must not be downgraded by arrival
+            // order.
+            let row_status = outcome.row.status;
+            if row_status == RunStatus::Failed {
                 overall_status = RunStatus::Failed;
+                leg_failed[leg_of[index]] = true;
+            } else if outcome.row.status == RunStatus::Cancelled
+                && overall_status != RunStatus::Failed
+            {
+                overall_status = RunStatus::Cancelled;
             }
             main_statuses[index] = Some(outcome.row);
 
@@ -4231,7 +4499,13 @@ impl PipelineRunner {
             }
 
             if outcome.abort {
-                aborting = true;
+                // Cancelled always stops the whole run; only a step's own
+                // failure is scoped to its leg (R560-F15).
+                if leg_scoped && row_status == RunStatus::Failed {
+                    leg_aborted[leg_of[index]] = true;
+                } else {
+                    aborting = true;
+                }
             }
         }
 
@@ -4301,6 +4575,30 @@ impl PipelineRunner {
         // Flatten back to the wire shape: declaration order, with the steps the
         // run never reached simply absent — identical to what the pre-scheduler
         // `break` produced.
+        // R560-F15: the artifacts of every leg that came through whole — each of
+        // its steps has a row, and every row is Success or Skipped. A step an
+        // aborted leg never admitted has no row, so that leg never qualifies.
+        // Read here, before the rows flatten away their indices; dispatched
+        // only when the run failed. A participant verdict failure names no
+        // leg, so it withholds every leg.
+        let whole_leg_produced: Vec<crate::types::ProducedArtifact> =
+            if leg_scoped && run_failure_reason.is_none() {
+                let mut broken = vec![false; total];
+                for (i, row) in main_statuses.iter().enumerate() {
+                    if !matches!(
+                        row.as_ref().map(|r| r.status),
+                        Some(RunStatus::Success | RunStatus::Skipped)
+                    ) {
+                        broken[leg_of[i]] = true;
+                    }
+                }
+                (0..total)
+                    .filter(|&i| !broken[leg_of[i]])
+                    .flat_map(|i| produced_by_index[i].iter().cloned())
+                    .collect()
+            } else {
+                Vec::new()
+            };
         let mut step_statuses: Vec<StepStatus> = main_statuses.into_iter().flatten().collect();
         for slot in produced_by_index {
             produced.extend(slot);
@@ -4336,6 +4634,7 @@ impl PipelineRunner {
                 name: step.name.clone(),
                 argv: step.argv.clone(),
                 env_keys: crate::events::credential_env_keys(std::env::vars()),
+                expect_slow: step.expect_slow,
                 at: started_at,
             });
 
@@ -4479,8 +4778,28 @@ impl PipelineRunner {
         // `dispatch_terminal_outcomes` (R603-T4) so the boot reconciler can
         // replay this exact chain for a remote run that reached terminal
         // Success while the daemon was down.
-        self.dispatch_terminal_outcomes(work_status, &produced)
-            .await?;
+        if work_status == RunStatus::Success {
+            self.dispatch_terminal_outcomes(&self.pipeline.on_success, &produced)
+                .await?;
+        } else {
+            self.dispatch_terminal_outcomes(&self.pipeline.on_fail, &produced)
+                .await?;
+            // R560-F15: a FAILED run still ships the legs that succeeded, but
+            // only through the outcomes that declared `per_leg`, and only with
+            // those legs' artifacts. `on_fail` went first, so an error from
+            // this publish cannot swallow the failure report.
+            if work_status == RunStatus::Failed && !whole_leg_produced.is_empty() {
+                let per_leg: Vec<Outcome> = self
+                    .pipeline
+                    .on_success
+                    .iter()
+                    .filter(|o| matches!(o, Outcome::Publish { per_leg: true, .. }))
+                    .cloned()
+                    .collect();
+                self.dispatch_terminal_outcomes(&per_leg, &whole_leg_produced)
+                    .await?;
+            }
+        }
 
         let completed_at = Utc::now();
         self.emit(QedEvent::RunFinished {
@@ -4532,6 +4851,7 @@ impl PipelineRunner {
             },
             produced,
         ))
+        })
     }
 
     /// Execute one already-admitted, already-substituted step to completion
@@ -4822,6 +5142,9 @@ impl PipelineRunner {
                 }
                 (RunStatus::Success, None)
             }
+            // Checked before the generic arm: a cancelled step is not a
+            // failure to report as one — see `RunnerError::Cancelled`'s doc.
+            Err(RunnerError::Cancelled) => (RunStatus::Cancelled, Some("cancelled".to_string())),
             Err(e) => {
                 let msg = match e {
                     RunnerError::StepFailed { msg, .. } => Some(msg.clone()),
@@ -4864,7 +5187,7 @@ impl PipelineRunner {
         // Keep the failure reason on the persisted StepStatus (not only in
         // the live StepFinished event) so `qed.status` surfaces *why* a
         // step failed after the run ends.
-        let error = if status == RunStatus::Failed {
+        let error = if matches!(status, RunStatus::Failed | RunStatus::Cancelled) {
             msg.clone()
         } else {
             None
@@ -4882,7 +5205,11 @@ impl PipelineRunner {
             name: step.name.clone(),
             was_local: placement == RunWhere::Local,
             resource: step.resource.clone(),
-            abort: status == RunStatus::Failed && !matches!(step.on_fail, OnFail::Continue),
+            // Cancelled always aborts the run, unconditionally — `on_fail =
+            // "continue"` is a policy about tolerating a step's own failure,
+            // not about overriding an operator's explicit stop.
+            abort: status == RunStatus::Cancelled
+                || (status == RunStatus::Failed && !matches!(step.on_fail, OnFail::Continue)),
             produced,
             outputs: step_outputs.clone(),
             row: StepStatus {
@@ -4906,18 +5233,16 @@ impl PipelineRunner {
     /// leg for a remote run that reached terminal Success while the daemon was
     /// down — see [`Self::resume_terminal_publish_for_remote_step`].
     ///
-    /// Outcome selection keys off `work_status` (steps + sidecars, snapshotted
-    /// before `finally`), so a flaky teardown never redirects `on_success` →
-    /// `on_fail`.
+    /// The caller selects `outcomes` off the *work* status (steps + sidecars,
+    /// snapshotted before `finally`), so a flaky teardown never redirects
+    /// `on_success` → `on_fail`. `run_inner` also calls this a second time for
+    /// a failed run, with only the `per_leg` outcomes and only the whole legs'
+    /// artifacts (R560-F15).
     async fn dispatch_terminal_outcomes(
         &self,
-        work_status: RunStatus,
+        outcomes: &[Outcome],
         produced: &[ProducedArtifact],
     ) -> Result<(), RunnerError> {
-        let outcomes = match work_status {
-            RunStatus::Success => &self.pipeline.on_success,
-            _ => &self.pipeline.on_fail,
-        };
 
         // Terminal outcomes operate on the run's produced artifacts, resolved
         // against the run's POSITIONED workspace once, so relative paths work
@@ -4980,6 +5305,8 @@ impl PipelineRunner {
                     prefix,
                     base_url,
                     require_explicit_version,
+                    // Consumed by `run_inner`'s outcome selection, not here.
+                    per_leg: _,
                 } => {
                     // SubPipeline children with `propagate.produces = true`
                     // have their publish suppressed — the parent owns the
@@ -5127,7 +5454,7 @@ impl PipelineRunner {
         // and may already be reaped", and destroying the record would remove
         // the operator's last chance at those bytes.
         self.reap_remote_workload(forge_id, &step.name).await;
-        self.dispatch_terminal_outcomes(RunStatus::Success, &produced)
+        self.dispatch_terminal_outcomes(&self.pipeline.on_success, &produced)
             .await
     }
 
@@ -5396,12 +5723,18 @@ impl PipelineRunner {
             parent_run_id: Some(self.run_id.clone()),
             // R755: mirrors the step's own opt-out (see the field doc) so
             // `run_inner`'s positioning skip can see it on this instance.
-            own_workspace: cfg.own_workspace,
+            // R887: unset means inherit, same as an explicit `false` — the
+            // case where that default would be a silent mis-composition is
+            // refused at load time by `validate_sub_pipeline_graph`, not
+            // guessed at here.
+            own_workspace: cfg.own_workspace.unwrap_or(false),
             // Inherited, not reset: a grandchild is exactly as invisible as a
             // child was, and `release-wizard → release-check → check →
             // cargo-test` is three levels deep.
             child_event_factory: self.child_event_factory.clone(),
+            child_abort_hook: self.child_abort_hook.clone(),
             index_offset: 0,
+            steps_are_subset: false,
             // Inherit so a SubPipeline whose child is a gha-workflow
             // step still honors the operator's matrix selection.
             gha_matrix_subset: self.gha_matrix_subset.clone(),
@@ -5482,8 +5815,37 @@ impl PipelineRunner {
             at: Utc::now(),
         });
 
-        // Async recursion needs explicit boxing.
-        let outcome = Box::pin(child_runner.run_inner()).await;
+        // Spawned (not a bare `Box::pin(...).await`) so a nested child can be
+        // cancelled independently of its ancestors: `qed.cancel
+        // <child_run_id>` needs a real task to abort, not a future buried
+        // inline in the parent's own poll tree. `child_abort_hook` — if the
+        // host installed one — is called with the fresh `AbortHandle` right
+        // after spawn, before anything can race a cancel arriving between
+        // "child exists" and "child is abortable". A declined hook (no
+        // daemon, `yah qed run` headless) leaves the child exactly as
+        // uncancellable-on-its-own as it was before this existed — cancelling
+        // the parent's task still tears the whole recursion down via drop.
+        let abort_hook = self.child_abort_hook.clone();
+        // `run_inner()` already returns `Pin<Box<dyn Future + Send>>` (see its
+        // own doc) — no extra boxing needed here, just await it inside the
+        // spawned task.
+        let join = tokio::spawn(async move { child_runner.run_inner().await });
+        if let Some(hook) = &abort_hook {
+            hook(&child_run_id, join.abort_handle());
+        }
+        let outcome = match join.await {
+            Ok(result) => result,
+            // `is_cancelled()` is the abort path (a targeted `qed.cancel` on
+            // this child, or a `qed.cancel` on an ancestor that walked the
+            // descendant tree and aborted this one too) — never a panic, so
+            // it's the ONLY JoinError variant translated to `Cancelled`
+            // rather than a generic step failure.
+            Err(join_err) if join_err.is_cancelled() => Err(RunnerError::Cancelled),
+            Err(join_err) => Err(RunnerError::StepFailed {
+                step: step.name.clone(),
+                msg: format!("sub-pipeline task panicked: {join_err}"),
+            }),
+        };
         // R719-F7: whatever lane the child left the run standing in — its own,
         // or the fleet lane if its last step offloaded — stand back in ours
         // before returning to the step loop. Same discipline as the R622 manual
@@ -5537,6 +5899,16 @@ impl PipelineRunner {
                     .flatten(),
                 needs: Vec::new(),
             }));
+        }
+
+        if meta.status == RunStatus::Cancelled {
+            // The child itself came back Cancelled without this step's own
+            // task ever being aborted — e.g. `qed.cancel` targeted a
+            // GRANDCHILD, which bubbled up to this child's own `run_inner`
+            // (same check, one level down) before we ever awaited the
+            // JoinHandle above. Bubble it up one more level rather than
+            // reporting it as a plain step failure.
+            return Err(RunnerError::Cancelled);
         }
 
         if meta.status != RunStatus::Success {
@@ -6163,6 +6535,90 @@ impl PipelineRunner {
                 step.name,
             )));
         };
+        // R906-F2 — refuse a late operator gate before parking, not after. The
+        // authoring-time lint only warns (a pipeline may legitimately be meant
+        // to run attended); this is where a run that would actually strand a
+        // human behind a compile fails instead. Same predicate as the lint
+        // (`operator_gate_is_late`), so the two verdicts cannot diverge.
+        //
+        // `ManualParkRequest` carries no audience and needs none — by the time
+        // one exists the park has already happened.
+        //
+        // Placed AHEAD of the `advance` probe, deliberately. A late operator
+        // gate is a pipeline authoring defect, and a defect that only surfaces
+        // on the runs where some unrelated shell predicate happened to fail is
+        // a defect that ships: the release wizard's `advance` auto-advances
+        // every rerun of an already-acked version, so a check behind it would
+        // stay silent on exactly the reruns. Failing deterministically is what
+        // makes `allow_late_operator_block` a deliberate act rather than a
+        // thing nobody discovered they needed.
+        if cfg.audience == crate::types::ManualAudience::Operator
+            && !self.pipeline.allow_late_operator_block
+        {
+            // A child run is late by construction: whatever invoked it ran
+            // first, so a gate nested inside a sub-pipeline can never be the
+            // root run's first manual step. No predicate can see that from the
+            // child's own steps, which is why it is checked here.
+            if self.parent_run_id.is_some() {
+                return Err(RunnerError::InvalidConfig(format!(
+                    "step `{}`: `audience = \"operator\"` inside a sub-pipeline run \
+                     (`{}`, invoked as a child) is late by construction — the parent \
+                     reached this pipeline by running everything ahead of it, so this \
+                     gate cannot be the run's first manual step and the human is being \
+                     asked to authorize a run at an unknown depth into it. Hoist the \
+                     gate into the root pipeline ahead of the sub-pipeline step, make \
+                     it `audience = \"agent\"`, or set \
+                     `allow_late_operator_block = true` on `{}`.",
+                    step.name, self.pipeline.name, self.pipeline.name,
+                )));
+            }
+            // A run whose step list is not the AUTHORED list is late by
+            // construction, for the same reason and with more force — this is
+            // the arm that holds on the paths an operator gate actually meets
+            // in anger. Two of them, both trimming `pipeline.steps` before the
+            // runner is built (app/yah/cli qed.rs + camp.rs):
+            //
+            //   * a resume-from-step run `drain(0..from)`s the leading steps
+            //     and hands over the offset as a bare `usize` — rerunning a
+            //     release is routine;
+            //   * a `selected_steps` name-subset filter `retain`s an arbitrary
+            //     set, which no offset can even describe.
+            //
+            // Either way the predicate below would reason over a list missing
+            // exactly the steps that were skipped, and clear a gate whose
+            // compiling predecessor was among them. A trimmed run cannot prove
+            // its gate was first, so it does not get to claim it was.
+            //
+            // The cost is a false positive on a legitimately-first gate that
+            // is not at index 0. `allow_late_operator_block` is the escape for
+            // this arm as for the others, and that is the right way round:
+            // erring toward refusing beats erring toward stranding a human
+            // deep inside a rerun.
+            if !self.steps_are_complete() {
+                let how = match (self.index_offset, self.steps_are_subset) {
+                    (0, _) => "a name-subset selection".to_string(),
+                    (n, false) => format!("resumed from step {n}"),
+                    (n, true) => format!("resumed from step {n}, then narrowed to a name subset"),
+                };
+                return Err(RunnerError::InvalidConfig(format!(
+                    "step `{}`: `audience = \"operator\"` in a run whose step list is \
+                     not the pipeline as authored ({}) is late by construction — the \
+                     omitted steps are not reachable from the runner, so this gate \
+                     cannot be shown to be the run's first, and a trimmed rerun is \
+                     exactly the path that would otherwise slip past the check. Run \
+                     `{}` whole, make the gate `audience = \"agent\"`, or set \
+                     `allow_late_operator_block = true` on `{}`.",
+                    step.name, how, self.pipeline.name, self.pipeline.name,
+                )));
+            }
+            if let Some(finding) = crate::types::operator_gate_is_late(
+                &self.pipeline,
+                &step.name,
+                &*self.sub_pipeline_resolver,
+            ) {
+                return Err(RunnerError::InvalidConfig(finding.to_string()));
+            }
+        }
         let cwd = self.resolve_camp_root()?;
         let advance = cfg
             .advance
@@ -6266,6 +6722,9 @@ impl PipelineRunner {
                 name: step.name.clone(),
                 form_id: id.clone(),
                 advance: advance.map(str::to_string),
+                audience: cfg.audience,
+                prompt: cfg.prompt.clone(),
+                terminal: cfg.terminal.clone(),
                 at: Utc::now(),
             });
             self.emit(QedEvent::StepOutput {
@@ -7155,11 +7614,16 @@ fn inputs_to_value(inputs: &std::collections::HashMap<String, String>) -> yah_qe
 /// caller's scope; nothing holds `&mut` at drop time) — [`PipelineRunner::run_inner`]
 /// only learns the run's terminal status *after* the guard was created, so
 /// the flag has to be settable through a shared reference.
+///
+/// R874-B2: `locked` records that this run holds a `git worktree lock` on the
+/// tree (see [`worktree_lock_reason`]). Drop releases it on every path, retained
+/// or not — the lock means "a run is building in here", and past drop none is.
 #[derive(Debug)]
 struct WorktreeGuard {
     camp_root: std::path::PathBuf,
     worktree: std::path::PathBuf,
     retain: std::cell::Cell<bool>,
+    locked: bool,
 }
 
 impl WorktreeGuard {
@@ -7171,6 +7635,14 @@ impl WorktreeGuard {
 
 impl Drop for WorktreeGuard {
     fn drop(&mut self) {
+        // Before the remove, too: `git worktree remove --force` refuses a
+        // locked tree.
+        if self.locked {
+            let _ = run_git(
+                &self.camp_root,
+                &["worktree", "unlock", &self.worktree.to_string_lossy()],
+            );
+        }
         if self.retain.get() {
             return;
         }
@@ -7180,6 +7652,42 @@ impl Drop for WorktreeGuard {
             .arg(&self.worktree)
             .output();
     }
+}
+
+/// The `git worktree lock --reason` a qed run stamps on the isolated worktree
+/// it builds in (R874-B2). Carries the pid of the process doing the build, so a
+/// reader can tell a live lock from one a crashed run left behind — git keeps
+/// the lock forever otherwise. The retention sweep (yah's `qed_worktrees`)
+/// parses it back with [`parse_worktree_lock_reason`]; keep the two in step.
+pub fn worktree_lock_reason(run_id: &str, pid: u32) -> String {
+    format!("qed-run {run_id} pid {pid}")
+}
+
+/// Inverse of [`worktree_lock_reason`]: `(run_id, pid)`, or `None` for any
+/// lock qed did not write (an operator's bare `git worktree lock`).
+pub fn parse_worktree_lock_reason(reason: &str) -> Option<(&str, u32)> {
+    let rest = reason.trim().strip_prefix("qed-run ")?;
+    let (run_id, pid) = rest.rsplit_once(" pid ")?;
+    let pid = pid.parse().ok()?;
+    (!run_id.is_empty()).then_some((run_id, pid))
+}
+
+/// Lock `worktree` on behalf of `run_id`, held by this process.
+fn lock_worktree(
+    camp_root: &std::path::Path,
+    worktree: &std::path::Path,
+    run_id: &str,
+) -> Result<(), String> {
+    run_git(
+        camp_root,
+        &[
+            "worktree",
+            "lock",
+            "--reason",
+            &worktree_lock_reason(run_id, std::process::id()),
+            &worktree.to_string_lossy(),
+        ],
+    )
 }
 
 /// Run a git command in `dir`, mapping a non-zero exit to its trimmed stderr.
@@ -9251,7 +9759,7 @@ mod tests {
         publish.needs = Some(vec!["build".into()]);
         let meta = PipelineRunner::new(make_pipeline("resumed", vec![publish]))
             .with_camp_root(camp.path().to_path_buf())
-            .with_index_offset(3)
+            .with_step_selection(3, false)
             .run()
             .await
             .unwrap();
@@ -9650,6 +10158,7 @@ mod tests {
 
     fn one_step_pipeline(name: &str, argv: Vec<String>) -> Pipeline {
         Pipeline {
+            allow_late_operator_block: false,
             participants: None,
             max_parallel: None,
             description: None,
@@ -9657,6 +10166,7 @@ mod tests {
             name: name.to_string(),
             label: name.to_string(),
             steps: vec![crate::types::QedStep {
+                            expect_slow: false,
                             participant: None,
                 needs: None,
                 resource: None,
@@ -11033,6 +11543,7 @@ mod tests {
 
         let mut pipeline = one_step_pipeline("test-abort", vec!["false".to_string()]);
         pipeline.steps.push(crate::types::QedStep {
+                                expect_slow: false,
                                 participant: None,
             needs: None,
             resource: None,
@@ -11150,6 +11661,7 @@ mod tests {
         argv: Vec<String>,
     ) -> Pipeline {
         Pipeline {
+            allow_late_operator_block: false,
             participants: None,
             max_parallel: None,
             description: None,
@@ -11157,6 +11669,7 @@ mod tests {
             name: "test".to_string(),
             label: "test".to_string(),
             steps: vec![crate::types::QedStep {
+                            expect_slow: false,
                             participant: None,
                 needs: None,
                 resource: None,
@@ -11289,6 +11802,7 @@ mod tests {
                 prefix: None,
                 base_url: None,
                 require_explicit_version: false,
+                per_leg: false,
             }],
             vec![],
             vec!["true".to_string()],
@@ -11328,6 +11842,7 @@ mod tests {
                 prefix: None,
                 base_url: None,
                 require_explicit_version: true,
+                per_leg: false,
             }],
             vec![],
             vec!["true".to_string()],
@@ -11362,6 +11877,7 @@ mod tests {
                 prefix: None,
                 base_url: None,
                 require_explicit_version: true,
+                per_leg: false,
             }],
             vec![],
             vec!["true".to_string()],
@@ -11408,6 +11924,7 @@ mod tests {
                 prefix: None,
                 base_url: None,
                 require_explicit_version: false,
+                per_leg: false,
             }],
             vec![],
             vec!["build-v8.sh".to_string()],
@@ -11462,6 +11979,7 @@ mod tests {
                 prefix: None,
                 base_url: None,
                 require_explicit_version: false,
+                per_leg: false,
             }],
             vec![],
             vec!["build-v8.sh".to_string()],
@@ -11505,6 +12023,7 @@ mod tests {
                 prefix: None,
                 base_url: None,
                 require_explicit_version: false,
+                per_leg: false,
             }],
             vec!["false".to_string()],
         );
@@ -11607,6 +12126,7 @@ mod tests {
                     prefix: None,
                     base_url: None,
                     require_explicit_version: false,
+                    per_leg: false,
                 },
             ],
             vec![],
@@ -13239,6 +13759,7 @@ mod tests {
             checklist: vec![],
             // Tight cadence so the auto-advance race resolves inside a test.
             advance_poll_secs: 1,
+            audience: crate::types::ManualAudience::Agent,
         }
     }
 
@@ -13331,18 +13852,26 @@ mod tests {
         )));
     }
 
-    /// R605-B17 regression. `commit-and-tag`'s real `advance` predicate
-    /// (`diff -q <run-token> <freeze-ack> && git describe --tags --exact-match`,
-    /// `.yah/qed/yah-release-wizard.toml`) must not be satisfiable by an ack
-    /// left over from a PRIOR run — only one written during THIS run. Before
-    /// this fix `advance` was just `git describe --tags --exact-match`, which
-    /// a tag cut by an EARLIER run satisfies forever after, so the very
-    /// probe-before-park optimization exercised by
-    /// `manual_advance_already_satisfied_skips_the_park` above skipped the
-    /// human entirely on every rerun and release-check re-tested stale bytes
-    /// — exactly what happened to the 0.8.32 release (tree fix authored
+    /// A manual `advance` must not be satisfiable by an artifact a PRIOR run
+    /// left behind — only by one produced during THIS run. The predicate here
+    /// is the nonce-file pair R605-B17 gave the release wizard's
+    /// `commit-and-tag` gate (`diff -q <run-token> <freeze-ack> && git describe
+    /// --tags --exact-match`); NOTE that the wizard no longer uses it, because
+    /// on 2026-09-14 that gate stopped being manual at all and became a
+    /// mechanical `git commit -a` + `git tag -f`. The property outlived the
+    /// predicate, so the test stays: it is the only coverage of
+    /// prior-run-artifact staleness at the `probe_manual_advance` level, and
+    /// the next manual step someone writes will hit the same trap.
+    ///
+    /// Why it mattered: before B17, `commit-and-tag`'s advance was just `git
+    /// describe --tags --exact-match`, which a tag cut by an EARLIER run
+    /// satisfies forever after — so the probe-before-park optimization
+    /// exercised by `manual_advance_already_satisfied_skips_the_park` above
+    /// skipped the human on every rerun and release-check re-tested stale
+    /// bytes. That is what happened to the 0.8.32 release (tree fix authored
     /// 18:13-18:32 PDT, freeze commit 17:25 PDT, rerun at 02:56Z tested the
-    /// 17:25 bytes a second time with nothing on screen saying why).
+    /// 17:25 bytes a second time with nothing on screen saying why), and then
+    /// to 0.8.39 five more times, which is what retired the gate.
     #[tokio::test]
     async fn manual_advance_ignores_an_ack_left_by_a_prior_run() {
         let tmp = tempfile::tempdir().unwrap();
@@ -13651,6 +14180,237 @@ mod tests {
         );
     }
 
+    /// R906-F2 — an `audience = "operator"` gate with a compile ahead of it
+    /// fails the run *before* it reaches a human. Note the satisfied `advance`:
+    /// this would otherwise be the happy path, which is the point — the check
+    /// sits ahead of the probe so an authoring defect cannot hide behind a
+    /// predicate that happens to hold.
+    #[tokio::test]
+    async fn a_late_operator_gate_fails_the_run_instead_of_parking() {
+        let mut cfg = manual_cfg("Authorize this release.", Some("true"));
+        cfg.audience = crate::types::ManualAudience::Operator;
+        // `sh -c "echo cargo"` costs nothing to run and still trips the argv
+        // scan on its `cargo` token — the detector reads argv, not exit codes.
+        let steps = vec![
+            mk_step("build", &["sh", "-c", "echo cargo"]),
+            mk_manual("authorize-release", cfg),
+        ];
+        let gate = Arc::new(ScriptedGate::new(vec![]));
+        let parks = Arc::clone(&gate.parks);
+
+        let meta = PipelineRunner::new(bg_pipeline("m-late-gate", steps))
+            .with_manual_gate(gate)
+            .run()
+            .await
+            .unwrap();
+
+        assert_eq!(meta.status, RunStatus::Failed);
+        let err = meta.steps[1].error.as_deref().unwrap_or_default();
+        assert!(
+            err.contains("authorize-release")
+                && err.contains("`build`")
+                && err.contains("allow_late_operator_block"),
+            "the failure must name the gate, the compiling step and the escape; got {err:?}"
+        );
+        assert!(
+            parks.lock().unwrap().is_empty(),
+            "nobody should have been asked"
+        );
+    }
+
+    /// The same pipeline with the opt-out set runs through — one flag, both
+    /// halves (the loader stops warning, the runner stops refusing).
+    #[tokio::test]
+    async fn allow_late_operator_block_lets_a_late_gate_run() {
+        let mut cfg = manual_cfg("Authorize this release.", Some("true"));
+        cfg.audience = crate::types::ManualAudience::Operator;
+        let steps = vec![
+            mk_step("build", &["sh", "-c", "echo cargo"]),
+            mk_manual("authorize-release", cfg),
+        ];
+        let mut pipeline = bg_pipeline("m-late-gate-allowed", steps);
+        pipeline.allow_late_operator_block = true;
+
+        let meta = PipelineRunner::new(pipeline)
+            .with_manual_gate(Arc::new(ScriptedGate::new(vec![])))
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(meta.status, RunStatus::Success);
+    }
+
+    /// R906-F2 — a RESUMED run cannot prove its operator gate was first, so it
+    /// is refused even when the surviving steps look clean. Note the pipeline
+    /// here is exactly the shape the rule asks for — gate at index 0, nothing
+    /// ahead of it — and it still fails: what the runner holds is a truncated
+    /// list, and the steps the resume skipped are not reachable from it.
+    ///
+    /// This is the path that matters. A release rerun is routine, and it is the
+    /// one way an operator gate would otherwise sail past the guard.
+    #[tokio::test]
+    async fn an_operator_gate_in_a_resumed_run_is_late_by_construction() {
+        let mut cfg = manual_cfg("Authorize this release.", Some("true"));
+        cfg.audience = crate::types::ManualAudience::Operator;
+        let gate = Arc::new(ScriptedGate::new(vec![]));
+        let parks = Arc::clone(&gate.parks);
+
+        let meta = PipelineRunner::new(bg_pipeline(
+            "m-resumed-gate",
+            vec![mk_manual("authorize-release", cfg)],
+        ))
+        .with_manual_gate(gate)
+        .with_step_selection(3, false)
+        .run()
+        .await
+        .unwrap();
+
+        assert_eq!(meta.status, RunStatus::Failed);
+        let err = meta.steps[0].error.as_deref().unwrap_or_default();
+        assert!(
+            err.contains("authorize-release")
+                && err.contains("resumed from step 3")
+                && err.contains("allow_late_operator_block"),
+            "the failure must name the gate, the resume and the escape; got {err:?}"
+        );
+        assert!(
+            parks.lock().unwrap().is_empty(),
+            "nobody should have been asked"
+        );
+    }
+
+    /// R906-F2 — a NAME-SUBSET run (`selected_steps`) is refused for the same
+    /// reason as a resume, and this is the arm an offset cannot express: the
+    /// filter `retain`s arbitrary steps, so `index_offset` is still 0 and the
+    /// surviving list looks, from inside the runner, exactly like a complete
+    /// one. `with_step_selection`'s second argument is the only thing that
+    /// distinguishes them.
+    #[tokio::test]
+    async fn an_operator_gate_in_a_name_subset_run_is_late_by_construction() {
+        let mut cfg = manual_cfg("Authorize this release.", Some("true"));
+        cfg.audience = crate::types::ManualAudience::Operator;
+        let gate = Arc::new(ScriptedGate::new(vec![]));
+        let parks = Arc::clone(&gate.parks);
+
+        let meta = PipelineRunner::new(bg_pipeline(
+            "m-subset-gate",
+            vec![mk_manual("authorize-release", cfg)],
+        ))
+        .with_manual_gate(gate)
+        .with_step_selection(0, true)
+        .run()
+        .await
+        .unwrap();
+
+        assert_eq!(meta.status, RunStatus::Failed);
+        let err = meta.steps[0].error.as_deref().unwrap_or_default();
+        assert!(
+            err.contains("authorize-release")
+                && err.contains("name-subset selection")
+                && err.contains("allow_late_operator_block"),
+            "the failure must name the gate, the subset and the escape; got {err:?}"
+        );
+        assert!(
+            parks.lock().unwrap().is_empty(),
+            "nobody should have been asked"
+        );
+    }
+
+    /// The same run from the start is fine — proving the refusals above are the
+    /// trimmed-list arm and not the gate itself.
+    #[tokio::test]
+    async fn the_same_operator_gate_run_from_the_start_is_accepted() {
+        let mut cfg = manual_cfg("Authorize this release.", Some("true"));
+        cfg.audience = crate::types::ManualAudience::Operator;
+        let meta = PipelineRunner::new(bg_pipeline(
+            "m-fresh-gate",
+            vec![mk_manual("authorize-release", cfg)],
+        ))
+        .with_manual_gate(Arc::new(ScriptedGate::new(vec![])))
+        .run()
+        .await
+        .unwrap();
+        assert_eq!(meta.status, RunStatus::Success);
+    }
+
+    /// R906-F2 — an operator gate reached as a SUB-PIPELINE CHILD is refused.
+    /// The child's own steps look immaculate (the gate is its only step); the
+    /// lateness is a property of how the child was reached, which is why the
+    /// runner checks `parent_run_id` rather than asking the predicate.
+    #[tokio::test]
+    async fn an_operator_gate_inside_a_child_run_is_late_by_construction() {
+        let mut cfg = manual_cfg("Authorize this release.", Some("true"));
+        cfg.audience = crate::types::ManualAudience::Operator;
+        let child = make_pipeline("child", vec![mk_manual("authorize-release", cfg)]);
+
+        let mut map = std::collections::HashMap::new();
+        map.insert("builtin:child".to_string(), child);
+        let resolver: Arc<dyn SubPipelineResolver + Send + Sync> = Arc::new(MapResolver(map));
+
+        let gate = Arc::new(ScriptedGate::new(vec![]));
+        let parks = Arc::clone(&gate.parks);
+        let root = make_pipeline(
+            "root",
+            vec![sub_step(
+                "descend",
+                SubPipelineRef::Builtin("child".into()),
+                false,
+            )],
+        );
+
+        let meta = PipelineRunner::new(root)
+            .with_sub_pipeline_resolver(resolver)
+            .with_manual_gate(gate)
+            .run()
+            .await
+            .unwrap();
+
+        assert_eq!(meta.status, RunStatus::Failed);
+        // The parent summarises rather than forwarding the child's message, so
+        // assert on what it does carry: which child, and which of its steps.
+        let err = meta.steps[0].error.as_deref().unwrap_or_default();
+        assert!(
+            err.contains("sub-pipeline `child`") && err.contains("`authorize-release`"),
+            "the parent's step error must name the child and the refusing step; got {err:?}"
+        );
+        assert!(
+            parks.lock().unwrap().is_empty(),
+            "nobody should have been asked"
+        );
+    }
+
+    /// Control for the test above: the identical nesting with the default
+    /// `audience = "agent"` runs through. Without this, the failure there could
+    /// equally be "a manual step inside a sub-pipeline is broken" — it is the
+    /// audience that makes the child's gate a refusal.
+    #[tokio::test]
+    async fn an_agent_audience_gate_inside_a_child_run_is_accepted() {
+        let child = make_pipeline(
+            "child",
+            vec![mk_manual(
+                "authorize-release",
+                manual_cfg("Authorize this release.", Some("true")),
+            )],
+        );
+        let mut map = std::collections::HashMap::new();
+        map.insert("builtin:child".to_string(), child);
+        let resolver: Arc<dyn SubPipelineResolver + Send + Sync> = Arc::new(MapResolver(map));
+
+        let meta = PipelineRunner::new(make_pipeline(
+            "root",
+            vec![sub_step(
+                "descend",
+                SubPipelineRef::Builtin("child".into()),
+                false,
+            )],
+        ))
+        .with_sub_pipeline_resolver(resolver)
+        .with_manual_gate(Arc::new(ScriptedGate::new(vec![])))
+        .run()
+        .await
+        .unwrap();
+        assert_eq!(meta.status, RunStatus::Success);
+    }
+
     /// Headless with a *satisfied* condition still passes — that is the whole
     /// point of `advance` being verifiable rather than an honour-system button.
     #[tokio::test]
@@ -13680,10 +14440,13 @@ mod tests {
         );
     }
 
-    /// R605-B18. `push-tag`'s real `advance` predicate (`.yah/qed/
-    /// yah-release-wizard.toml`) must compare the OBJECT origin's tag
-    /// resolves to against the local tag's object, not just that a
-    /// same-named ref exists on origin. Before this fix `advance` was
+    /// R605-B18. A "the tag reached origin" check must compare the OBJECT
+    /// origin's tag resolves to against the local tag's object, not just that a
+    /// same-named ref exists on origin. This shell is verbatim the wizard's
+    /// `push-tag` check; since 2026-09-14 it runs there as a post-push
+    /// assertion in a mechanical step rather than as a manual `advance`, but
+    /// `probe_manual_advance` is still the harness that can evaluate it against
+    /// a real repo pair, so the test keeps that shape. Before this fix it was
     /// `git ls-remote --exit-code --tags origin "$(git describe --tags
     /// --exact-match)"` — a name-only check. R605-B17 made `commit-and-tag`
     /// instruct a delete-and-recut under the SAME version name whenever a
@@ -14453,6 +15216,7 @@ remote_sha="$(git ls-remote --tags origin | awk -v peeled="refs/tags/${name}^{}"
 
     fn build_image_pipeline(image: &str) -> Pipeline {
         Pipeline {
+            allow_late_operator_block: false,
             participants: None,
             max_parallel: None,
             description: None,
@@ -14460,6 +15224,7 @@ remote_sha="$(git ls-remote --tags origin | awk -v peeled="refs/tags/${name}^{}"
             name: "image".to_string(),
             label: "Bake image".to_string(),
             steps: vec![crate::types::QedStep {
+                            expect_slow: false,
                             participant: None,
                 needs: None,
                 resource: None,
@@ -14722,6 +15487,7 @@ description = "smoke test image"
     /// don't depend on a real cross build.
     fn package_native_tarball_pipeline(image: &str, binary_rel: &str, triple: &str) -> Pipeline {
         Pipeline {
+            allow_late_operator_block: false,
             participants: None,
             max_parallel: None,
             description: None,
@@ -14729,6 +15495,7 @@ description = "smoke test image"
             name: "pack".to_string(),
             label: "Package native tarball".to_string(),
             steps: vec![crate::types::QedStep {
+                            expect_slow: false,
                             participant: None,
                 needs: None,
                 resource: None,
@@ -14998,6 +15765,7 @@ produces    = ["native-tarball"]
 
     fn musl_preflight_pipeline(package: &str) -> Pipeline {
         Pipeline {
+            allow_late_operator_block: false,
             participants: None,
             max_parallel: None,
             description: None,
@@ -15005,6 +15773,7 @@ produces    = ["native-tarball"]
             name: "preflight".to_string(),
             label: "musl-static preflight".to_string(),
             steps: vec![crate::types::QedStep {
+                            expect_slow: false,
                             participant: None,
                 needs: None,
                 resource: None,
@@ -15137,6 +15906,7 @@ produces    = ["native-tarball"]
     /// the same image+triple → on-disk-path convention both steps share.
     fn pack_and_sign_pipeline(image: &str, binary_rel: &str, triple: &str) -> Pipeline {
         Pipeline {
+            allow_late_operator_block: false,
             participants: None,
             max_parallel: None,
             description: None,
@@ -15145,6 +15915,7 @@ produces    = ["native-tarball"]
             label: "Package + sign native tarball".to_string(),
             steps: vec![
                 crate::types::QedStep {
+                    expect_slow: false,
                     participant: None,
                     needs: None,
                     resource: None,
@@ -15187,6 +15958,7 @@ produces    = ["native-tarball"]
                     outputs: Vec::new(),
                 },
                 crate::types::QedStep {
+                    expect_slow: false,
                     participant: None,
                     needs: None,
                     resource: None,
@@ -15251,6 +16023,7 @@ produces    = ["native-tarball"]
     /// already exist" gate without coupling to the packaging step.
     fn sign_only_pipeline(image: &str, triple: &str) -> Pipeline {
         Pipeline {
+            allow_late_operator_block: false,
             participants: None,
             max_parallel: None,
             description: None,
@@ -15258,6 +16031,7 @@ produces    = ["native-tarball"]
             name: "sign".to_string(),
             label: "Sign native tarball".to_string(),
             steps: vec![crate::types::QedStep {
+                            expect_slow: false,
                             participant: None,
                 needs: None,
                 resource: None,
@@ -15478,6 +16252,7 @@ produces    = ["native-tarball"]
 
     fn shell_step(name: &str, argv: Vec<&str>) -> crate::types::QedStep {
         crate::types::QedStep {
+            expect_slow: false,
             needs: None,
             resource: None,
             inputs: Vec::new(),
@@ -15872,6 +16647,7 @@ produces    = ["native-tarball"]
         propagate_produces: bool,
     ) -> crate::types::QedStep {
         crate::types::QedStep {
+            expect_slow: false,
             participant: None,
             needs: None,
             resource: None,
@@ -15910,7 +16686,7 @@ produces    = ["native-tarball"]
                     outputs: Vec::new(),
                 },
                 opaque: false,
-                own_workspace: false,
+                own_workspace: None,
             }),
             outputs: Vec::new(),
             gha_workflow: None,
@@ -15926,6 +16702,7 @@ produces    = ["native-tarball"]
 
     fn make_pipeline(name: &str, steps: Vec<crate::types::QedStep>) -> Pipeline {
         Pipeline {
+            allow_late_operator_block: false,
             max_parallel: None,
             description: None,
             tags: Vec::new(),
@@ -16136,6 +16913,93 @@ produces    = ["native-tarball"]
         assert!(!ws.exists(), "an unretained guard on the resumed run still tears down normally");
     }
 
+    /// The lock reason `git worktree list --porcelain` reports for `wt`, if
+    /// locked. Paths compare canonicalized: `$TMPDIR` is a symlink on macOS.
+    fn worktree_lock_of(repo: &std::path::Path, wt: &std::path::Path) -> Option<String> {
+        let out = std::process::Command::new("git")
+            .current_dir(repo)
+            .args(["worktree", "list", "--porcelain"])
+            .output()
+            .unwrap();
+        let canon = |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let want = canon(wt);
+        let mut in_record = false;
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            if let Some(path) = line.strip_prefix("worktree ") {
+                in_record = canon(std::path::Path::new(path)) == want;
+            } else if in_record {
+                if let Some(reason) = line.strip_prefix("locked") {
+                    return Some(reason.trim_start().to_string());
+                }
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn worktree_lock_reason_round_trips_and_ignores_foreign_locks() {
+        let reason = worktree_lock_reason("3c867d09-3a5c", 4242);
+        assert_eq!(parse_worktree_lock_reason(&reason), Some(("3c867d09-3a5c", 4242)));
+        // An operator's bare lock, or one with prose, is not ours to judge.
+        assert_eq!(parse_worktree_lock_reason(""), None);
+        assert_eq!(parse_worktree_lock_reason("on an external disk"), None);
+        assert_eq!(parse_worktree_lock_reason("qed-run  pid 1"), None);
+        assert_eq!(parse_worktree_lock_reason("qed-run abc pid nope"), None);
+    }
+
+    /// R874-B2: an isolated run holds a `git worktree lock` naming itself for
+    /// as long as it builds, released on drop whether or not the tree is
+    /// retained. That lock is what the daemon's retention sweep reads to leave
+    /// a resumed run's tree alone — the SOURCE run's meta keeps tracking the
+    /// path, and the sweep cannot otherwise see that a newer run is in it.
+    /// A second resume of the same source must not share the tree.
+    #[test]
+    fn workspace_isolated_run_locks_its_worktree_and_a_concurrent_resume_cannot_share_it() {
+        let repo = init_git_repo();
+        let runner =
+            PipelineRunner::new(pipeline_with_workspace(crate::types::WorkspaceMode::Isolated))
+                .with_camp_root(repo.path().to_path_buf());
+        let (ws, guard) = runner.prepare_workspace(repo.path()).unwrap();
+        let lock = worktree_lock_of(repo.path(), &ws).expect("a fresh isolated worktree is locked");
+        assert_eq!(
+            parse_worktree_lock_reason(&lock),
+            Some((runner.run_id.as_str(), std::process::id()))
+        );
+        guard.unwrap().retain();
+        assert_eq!(
+            worktree_lock_of(repo.path(), &ws),
+            None,
+            "a retained worktree's lock is released with the run"
+        );
+
+        let resume = || {
+            PipelineRunner::new(pipeline_with_workspace(crate::types::WorkspaceMode::Isolated))
+                .with_camp_root(repo.path().to_path_buf())
+                .with_resume_workspace(ws.clone())
+        };
+        let first = resume();
+        let (first_ws, first_guard) = first.prepare_workspace(repo.path()).unwrap();
+        assert_eq!(first_ws, ws);
+        assert_eq!(
+            worktree_lock_of(repo.path(), &ws)
+                .as_deref()
+                .and_then(parse_worktree_lock_reason)
+                .map(|(id, _)| id.to_string()),
+            Some(first.run_id.clone()),
+            "the lock names the RESUMED run, not the one the path was minted from"
+        );
+
+        let second = resume();
+        let (second_ws, second_guard) = second.prepare_workspace(repo.path()).unwrap();
+        assert_ne!(second_ws, ws, "a held retained worktree degrades the second resume to a fresh one");
+        drop(second_guard);
+        assert!(ws.exists(), "the second run's teardown must not touch the first run's tree");
+        assert!(worktree_lock_of(repo.path(), &ws).is_some(), "nor release its lock");
+
+        drop(first_guard);
+        assert!(!ws.exists(), "the first resume still tears down normally");
+    }
+
     /// R766, end-to-end: a failed `Isolated` run's meta carries the worktree
     /// path, and a second runner constructed with `with_resume_workspace` off
     /// that path actually sees the first run's filesystem mutation.
@@ -16213,6 +17077,7 @@ produces    = ["native-tarball"]
                 prefix: None,
                 base_url: None,
                 require_explicit_version: false,
+                per_leg: false,
             }],
             vec![],
             // Write the artifact where `produces` says it is — relative to the
@@ -16272,6 +17137,7 @@ produces    = ["native-tarball"]
                 prefix: None,
                 base_url: Some("https://cdn.yah.dev".into()),
                 require_explicit_version: false,
+                per_leg: false,
             }],
             vec![],
             vec![
@@ -16317,6 +17183,7 @@ produces    = ["native-tarball"]
                 prefix: None,
                 base_url: Some("https://cdn.yah.dev".into()),
                 require_explicit_version: false,
+                per_leg: false,
             }],
             vec![],
             vec!["true".into()],
@@ -16599,6 +17466,119 @@ produces    = ["native-tarball"]
         }
     }
 
+    /// R560-F15: records each publish's artifact paths and each `almanac_run`
+    /// name, so a test sees which outcome lists fired and what they carried.
+    #[derive(Default)]
+    struct LegDispatcher {
+        published: Mutex<Vec<Vec<String>>>,
+        almanac: Mutex<Vec<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl OutcomeDispatcher for LegDispatcher {
+        async fn yubaba_deploy(&self, _s: &str, _e: &str) -> Result<(), RunnerError> {
+            Ok(())
+        }
+        async fn almanac_run(&self, p: &str) -> Result<(), RunnerError> {
+            self.almanac.lock().unwrap().push(p.to_string());
+            Ok(())
+        }
+        async fn publish(&self, req: &crate::publish::PublishRequest) -> Result<(), RunnerError> {
+            let paths = req.artifacts.iter().map(|a| a.path.clone()).collect();
+            self.published.lock().unwrap().push(paths);
+            Ok(())
+        }
+    }
+
+    /// mesofact-musl's shape, two steps per leg: x86 = `x86-build` (slow) →
+    /// `x86-stage` (produces); arm = `arm-build` (fails fast) → `arm-stage`
+    /// (produces). The legs share no edge. `on_fail` is an almanac marker.
+    fn two_leg_pipeline(per_leg: bool, dir: &std::path::Path) -> (Pipeline, String, String) {
+        let x86_art = dir.join("mesofact-x86_64.tar.gz");
+        let arm_art = dir.join("mesofact-aarch64.tar.gz");
+        std::fs::write(&x86_art, b"x86").unwrap();
+        std::fs::write(&arm_art, b"arm").unwrap();
+        let (x86_art, arm_art) = (
+            x86_art.to_string_lossy().into_owned(),
+            arm_art.to_string_lossy().into_owned(),
+        );
+        // Slow enough that arm-build has failed before x86-stage is admitted,
+        // so a run-wide abort would strand x86-stage.
+        let mut x86_build = shell_step("x86-build", vec!["sleep", "0.5"]);
+        x86_build.needs = Some(vec![]);
+        let mut x86_stage = producing_step("x86-stage", "mesofact", &x86_art);
+        x86_stage.needs = Some(vec!["x86-build".into()]);
+        let mut arm_build = shell_step("arm-build", vec!["false"]);
+        arm_build.needs = Some(vec![]);
+        let mut arm_stage = producing_step("arm-stage", "mesofact", &arm_art);
+        arm_stage.needs = Some(vec!["arm-build".into()]);
+        let mut p = make_pipeline(
+            "two-legs",
+            vec![x86_build, x86_stage, arm_build, arm_stage],
+        );
+        p.on_success = vec![Outcome::Publish {
+            provider: "r2".into(),
+            bucket: "yah-dev".into(),
+            prefix: None,
+            base_url: None,
+            require_explicit_version: false,
+            per_leg,
+        }];
+        p.on_fail = vec![Outcome::AlmanacRun {
+            pipeline: "on-fail".into(),
+        }];
+        (p, x86_art, arm_art)
+    }
+
+    #[tokio::test]
+    async fn per_leg_publish_ships_the_green_leg_and_still_fails_the_run() {
+        let tmp = TempDir::new().unwrap();
+        let (pipeline, x86_art, _arm_art) = two_leg_pipeline(true, tmp.path());
+        let dispatcher = Arc::new(LegDispatcher::default());
+        let meta = PipelineRunner::new_with_dispatcher(pipeline, dispatcher.clone())
+            .run()
+            .await
+            .unwrap();
+
+        assert_eq!(meta.status, RunStatus::Failed, "a failed leg still fails the run");
+        let row = |name: &str| meta.steps.iter().find(|s| s.name == name).map(|s| s.status);
+        assert_eq!(row("arm-build"), Some(RunStatus::Failed));
+        assert_eq!(row("arm-stage"), None, "the failed leg's dependent is never run");
+        assert_eq!(
+            row("x86-stage"),
+            Some(RunStatus::Success),
+            "the other leg's dependent runs despite arm's abort"
+        );
+        assert_eq!(
+            *dispatcher.almanac.lock().unwrap(),
+            vec!["on-fail".to_string()],
+            "on_fail fires for the failure"
+        );
+        assert_eq!(
+            *dispatcher.published.lock().unwrap(),
+            vec![vec![x86_art]],
+            "exactly one publish, carrying only the green leg's artifact"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_wide_publish_ships_nothing_when_any_leg_fails() {
+        let tmp = TempDir::new().unwrap();
+        let (pipeline, _, _) = two_leg_pipeline(false, tmp.path());
+        let dispatcher = Arc::new(LegDispatcher::default());
+        let meta = PipelineRunner::new_with_dispatcher(pipeline, dispatcher.clone())
+            .run()
+            .await
+            .unwrap();
+
+        assert_eq!(meta.status, RunStatus::Failed);
+        assert!(
+            dispatcher.published.lock().unwrap().is_empty(),
+            "without per_leg a failed leg withholds every publish"
+        );
+        assert_eq!(*dispatcher.almanac.lock().unwrap(), vec!["on-fail".to_string()]);
+    }
+
     #[tokio::test]
     async fn sub_pipeline_resolves_unresolvable_with_clear_error() {
         let root = make_pipeline(
@@ -16699,6 +17679,59 @@ produces    = ["native-tarball"]
         assert_eq!(meta.status, RunStatus::Failed);
     }
 
+    /// Cancelling JUST the nested child's task (never the root's) still
+    /// stops the whole run and reports `Cancelled`, not `Failed` — the
+    /// bubble-up path added for `qed.cancel <nested_child_run_id>`.
+    #[tokio::test]
+    async fn sub_pipeline_child_cancel_bubbles_up_to_parent() {
+        let child = make_pipeline("child", vec![shell_step("slow", vec!["sleep", "5"])]);
+        let root = make_pipeline(
+            "root",
+            vec![sub_step(
+                "compose",
+                SubPipelineRef::Builtin("child".into()),
+                false,
+            )],
+        );
+        let mut map = std::collections::HashMap::new();
+        map.insert("builtin:child".to_string(), child);
+        let resolver: Arc<dyn SubPipelineResolver + Send + Sync> = Arc::new(MapResolver(map));
+
+        // Stands in for the daemon's `child_abort_hook` (camp.rs): captures
+        // the child's real AbortHandle the moment it's spawned, exactly what
+        // `qed.cancel <child_run_id>` would reach for.
+        let captured: Arc<std::sync::Mutex<Option<tokio::task::AbortHandle>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let captured_for_hook = Arc::clone(&captured);
+        let hook: ChildAbortHook = Arc::new(move |_run_id: &str, handle: tokio::task::AbortHandle| {
+            *captured_for_hook.lock().unwrap() = Some(handle);
+        });
+
+        let runner = PipelineRunner::new(root)
+            .with_sub_pipeline_resolver(resolver)
+            .with_child_abort_hook(hook);
+
+        let run = tokio::spawn(async move { runner.run().await });
+
+        // The hook fires from inside `execute_step_sub_pipeline`, asynchronously
+        // relative to this test — poll rather than assume it's already there.
+        let handle = loop {
+            if let Some(h) = captured.lock().unwrap().clone() {
+                break h;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        };
+        // Cancel ONLY the child's task — never touches `runner`/the root task.
+        handle.abort();
+
+        let meta = run.await.unwrap().unwrap();
+        assert_eq!(
+            meta.status,
+            RunStatus::Cancelled,
+            "a cancelled nested child must bubble up as Cancelled, not Failed"
+        );
+    }
+
     // R755: `own_workspace` — a child records where it actually built by
     // writing `pwd` to a marker file the test reads back afterward (the
     // child's own worktree/positioned-tree is torn down by the time `run()`
@@ -16722,7 +17755,7 @@ produces    = ["native-tarball"]
             "root",
             vec![{
                 let mut s = sub_step("compose", SubPipelineRef::Builtin("child".into()), false);
-                s.sub_pipeline.as_mut().unwrap().own_workspace = true;
+                s.sub_pipeline.as_mut().unwrap().own_workspace = Some(true);
                 s
             }],
         );
@@ -16751,23 +17784,32 @@ produces    = ["native-tarball"]
     }
 
     #[tokio::test]
-    async fn sub_pipeline_own_workspace_default_false_inherits_live_parent() {
+    async fn sub_pipeline_own_workspace_false_inherits_live_parent() {
         let repo = init_git_repo();
         let marker_dir = tempfile::tempdir().unwrap();
         let marker = marker_dir.path().join("where.txt");
 
-        // Child declares Isolated too — but WITHOUT own_workspace, W224/R533-F11
-        // inheritance still wins: this is the pre-R755 default behaviour and
-        // must not regress.
+        // Child declares Isolated too — but with `own_workspace = false`,
+        // W224/R533-F11 inheritance still wins: this is the pre-R755 default
+        // behaviour, it is what `release-wizard`'s `npm-publish` needs (it
+        // must publish the version-bump the parent has not committed yet),
+        // and it must not regress.
+        //
+        // R887: what changed is that the step must now SAY so. Leaving
+        // `own_workspace` unset here is refused by
+        // `validate_sub_pipeline_graph` (see
+        // `types::tests::an_isolated_child_under_a_live_parent_must_state_which_tree`)
+        // — the runner itself still treats unset as inherit, because by the
+        // time a Pipeline reaches it the loader has already had its say.
         let mut child = make_pipeline("child", vec![pwd_marker_step(&marker)]);
         child.workspace = crate::types::WorkspaceMode::Isolated;
         let root = make_pipeline(
             "root",
-            vec![sub_step(
-                "compose",
-                SubPipelineRef::Builtin("child".into()),
-                false,
-            )],
+            vec![{
+                let mut s = sub_step("compose", SubPipelineRef::Builtin("child".into()), false);
+                s.sub_pipeline.as_mut().unwrap().own_workspace = Some(false);
+                s
+            }],
         );
         let mut map = std::collections::HashMap::new();
         map.insert("builtin:child".to_string(), child);
@@ -16784,8 +17826,8 @@ produces    = ["native-tarball"]
         assert_eq!(
             where_built,
             repo_canon.to_string_lossy(),
-            "without own_workspace, a child inherits the parent's positioned tree \
-             even when its own pipeline declares Isolated"
+            "with own_workspace = false, a child inherits the parent's positioned \
+             tree even when its own pipeline declares Isolated"
         );
     }
 
@@ -16899,6 +17941,7 @@ jobs:
         // Synthesised one-step pipeline carrying the GhaWorkflow step,
         // exactly as `LoaderSubPipelineResolver::resolve` would build it.
         let step = crate::types::QedStep {
+                       expect_slow: false,
                        participant: None,
             needs: None,
             resource: None,
@@ -16946,6 +17989,7 @@ jobs:
             toolchain: None,
         };
         let child = Pipeline {
+            allow_late_operator_block: false,
                         participants: None,
             max_parallel: None,
             description: None,
@@ -17182,6 +18226,7 @@ jobs:
         // Synthesised one-step pipeline carrying the GhaWorkflow step, exactly
         // as `LoaderSubPipelineResolver::resolve` would build it.
         let step = crate::types::QedStep {
+                       expect_slow: false,
                        participant: None,
             needs: None,
             resource: None,
@@ -17229,6 +18274,7 @@ jobs:
             toolchain: None,
         };
         let child = Pipeline {
+            allow_late_operator_block: false,
                         participants: None,
             max_parallel: None,
             description: None,
@@ -17343,6 +18389,7 @@ jobs:
             prefix: None,
             base_url: None,
             require_explicit_version: false,
+            per_leg: false,
         }];
 
         // Parent: SubPipeline child with propagate.produces=true + its own
@@ -17362,6 +18409,7 @@ jobs:
             prefix: None,
             base_url: None,
             require_explicit_version: false,
+            per_leg: false,
         }];
 
         let mut map = std::collections::HashMap::new();
@@ -17394,6 +18442,7 @@ jobs:
             prefix: None,
             base_url: None,
             require_explicit_version: false,
+            per_leg: false,
         }];
 
         let mut root = make_pipeline(
@@ -17410,6 +18459,7 @@ jobs:
             prefix: None,
             base_url: None,
             require_explicit_version: false,
+            per_leg: false,
         }];
 
         let mut map = std::collections::HashMap::new();
@@ -17457,6 +18507,7 @@ jobs:
             prefix: None,
             base_url: None,
             require_explicit_version: false,
+            per_leg: false,
         }];
 
         let mut map = std::collections::HashMap::new();
@@ -17617,6 +18668,7 @@ jobs:
             prefix: None,
             base_url: Some("https://releases.yah.dev".into()),
             require_explicit_version: false,
+            per_leg: false,
         }];
 
         let mut map = std::collections::HashMap::new();
@@ -18030,6 +19082,7 @@ jobs:
                 prefix: None,
                 base_url: None,
                 require_explicit_version: false,
+                per_leg: false,
             }],
             vec![],
             vec!["true".to_string()],
@@ -18590,6 +19643,7 @@ jobs:
 
     fn gating_step(name: &str) -> crate::types::QedStep {
         crate::types::QedStep {
+            expect_slow: false,
             participant: None,
             needs: None,
             resource: None,
@@ -18640,6 +19694,7 @@ jobs:
         let mut s = gating_step("disabled");
         s.enabled = false;
         let pipeline = Pipeline {
+            allow_late_operator_block: false,
                            participants: None,
             max_parallel: None,
             description: None,
@@ -18682,6 +19737,7 @@ jobs:
         let mut s = gating_step("stubbed");
         s.activation = crate::types::StepActivation::Stubbed;
         let pipeline = Pipeline {
+            allow_late_operator_block: false,
                            participants: None,
             max_parallel: None,
             description: None,
@@ -18720,6 +19776,7 @@ jobs:
         let mut s = gating_step("stubbed");
         s.activation = crate::types::StepActivation::Stubbed;
         let pipeline = Pipeline {
+            allow_late_operator_block: false,
                            participants: None,
             max_parallel: None,
             description: None,
@@ -18761,6 +19818,7 @@ jobs:
         s.enabled = false;
         s.activation = crate::types::StepActivation::Stubbed; // both knobs set
         let pipeline = Pipeline {
+            allow_late_operator_block: false,
                            participants: None,
             max_parallel: None,
             description: None,
@@ -18801,6 +19859,7 @@ jobs:
         let mut s = gating_step("conditional");
         s.if_cond = Some("matrix.target == 'ios-device'".into());
         let pipeline = Pipeline {
+            allow_late_operator_block: false,
                            participants: None,
             max_parallel: None,
             description: None,
@@ -18848,6 +19907,7 @@ jobs:
         let mut s = gating_step("conditional");
         s.if_cond = Some("matrix.target == 'ios-device'".into());
         let pipeline = Pipeline {
+            allow_late_operator_block: false,
                            participants: None,
             max_parallel: None,
             description: None,
@@ -18889,6 +19949,7 @@ jobs:
         let mut s = gating_step("conditional");
         s.if_cond = Some("${{ matrix.target == 'ios-device' }}".into());
         let pipeline = Pipeline {
+            allow_late_operator_block: false,
                            participants: None,
             max_parallel: None,
             description: None,
@@ -18941,6 +20002,7 @@ jobs:
         params: HashMap<String, crate::types::ParamDef>,
     ) -> Pipeline {
         Pipeline {
+            allow_late_operator_block: false,
             participants: None,
             max_parallel: None,
             description: None,
@@ -18973,6 +20035,7 @@ jobs:
             default: default.map(|d| d.to_string()),
             options: Vec::new(),
             options_from: None,
+            options_cmd: None,
         }
     }
 
@@ -19111,6 +20174,7 @@ jobs:
         let mut gated = gating_step("cleanup");
         gated.if_cond = Some("always()".into());
         let pipeline = Pipeline {
+            allow_late_operator_block: false,
                            participants: None,
             max_parallel: None,
             description: None,
@@ -19148,6 +20212,7 @@ jobs:
         let mut gated = gating_step("only-on-fail");
         gated.if_cond = Some("failure()".into());
         let pipeline = Pipeline {
+            allow_late_operator_block: false,
                            participants: None,
             max_parallel: None,
             description: None,
@@ -19180,6 +20245,7 @@ jobs:
         let mut gated = gating_step("only-on-fail");
         gated.if_cond = Some("failure()".into());
         let pipeline = Pipeline {
+            allow_late_operator_block: false,
                            participants: None,
             max_parallel: None,
             description: None,
@@ -19212,6 +20278,7 @@ jobs:
         let mut gated = gating_step("only-on-success");
         gated.if_cond = Some("success()".into());
         let pipeline = Pipeline {
+            allow_late_operator_block: false,
                            participants: None,
             max_parallel: None,
             description: None,
@@ -19244,6 +20311,7 @@ jobs:
         let mut gated = gating_step("on-cancel");
         gated.if_cond = Some("cancelled()".into());
         let pipeline = Pipeline {
+            allow_late_operator_block: false,
                            participants: None,
             max_parallel: None,
             description: None,

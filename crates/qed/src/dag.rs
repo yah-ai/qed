@@ -94,7 +94,7 @@ pub enum Missing {
     Reject,
     /// Treat the edge as already satisfied and drop it. The **runner** uses
     /// this, because a resume-from-step run hands it a pipeline whose leading
-    /// steps were `drain`ed (`with_index_offset`): a surviving `needs` pointing
+    /// steps were `drain`ed (`with_step_selection`): a surviving `needs` pointing
     /// into the drained prefix names a step that genuinely already ran.
     Satisfied,
 }
@@ -223,9 +223,48 @@ pub fn dependents(preds: &[Vec<usize>], root: usize) -> HashSet<usize> {
     seen
 }
 
+/// R560-F15: partition steps into LEGS — the weakly-connected components of
+/// the dependency graph, i.e. sets of steps that share no edge in either
+/// direction with any step outside the set. Returns one leg id per step; ids
+/// are the smallest step index in the leg, so they are stable and `< len`.
+///
+/// On an implicit chain every step is connected, so the whole pipeline is a
+/// single leg (id 0). Two `needs = []` roots with private dependents are two.
+pub fn legs(preds: &[Vec<usize>]) -> Vec<usize> {
+    let mut leg: Vec<usize> = (0..preds.len()).collect();
+    fn find(leg: &mut [usize], mut i: usize) -> usize {
+        while leg[i] != i {
+            leg[i] = leg[leg[i]];
+            i = leg[i];
+        }
+        i
+    }
+    for (i, ps) in preds.iter().enumerate() {
+        for &p in ps {
+            let (a, b) = (find(&mut leg, i), find(&mut leg, p));
+            // Union toward the smaller root so the id is the leg's first step.
+            let (lo, hi) = if a < b { (a, b) } else { (b, a) };
+            leg[hi] = lo;
+        }
+    }
+    (0..preds.len()).map(|i| find(&mut leg, i)).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legs_are_weakly_connected_components() {
+        // Chain 0 → 1 → 2: one leg.
+        assert_eq!(legs(&[vec![], vec![0], vec![1]]), vec![0, 0, 0]);
+        // Two roots with private dependents: two legs.
+        assert_eq!(legs(&[vec![], vec![0], vec![], vec![2]]), vec![0, 0, 2, 2]);
+        // A fan-in step consuming both roots joins them into one leg, even
+        // when the later root is reached first.
+        assert_eq!(legs(&[vec![], vec![], vec![1, 0]]), vec![0, 0, 0]);
+        assert_eq!(legs(&[vec![2], vec![2], vec![]]), vec![0, 0, 0]);
+    }
 
     /// A step with a name and optional needs; everything else default.
     fn s(name: &str, needs: Option<&[&str]>) -> QedStep {

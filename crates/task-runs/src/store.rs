@@ -153,6 +153,47 @@ pub struct ChunkFilter {
     pub limit: Option<usize>,
 }
 
+// ─── Durability ───────────────────────────────────────────────────────────────
+
+/// Put this connection's syncs where they stop corruption, and take them off
+/// the commit path where they only cost.
+///
+/// On macOS `fsync(2)` returns once the data reaches the drive — it does not
+/// wait for the drive to flush its own write cache, and `fcntl(F_FULLFSYNC)`
+/// is the documented barrier. `turso_core` implements both but defaults to
+/// plain `fsync` on Apple, so the window between "the checkpoint synced the
+/// database file" and "the drive actually wrote it" is real. A panic inside
+/// that window takes the pages the checkpoint just wrote while the WAL reset
+/// that followed survives, and the result is committed data that exists in
+/// neither file. That is what happened to `task-runs.turso` (R914, 118 pages)
+/// and `gnome_queue.turso` (R914-B4, 38 rows) two days apart on one machine.
+///
+/// `F_FULLFSYNC` is a device-wide cache flush — 3.86 ms against `fsync`'s
+/// 0.029 ms, measured on the machine that lost both stores — so it ships
+/// alongside `synchronous = NORMAL`, which stops turso syncing on every
+/// commit and leaves the barrier on the checkpoint and WAL-restart path that
+/// actually failed. turso's own comment says so at `storage/pager.rs:4312`:
+/// "NORMAL mode skips fsync on WAL commit (but still fsyncs on checkpoint and
+/// wal restart)". This store writes a row per PTY chunk, so the pairing is
+/// load-bearing. Measured over 200 single-row commits: turso's default
+/// (`FULL` + `fsync`) 0.090 ms/commit, `FULL` + `F_FULLFSYNC` 3.612, and the
+/// shipped `NORMAL` + `F_FULLFSYNC` 0.225. The barrier is not free here —
+/// 2.5x the default — but `fullfsync` on its own would have been 40x.
+///
+/// Full writeup, including the forensics, lives in the yah monorepo at
+/// `crates/yah/camp-service/src/store_durability.rs`. It is restated rather
+/// than shared because `oss/qed` is an independent workspace that must build
+/// standalone.
+async fn harden_sync(conn: &Connection) -> Result<(), StoreError> {
+    conn.execute("PRAGMA synchronous = NORMAL", ()).await?;
+    if cfg!(target_vendor = "apple") {
+        // `PRAGMA fullfsync` is Apple-gated inside `turso_core`; plain
+        // `fsync` is already a barrier elsewhere.
+        conn.execute("PRAGMA fullfsync = ON", ()).await?;
+    }
+    Ok(())
+}
+
 // ─── TaskStore ────────────────────────────────────────────────────────────────
 
 struct SeqCounters {
@@ -175,6 +216,7 @@ impl TaskStore {
             .build()
             .await?;
         let conn = db.connect()?;
+        harden_sync(&conn).await?;
         conn.execute_batch(SCHEMA).await?;
         /* `CREATE TABLE IF NOT EXISTS` won't add a column to a runs table that
            predates `origin`, so add it idempotently for already-created DBs.
@@ -219,9 +261,19 @@ impl TaskStore {
     /// concurrent writers (PTY reader chunks, shim-FIFO events, lifecycle
     /// status), and without it the loser of a write-lock race gets an
     /// immediate `Busy` instead of waiting its turn.
-    fn conn(&self) -> Result<Connection, StoreError> {
+    /// Every connection is also hardened against the macOS `fsync` gap
+    /// (R914-B4). `PRAGMA fullfsync` lives on the *pager*, which turso builds
+    /// per `Connection`, so it cannot be set once at open: auto-checkpoint
+    /// fires on whichever connection happens to cross the WAL threshold, and
+    /// an un-hardened one there is exactly how this store lost 118 committed
+    /// pages on 2026-09-15. The full mechanism is documented in the yah
+    /// monorepo at `crates/yah/camp-service/src/store_durability.rs`; it is
+    /// restated rather than shared because `oss/qed` is an independent
+    /// workspace that must build standalone.
+    async fn conn(&self) -> Result<Connection, StoreError> {
         let conn = self.db.connect()?;
         let _ = conn.busy_timeout(BUSY_TIMEOUT);
+        harden_sync(&conn).await?;
         Ok(conn)
     }
 
@@ -242,7 +294,7 @@ impl TaskStore {
         let mut delay = BUSY_RETRY_BASE;
         let mut last: StoreError;
         loop {
-            match self.conn()?.execute(sql, params.clone()).await {
+            match self.conn().await?.execute(sql, params.clone()).await {
                 Ok(n) => return Ok(n),
                 Err(e) if is_busy(&e) => last = StoreError::Sql(e),
                 Err(e) => return Err(StoreError::Sql(e)),
@@ -376,7 +428,7 @@ impl TaskStore {
 
     async fn max_seq(&self, table: &str, run_id: &str) -> Result<Option<u32>, StoreError> {
         let sql = format!("SELECT MAX(seq) FROM {table} WHERE run_id = ?1");
-        let mut rows = self.conn()?.query(&sql, params![run_id.to_string()]).await?;
+        let mut rows = self.conn().await?.query(&sql, params![run_id.to_string()]).await?;
         match rows.next().await? {
             Some(row) => {
                 let v: Option<i64> = row.get(0)?;
@@ -388,7 +440,7 @@ impl TaskStore {
 
     pub async fn get_run(&self, id: &TaskRunId) -> Result<Option<TaskRunMeta>, StoreError> {
         let mut rows = self
-            .conn()?
+            .conn().await?
             .query(
                 "SELECT id, command, cwd, env_json, started_at, ended_at, exit_code, signal, \
                         status, status_detail, label, initiator, beholder_status, pinned, origin, \
@@ -405,7 +457,7 @@ impl TaskStore {
 
     pub async fn chunk_count(&self, run_id: &TaskRunId) -> Result<u32, StoreError> {
         let mut rows = self
-            .conn()?
+            .conn().await?
             .query(
                 "SELECT COUNT(*) FROM chunks WHERE run_id = ?1",
                 params![run_id.to_string()],
@@ -455,7 +507,7 @@ impl TaskStore {
             archived_clause, where_extra
         );
 
-        let mut rows = self.conn()?.query(&sql, params_from_iter(p)).await?;
+        let mut rows = self.conn().await?.query(&sql, params_from_iter(p)).await?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().await? {
             out.push(row_to_meta(&row)?);
@@ -466,7 +518,7 @@ impl TaskStore {
     pub async fn archive_run(&self, id: &TaskRunId) -> Result<(), StoreError> {
         let now = unix_now() as i64;
         let count = self
-            .conn()?
+            .conn().await?
             .execute(
                 "UPDATE runs SET archived_at = ?1 WHERE id = ?2 AND archived_at IS NULL",
                 params![now, id.to_string()],
@@ -480,7 +532,7 @@ impl TaskStore {
 
     pub async fn pin_run(&self, id: &TaskRunId, pinned: bool) -> Result<(), StoreError> {
         let count = self
-            .conn()?
+            .conn().await?
             .execute(
                 "UPDATE runs SET pinned = ?1 WHERE id = ?2",
                 params![pinned as i64, id.to_string()],
@@ -510,7 +562,7 @@ impl TaskStore {
             .await?;
 
         result.chunks_deleted += self
-            .conn()?
+            .conn().await?
             .execute(
                 "DELETE FROM chunks \
                  WHERE run_id IN (SELECT id FROM runs WHERE archived_at IS NOT NULL)",
@@ -519,7 +571,7 @@ impl TaskStore {
             .await?;
 
         result.events_deleted += self
-            .conn()?
+            .conn().await?
             .execute(
                 "DELETE FROM events \
                  WHERE run_id IN (SELECT id FROM runs WHERE archived_at IS NOT NULL)",
@@ -528,7 +580,7 @@ impl TaskStore {
             .await?;
 
         result.chunks_deleted += self
-            .conn()?
+            .conn().await?
             .execute(
                 "DELETE FROM chunks WHERE run_id IN \
                  (SELECT id FROM runs WHERE archived_at IS NULL AND pinned = 0 AND started_at < ?1)",
@@ -537,7 +589,7 @@ impl TaskStore {
             .await?;
 
         result.events_deleted += self
-            .conn()?
+            .conn().await?
             .execute(
                 "DELETE FROM events WHERE run_id IN \
                  (SELECT id FROM runs WHERE archived_at IS NULL AND pinned = 0 AND started_at < ?1)",
@@ -549,7 +601,7 @@ impl TaskStore {
     }
 
     async fn count_query(&self, sql: &str, params: Vec<Value>) -> Result<u64, StoreError> {
-        let mut rows = self.conn()?.query(sql, params_from_iter(params)).await?;
+        let mut rows = self.conn().await?.query(sql, params_from_iter(params)).await?;
         let row = rows.next().await?.expect("COUNT(*) returns one row");
         let n: i64 = row.get(0)?;
         Ok(n as u64)
@@ -585,7 +637,7 @@ impl TaskStore {
             where_clause, limit_clause
         );
 
-        let mut rows = self.conn()?.query(&sql, params_from_iter(p)).await?;
+        let mut rows = self.conn().await?.query(&sql, params_from_iter(p)).await?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().await? {
             let seq: i64 = row.get(0)?;
@@ -743,7 +795,7 @@ impl TaskStore {
              FROM events WHERE {where_clause} ORDER BY seq {limit_clause}"
         );
 
-        let mut rows = self.conn()?.query(&sql, params_from_iter(p)).await?;
+        let mut rows = self.conn().await?.query(&sql, params_from_iter(p)).await?;
         let mut events = Vec::new();
         while let Some(row) = rows.next().await? {
             events.push(row_to_event(&row)?);
@@ -810,7 +862,7 @@ impl TaskStore {
 
         let exists: bool = {
             let mut rows = self
-                .conn()?
+                .conn().await?
                 .query(
                     "SELECT 1 FROM _event_field_indexes WHERE field_path = ?1",
                     params![field_path.to_string()],
@@ -830,10 +882,10 @@ impl TaskStore {
              ON events(run_id, json_extract(fields_json, '{escaped}')) \
              WHERE json_extract(fields_json, '{escaped}') IS NOT NULL"
         );
-        self.conn()?.execute_batch(&sql).await?;
+        self.conn().await?.execute_batch(&sql).await?;
 
         let now = unix_now();
-        self.conn()?
+        self.conn().await?
             .execute(
                 "INSERT OR IGNORE INTO _event_field_indexes (field_path, index_name, created_at) \
                  VALUES (?1, ?2, ?3)",
@@ -973,7 +1025,7 @@ impl TaskStore {
         );
         p.push(Value::Integer(limit));
 
-        let mut rows = self.conn()?.query(&sql, params_from_iter(p)).await?;
+        let mut rows = self.conn().await?.query(&sql, params_from_iter(p)).await?;
         let mut buckets = Vec::new();
         while let Some(row) = rows.next().await? {
             let key: Option<String> = row.get(0)?;
@@ -990,7 +1042,7 @@ impl TaskStore {
 
     pub async fn upsert_triage(&self, triage: &Triage) -> Result<(), StoreError> {
         let keep_json = serde_json::to_string(&triage.keep)?;
-        self.conn()?
+        self.conn().await?
             .execute(
                 "INSERT OR REPLACE INTO triages \
                  (run_id, synopsis, keep_json, primary_lo, primary_hi, \
@@ -1014,7 +1066,7 @@ impl TaskStore {
 
     pub async fn get_triage(&self, run_id: &TaskRunId) -> Result<Option<Triage>, StoreError> {
         let mut rows = self
-            .conn()?
+            .conn().await?
             .query(
                 "SELECT run_id, synopsis, keep_json, primary_lo, primary_hi, \
                  model, prompt_version, cached_at, partial \
@@ -1052,7 +1104,7 @@ impl TaskStore {
 
     pub async fn list_field_indexes(&self) -> Result<Vec<FieldIndexInfo>, StoreError> {
         let mut rows = self
-            .conn()?
+            .conn().await?
             .query(
                 "SELECT field_path, index_name, created_at \
                  FROM _event_field_indexes ORDER BY created_at",

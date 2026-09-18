@@ -10,7 +10,7 @@
 //! # Integration point
 //!
 //! ```ignore
-//! let result = registry.attach(raw_cmd, &BeholderSelect::Auto, tty_attached);
+//! let result = registry.attach(raw_cmd, &BeholderSelect::Auto, verbatim_output);
 //! // spawn the process with result.argv (may be rewritten)
 //! // for each chunk captured:
 //! if let Some(b) = result.beholder.as_mut() {
@@ -201,18 +201,34 @@ impl BeholderRegistry {
     /// Determine and attach a beholder for the given invocation.
     ///
     /// - Tokenizes `raw_cmd` and strips wrapper binaries (bunx, npx, pnpm, npm exec).
-    /// - `tty_attached` signals that a human-facing terminal tile is watching:
-    ///   `Rewriter` beholders decline in `Auto` mode to avoid clobbering human
-    ///   output. `Force` always attaches but records `forced-against-tty`.
+    /// - `verbatim_output` signals that somebody reads this run's output as
+    ///   text — a human watching a terminal tile, or an attach client that
+    ///   promised its caller byte-identical passthrough. `Rewriter` beholders
+    ///   decline in `Auto` mode rather than change what that reader sees;
+    ///   `Force` still attaches but records `forced-against-verbatim`.
+    ///
+    ///   This flag used to be `tty_attached`, and the rename is the R739-B10
+    ///   fix rather than tidying. A PTY was never the thing that mattered: what
+    ///   matters is whether anything downstream renders the bytes. `yah build
+    ///   run` moved off a PTY onto pipes (R739-F6) and instantly started
+    ///   leaking `--message-format=json-render-diagnostics` output into an
+    ///   agent's stdout, because the only flag that could have stopped it was
+    ///   named after the mechanism instead of the requirement.
     /// - Behaviour depends on `select`:
     ///   - `Auto` — walk in priority order, first `matches` hit wins.
     ///   - `Force(name)` — find by name; bypass `matches` (records
     ///     `forced-against-flags` if the beholder would have declined, or
-    ///     `forced-against-tty` if a TTY is attached and mode is Rewriter).
+    ///     `forced-against-verbatim` if the output is read verbatim and mode is
+    ///     Rewriter).
     ///   - `None` — bytes-only; no beholder attached.
     /// - If a `Rewriter` beholder attaches, its `adjust_argv` is applied to the
     ///   returned `AttachResult.argv` and the diff is surfaced on `status`.
-    pub fn attach(&self, raw_cmd: &str, select: &BeholderSelect, tty_attached: bool) -> AttachResult {
+    pub fn attach(
+        &self,
+        raw_cmd: &str,
+        select: &BeholderSelect,
+        verbatim_output: bool,
+    ) -> AttachResult {
         let mut argv = resolve_argv(raw_cmd);
 
         // A shell line is not an argv, and this registry can only reason about
@@ -257,8 +273,11 @@ impl BeholderRegistry {
                         let is_rewriter = matches!(factory.mode(), BeholderMode::Rewriter { .. } | BeholderMode::DynamicRewriter { .. });
                         let base_status = if would_decline {
                             BeholderStatus::forced_against_flags(factory.name(), factory.version())
-                        } else if tty_attached && is_rewriter {
-                            BeholderStatus::forced_against_tty(factory.name(), factory.version())
+                        } else if verbatim_output && is_rewriter {
+                            BeholderStatus::forced_against_verbatim(
+                                factory.name(),
+                                factory.version(),
+                            )
                         } else {
                             BeholderStatus::forced(factory.name(), factory.version())
                         };
@@ -273,11 +292,12 @@ impl BeholderRegistry {
                 for factory in &self.entries {
                     if factory.matches(&argv) {
                         let is_rewriter = matches!(factory.mode(), BeholderMode::Rewriter { .. } | BeholderMode::DynamicRewriter { .. });
-                        // TTY-attached: Rewriter beholders decline to preserve human output.
-                        if tty_attached && is_rewriter {
+                        // Somebody reads these bytes: a Rewriter beholder would
+                        // change what they read, so it declines instead.
+                        if verbatim_output && is_rewriter {
                             return AttachResult {
                                 beholder: None,
-                                status: BeholderStatus::declined(factory.name(), "tty-attached"),
+                                status: BeholderStatus::declined(factory.name(), "verbatim-output"),
                                 argv,
                             };
                         }
@@ -406,7 +426,9 @@ const CARGO_DIAG_SUBCOMMANDS: &[&str] = &[
 /// makes cargo emit one JSON object per line rather than human-formatted text.
 ///
 /// Declines when the user already specified `--message-format` (respects
-/// explicit intent; see R070-T5 for TTY-aware behaviour rules).
+/// explicit intent), and — since the rewrite replaces cargo's own human output
+/// with JSON — whenever the run is spawned with `verbatim_output`, i.e. when
+/// something downstream is going to render those bytes (R070-T5, R739-B10).
 pub struct CargoBeholderFactory;
 
 impl BeholderFactory for CargoBeholderFactory {
@@ -2258,22 +2280,22 @@ mod tests {
         assert_eq!(result.status.text, "attached:first@1.0");
     }
 
-    // ─── TTY-aware behavior tests ─────────────────────────────────────────────
+    // ─── verbatim-output behaviour tests ──────────────────────────────────────
 
     #[test]
-    fn tty_attached_causes_rewriter_to_decline_in_auto() {
+    fn verbatim_output_causes_rewriter_to_decline_in_auto() {
         let mut registry = BeholderRegistry::new();
         registry.register(Box::new(RewriterFactory));
         let result = registry.attach("cargo check --workspace", &BeholderSelect::Auto, true);
-        // Beholder declines to preserve human output on the TTY.
-        assert!(result.beholder.is_none(), "rewriter must not attach when tty_attached");
+        // Beholder declines rather than change what the reader sees.
+        assert!(result.beholder.is_none(), "rewriter must not attach under verbatim_output");
         assert!(
             result.status.text.contains("declined:cargo"),
             "got: {}",
             result.status.text
         );
         assert!(
-            result.status.text.contains("tty-attached"),
+            result.status.text.contains("verbatim-output"),
             "got: {}",
             result.status.text
         );
@@ -2281,33 +2303,62 @@ mod tests {
         assert!(!result.argv.contains(&"--message-format=json-render-diagnostics".to_string()));
     }
 
+    /// R739-B10, against the REAL cargo factory rather than the test double.
+    ///
+    /// The double proves the registry's rule; this proves the rule reaches the
+    /// beholder that actually shipped the defect. A relocated `cargo check`
+    /// that succeeds emits one `compiler-artifact` record per crate, and with
+    /// the rewrite applied every one of them lands on the agent's stdout as raw
+    /// JSON — observed live 2026-08-28.
     #[test]
-    fn tty_attached_does_not_affect_parser_beholder() {
+    fn the_real_cargo_rewriter_declines_when_the_output_is_read_verbatim() {
+        let mut registry = BeholderRegistry::new();
+        registry.register(Box::new(CargoBeholderFactory));
+        let result = registry.attach("cargo check -p yah --lib", &BeholderSelect::Auto, true);
+        assert!(result.beholder.is_none(), "got: {}", result.status.text);
+        assert!(
+            !result.argv.contains(&"--message-format=json-render-diagnostics".to_string()),
+            "the command line must reach the shell exactly as the caller wrote it: {:?}",
+            result.argv
+        );
+        // …and the same line with nobody reading the bytes still gets the
+        // structured events, so this is a targeted decline and not a disabling.
+        let observed = registry.attach("cargo check -p yah --lib", &BeholderSelect::Auto, false);
+        assert!(observed.beholder.is_some(), "got: {}", observed.status.text);
+    }
+
+    #[test]
+    fn verbatim_output_does_not_affect_parser_beholder() {
         let mut registry = BeholderRegistry::new();
         registry.register(Box::new(PrefixFactory { prefix: "cargo", name: "cargo" }));
-        // Parser beholders are fine on a TTY — they don't rewrite argv.
+        // Parser beholders never touch argv, so they change nothing the reader
+        // sees and have no reason to decline.
         let result = registry.attach("cargo check --workspace", &BeholderSelect::Auto, true);
-        assert!(result.beholder.is_some(), "parser beholder must attach even on a TTY");
+        assert!(
+            result.beholder.is_some(),
+            "parser beholder must attach even under verbatim_output"
+        );
         assert_eq!(result.status.text, "attached:cargo@1.0");
     }
 
     #[test]
-    fn force_overrides_tty_decline_and_records_forced_against_tty() {
+    fn force_overrides_verbatim_decline_and_records_forced_against_verbatim() {
         let mut registry = BeholderRegistry::new();
         registry.register(Box::new(RewriterFactory));
-        // Force overrides the TTY-decline rule; operator explicitly wants structured output.
+        // Force overrides the decline; the operator explicitly wants structured
+        // output and accepts what it does to the stream.
         let result =
             registry.attach("cargo check", &BeholderSelect::Force("cargo".to_string()), true);
-        assert!(result.beholder.is_some(), "Force must attach even on a TTY");
+        assert!(result.beholder.is_some(), "Force must attach under verbatim_output");
         assert!(
-            result.status.text.contains("forced-against-tty"),
+            result.status.text.contains("forced-against-verbatim"),
             "got: {}",
             result.status.text
         );
         // Rewrite still applied (forced) and surfaced.
         assert!(
             result.argv.contains(&"--message-format=json-render-diagnostics".to_string()),
-            "rewrite must still be applied when forced on TTY"
+            "rewrite must still be applied when forced"
         );
     }
 

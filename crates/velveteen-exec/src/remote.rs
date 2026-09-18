@@ -912,6 +912,44 @@ pub(crate) fn build_workload_spec(
 /// variable rather than from a hardcoded path.
 pub const PRODUCED_DIR_ENV: &str = "YAH_PRODUCED_DIR";
 
+/// What a natively-executed forge step declares it writes (R885-B11), for
+/// [`WRITABLE_PATHS_ANNOTATION`](workload_spec::WRITABLE_PATHS_ANNOTATION).
+///
+/// The whole forge state root, not the per-run produced dir under it: the same
+/// root holds [`forge_state::BUILD_OUT_DIR`](workload_spec::forge_state) and the
+/// R876-F4 build cache, and `ensure_forge_state_dirs` mkdirs any forge bind
+/// beneath it, so a declaration scoped tighter than the root would have to be
+/// re-derived every time a fourth thing lands under it.
+///
+/// `/tmp` is deliberately absent: `kamaji::sandbox` grants it to every confined
+/// workload, so restating it here would be noise that could drift.
+///
+/// # This is a conservative declaration, not a measured one — say so downstream
+///
+/// A forge step's argv is arbitrary (`ForgeCommand::Subprocess`), so its write
+/// set is not statically knowable from this side and nothing here can make it
+/// so. What *is* known:
+///
+/// - `workdir` and [`PRODUCED_DIR_ENV`] both point under this root, and
+///   `apply_exec_context` refuses a relative `cwd` outright and has no channel
+///   for a worker-side checkout, so today every native step runs with its cwd
+///   inside it.
+/// - The R876-F4 build cache — the one place a toolchain's own scratch is meant
+///   to live — is *refused* for a native forge (no mount namespace to bind it
+///   into), so a native step's toolchain writes wherever its environment points
+///   it: `$CARGO_HOME`, `$HOME/.rustup`, a `CARGO_TARGET_DIR`. Those are node
+///   configuration, invisible from the coordinator that builds this spec, and
+///   **not covered by this declaration.**
+///
+/// So a native step that only reads a toolchain and writes its artifacts is
+/// confined correctly, and one that populates a cargo registry cache under
+/// `$HOME` gets `EACCES` on a Linux worker. No such step is deployed today
+/// (R885-B9 measured the fleet: zero native forge workloads on any of the three
+/// nodes), and the native leg's live use is Darwin signing, where landlock does
+/// not exist. The fix when one appears is to widen this declaration, which is
+/// the point of having it be a declaration.
+const NATIVE_WRITABLE_PATHS: &str = workload_spec::forge_state::HOST_ROOT;
+
 /// Turn a container-shaped forge spec into a natively-executed one
 /// (R577-T1 / W254).
 ///
@@ -938,10 +976,24 @@ pub const PRODUCED_DIR_ENV: &str = "YAH_PRODUCED_DIR";
 ///    the retrieval side (`fetch_produced_file` → `forge_produced::host_path`)
 ///    reads back from. Dropping the volume as "unused" would silently break
 ///    both, so it stays and this comment says why.
+///
+/// R885-B11 added a fourth: the
+/// [`WRITABLE_PATHS_ANNOTATION`](workload_spec::WRITABLE_PATHS_ANNOTATION)
+/// declaration kamaji's landlock policy reads. See [`NATIVE_WRITABLE_PATHS`].
+/// It is the whole of what confines a native forge step and the whole of what
+/// that step is then allowed to write: `kamaji::sandbox::writable_roots`
+/// confines a workload if and only if this annotation is present and non-empty,
+/// so the kept volume (3) neither turns the policy on nor — being inert here —
+/// would have been any use if it did. Widen this declaration, not the volume
+/// list, if a step needs more.
 fn mark_native_exec(ws: &mut WorkloadSpec, forge_id: &ForgeId) {
     ws.annotations.insert(
         workload_spec::NATIVE_EXEC_ANNOTATION.into(),
         workload_spec::NATIVE_EXEC_VALUE.into(),
+    );
+    ws.annotations.insert(
+        workload_spec::WRITABLE_PATHS_ANNOTATION.into(),
+        NATIVE_WRITABLE_PATHS.into(),
     );
 
     let produced = workload_spec::forge_produced::host_dir(&forge_id.to_string());
@@ -1096,9 +1148,14 @@ fn build_image_workload_spec(
     // inverted from raising buildkit's cgroup ceiling to *lowering* it by 16x,
     // still narrating the old direction. Inheriting for_forge's ceiling is what
     // the comment always meant. The placement floor is unaffected either way;
-    // it comes from the MEMORY_REQUEST_ANNOTATION for_forge sets.
+    // it comes from the `resources.memory_request_mb` for_forge sets.
     ws.resources.cpu_millis = 2000;
-    ws.resources.ephemeral_storage_mb = 4096;
+    // R885-T6 deleted `resources.ephemeral_storage_mb`; this line used to set it
+    // to 4096. It is now the scratch *floor*, which is what this number always
+    // meant here — the microVM backend read the old field as a floor, never as
+    // the cap its doc comment claimed. Still inert in practice (the backend's
+    // own floor is 8 GiB), kept so the declaration survives.
+    ws.resources.scratch_floor_mb = Some(4096);
 
     // R636-B2: this is the one workload in the fleet that runs a container
     // runtime *inside* its own container. `rootlesskit` (the rootless BuildKit
@@ -1127,11 +1184,13 @@ fn build_image_workload_spec(
             source: VolumeSource::Bind { host_path: context.to_path_buf() },
             target: PathBuf::from("/yah/build/context"),
             read_only: true,
+            from_secret_mount: false,
         });
         ws.volumes.push(VolumeMount {
             source: VolumeSource::Bind { host_path: dockerfile_parent.to_path_buf() },
             target: PathBuf::from("/yah/build/dockerfile"),
             read_only: true,
+            from_secret_mount: false,
         });
     }
 
@@ -1145,6 +1204,7 @@ fn build_image_workload_spec(
             },
             target: PathBuf::from("/yah/build/out"),
             read_only: false,
+            from_secret_mount: false,
         });
         format!("/yah/build/out/{}", oci_archive_basename(first_tag))
     });
@@ -1775,6 +1835,20 @@ mod remote {
             ws.volumes
         );
 
+        // R885-B11: the native spec declares what it writes, and that
+        // declaration has to actually cover the dir the step is pointed at.
+        // Carrying the volume above is what makes kamaji confine this workload
+        // at all, so an undeclared native forge would be confined to an inert
+        // mount and able to write nowhere.
+        let declared = ws.writable_paths().expect("declaration must parse");
+        assert!(
+            declared
+                .iter()
+                .any(|p| produced.starts_with(p) || p == &produced),
+            "the produced dir {} must be inside a declared writable path: {declared:?}",
+            produced.display()
+        );
+
         // Same spec, container runtime: no marker. The Linux offload leg proven
         // live on us-west-002 must be byte-for-byte unaffected by this change.
         let container = build_workload_spec(
@@ -1794,6 +1868,13 @@ mod remote {
         assert!(!container.wants_native_exec());
         assert!(container.workdir.is_none());
         assert!(!container.env.iter().any(|e| e.name == PRODUCED_DIR_ENV));
+        // The declaration is native-only: a container step's writes are bounded
+        // by its mount namespace, and declaring paths for it would describe a
+        // confinement nothing applies.
+        assert!(container
+            .writable_paths()
+            .expect("declaration must parse")
+            .is_empty());
     }
 
     /// R605-F8: a remote + microVM subprocess forge synthesizes an ordinary

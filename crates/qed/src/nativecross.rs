@@ -80,6 +80,7 @@
 //! @yah:gotcha("RESIDUAL BUG FROM THIS TICKET, found and fixed by R746-F9 on 2026-08-24 (flagged here so this ticket's reviewer sees it). The zigbuild reroute was verified BY HAND as 'cargo zigbuild --release -p mesofact --locked --target ...' -- the correct shape -- but scripts/cross-build-guarded.sh builds one option array shared by all three builders, and it began with the literal word 'build'. So the zigbuild branch actually ran 'cargo zigbuild build --release ...', which cargo-zigbuild 0.23.0 rejects before compiling anything: error: unexpected argument 'build' found / Usage: cargo-zigbuild zigbuild [OPTIONS]. Every zigbuild leg through the script therefore failed at argv parsing. Reproduced in qed run e6bdb2ab-0f12-4d0f-9334-790d46f2e60f (2026-08-20), both mesofact-build linux-gnu legs, identical error.")
 //! @yah:gotcha("FIX (R746-F9): the shared array no longer carries a subcommand word; each branch prepends its own -- 'cargo build', 'cargo zigbuild', 'cross build'. VERIFIED live from this arm64 mac: mesofact-build compiled clean through the fixed script for x86_64-unknown-linux-gnu (2m41s) and aarch64-unknown-linux-gnu (2m20s), both artifacts confirmed real Linux ELFs of the right arch via 'file'.")
 
+use crate::buildcap::{InstallCommand, Shell};
 use crate::platform::{arch_of, host_native_crossable};
 
 /// A host-native cross-compilation mechanism — the concrete toolchain a
@@ -179,18 +180,62 @@ impl CrossTool {
     /// but [unavailable](ToolAvailability). Mirrors the
     /// [`preflight`](crate::preflight) discipline of routing the operator to
     /// the fix rather than dying with a raw toolchain error.
-    pub fn install_hint(&self) -> &'static str {
+    /// R919-F1: the hint is now *derived* from [`install_commands`], so the
+    /// prose an operator reads on a failed step and the checklist a client
+    /// renders from [`crate::buildcap`] are the same commands by construction.
+    /// It also carries the REAL `target` — this used to print a literal
+    /// `rustup target add <triple>`, leaving the substitution to whoever read
+    /// the error.
+    ///
+    /// [`install_commands`]: Self::install_commands
+    pub fn install_hint(&self, target: &str) -> String {
+        let cmds = self
+            .install_commands(target, Shell::Posix)
+            .into_iter()
+            .map(|c| format!("`{}`", c.line))
+            .collect::<Vec<_>>()
+            .join(" and ");
         match self {
             CrossTool::CargoZigbuild => {
-                "install cargo-zigbuild + zig: `cargo install cargo-zigbuild` and \
-                 `brew install zig` (or download from ziglang.org)"
+                format!("install cargo-zigbuild + zig: {cmds} (or download zig from ziglang.org)")
             }
-            CrossTool::MuslCross => {
-                "install a musl cross toolchain: `brew install FiloSottile/musl-cross/musl-cross` \
-                 (macOS) or the `<arch>-linux-musl-cross` package — or install cargo-zigbuild, \
-                 which needs no per-target toolchain"
-            }
-            CrossTool::CargoNative => "add the rustup target: `rustup target add <triple>`",
+            CrossTool::MuslCross => format!(
+                "install a musl cross toolchain: {cmds} (macOS) or your platform's \
+                 musl-cross package — or install cargo-zigbuild, which needs no \
+                 per-target toolchain"
+            ),
+            CrossTool::CargoNative => format!("add the rustup target: {cmds}"),
+        }
+    }
+
+    /// The structured, copy-pasteable form of [`install_hint`](Self::install_hint)
+    /// for `target`, written for `shell` (R919-F1, W352).
+    ///
+    /// Each entry is exactly one line with no continuations —
+    /// [`InstallCommand::new`] enforces it. `musl-cross` names the concrete
+    /// `<arch>-linux-musl` package for this target rather than a placeholder.
+    pub fn install_commands(&self, target: &str, shell: Shell) -> Vec<InstallCommand> {
+        match self {
+            CrossTool::CargoZigbuild => vec![
+                InstallCommand::new(shell, "cargo install cargo-zigbuild", false),
+                InstallCommand::new(shell, "brew install zig", false)
+                    .with_note("or install zig from ziglang.org and put it on PATH"),
+            ],
+            CrossTool::MuslCross => vec![InstallCommand::new(
+                shell,
+                "brew install FiloSottile/musl-cross/musl-cross",
+                false,
+            )
+            .with_note(format!(
+                "must end up providing `{}-gcc` on PATH; cargo-zigbuild covers every \
+                 target with no per-target install",
+                musl_cc_prefix(target)
+            ))],
+            CrossTool::CargoNative => vec![InstallCommand::new(
+                shell,
+                format!("rustup target add {target}"),
+                false,
+            )],
         }
     }
 
@@ -212,7 +257,7 @@ impl CrossTool {
 /// prefers zigbuild but falls back to musl-cross for musl targets when zig
 /// isn't installed. Build it from a real probe ([`Self::probe`]) at runtime,
 /// or by hand in tests so the fallback ladder is *specified*.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ToolAvailability {
     /// `cargo zigbuild` resolves (cargo-zigbuild + zig installed).
     pub zigbuild: bool,
@@ -267,13 +312,21 @@ pub struct NativeCrossPlan {
 #[error(
     "no host-native cross toolchain for `{target}` on host `{host}`: {} is not installed — {}",
     .preferred.label(),
-    .preferred.install_hint()
+    .preferred.install_hint(.target)
 )]
 pub struct CrossToolUnavailable {
     pub host: String,
     pub target: String,
     /// The tool [`select_cross_tool`] would have used had it been present.
     pub preferred: CrossTool,
+}
+
+impl CrossToolUnavailable {
+    /// The actionable install text for this failure, carrying the real target
+    /// triple. Same string the [`Display`](std::fmt::Display) impl embeds.
+    pub fn install_hint(&self) -> String {
+        self.preferred.install_hint(&self.target)
+    }
 }
 
 /// Select the host-native cross toolchain for `target` on `host`, honoring
@@ -452,8 +505,10 @@ fn cargo_target_env_key(target: &str) -> String {
 
 /// Run a probe argv and report whether it exited successfully. Any spawn
 /// failure (binary absent) or non-zero exit reads as "unavailable". The shell
-/// seam [`ToolAvailability::probe`] is built on.
-fn probe_ok(argv: &[String]) -> bool {
+/// seam [`ToolAvailability::probe`] is built on — and, since R919-F1, the one
+/// [`crate::buildcap`]'s platform-SDK probes share, so there is a single
+/// definition of "is this tool here".
+pub(crate) fn probe_ok<S: AsRef<std::ffi::OsStr>>(argv: &[S]) -> bool {
     let Some((prog, args)) = argv.split_first() else {
         return false;
     };
@@ -786,12 +841,39 @@ mod tests {
         assert_eq!(CrossTool::MuslCross.label(), "musl-cross");
         assert_eq!(CrossTool::CargoNative.label(), "native (cargo build)");
         assert!(CrossTool::CargoZigbuild
-            .install_hint()
+            .install_hint(X64_MUSL)
             .contains("cargo-zigbuild"));
-        assert!(CrossTool::MuslCross.install_hint().contains("musl-cross"));
-        assert!(CrossTool::CargoNative
-            .install_hint()
-            .contains("rustup target add"));
+        assert!(CrossTool::MuslCross
+            .install_hint(X64_MUSL)
+            .contains("musl-cross"));
+        // R919-F1: the hint carries the REAL triple, not a `<triple>` token the
+        // reader has to substitute by hand.
+        let native = CrossTool::CargoNative.install_hint(X64_MUSL);
+        assert!(native.contains(&format!("rustup target add {X64_MUSL}")), "{native}");
+        assert!(!native.contains("<triple>"), "{native}");
+    }
+
+    /// R919-F1: every emitted install command is ONE LINE with no continuation
+    /// character — the W352 lesson, enforced at the source these hints are now
+    /// derived from. `InstallCommand::new` asserts it too; this walks the whole
+    /// reachable set.
+    #[test]
+    fn install_commands_are_single_lines() {
+        for tool in [
+            CrossTool::CargoZigbuild,
+            CrossTool::MuslCross,
+            CrossTool::CargoNative,
+        ] {
+            for target in [X64_MUSL, X64_LINUX, ARM_MAC] {
+                for shell in [crate::buildcap::Shell::Posix, crate::buildcap::Shell::Windows] {
+                    for cmd in tool.install_commands(target, shell) {
+                        assert!(!cmd.line.contains('\n'), "{:?}", cmd.line);
+                        assert_eq!(cmd.line.trim(), cmd.line, "{:?}", cmd.line);
+                        assert!(!cmd.line.contains("<triple>"), "{:?}", cmd.line);
+                    }
+                }
+            }
+        }
     }
 
     #[test]

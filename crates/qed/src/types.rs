@@ -334,6 +334,7 @@
 //! @yah:gotcha("When a card carries BOTH a Tag and a Path trigger, the exporter cannot render it faithfully: inside one Actions `push:` block, ref filters and `paths` are ANDed, so 'on release OR when these files change' is not expressible there. Push a Degradation, exactly as the Pipeline arm does for workflow_run. Do NOT reject the combination at config time — QED's own dispatchers can express it fine, and refusing a valid pipeline because one export target is lossy would be the tail wagging the dog.")
 //! @yah:assumes("That the git-mirror hook which fires Tag can see the changed-path list for a push. If it cannot, the dispatch half of this ticket is bigger than the enum half and should be split — confirm before estimating.")
 //! @yah:assumes("Trigger::Tag is matched only in export.rs and config.rs tests across external/yah (grepped 2026-08-20), so the hook that types.rs:365 describes was not located in this pass. Find it before writing the dispatch code.")
+//! @yah:next("REVERSE EDGE, added from the noisetable camp (R660-S6): when this lands, go flip the motivating consumer yourself. In ~/ss/noisetable, .yah/qed/third-party-notices.toml carries a Schedule{cron} '15 4 * * *' nightly as the interim (comment at lines 18-29 says so); replace it with a Path trigger over Cargo.lock, web/*/package.json and the ATTRIBUTION.md files, then close noisetable's R660-S6. This @yah:next IS the edge — a notify_on cannot carry it, because dep_status (crates/yah/board/src/ticket.rs:1114) returns Unresolvable for an id the local board never saw, so a cross-camp notify_on never fires.")
 //!
 //! @yah:ticket(R833-F10, "DEFERRED: trigger dispatch — nothing fires Trigger::Tag, and a dispatcher needs a build-storm guard designed in before it ships")
 //! @yah:at(2026-08-29T20:54:08Z)
@@ -348,6 +349,7 @@
 //! @yah:next("Tier: Wizard -- the storm guard and the decision to add a durable watcher at all are design judgement about what this camp is willing to operate.")
 //! @yah:gotcha("THE STORM GUARD IS THE DESIGN, not a detail. GHA's model assumes human-paced pushes. This camp has ten agents wip-committing constantly, so a branch-triggered dispatcher would produce a build storm. The shape W330 specifies: TAGS ONLY by default -- rare and deliberately cut -- with branch triggers opt-in per branch. Whoever picks this up must design that guard in before shipping, not bolt it on after the first storm.")
 //! @yah:gotcha("STATE OF THE CODE, verified in W330's inventory: Trigger::{Manual, Tag, Schedule, Pipeline} are all DECLARED (oss/qed/crates/qed/src/types.rs). Cron and pipeline-chaining fire. NOTHING fires Tag -- the variant exists and its doc comment names a GHA shim or yubaba hook that does not dispatch it. So this is a missing dispatcher, not a missing type.")
+//! @yah:gotcha("OPERATOR REQUIREMENT (2026-09-13, Leif): whether a rig acts on the Tag dispatcher must be a PER-RIG opt-in, not global — a local dev workstation must never auto-build on a pushed tag, only a rig explicitly configured as a release runner may. us-west-003 is designated as the first such rig — the first \"CI runner fired by a git tag\" fleet node. This is in addition to, not instead of, the tags-vs-branches storm guard already noted above; whoever designs the dispatcher needs both axes (which trigger kinds fire, and which rigs listen) before it ships.")
 //!
 //! @yah:ticket(R823-F2, "QED multi-participant jobs: N hosts in one run, addressable to each other, one verdict")
 //! @yah:status(review)
@@ -403,6 +405,36 @@
 //! @yah:handoff("LEADER DECISION on the sharing key, so it is not reopened: keyed by pipeline + step + target triple, derived BY QED rather than declared — `QedStep.cache` is a bool, so a colliding key cannot be typed by a pipeline author. Eviction is explicit rather than unbounded, via a shared `forge_cache::evict_plan`: idle > 14 days unconditionally, plus LRU while the holding filesystem is under a 10 GiB free floor. Swept by yubaba at deploy and by the runner before each cached local step. An unbounded cache on a worker rootfs was the trap here — the arm workers' 2.5 GB rootfs is the recorded blocker this had to not make worse.")
 //! @yah:verify("THE MEASUREMENT, which is this ticket's actual deliverable, three timed in-process runs against the 9m56s / 9m57s / 11m10s cold baseline: **11m13s cold** (cache created, 795 crates compiled), **37.955s with no source change** (4 crates), **3m57s with a one-line change** (only the changed crate plus dependents; the residue is two irreducible V8 links). THE MTIME TRAP DOES NOT BITE, and this was checked rather than assumed: `pack_source_context`'s `tar::Builder::append_file` carries the camp tree's real mtimes through the extract, so cargo's freshness survives. The no-change run was confirmed a genuine warm build and not a short-circuit — no source mtime changed between runs, and the 795-vs-4 crate counts are the evidence.")
 //! @yah:gotcha("THE aarch64 LEG WENT GREEN, ON ALL THREE RUNS. It had failed on every one of the 14+ recorded runs before this. That is a bigger deal than the timings: it means `[[pipeline.on_success]]` is now reachable for the first time, so mesofact-musl's publish is genuinely armed and R876-F6's gate is the only thing standing between an iteration run and a write to cdn.yah.dev. Also note the eviction sweep is in the tree but reaches us-west-003 only on the next yubaba roll — until then that node has the mount without the sweep.")
+//!
+//! @yah:ticket(R906-F2, "ManualConfig.audience (default \"agent\") + validator: one operator gate, first manual step, nothing compiles before it")
+//! @yah:status(review)
+//! @yah:at(2026-09-14T18:58:22Z)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R906)
+//! @yah:next("Three enforcement points, all needed: (1) serde default = agent on the new field; (2) load-time validation — at most one operator step, it must be the first manual step, and no step before it may invoke a compiler (check the argv for cargo/rustc/bun/tauri rather than inventing an `irreversible` marker QED has no notion of); (3) runtime — blocked_on_operator past the ack fails the run, with a per-pipeline `allow_late_operator_block` opt-out. Warn, do not error, at authoring time; the warning must not cite measured durations because QED has none.")
+//! @yah:gotcha("Tier: Warrior — small typed change, but the validator rule lands on every pipeline in .yah/qed/ at once and `every_camp_pipeline_loads_and_validates` will catch anything it breaks.")
+//! @yah:gotcha("HALF OF THIS TICKET ALREADY LANDED IN R906-F1 (uncommitted, tree anchor bae81d65) — read the code before re-deriving it. `ManualAudience {Agent(#[default]), Operator}` and `ManualConfig.audience` are in oss/qed/crates/qed/src/types.rs with serde `rename_all = \"snake_case\"`, the default is agent, and the field is threaded to the daemon on `QedEvent::StepAwaitingHuman` -> `QedEventWire::StepAwaitingHuman.audience` so `qed.await` can split needs_agent from blocked_on_operator. `.yah/schema/qed-pipeline.toml.schema.json` is regenerated and check-schema-drift.sh is green. The rule is also already ENFORCED at the one door agents use: `QedResumeParams.as_agent` makes `qed_resume_handler` refuse an operator-audience park. WHAT IS LEFT is the validator: at most one operator step, it must be the first manual step, no step before it may invoke a compiler, warn-at-authoring / fail-at-runtime, plus the `allow_late_operator_block` per-pipeline opt-out.")
+//! @yah:verify("cd oss/qed && cargo test -p yah-qed  # 1000 passed / 0 failed / 1 ignored")
+//! @yah:verify("cargo test -p yah every_camp_pipeline_loads_and_validates  # 1 passed / 0 failed")
+//! @yah:verify("./scripts/check-schema-drift.sh  # ok")
+//! @yah:verify("cargo check --workspace --all-targets  # exit 0")
+//! @yah:handoff("SHIPPED, uncommitted, on tree anchor bae81d65930fc91672d954b7cc25a9ab6ac1c890. ONE shared predicate, both enforcement points calling it, no second implementation: `operator_gate_is_late(&Pipeline, gate, &dyn SubPipelineResolver) -> Option<OperatorGateFinding>` in oss/qed/crates/qed/src/types.rs, below `sub_pipeline_ref_token`. THE RULE: (a) at most one `audience = \"operator\"` manual step per pipeline -> `Duplicate`; (b) it must be the first manual step -> `NotFirstManual`; (c) nothing ordered before it may invoke a compiler, INCLUDING inside sub-pipelines it recurses into -> `Late`. Extras from (a) report only as Duplicate. Each `Display` names the gate, the blocker, the child pipeline it was found in when it is one, and `allow_late_operator_block`; no duration is cited anywhere — the phrasing is that the step parks on a human at an unknown depth into an unbounded run.")
+//! @yah:handoff("MECHANISM. Compiler detection is argv-only — `pub const COMPILER_PROGRAMS` (cargo, rustc, bun, bunx, tauri, npm, pnpm, yarn, tsc, cc, clang, gcc, go), doc-commented with why it is argv-based rather than a new marker or the `concurrency_key = \"cargo-target\"` convention; `compiler_invoked_by` whitespace-splits EVERY argv element and matches each token's BASENAME, so `/usr/bin/cargo` and `sh -c \"cargo build\"` both hit. \"Before\" (`steps_before`) = declared-ahead UNION transitive `needs` predecessors MINUS `dag::dependents(preds, gate)`: on the implicit chain exactly execution order, on an explicit DAG also catching a step that may merely run concurrently. Sub-pipeline recursion copies `validate_sub_pipeline_graph`'s resolver+chain shape, stopping on a repeated token or past MAX_SUB_PIPELINE_DEPTH.")
+//! @yah:handoff("WARN AT AUTHORING, REFUSE AT RUNTIME. `Pipeline::lint_operator_gates` RETURNS `Vec<OperatorGateFinding>` (that is the test surface); `load_and_validate_graph` keeps its `Result<Pipeline, ConfigError>` signature and just loops them through `tracing::warn!`. No warning framework invented. It hangs there rather than in `pipeline_from_str`/`validate_steps` because it is the only entry holding a `SubPipelineResolver`; `load` and `load_and_validate_graph` stay separate. `Pipeline::allow_late_operator_block: bool` (bare `#[serde(default)]`, mirrored on `PipelineConfig`, mapped in `pipeline_from_str`) is the SINGLE escape for the lint and all three runtime arms, and is on `resolve_specialization`'s `body_keys` reject list so an alias cannot silence its base's rule behind the base's back. Schema regenerated (`cargo run -q -p xtask -- emit-schemas`); drift green.")
+//! @yah:handoff("RUNTIME GUARD — three arms in `execute_step_manual` under `audience == Operator && !allow_late_operator_block`, all `RunnerError::InvalidConfig`, all AHEAD of the `advance` probe. (1) `parent_run_id.is_some()`: a sub-pipeline CHILD is late by construction — the parent reached it by running everything ahead, which no predicate can see from the child's own steps. (2) `!steps_are_complete()`: the runner is not holding the pipeline AS AUTHORED, so it cannot show the gate was first. Two ways in, both trimming `pipeline.steps` before construction — a resume-from-step `drain(0..from)` and a `selected_steps` `retain` of an arbitrary set; either leaves the predicate reasoning over a list missing exactly the skipped steps, clearing a gate whose compiling predecessor was among them. The error names which (`resumed from step N` / `a name-subset selection` / both). (3) otherwise ask the shared predicate. PROBE PLACEMENT IS DELIBERATE (comment at the site): a late gate is an authoring defect, and one that surfaces only when an unrelated shell predicate happens to fail is a defect that ships — the release wizard's `advance` auto-advances every rerun of an already-acked version, so a check behind the probe would stay silent on exactly those reruns. Consequence: a late gate fails even when its `advance` already holds. Arm (2) costs a false positive on a legitimately-first gate not at index 0 in a trimmed run; erring toward refusing beats erring toward stranding a human inside a rerun.")
+//! @yah:handoff("SIGNATURE WIDENED, no shim (pre-1.0, per root CLAUDE.md). `PipelineRunner::with_index_offset(usize)` is GONE, replaced by `with_step_selection(resumed_from: usize, subset: bool)`, with a new private `steps_are_subset` beside `index_offset` and a private `steps_are_complete()` deriving arm (2) from both. Two fields, not one: a resume drops a PREFIX (a count describes it, and it still has to drive emitted step indices) while a subset drops ARBITRARY steps (no count can describe it), and one run can do both. They travel in one setter so a caller that trimmed the list cannot report the half affecting UI indices while silently omitting the half that decides whether the gate can be shown to be first. Call sites: qed.rs:1357 passes `subset = false` (that path hardcodes `selected_steps: None`); camp.rs computes `steps_are_subset = p.selected_steps.is_some()` right after the `retain` and feeds the direct runner build (:10778) and the matrix helper, which took one new `bool` param (:9385 signature, :10609 arg, :9511 builder). Two in-crate test call sites and three doc references moved with it.")
+//! @yah:handoff("TESTS — 15 new, all passing. config.rs (8), real files on real disk through `PipelineLoader` + `LoaderSubPipelineResolver` since the rule's whole difficulty is resolving a sub-pipeline: gate behind a CHILD pipeline's cargo step is flagged (the case a non-recursing validator would pass; also asserts `load_and_validate_graph` still returns Ok, i.e. warn never errors); gate-first-nothing-compiling clean; two gates flagged; opt-out suppresses; `sh -c \"cargo build\"` detected; gate after an agent manual step is NotFirstManual; an agent-audience gate behind a compile NOT flagged; an alias may not declare the opt-out. runner.rs (7): late gate fails instead of parking (satisfied `advance`, ScriptedGate recorded ZERO parks); opt-out lets it run; resumed run refused; NAME-SUBSET run refused via `with_step_selection(0, true)` — the arm no offset can express, since `index_offset` is still 0 and the surviving list looks complete from inside the runner; same pipeline from the start ACCEPTED (proving it is the trimmed-list arm, not the gate); child run refused; agent-audience child ACCEPTED (proving it is the audience, not sub-pipeline+manual being broken). The child test asserts on the parent's SUMMARY, since the parent summarises rather than forwarding the child's message. Camp test switched: `every_camp_pipeline_loads_and_validates` now calls `load_and_validate_graph(stem)`, so the camp's real pipelines exercise the recursion they never did under plain `load`; `checked > 10` kept.")
+//! @yah:handoff("NOTHING IN .yah/qed/ TRIPS THE RULE TODAY, verified not assumed: `rg -n audience .yah/qed/` returns nothing, so all four `kind = \"manual\"` steps (gha-schema-drift, yah-desktop-e2e, keys-sweep, yah-release-wizard:365) default to Agent. WHOEVER FLIPS `authorize-release` TO OPERATOR: it trips rule (c) — its predecessor `version-bump` (yah-release-wizard.toml:332) is a sub-pipeline into yah-version-bump.toml, which runs `cargo run -q -p xtask -- release` at lines 104 and 109 — and also arm (2), since wizard reruns and step-subset reruns are routine. The recipe's own comment at :338-360 argues that position deliberately, so the answer there is `allow_late_operator_block = true` on that pipeline: exactly the case the opt-out was specified for.")
+//! @yah:handoff("ALSO FIXED IN-PASS, and VERIFIED. Fixed: the dangling `[Pipeline::validate]` intra-doc link on `ManualAudience::Operator` now points at the real lint fn + the opt-out (`cargo doc -p yah-qed --no-deps` emits zero warnings against any new or edited item; the crate's pile of unresolved-link warnings is all pre-existing); the doc claim that the release wizard \"accumulated three\" manual steps corrected to exactly one; and `desktop_release_matrix_routes_each_row_to_its_own_platform` (lib.rs), RED AT THE ANCHOR because it loaded `\"desktop-release\"` while the camp file is `yah-desktop-release.toml` (`git ls-tree bae81d65 .yah/qed/`) — a permanent NotFound under the R707 stem-IS-the-name coupling. Adding the `Pipeline` field also broke 31 exhaustive struct literals (no `..Default::default()` anywhere); the 26 `#[cfg(test)]` ones were inserted by a script that refused any target line not matching `Pipeline \\{$`. Verified, output read: `cd oss/qed && cargo test -p yah-qed` = 1000 passed / 0 failed / 1 ignored; `cargo test -p yah every_camp_pipeline_loads_and_validates` = 1 passed / 0 failed; `./scripts/check-schema-drift.sh` = ok; `cargo check --workspace --all-targets` = exit 0, re-run after the signature change — the only breakage outside qed was mechanical (four `///` doc comments I had put on a camp.rs function parameter, which Rust rejects; changed to `//`). The filed verify line said `cargo build -p qed`: no such package — the crate is `yah-qed` and its dev-deps resolve only from the `oss/qed` workspace. `cargo fmt` deliberately NOT run: `--check` already reports diffs in files this ticket never touched, so the tree is broadly unformatted and a run here is the 2026-08-28 path-dep incident the root CLAUDE.md warns about.")
+//!
+//! @yah:ticket(R906-B3, "apply_params does not substitute into the manual block, so a gate predicate cannot see its own pipeline's params")
+//! @yah:status(review)
+//! @yah:at(2026-09-14T19:14:25Z)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
+//! @yah:parent(R906)
+//! @yah:severity(medium)
+//! @yah:gotcha("Tier: Thief — ~10 lines and a test. THIS GAP IS WHY TWO UGLY THINGS EXIST: R605-B17 had to invent an on-disk nonce protocol (run-token/freeze-ack) to get per-run state into a predicate, and yah-release-wizard's authorize-release reads its version out of Cargo.toml with awk instead of comparing against {{spec}}. runner.rs already records the gap twice. Note R605-B19 separately made QED_RUN_ID/QED_STEP_NAME available in advance's env — that solved per-RUN identity, not param substitution; they are different holes.")
+//! @yah:handoff("Extended `apply_params` (oss/qed/crates/qed/src/types.rs:992) to substitute into `step.manual`: `prompt` (String), each `terminal[]` entry, `advance` (Option<String>, substituted when Some), and each `checklist[]` entry — reusing the existing `substitute()` helper, no new one written. `audience: ManualAudience` is an enum, correctly left untouched. Test `apply_params_substitutes_manual_block` (beside `apply_params_substitutes_argv_and_env`) now asserts all four fields including `checklist[]`. Verified on tree anchor bae81d65930fc91672d954b7cc25a9ab6ac1c890: `cd oss/qed && cargo test -p yah-qed` = 1001 passed / 0 failed / 1 ignored (unchanged from baseline, strengthened an existing test rather than adding one); `cargo check --workspace --all-targets` from repo root = exit 0. No signature change to `apply_params`, so no call sites touched. Uncommitted — shared tree (R906-F1/F2 also uncommitted in the same file); no git write commands run.")
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -514,6 +546,17 @@ pub enum WorkspaceMode {
     /// camp root (and any uncommitted work in it) is untouched. The correct
     /// mode for releases — a tag is always cut from clean committed state.
     Isolated,
+}
+
+/// The TOML spelling of a [`WorkspaceMode`] — what an author writes for
+/// `[pipeline] workspace`, so an error message can quote the key rather than
+/// the Rust variant name.
+pub fn workspace_mode_key(mode: WorkspaceMode) -> &'static str {
+    match mode {
+        WorkspaceMode::Live => "live",
+        WorkspaceMode::Checkout => "checkout",
+        WorkspaceMode::Isolated => "isolated",
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -728,6 +771,20 @@ pub struct Pipeline {
     /// them until one needs a multi-node case. See [`crate::participants`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub participants: Option<crate::participants::ParticipantSet>,
+    /// R906-F2 — opt out of the operator-gate rule
+    /// ([`Self::lint_operator_gates`]): this pipeline may declare several
+    /// `audience = "operator"` manual steps, place one after another manual
+    /// step, or place one behind a compile.
+    ///
+    /// Set it when the pipeline is genuinely meant to be *attended throughout*
+    /// — a human is at the keyboard for its whole length, so "parks on a person
+    /// at an unknown depth into an unbounded run" is not a cost it pays.
+    /// Everything else should move the gate instead. It suppresses both halves
+    /// at once (the load-time warning and the run-time failure), deliberately:
+    /// a pipeline that warns but runs, or runs but warns, is the state this
+    /// rule exists to avoid.
+    #[serde(default)]
+    pub allow_late_operator_block: bool,
 }
 
 /// Key an unkeyed pipeline falls back to (R719-F1). Camp-global: every
@@ -939,9 +996,12 @@ impl Pipeline {
         Ok(resolved)
     }
 
-    /// Substitute `{{key}}` placeholders in every step's `argv`, `env`, and a
+    /// Substitute `{{key}}` placeholders in every step's `argv`, `env`, a
     /// `gha-workflow` step's `inputs` and `matrix` (a gha-workflow step has no
-    /// argv or env, so these are its only parameterisable surface). Unknown
+    /// argv or env, so these are its only parameterisable surface), a
+    /// `sub-pipeline` step's forwarded `params`, a step's `platform.target`,
+    /// and a `manual` step's `prompt`, `terminal`, `advance`, and `checklist`
+    /// (R906-B3 — `audience` is an enum, not substitutable). Unknown
     /// placeholders are left untouched. Feed this the result of
     /// [`Self::resolve_params`], which fills defaults and checks required params.
     pub fn apply_params(&mut self, params: &HashMap<String, String>) {
@@ -988,6 +1048,24 @@ impl Pipeline {
             if let Some(spec) = step.platform.as_mut() {
                 if let Some(target) = spec.target.as_mut() {
                     *target = substitute(target, params);
+                }
+            }
+            // R906-B3: a manual step's gate predicate (`advance`) and its
+            // human-facing text (`prompt`, `terminal`, `checklist`) are the
+            // pipeline's params too — without this a predicate can't see its
+            // own run's params (R605-B17's on-disk nonce protocol exists only
+            // because of this gap). `audience` is an enum, not a template, so
+            // it is deliberately not touched here.
+            if let Some(cfg) = step.manual.as_mut() {
+                cfg.prompt = substitute(&cfg.prompt, params);
+                for line in &mut cfg.terminal {
+                    *line = substitute(line, params);
+                }
+                if let Some(advance) = cfg.advance.as_mut() {
+                    *advance = substitute(advance, params);
+                }
+                for item in &mut cfg.checklist {
+                    *item = substitute(item, params);
                 }
             }
         }
@@ -1358,6 +1436,27 @@ pub struct QedStep {
     /// end. `None` (the default) ⇒ reap at end of the step loop.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub background_until: Option<String>,
+    /// The author's declaration that this step is *legitimately* long-running
+    /// (R906-F1). Read by `qed.await`'s liveness tick: a tree whose deepest
+    /// transition has not moved for the whole wait is normally a concern —
+    /// "55m with no milestone means the pipeline needs finer ones" — and this
+    /// is the one way to say "not here, and I meant it".
+    ///
+    /// A DECLARATION, not a measurement. QED has no duration model and should
+    /// not acquire one: the measured spread across this camp's history is p50
+    /// 6s / p99 46m, four orders of magnitude driven by cache state and machine
+    /// contention rather than by step identity, so a learned per-step estimate
+    /// would be noise with a confidence interval. A flat tree-transition
+    /// timeout plus a reviewable opt-out beats that, for the same reason a fuse
+    /// beats a model of your wiring.
+    ///
+    /// Set it only where a single step genuinely does an hour of uninterrupted
+    /// work with nothing meaningful to report in between — the only case found
+    /// in this camp's history is `build-v8-musl` (56-60m, three occurrences).
+    /// If you are reaching for it because a step "sometimes" takes a while, the
+    /// answer is smaller steps.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub expect_slow: bool,
     /// For `kind = wait-for` (R513-F3, W207 Gap #5): the network endpoint to
     /// poll and the timeout/interval budget. Required when `kind = wait-for`;
     /// `validate()` rejects misconfiguration (missing block, no target, both
@@ -1636,31 +1735,42 @@ pub struct SubPipelineConfig {
     /// workflow whose internals are noise. Default `false` (transparent).
     #[serde(default)]
     pub opaque: bool,
-    /// Opt out of W224/R533-F11 inheritance: reposition this child's OWN
-    /// workspace per its OWN pipeline's declared [`WorkspaceMode`], instead
-    /// of skipping positioning and building from the parent's already-
-    /// positioned tree. Default `false` (inherit — the original, and still
-    /// correct, behaviour for a child meant to share the parent's exact
-    /// tree, e.g. `desktop-release` composed under an `Isolated` `release`
-    /// run).
+    /// Which tree this child builds in — **required whenever the two
+    /// answers differ** (R887), unset otherwise.
     ///
-    /// Exists for the opposite case: a parent pipeline that is `Live` (it
-    /// mutates the tree for human review — see `version-bump`) composing a
-    /// child that must publish from clean committed state regardless (see
-    /// `oss-publish`, declared `Isolated`). Without this, the child's own
-    /// `workspace` declaration is silently discarded and it builds from
-    /// the parent's live, possibly-uncommitted tree — the gap R755 closed:
-    /// `release-wizard` forced `oss-publish` to run `Live` because it
-    /// shares the wizard's `workspace = "live"`, so `cargo publish` saw
-    /// whatever was on disk rather than the tagged commit.
+    /// - `true`: the child calls its own `prepare_workspace` against the
+    ///   PARENT's positioned tree as the git base (so `git worktree add`
+    ///   resolves the child's target ref — normally HEAD, i.e. whatever the
+    ///   parent just committed/tagged — from the same repository the parent
+    ///   is standing in, not a second clone), positioning per its OWN
+    ///   pipeline's declared [`WorkspaceMode`].
+    /// - `false`: W224/R533-F11 inheritance — skip positioning entirely and
+    ///   build from the parent's already-positioned tree, discarding the
+    ///   child's own `workspace` declaration. Correct for a child meant to
+    ///   share the parent's exact tree, including a `Live` parent that has
+    ///   already MUTATED it (`release-wizard`'s `npm-publish` must publish
+    ///   the version `version-bump` wrote and has not yet committed).
+    /// - unset: inherit, exactly as `false` — *unless* the child declares a
+    ///   [`WorkspaceMode`] it would not actually get, which
+    ///   [`validate_sub_pipeline_graph`] refuses at load time
+    ///   ([`SubPipelineError::WorkspaceInheritanceUnstated`]).
     ///
-    /// Set `true`, the child calls its own `prepare_workspace` against the
-    /// PARENT's positioned tree as the git base (so `git worktree add`
-    /// resolves the child's target ref — normally HEAD, i.e. whatever the
-    /// parent just committed/tagged — from the same repository the parent
-    /// is standing in, not a second clone).
-    #[serde(default)]
-    pub own_workspace: bool,
+    /// **Why unset is an error in that one case, rather than a default.**
+    /// Both answers are right somewhere and neither is right often enough to
+    /// default to: `oss-publish` under the `Live` wizard must build committed
+    /// bytes (`true`), `npm-publish` under the same wizard must build the
+    /// uncommitted bump (`false`). A silent default therefore mis-composes
+    /// half the recipes that hit it, and it did — R755 found `oss-publish`
+    /// publishing from the wizard's live tree, 2026-09-04 found every
+    /// published dmg bundled from `desktop-channel`'s inherited live tree,
+    /// and R887 found `yah-cli-release`'s `stamp-build-id` dirty check
+    /// reading the camp root's 38 uncommitted files inside what its own
+    /// error message called an impossible state. Three occurrences, one
+    /// cause, each fixed by hand on one step while the next composition site
+    /// inherited the same trap. Stating it is one word at the call site and
+    /// the only thing that makes the mistake unrepresentable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub own_workspace: Option<bool>,
 }
 
 /// How a [`StepKind::SubPipeline`] step resolves to a runnable child. The
@@ -1948,6 +2058,41 @@ pub const ENV_MANUAL_RUN_ID: &str = "QED_RUN_ID";
 /// vs `push-tag`) that might otherwise reuse a similarly-shaped predicate.
 pub const ENV_MANUAL_STEP_NAME: &str = "QED_STEP_NAME";
 
+/// Who a [`StepKind::Manual`] gate is addressed to (R906-F1).
+///
+/// The classifying rule, and it is not a matter of taste: **an agent may answer
+/// a gate that asks "is this done / is this right"; it may never answer one
+/// that asks "may I".** The second kind authorizes the irreversible work that
+/// follows, and a thing cannot authorize itself.
+///
+/// [`Self::Agent`] is the default, which inverts what QED did before this
+/// existed — every `kind = "manual"` step was implicitly a human's, and a
+/// pipeline could grow as many of them as it liked with nothing saying so
+/// (`yah-release-wizard` is deliberately down to exactly one operator gate,
+/// `authorize-release`, plus `roll-the-fleet` as an agent-audience manual step).
+/// Most gates are in fact the first kind: "the version bump is right", "the tag
+/// points at the freeze commit". Those are judgements a supervising agent can
+/// make and, with an `advance` predicate, *prove*.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum ManualAudience {
+    /// A supervising agent may answer this gate. Woken by `qed.await` with
+    /// reason `needs_agent`: do the work, satisfy `advance`, then release the
+    /// park with `qed.resume`.
+    #[default]
+    Agent,
+    /// Only a human may answer. `qed.await` reports `blocked_on_operator` and a
+    /// supervising agent must notify and re-park rather than answer.
+    ///
+    /// Position matters as much as the flag: an operator gate means "did you
+    /// mean to run this, here are the facts", so it belongs at the front of a
+    /// pipeline, before anything expensive has been spent. See
+    /// [`Pipeline::lint_operator_gates`] for the rule that enforces it (R906-F2)
+    /// and [`Pipeline::allow_late_operator_block`] for the opt-out.
+    Operator,
+}
+
 /// Step-level config for [`StepKind::Manual`] (R622, W282). Describes the
 /// human's half of a pipeline: what they must accomplish, what to put in front
 /// of them, and how the pipeline confirms they did it.
@@ -2010,6 +2155,11 @@ pub struct ManualConfig {
     /// Ignored when `advance` is `None` (nothing to poll).
     #[serde(default = "default_manual_advance_poll_secs")]
     pub advance_poll_secs: u64,
+    /// Who may answer this gate (R906-F1). Defaults to
+    /// [`ManualAudience::Agent`] — see that type for the classifying rule and
+    /// for why the default is the way round it is.
+    #[serde(default)]
+    pub audience: ManualAudience,
 }
 
 /// `pub(crate)` so [`crate::doc_source`] can lower a `manual` cell without
@@ -2096,6 +2246,24 @@ pub enum SubPipelineError {
     Cycle { chain: String },
     #[error("sub-pipeline nesting exceeded max depth of {max}: {chain}")]
     MaxDepthExceeded { max: usize, chain: String },
+    /// R887: the child declares a [`WorkspaceMode`] that inheritance would
+    /// silently discard, and the step does not say which it meant. See
+    /// [`SubPipelineConfig::own_workspace`] for why this is not defaulted.
+    #[error(
+        "step `{step}` runs `{child}`, which declares workspace = \"{child_mode}\" — but a \
+         sub-pipeline child inherits its parent's tree, and this one would build \"{inherited}\" \
+         instead. Say which you meant in the step's [sub_pipeline] block: \
+         `own_workspace = true` (position the child's own {child_mode} tree — what a release \
+         child that must build COMMITTED bytes wants) or `own_workspace = false` (inherit the \
+         parent's {inherited} tree — what a child that must see the parent's uncommitted \
+         mutations wants)"
+    )]
+    WorkspaceInheritanceUnstated {
+        step: String,
+        child: String,
+        child_mode: String,
+        inherited: String,
+    },
 }
 
 /// Resolver hook for [`validate_sub_pipeline_graph`]. The validator calls
@@ -2154,13 +2322,18 @@ pub fn validate_sub_pipeline_graph(
 ) -> Result<(), SubPipelineError> {
     let root = format!("pipeline:{}", pipeline.name);
     let mut chain: Vec<String> = vec![root];
-    visit_sub_pipeline(pipeline, resolver, &mut chain)
+    visit_sub_pipeline(pipeline, resolver, &mut chain, pipeline.workspace)
 }
 
+/// `inherited` is the [`WorkspaceMode`] `pipeline`'s own steps actually run
+/// under — its declared mode at the root, and whatever its ancestors handed
+/// down for a child that did not reposition (see
+/// [`SubPipelineConfig::own_workspace`]).
 fn visit_sub_pipeline(
     pipeline: &Pipeline,
     resolver: &dyn SubPipelineResolver,
     chain: &mut Vec<String>,
+    inherited: WorkspaceMode,
 ) -> Result<(), SubPipelineError> {
     for step in &pipeline.steps {
         if step.kind != StepKind::SubPipeline {
@@ -2189,7 +2362,34 @@ fn visit_sub_pipeline(
         }
         chain.push(token);
         if let Some(child) = resolver.resolve(&cfg.target) {
-            visit_sub_pipeline(&child, resolver, chain)?;
+            // R887: a child that declares `Isolated` and would inherit
+            // something else has to say which it meant. Deliberately narrow:
+            // ONLY `Isolated`, because that is the mode an author writes on
+            // purpose (a release cuts from committed bytes) and the only one
+            // whose silent loss has shipped wrong artifacts — three times.
+            // `Checkout` is excluded even though it is equally "not
+            // inherited": it is the serde DEFAULT for an undeclared
+            // `[pipeline] workspace`, so firing on it would demand a decision
+            // on every child whose author never thought about workspaces at
+            // all, and "unset" cannot be told from "chose the default" once
+            // the TOML is parsed.
+            if child.workspace == WorkspaceMode::Isolated
+                && inherited != WorkspaceMode::Isolated
+                && cfg.own_workspace.is_none()
+            {
+                return Err(SubPipelineError::WorkspaceInheritanceUnstated {
+                    step: step.name.clone(),
+                    child: child.name.clone(),
+                    child_mode: workspace_mode_key(child.workspace).to_string(),
+                    inherited: workspace_mode_key(inherited).to_string(),
+                });
+            }
+            let child_inherits = if cfg.own_workspace == Some(true) {
+                child.workspace
+            } else {
+                inherited
+            };
+            visit_sub_pipeline(&child, resolver, chain, child_inherits)?;
         }
         chain.pop();
     }
@@ -2206,6 +2406,327 @@ pub fn sub_pipeline_ref_token(target: &SubPipelineRef) -> String {
         SubPipelineRef::Path(path) => format!("path:{}", path.display()),
         SubPipelineRef::GhaWorkflow { path, .. } => format!("gha:{}", path.display()),
         SubPipelineRef::Peer { camp, pipeline } => format!("peer:{camp}:{pipeline}"),
+    }
+}
+
+/// Program basenames that mean "this step compiles something" (R906-F2).
+///
+/// **Derived from `argv`, deliberately.** The two alternatives were both
+/// rejected: a new per-step `irreversible`/`expensive` marker is a field every
+/// author must remember to set (and the pipelines that most need this rule are
+/// exactly the ones nobody re-reads), and `concurrency_key = "cargo-target"` is
+/// a *convention* for serializing against the shared target dir, not a
+/// guarantee that the step compiles or that a compiling step declares it. The
+/// argv is the one description of a step that cannot be out of date with what
+/// the step actually runs.
+///
+/// Matched against the **basename** of each whitespace-separated token in every
+/// `argv` element, so `/usr/bin/cargo`, `sh -c "cargo build"` and
+/// `["bun", "run", "build"]` all hit.
+pub const COMPILER_PROGRAMS: &[&str] = &[
+    "cargo", "rustc", "bun", "bunx", "tauri", "npm", "pnpm", "yarn", "tsc", "cc", "clang", "gcc",
+    "go",
+];
+
+/// Basename of a shell token — the last path segment, either separator.
+fn program_basename(token: &str) -> &str {
+    token.rsplit(['/', '\\']).next().unwrap_or(token)
+}
+
+/// The first entry of [`COMPILER_PROGRAMS`] this step's `argv` invokes, if any.
+pub fn compiler_invoked_by(step: &QedStep) -> Option<&'static str> {
+    step.argv
+        .iter()
+        .flat_map(|element| element.split_whitespace())
+        .find_map(|token| {
+            let base = program_basename(token);
+            COMPILER_PROGRAMS.iter().copied().find(|p| *p == base)
+        })
+}
+
+/// What the operator-gate rule found wrong with a pipeline (R906-F2).
+///
+/// Returned rather than logged so the rule has a test surface;
+/// [`crate::config::PipelineLoader::load_and_validate_graph`] renders each one
+/// through `tracing::warn!`. These are **warnings at authoring time** — a
+/// pipeline nobody intends to run unattended is legitimate, so the loader never
+/// hard-errors on one. The runtime half
+/// ([`crate::runner::PipelineRunner`]'s manual arm) is where a late operator
+/// gate actually fails a run, and it asks the same predicate
+/// ([`operator_gate_is_late`]) so the two cannot drift.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OperatorGateFinding {
+    /// Something compiles before the gate is reached.
+    Late {
+        /// The `audience = "operator"` step.
+        gate: String,
+        /// The step whose `argv` invokes a compiler.
+        blocker: String,
+        /// `Some(name)` when `blocker` lives inside a sub-pipeline rather than
+        /// in the pipeline that declares the gate.
+        blocker_pipeline: Option<String>,
+        /// Which entry of [`COMPILER_PROGRAMS`] matched.
+        program: String,
+    },
+    /// The gate is not the first step that parks on a human.
+    NotFirstManual {
+        gate: String,
+        earlier: String,
+        earlier_pipeline: Option<String>,
+    },
+    /// More than one `audience = "operator"` step in one pipeline.
+    Duplicate { first: String, extra: String },
+}
+
+impl std::fmt::Display for OperatorGateFinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        fn located(step: &str, pipeline: &Option<String>) -> String {
+            match pipeline {
+                Some(p) => format!("`{step}` (in sub-pipeline `{p}`)"),
+                None => format!("`{step}`"),
+            }
+        }
+        match self {
+            Self::Late {
+                gate,
+                blocker,
+                blocker_pipeline,
+                program,
+            } => write!(
+                f,
+                "operator gate `{gate}` is late: {} invokes `{program}` before it. \
+                 An operator gate asks \"did you mean to run this\"; behind a compile it \
+                 instead asks a human to come back at an unknown depth into an unbounded \
+                 run, and everything spent before the answer is spent on a run nobody \
+                 authorized. Move the gate ahead of {}, or set \
+                 `allow_late_operator_block = true` on the pipeline if it is meant to be \
+                 attended throughout.",
+                located(blocker, blocker_pipeline),
+                located(blocker, blocker_pipeline),
+            ),
+            Self::NotFirstManual {
+                gate,
+                earlier,
+                earlier_pipeline,
+            } => write!(
+                f,
+                "operator gate `{gate}` is not the first manual step: {} parks first. \
+                 A human answering the second gate has already been asked once, so the \
+                 authorization the operator gate is for was not the run's first question. \
+                 Move the gate ahead of {}, or set `allow_late_operator_block = true` on \
+                 the pipeline.",
+                located(earlier, earlier_pipeline),
+                located(earlier, earlier_pipeline),
+            ),
+            Self::Duplicate { first, extra } => write!(
+                f,
+                "pipeline declares more than one `audience = \"operator\"` manual step \
+                 (`{first}` and `{extra}`): an operator gate authorizes the run, and a run \
+                 is authorized once. Make `{extra}` `audience = \"agent\"` (an agent may \
+                 answer \"is this done / is this right\"), or set \
+                 `allow_late_operator_block = true` on the pipeline."
+            ),
+        }
+    }
+}
+
+/// Where something was found ahead of an operator gate: the step's name, and
+/// the sub-pipeline it lives in (`None` = the gate's own pipeline).
+type Located = (String, Option<String>);
+
+/// **The** operator-gate predicate (R906-F2). Both enforcement points call
+/// this one function: [`Pipeline::lint_operator_gates`] at authoring time and
+/// the runner's manual arm at run time. Two parallel implementations of
+/// "is this gate late?" would drift, and the drift would be invisible — a
+/// pipeline that warns but runs, or runs but warns.
+///
+/// `gate` names an `audience = "operator"` step in `pipeline`. Returns `None`
+/// when the gate is fine, when the pipeline sets
+/// [`Pipeline::allow_late_operator_block`], or when no step of that name is
+/// present (a resume-from-step run hands the runner a drained pipeline; a
+/// missing name is not evidence of lateness).
+///
+/// # What counts as "before"
+///
+/// Every step declared ahead of the gate, plus every transitive `needs`
+/// predecessor of it, minus everything that transitively depends on the gate.
+/// On the implicit chain — which is every pipeline that declares no `needs` —
+/// that is exactly execution order. On an explicit DAG it also catches a step
+/// that merely *may* run concurrently with the gate, which is the right answer:
+/// a compile racing the human has still been spent by the time they answer.
+///
+/// # Sub-pipelines are the whole point
+///
+/// A `kind = "sub-pipeline"` step ahead of the gate is descended into, because
+/// the expensive thing is routinely a child's: `yah-release-wizard`'s gate
+/// follows `version-bump`, whose child pipeline runs `cargo run -p xtask`. A
+/// rule that only read the parent's own `argv` would call that pipeline clean.
+pub fn operator_gate_is_late(
+    pipeline: &Pipeline,
+    gate: &str,
+    resolver: &dyn SubPipelineResolver,
+) -> Option<OperatorGateFinding> {
+    if pipeline.allow_late_operator_block {
+        return None;
+    }
+    let gate_index = pipeline.steps.iter().position(|s| s.name == gate)?;
+    let before = steps_before(&pipeline.steps, gate_index);
+    let ahead: Vec<&QedStep> = before.iter().map(|&i| &pipeline.steps[i]).collect();
+
+    let mut chain = vec![format!("pipeline:{}", pipeline.name)];
+    let mut compiler: Option<(Located, &'static str)> = None;
+    let mut manual: Option<Located> = None;
+    scan_for_blockers(
+        &ahead,
+        None,
+        resolver,
+        &mut chain,
+        &mut compiler,
+        &mut manual,
+    );
+
+    if let Some(((blocker, blocker_pipeline), program)) = compiler {
+        return Some(OperatorGateFinding::Late {
+            gate: gate.to_string(),
+            blocker,
+            blocker_pipeline,
+            program: program.to_string(),
+        });
+    }
+    if let Some((earlier, earlier_pipeline)) = manual {
+        return Some(OperatorGateFinding::NotFirstManual {
+            gate: gate.to_string(),
+            earlier,
+            earlier_pipeline,
+        });
+    }
+    None
+}
+
+/// Indices that run before — or alongside — `gate`. See
+/// [`operator_gate_is_late`] for why "alongside" counts.
+fn steps_before(steps: &[QedStep], gate: usize) -> Vec<usize> {
+    let mut set: std::collections::BTreeSet<usize> = (0..gate).collect();
+    if let Ok(preds) = crate::dag::predecessors(steps, crate::dag::Missing::Satisfied) {
+        let mut frontier = vec![gate];
+        let mut seen: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        while let Some(cur) = frontier.pop() {
+            for &p in &preds[cur] {
+                if seen.insert(p) {
+                    set.insert(p);
+                    frontier.push(p);
+                }
+            }
+        }
+        // A step declared earlier that `needs` the gate genuinely runs after it.
+        for after in crate::dag::dependents(&preds, gate) {
+            set.remove(&after);
+        }
+    }
+    set.remove(&gate);
+    set.into_iter().collect()
+}
+
+/// Walk `steps` (and, for sub-pipeline steps, their children) recording the
+/// first compiler invocation and the first manual step seen. Stops descending
+/// on a repeated target or past [`MAX_SUB_PIPELINE_DEPTH`] — cycles are already
+/// rejected by [`validate_sub_pipeline_graph`] on the load path, but the
+/// runtime caller has no such guarantee and a validator must not hang.
+fn scan_for_blockers(
+    steps: &[&QedStep],
+    child_of: Option<&str>,
+    resolver: &dyn SubPipelineResolver,
+    chain: &mut Vec<String>,
+    compiler: &mut Option<(Located, &'static str)>,
+    manual: &mut Option<Located>,
+) {
+    for step in steps {
+        if compiler.is_none() {
+            if let Some(program) = compiler_invoked_by(step) {
+                *compiler = Some(((step.name.clone(), child_of.map(str::to_string)), program));
+            }
+        }
+        if manual.is_none() && step.kind == StepKind::Manual {
+            *manual = Some((step.name.clone(), child_of.map(str::to_string)));
+        }
+        if compiler.is_some() && manual.is_some() {
+            return;
+        }
+        if step.kind != StepKind::SubPipeline {
+            continue;
+        }
+        let Some(cfg) = step.sub_pipeline.as_ref() else {
+            continue;
+        };
+        let token = sub_pipeline_ref_token(&cfg.target);
+        if chain.contains(&token) || chain.len() > MAX_SUB_PIPELINE_DEPTH {
+            continue;
+        }
+        let Some(child) = resolver.resolve(&cfg.target) else {
+            continue;
+        };
+        chain.push(token);
+        let child_steps: Vec<&QedStep> = child.steps.iter().collect();
+        scan_for_blockers(
+            &child_steps,
+            Some(&child.name),
+            resolver,
+            chain,
+            compiler,
+            manual,
+        );
+        chain.pop();
+    }
+}
+
+impl Pipeline {
+    /// Check this pipeline's `audience = "operator"` manual gates (R906-F2).
+    ///
+    /// The three rules, in the order they are reported:
+    /// 1. **At most one** operator gate per pipeline.
+    /// 2. It must be the **first** manual step.
+    /// 3. **Nothing before it may compile** — including inside sub-pipelines it
+    ///    descends into.
+    ///
+    /// Rules 2 and 3 are [`operator_gate_is_late`], which the runner calls too.
+    /// Rule 1's extras are reported as [`OperatorGateFinding::Duplicate`] and
+    /// not additionally re-reported as not-first, which they trivially are.
+    ///
+    /// Findings are returned, never raised: authoring-time this is a warning
+    /// (see [`OperatorGateFinding`]), and `allow_late_operator_block` silences
+    /// the whole check.
+    pub fn lint_operator_gates(
+        &self,
+        resolver: &dyn SubPipelineResolver,
+    ) -> Vec<OperatorGateFinding> {
+        if self.allow_late_operator_block {
+            return Vec::new();
+        }
+        let gates: Vec<&str> = self
+            .steps
+            .iter()
+            .filter(|s| {
+                s.kind == StepKind::Manual
+                    && s.manual
+                        .as_ref()
+                        .is_some_and(|m| m.audience == ManualAudience::Operator)
+            })
+            .map(|s| s.name.as_str())
+            .collect();
+        let Some(first) = gates.first().copied() else {
+            return Vec::new();
+        };
+        let mut out: Vec<OperatorGateFinding> = gates[1..]
+            .iter()
+            .map(|extra| OperatorGateFinding::Duplicate {
+                first: first.to_string(),
+                extra: (*extra).to_string(),
+            })
+            .collect();
+        if let Some(finding) = operator_gate_is_late(self, first, resolver) {
+            out.push(finding);
+        }
+        out
     }
 }
 
@@ -2891,6 +3412,23 @@ pub struct ParamDef {
     /// degrade to free text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub options_from: Option<String>,
+    /// A shell command whose non-empty stdout lines become [`Self::options`]
+    /// at READ time, the first line also becoming [`Self::default`] — for a
+    /// closed set that is computed rather than enumerated from files, e.g. the
+    /// release wizard's next patch/minor/major version off `Cargo.toml`:
+    ///
+    /// ```toml
+    /// spec = { options_cmd = "scripts/release-versions.sh" }
+    /// ```
+    ///
+    /// Run from the camp root by
+    /// [`PipelineLoader::load`](crate::config::PipelineLoader::load) (and a
+    /// doc's `resolved_params`), so the catalog, the desktop dropdown and
+    /// [`Pipeline::resolve_params`] all read the same filled list. It owns the
+    /// list outright: `options`, `options_from` or `default` beside it is a
+    /// load error, not a merge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub options_cmd: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2934,6 +3472,25 @@ pub enum Outcome {
         /// existing fallback-to-workspace-version behaviour.
         #[serde(default)]
         require_explicit_version: bool,
+        /// R560-F15: publish per LEG rather than per run. A leg is one
+        /// weakly-connected component of the step `needs` graph
+        /// ([`crate::dag::legs`]) — e.g. mesofact-musl's x86 and arm builds,
+        /// each a root with no shared step. When `true`:
+        ///
+        ///   * a step failure aborts only its own leg (its not-yet-admitted
+        ///     steps are never run); the other legs keep going;
+        ///   * if the run ends Failed, this outcome still fires, carrying only
+        ///     the artifacts of legs whose every step succeeded or was skipped.
+        ///     The run still reports `Failed` and `on_fail` still fires, so a
+        ///     broken leg never reads as a green release.
+        ///
+        /// Every other `on_success` outcome keeps requiring the whole run to
+        /// succeed. A pipeline with no explicit `needs` is one chain, hence one
+        /// leg, so the flag changes nothing there. Do not set it when a failing
+        /// leg is meant to GATE the release (a parallel test leg): outcomes
+        /// cannot declare `needs`, so per-leg publish cannot see that gate.
+        #[serde(default)]
+        per_leg: bool,
     },
     /// Dispatch a named vendor release adapter (R509) — Apple notarize/staple,
     /// Authenticode sign, Sparkle appcast, TestFlight/Play/GitHub upload.
@@ -3317,6 +3874,22 @@ pub enum RunStatus {
 }
 
 impl RunStatus {
+    /// Has this run or step reached a state it can never leave?
+    ///
+    /// [`Self::AwaitingHuman`] is deliberately NOT terminal even though a park
+    /// can outlive everything around it: the run is alive, holds no lock, and
+    /// resumes the moment its gate is answered. Treating it as terminal is the
+    /// mistake that makes a supervisor report a release "done" while it sits
+    /// waiting for someone to look at it.
+    pub fn is_terminal(self) -> bool {
+        match self {
+            RunStatus::Queued | RunStatus::Running | RunStatus::AwaitingHuman => false,
+            RunStatus::Success | RunStatus::Failed | RunStatus::Cancelled | RunStatus::Skipped => {
+                true
+            }
+        }
+    }
+
     /// Aggregate child run statuses into a single parent status (R506-F1
     /// matrix fan-out). Mirrors [`yah_qed_gha::JobResult::aggregate`] exactly so a
     /// matrixed parent run reports the same overall verdict the GHA graph would
@@ -3467,6 +4040,7 @@ mod tests {
 
     fn one_step(argv: Vec<&str>, env: &[(&str, &str)]) -> Pipeline {
         Pipeline {
+            allow_late_operator_block: false,
             participants: None,
             max_parallel: None,
             description: None,
@@ -3474,6 +4048,7 @@ mod tests {
             name: "p".into(),
             label: "p".into(),
             steps: vec![QedStep {
+                            expect_slow: false,
                             participant: None,
                 needs: None,
                 resource: None,
@@ -3610,6 +4185,34 @@ mod tests {
     }
 
     #[test]
+    fn apply_params_substitutes_manual_block() {
+        // R906-B3: a manual step's gate predicate couldn't see its own
+        // pipeline's params (R605-B17's on-disk nonce protocol and
+        // yah-release-wizard's `awk`-out-of-Cargo.toml workaround both exist
+        // only because of this gap). Cover all three fields the ticket names.
+        let mut p = one_step(vec!["bash", "noop.sh"], &[]);
+        p.steps[0].manual = Some(ManualConfig {
+            prompt: "Confirm version {{version}} is correct.".into(),
+            terminal: vec!["git tag v{{version}}".into()],
+            advance: Some("git describe --tags --exact-match v{{version}}".into()),
+            checklist: vec!["Tag v{{version}} pushed".into()],
+            advance_poll_secs: 5,
+            audience: ManualAudience::Agent,
+        });
+        let mut params = HashMap::new();
+        params.insert("version".to_string(), "1.2.3".to_string());
+        p.apply_params(&params);
+        let manual = p.steps[0].manual.as_ref().unwrap();
+        assert_eq!(manual.prompt, "Confirm version 1.2.3 is correct.");
+        assert_eq!(manual.terminal, vec!["git tag v1.2.3".to_string()]);
+        assert_eq!(
+            manual.advance.as_deref(),
+            Some("git describe --tags --exact-match v1.2.3")
+        );
+        assert_eq!(manual.checklist, vec!["Tag v1.2.3 pushed".to_string()]);
+    }
+
+    #[test]
     fn apply_params_substitutes_platform_target() {
         // R786-B1: release-build.toml's cross-build step declares
         // `platform = { target = "{{target}}" }` so qed's native_cross_plan
@@ -3654,6 +4257,7 @@ mod tests {
                 default: Some("--no-sidecars".to_string()),
                 options: Vec::new(),
                 options_from: None,
+                options_cmd: None,
             },
         );
         // The loader moves a pinned key OUT of `params` and into `pins`.
@@ -3682,7 +4286,7 @@ mod tests {
         let mut p = one_step(vec!["build", "{{package}}", "{{features}}"], &[]);
         p.params.insert(
             "package".to_string(),
-            ParamDef { required: true, description: None, default: None, options: Vec::new(), options_from: None },
+            ParamDef { required: true, description: None, default: None, options: Vec::new(), options_from: None, options_cmd: None },
         );
         p.params.insert(
             "features".to_string(),
@@ -3692,6 +4296,7 @@ mod tests {
                 default: Some(String::new()),
                 options: Vec::new(),
                 options_from: None,
+                options_cmd: None,
             },
         );
 
@@ -3712,7 +4317,7 @@ mod tests {
         for name in ["board", "version"] {
             p.params.insert(
                 name.to_string(),
-                ParamDef { required: true, description: None, default: None, options: Vec::new(), options_from: None },
+                ParamDef { required: true, description: None, default: None, options: Vec::new(), options_from: None, options_cmd: None },
             );
         }
         p.params.insert(
@@ -3723,6 +4328,7 @@ mod tests {
                 default: Some("stable".to_string()),
                 options: Vec::new(),
                 options_from: None,
+                options_cmd: None,
             },
         );
 
@@ -3753,6 +4359,7 @@ mod tests {
                 default: Some("stable".to_string()),
                 options: Vec::new(),
                 options_from: None,
+                options_cmd: None,
             },
         );
         let supplied: HashMap<String, String> = [
@@ -3779,6 +4386,7 @@ mod tests {
                 default: Some("orangepi_zero2w".to_string()),
                 options: vec!["orangepi_zero2w".to_string(), "rpi_zero2w".to_string()],
                 options_from: None,
+                options_cmd: None,
             },
         );
 
@@ -3806,6 +4414,7 @@ mod tests {
                 default: None,
                 options: vec!["orangepi_zero2w".to_string(), "rpi_zero2w".to_string()],
                 options_from: None,
+                options_cmd: None,
             },
         );
         let supplied: HashMap<String, String> =
@@ -3837,6 +4446,7 @@ mod tests {
                 default: None,
                 options: Vec::new(),
                 options_from: None,
+                options_cmd: None,
             },
         );
         let supplied: HashMap<String, String> =
@@ -3974,6 +4584,7 @@ mod tests {
             advance: None,
             checklist: vec![],
             advance_poll_secs: 5,
+            audience: ManualAudience::Agent,
         }
     }
 
@@ -4092,6 +4703,7 @@ checklist = ["Diff reviewed"]
 
     fn build_image_step(name: &str) -> QedStep {
         QedStep {
+            expect_slow: false,
             participant: None,
             needs: None,
             resource: None,
@@ -4137,6 +4749,7 @@ checklist = ["Diff reviewed"]
 
     fn package_native_tarball_step(name: &str) -> QedStep {
         QedStep {
+            expect_slow: false,
             participant: None,
             needs: None,
             resource: None,
@@ -4182,6 +4795,7 @@ checklist = ["Diff reviewed"]
 
     fn musl_static_preflight_step(name: &str) -> QedStep {
         QedStep {
+            expect_slow: false,
             participant: None,
             needs: None,
             resource: None,
@@ -4381,6 +4995,7 @@ checklist = ["Diff reviewed"]
 
     fn sign_native_tarball_step(name: &str) -> QedStep {
         QedStep {
+            expect_slow: false,
             participant: None,
             needs: None,
             resource: None,
@@ -4865,6 +5480,7 @@ checklist = ["Diff reviewed"]
 
     fn sub_pipeline_step(name: &str, target: SubPipelineRef) -> QedStep {
         QedStep {
+            expect_slow: false,
             participant: None,
             needs: None,
             resource: None,
@@ -4900,7 +5516,7 @@ checklist = ["Diff reviewed"]
                 params: HashMap::new(),
                 propagate: SubPipelineCollect::default(),
                 opaque: false,
-                own_workspace: false,
+                own_workspace: None,
             }),
             outputs: Vec::new(),
             gha_workflow: None,
@@ -4916,6 +5532,7 @@ checklist = ["Diff reviewed"]
 
     fn pipeline_with(name: &str, steps: Vec<QedStep>) -> Pipeline {
         Pipeline {
+            allow_late_operator_block: false,
             participants: None,
             max_parallel: None,
             description: None,
@@ -5452,6 +6069,114 @@ checklist = ["Diff reviewed"]
         map.insert("builtin:child-b".to_string(), leaf);
         let resolver = MapResolver(map);
         assert!(validate_sub_pipeline_graph(&root, &resolver).is_ok());
+    }
+
+    /// R887. `yah-cli-release` declares `workspace = "isolated"` and was
+    /// composed by the `live` release wizard with nothing said either way, so
+    /// it built in the wizard's live tree — its `stamp-build-id` step read the
+    /// camp root's 38 uncommitted files and refused to stamp, inside what its
+    /// own error called an impossible state. The third time that shape shipped.
+    #[test]
+    fn an_isolated_child_under_a_live_parent_must_state_which_tree() {
+        let mut child = pipeline_with("cli-release", vec![]);
+        child.workspace = WorkspaceMode::Isolated;
+        let mut root = pipeline_with(
+            "wizard",
+            vec![sub_pipeline_step(
+                "publish-cli",
+                SubPipelineRef::Builtin("cli-release".into()),
+            )],
+        );
+        root.workspace = WorkspaceMode::Live;
+        let mut map = HashMap::new();
+        map.insert("builtin:cli-release".to_string(), child);
+        let resolver = MapResolver(map);
+
+        let err = validate_sub_pipeline_graph(&root, &resolver).unwrap_err();
+        match err {
+            SubPipelineError::WorkspaceInheritanceUnstated {
+                ref step,
+                ref child,
+                ref child_mode,
+                ref inherited,
+            } => {
+                assert_eq!(step, "publish-cli");
+                assert_eq!(child, "cli-release");
+                // The message has to name BOTH trees: an author who reads only
+                // "declares isolated" fixes it by writing `own_workspace =
+                // true` even when the child needed the live tree.
+                assert_eq!(child_mode, "isolated");
+                assert_eq!(inherited, "live");
+                let msg = err.to_string();
+                assert!(msg.contains("own_workspace = true"), "{msg}");
+                assert!(msg.contains("own_workspace = false"), "{msg}");
+            }
+            other => panic!("expected WorkspaceInheritanceUnstated, got {other:?}"),
+        }
+
+        // Either answer clears it — the rule is that one of them is written
+        // down, not which one.
+        for stated in [Some(true), Some(false)] {
+            let mut stated_root = root.clone();
+            stated_root.steps[0].sub_pipeline.as_mut().unwrap().own_workspace = stated;
+            assert!(
+                validate_sub_pipeline_graph(&stated_root, &resolver).is_ok(),
+                "own_workspace = {stated:?} states the intent and must pass"
+            );
+        }
+    }
+
+    /// The other half of the rule: inheritance that already DELIVERS what the
+    /// child declared is not a conflict, so composing a release inside a
+    /// release stays silent (`yah-release` → `yah-desktop-release`, both
+    /// `isolated`) — including through a child that repositioned.
+    #[test]
+    fn an_isolated_child_of_an_isolated_tree_needs_no_statement() {
+        let mut leaf = pipeline_with("desktop-release", vec![]);
+        leaf.workspace = WorkspaceMode::Isolated;
+        let mut mid = pipeline_with(
+            "release",
+            vec![sub_pipeline_step(
+                "desktop",
+                SubPipelineRef::Builtin("desktop-release".into()),
+            )],
+        );
+        mid.workspace = WorkspaceMode::Isolated;
+        let mut map = HashMap::new();
+        map.insert("builtin:desktop-release".to_string(), leaf);
+        map.insert("builtin:release".to_string(), mid.clone());
+        let resolver = MapResolver(map);
+
+        // Isolated root -> isolated child, nothing stated.
+        assert!(validate_sub_pipeline_graph(&mid, &resolver).is_ok());
+
+        // Live root -> `own_workspace = true` child (now isolated) -> isolated
+        // grandchild, nothing stated on the grandchild: the tree it inherits
+        // is already a worktree, so there is nothing to decide.
+        let mut root = pipeline_with(
+            "wizard",
+            vec![sub_pipeline_step(
+                "compose",
+                SubPipelineRef::Builtin("release".into()),
+            )],
+        );
+        root.workspace = WorkspaceMode::Live;
+        root.steps[0].sub_pipeline.as_mut().unwrap().own_workspace = Some(true);
+        assert!(validate_sub_pipeline_graph(&root, &resolver).is_ok());
+
+        // …and with the same child INHERITING the live tree instead, the
+        // grandchild's own `isolated` is the one being discarded — same
+        // failure, one level down, which is why the walk threads the
+        // effective mode rather than reading the parent's declaration.
+        root.steps[0].sub_pipeline.as_mut().unwrap().own_workspace = Some(false);
+        let err = validate_sub_pipeline_graph(&root, &resolver).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                SubPipelineError::WorkspaceInheritanceUnstated { ref step, .. } if step == "desktop"
+            ),
+            "expected the GRANDCHILD's step to be named, got {err:?}"
+        );
     }
 
     #[test]

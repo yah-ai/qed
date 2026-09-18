@@ -182,6 +182,13 @@ pub enum QedEvent {
         name: String,
         argv: Vec<String>,
         env_keys: Vec<String>,
+        /// The step's [`crate::types::QedStep::expect_slow`] declaration,
+        /// carried on the event so a consumer watching the run's liveness can
+        /// tell "this step has been quiet for an hour and its author said it
+        /// would be" from "this step has been quiet for an hour" without
+        /// re-reading the pipeline TOML — which, for a sub-pipeline child, it
+        /// may not even be able to locate.
+        expect_slow: bool,
         at: DateTime<Utc>,
     },
     /// A step was dispatched to a remote build-worker and now has a durable
@@ -214,6 +221,17 @@ pub enum QedEvent {
         name: String,
         form_id: Option<String>,
         advance: Option<String>,
+        /// Who is allowed to answer this park (R906-F1) — the field that
+        /// splits a supervising agent's `needs_agent` wake from its
+        /// `blocked_on_operator` one. See [`crate::types::ManualAudience`].
+        audience: crate::types::ManualAudience,
+        /// [`crate::types::ManualConfig::prompt`], echoed so a consumer woken
+        /// by this park knows what is being asked without a second lookup. The
+        /// form carries the same text, but a headless park has no form.
+        prompt: String,
+        /// [`crate::types::ManualConfig::terminal`] — the starting kit for
+        /// whoever answers. Echoed for the same reason as `prompt`.
+        terminal: Vec<String>,
         at: DateTime<Utc>,
     },
     /// One line of stdout/stderr captured from the executing step (local runs).

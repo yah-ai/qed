@@ -231,6 +231,8 @@ pub enum DocSourceError {
     OptionsFromMatchedNothing(String, String),
     #[error("param `{0}`: `options_from={1}` is not a `<dir>/<pattern>` glob — it needs a directory to enumerate")]
     OptionsFromNotAGlob(String, String),
+    #[error("{0}")]
+    OptionsCmd(String),
 }
 
 /// One runnable cell, parsed but not yet lowered.
@@ -416,6 +418,8 @@ impl DocSource {
         let mut out = self.config.params.clone();
         for (name, def) in out.iter_mut() {
             resolve_options_from(camp_root, name, def)?;
+            crate::config::resolve_options_cmd(camp_root, name, def)
+                .map_err(DocSourceError::OptionsCmd)?;
         }
         Ok(out)
     }
@@ -475,6 +479,7 @@ impl DocSource {
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(Pipeline {
+            allow_late_operator_block: false,
             name: self.name.clone(),
             label: self
                 .config
@@ -550,6 +555,10 @@ impl DocSource {
                         .map(|c| substitute_params(c, params))
                         .collect(),
                     advance_poll_secs: crate::types::default_manual_advance_poll_secs(),
+                    // A runbook cell has no `audience` attribute to lower, so
+                    // it takes the type's default (agent) like any TOML step
+                    // that omits the key.
+                    audience: Default::default(),
                 }),
                 // Always `Abort`, and deliberately not the `assert`/`show`
                 // choice the other cells make: a manual step only "fails" when

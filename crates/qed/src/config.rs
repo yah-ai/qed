@@ -363,6 +363,10 @@ pub struct PipelineConfig {
     /// [`crate::types::Pipeline::participants`].
     #[serde(default)]
     participants: Option<crate::participants::ParticipantSet>,
+    /// R906-F2 — `allow_late_operator_block`. See
+    /// [`crate::types::Pipeline::allow_late_operator_block`].
+    #[serde(default)]
+    allow_late_operator_block: bool,
 }
 
 #[derive(Clone)]
@@ -549,10 +553,23 @@ impl PipelineLoader {
     /// you want parse-time confirmation that the SubPipeline graph is
     /// well-formed; plain [`Self::load`] skips the walk so loading
     /// individual children doesn't re-validate the whole graph repeatedly.
+    ///
+    /// R906-F2 hangs the operator-gate lint here rather than in
+    /// `pipeline_from_str` (where `validate_steps` and friends live, and where
+    /// a load-time check would otherwise belong) for one reason: the rule has to descend into
+    /// sub-pipelines (the compile that precedes a gate is routinely a child's),
+    /// and this is the only entry that holds a
+    /// [`SubPipelineResolver`](crate::types::SubPipelineResolver). Its findings
+    /// go out as `tracing::warn!` and never change this function's result — a
+    /// pipeline nobody intends to run unattended is legitimate, so authoring
+    /// time warns and only [`crate::runner::PipelineRunner`] refuses.
     pub fn load_and_validate_graph(&self, name: &str) -> Result<Pipeline, ConfigError> {
         let pipeline = self.load(name)?;
         let resolver = LoaderSubPipelineResolver::new(self.clone());
         crate::types::validate_sub_pipeline_graph(&pipeline, &resolver)?;
+        for finding in pipeline.lint_operator_gates(&resolver) {
+            tracing::warn!(pipeline = %pipeline.name, "{finding}");
+        }
         Ok(pipeline)
     }
 
@@ -600,7 +617,7 @@ impl PipelineLoader {
         if parsed.pipeline.alias_of.is_some() {
             return self.resolve_specialization(parsed, content, chain);
         }
-        let pipeline = Pipeline {
+        let mut pipeline = Pipeline {
             name: parsed.pipeline.name,
             label: parsed.pipeline.label,
             // Explicit key wins; otherwise the file's own header block is the
@@ -628,10 +645,15 @@ impl PipelineLoader {
             on_change: parsed.on_change,
             finally: parsed.pipeline.finally,
             participants: parsed.pipeline.participants,
+            allow_late_operator_block: parsed.pipeline.allow_late_operator_block,
         };
         self.validate_steps(&pipeline)?;
         self.validate_dag(&pipeline)?;
         self.validate_binds(&pipeline)?;
+        let camp_root = self.workspace_root();
+        for (name, def) in pipeline.params.iter_mut() {
+            resolve_options_cmd(&camp_root, name, def).map_err(ConfigError::InvalidParam)?;
+        }
         self.validate_params(&pipeline)?;
         // R823-F2: allocate the set here purely to prove it allocates. The
         // runner re-derives it (the plan is pure, so both get the same one);
@@ -711,6 +733,13 @@ impl PipelineLoader {
         }
         if cfg.participants.is_some() {
             body_keys.push("participants");
+        }
+        // R906-F2: the operator-gate opt-out describes the base's *steps*, so
+        // it belongs with them — an alias that could silence the base's gate
+        // rule without the base saying so is exactly the drift the flag's
+        // "suppresses both halves at once" rule is written to prevent.
+        if cfg.allow_late_operator_block {
+            body_keys.push("allow_late_operator_block");
         }
         if !parsed.binds.is_empty() {
             body_keys.push("[[bind]]");
@@ -968,6 +997,78 @@ impl PipelineLoader {
     }
 }
 
+/// How long a [`ParamDef::options_cmd`](crate::types::ParamDef::options_cmd)
+/// may run. The daemon's catalog loads every pipeline on each poll, so a hung
+/// command must fail the load rather than hang the catalog.
+const OPTIONS_CMD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Run a param's `options_cmd` and make its output the param's closed set: one
+/// option per non-empty stdout line, the first line the default. Called on
+/// every load, so the options track the tree rather than the moment the file
+/// was written. A command that fails, times out or prints nothing is an error,
+/// never a silent degrade to free text.
+pub(crate) fn resolve_options_cmd(
+    camp_root: &Path,
+    name: &str,
+    def: &mut crate::types::ParamDef,
+) -> Result<(), String> {
+    let Some(cmd) = def.options_cmd.clone() else {
+        return Ok(());
+    };
+    if !def.options.is_empty() || def.options_from.is_some() || def.default.is_some() {
+        return Err(format!(
+            "[pipeline.params.{name}]: `options_cmd` supplies both the options and the default \
+             (its first line) — drop `options`, `options_from` and `default`"
+        ));
+    }
+    let fail = |why: String| format!("[pipeline.params.{name}]: options_cmd `{cmd}` {why}");
+    let mut child = std::process::Command::new("sh")
+        .arg("-c")
+        .arg(&cmd)
+        .current_dir(camp_root)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| fail(format!("did not start: {e}")))?;
+    let deadline = std::time::Instant::now() + OPTIONS_CMD_TIMEOUT;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(fail(format!("timed out after {OPTIONS_CMD_TIMEOUT:?}")));
+            }
+            Err(e) => return Err(fail(format!("could not be awaited: {e}"))),
+        }
+    };
+    let output = child
+        .wait_with_output()
+        .map_err(|e| fail(format!("output unreadable: {e}")))?;
+    if !status.success() {
+        return Err(fail(format!(
+            "exited {status}: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    let options: Vec<String> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    let Some(first) = options.first() else {
+        return Err(fail("printed no options".to_string()));
+    };
+    def.default = Some(first.clone());
+    def.options = options;
+    Ok(())
+}
+
 /// Bridge a [`PipelineLoader`] into the [`SubPipelineResolver`] trait so
 /// [`PipelineRunner`](crate::runner::PipelineRunner) can recurse into
 /// SubPipeline children without `runner.rs` taking a direct dependency on
@@ -1030,6 +1131,7 @@ fn synthesise_gha_pipeline(entry: &GhaWorkflowEntry) -> Pipeline {
         ..Default::default()
     };
     Pipeline {
+        allow_late_operator_block: false,
         description: None,
         name: entry.name.clone(),
         label: entry
@@ -1146,6 +1248,7 @@ impl SubPipelineResolver for LoaderSubPipelineResolver {
                     ..Default::default()
                 };
                 Some(crate::types::Pipeline {
+                    allow_late_operator_block: false,
                     description: None,
                     name: format!("gha-workflow:{}", path.display()),
                     label: String::new(),
@@ -1447,6 +1550,58 @@ target = "desktop"
         assert_eq!(advertised, vec!["notify", "profile"]);
         // ...but it is still a param at run time.
         assert_eq!(p.pins.get("target").map(String::as_str), Some("desktop"));
+    }
+
+    fn options_cmd_pipeline(param: &str) -> String {
+        format!(
+            "[pipeline]\nname = \"versions\"\nlabel = \"l\"\n\n\
+             [pipeline.params.spec]\n{param}\n\n\
+             [[pipeline.steps]]\nname = \"s\"\nargv = [\"true\"]\n"
+        )
+    }
+
+    /// The command's lines are the closed set and its first line the default,
+    /// so a keyword the command never printed is refused at run time.
+    #[test]
+    fn options_cmd_fills_options_and_defaults_to_the_first_line() {
+        let (_d, loader) = camp(&[(
+            "versions",
+            &options_cmd_pipeline("options_cmd = \"printf '0.8.40\\\\n0.9.0\\\\n'\""),
+        )]);
+        let p = loader.load("versions").unwrap();
+        let def = &p.params["spec"];
+        assert_eq!(def.options, vec!["0.8.40".to_string(), "0.9.0".to_string()]);
+        assert_eq!(def.default.as_deref(), Some("0.8.40"));
+        assert_eq!(
+            p.resolve_params(&HashMap::new()).unwrap().get("spec").map(String::as_str),
+            Some("0.8.40")
+        );
+        let patch: HashMap<String, String> =
+            [("spec".to_string(), "patch".to_string())].into_iter().collect();
+        assert!(p.resolve_params(&patch).is_err());
+    }
+
+    #[test]
+    fn options_cmd_that_fails_or_prints_nothing_fails_the_load() {
+        let (_d, loader) = camp(&[
+            ("versions", &options_cmd_pipeline("options_cmd = \"echo nope >&2; exit 3\"")),
+        ]);
+        let err = loader.load("versions").unwrap_err().to_string();
+        assert!(err.contains("nope"), "{err}");
+
+        let (_d, loader) = camp(&[("versions", &options_cmd_pipeline("options_cmd = \"true\""))]);
+        let err = loader.load("versions").unwrap_err().to_string();
+        assert!(err.contains("printed no options"), "{err}");
+    }
+
+    #[test]
+    fn options_cmd_refuses_a_hand_written_default_beside_it() {
+        let (_d, loader) = camp(&[(
+            "versions",
+            &options_cmd_pipeline("options_cmd = \"echo 1.0.0\"\ndefault = \"1.0.0\""),
+        )]);
+        let err = loader.load("versions").unwrap_err().to_string();
+        assert!(err.contains("drop `options`"), "{err}");
     }
 
     /// A pin is the specialization's identity, not a default: substitution and
@@ -3743,5 +3898,305 @@ coordinator = true
             .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("participants"), "{msg}");
+    }
+
+    // ---- R906-F2: the operator-gate rule -------------------------------
+
+    /// Lay down a camp whose `.yah/qed/` holds the given `<stem>.toml` files,
+    /// returning its qed dir. Real files on real disk, because the rule's whole
+    /// difficulty is *resolving a sub-pipeline*, and a `Pipeline` literal would
+    /// skip exactly that.
+    fn fixture_gate_camp(tmp: &Path, files: &[(&str, &str)]) -> std::path::PathBuf {
+        let qed = tmp.join("camp/.yah/qed");
+        fs::create_dir_all(&qed).unwrap();
+        for (stem, body) in files {
+            fs::write(qed.join(format!("{stem}.toml")), body).unwrap();
+        }
+        qed
+    }
+
+    fn gate_findings(qed: &Path, stem: &str) -> Vec<crate::types::OperatorGateFinding> {
+        let loader = PipelineLoader::new(qed);
+        let pipeline = loader.load(stem).expect("fixture pipeline should load");
+        let resolver = LoaderSubPipelineResolver::new(loader);
+        pipeline.lint_operator_gates(&resolver)
+    }
+
+    /// A child pipeline that compiles. The parent's own `argv` says nothing
+    /// about it, which is the entire point.
+    const COMPILING_CHILD: &str = r#"
+[pipeline]
+name  = "version-bump"
+label = "Bump versions"
+
+[[pipeline.steps]]
+name = "bump"
+argv = ["cargo", "run", "-q", "-p", "xtask", "--", "release"]
+"#;
+
+    const OPERATOR_GATE_BLOCK: &str = r#"
+[pipeline.steps.manual]
+prompt   = "Authorize this release."
+audience = "operator"
+"#;
+
+    /// THE case the rule exists for: nothing in the parent's own steps
+    /// compiles, so a validator that did not descend into the sub-pipeline
+    /// would call this pipeline clean.
+    #[test]
+    fn operator_gate_behind_a_child_pipelines_cargo_step_is_flagged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = format!(
+            r#"
+[pipeline]
+name  = "wizard"
+label = "Release wizard"
+
+[[pipeline.steps]]
+name = "version-bump"
+kind = "sub-pipeline"
+
+[pipeline.steps.sub_pipeline]
+target = {{ path = ".yah/qed/version-bump.toml" }}
+
+[[pipeline.steps]]
+name = "authorize-release"
+kind = "manual"
+{OPERATOR_GATE_BLOCK}
+"#
+        );
+        let qed = fixture_gate_camp(
+            tmp.path(),
+            &[("wizard", &parent), ("version-bump", COMPILING_CHILD)],
+        );
+
+        let findings = gate_findings(&qed, "wizard");
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        match &findings[0] {
+            crate::types::OperatorGateFinding::Late {
+                gate,
+                blocker,
+                blocker_pipeline,
+                program,
+            } => {
+                assert_eq!(gate, "authorize-release");
+                assert_eq!(blocker, "bump");
+                assert_eq!(blocker_pipeline.as_deref(), Some("version-bump"));
+                assert_eq!(program, "cargo");
+            }
+            other => panic!("expected Late, got {other:?}"),
+        }
+
+        // Warn, never error: the load still succeeds.
+        PipelineLoader::new(&qed)
+            .load_and_validate_graph("wizard")
+            .expect("a late gate warns; it must not fail the load");
+    }
+
+    /// The opt-out silences the same fixture. Both halves at once — the
+    /// runtime check reads the same flag off the same `Pipeline`.
+    #[test]
+    fn allow_late_operator_block_suppresses_the_finding() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent = format!(
+            r#"
+[pipeline]
+name  = "wizard"
+label = "Release wizard"
+allow_late_operator_block = true
+
+[[pipeline.steps]]
+name = "version-bump"
+kind = "sub-pipeline"
+
+[pipeline.steps.sub_pipeline]
+target = {{ path = ".yah/qed/version-bump.toml" }}
+
+[[pipeline.steps]]
+name = "authorize-release"
+kind = "manual"
+{OPERATOR_GATE_BLOCK}
+"#
+        );
+        let qed = fixture_gate_camp(
+            tmp.path(),
+            &[("wizard", &parent), ("version-bump", COMPILING_CHILD)],
+        );
+        assert!(gate_findings(&qed, "wizard").is_empty());
+    }
+
+    /// Gate first, compile after — the shape the rule is asking authors for.
+    #[test]
+    fn operator_gate_first_with_nothing_compiling_before_it_is_clean() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body = format!(
+            r#"
+[pipeline]
+name  = "wizard"
+label = "Release wizard"
+
+[[pipeline.steps]]
+name = "authorize-release"
+kind = "manual"
+{OPERATOR_GATE_BLOCK}
+
+[[pipeline.steps]]
+name = "build"
+argv = ["cargo", "build", "--release"]
+"#
+        );
+        let qed = fixture_gate_camp(tmp.path(), &[("wizard", &body)]);
+        assert!(gate_findings(&qed, "wizard").is_empty());
+    }
+
+    /// A run is authorized once.
+    #[test]
+    fn two_operator_gates_in_one_pipeline_are_flagged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body = format!(
+            r#"
+[pipeline]
+name  = "wizard"
+label = "Release wizard"
+
+[[pipeline.steps]]
+name = "authorize-release"
+kind = "manual"
+{OPERATOR_GATE_BLOCK}
+
+[[pipeline.steps]]
+name = "authorize-push"
+kind = "manual"
+{OPERATOR_GATE_BLOCK}
+"#
+        );
+        let qed = fixture_gate_camp(tmp.path(), &[("wizard", &body)]);
+        let findings = gate_findings(&qed, "wizard");
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        match &findings[0] {
+            crate::types::OperatorGateFinding::Duplicate { first, extra } => {
+                assert_eq!(first, "authorize-release");
+                assert_eq!(extra, "authorize-push");
+            }
+            other => panic!("expected Duplicate, got {other:?}"),
+        }
+    }
+
+    /// The whitespace-split path: the compiler is an argument, not the program.
+    #[test]
+    fn sh_dash_c_cargo_build_is_detected_as_compiling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body = format!(
+            r#"
+[pipeline]
+name  = "wizard"
+label = "Release wizard"
+
+[[pipeline.steps]]
+name = "sneaky"
+argv = ["sh", "-c", "cargo build --release"]
+
+[[pipeline.steps]]
+name = "authorize-release"
+kind = "manual"
+{OPERATOR_GATE_BLOCK}
+"#
+        );
+        let qed = fixture_gate_camp(tmp.path(), &[("wizard", &body)]);
+        let findings = gate_findings(&qed, "wizard");
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        match &findings[0] {
+            crate::types::OperatorGateFinding::Late {
+                blocker,
+                blocker_pipeline,
+                program,
+                ..
+            } => {
+                assert_eq!(blocker, "sneaky");
+                assert_eq!(blocker_pipeline.as_deref(), None);
+                assert_eq!(program, "cargo");
+            }
+            other => panic!("expected Late, got {other:?}"),
+        }
+    }
+
+    /// Rule 2 on its own: nothing compiles, but a human is asked twice and the
+    /// operator gate is the second ask.
+    #[test]
+    fn operator_gate_after_an_agent_manual_step_is_not_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body = format!(
+            r#"
+[pipeline]
+name  = "wizard"
+label = "Release wizard"
+
+[[pipeline.steps]]
+name = "confirm-notes"
+kind = "manual"
+
+[pipeline.steps.manual]
+prompt = "Do the release notes read right?"
+
+[[pipeline.steps]]
+name = "authorize-release"
+kind = "manual"
+{OPERATOR_GATE_BLOCK}
+"#
+        );
+        let qed = fixture_gate_camp(tmp.path(), &[("wizard", &body)]);
+        let findings = gate_findings(&qed, "wizard");
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        match &findings[0] {
+            crate::types::OperatorGateFinding::NotFirstManual { gate, earlier, .. } => {
+                assert_eq!(gate, "authorize-release");
+                assert_eq!(earlier, "confirm-notes");
+            }
+            other => panic!("expected NotFirstManual, got {other:?}"),
+        }
+    }
+
+    /// An `audience = "agent"` gate — the default — is not this rule's
+    /// business at all, however late it sits. The camp's own pipelines are all
+    /// in this state today, which is why landing the rule changes nothing.
+    #[test]
+    fn an_agent_audience_gate_behind_a_compile_is_not_flagged() {
+        let tmp = tempfile::tempdir().unwrap();
+        let body = r#"
+[pipeline]
+name  = "wizard"
+label = "Release wizard"
+
+[[pipeline.steps]]
+name = "build"
+argv = ["cargo", "build", "--release"]
+
+[[pipeline.steps]]
+name = "confirm"
+kind = "manual"
+
+[pipeline.steps.manual]
+prompt = "Does the build look right?"
+"#;
+        let qed = fixture_gate_camp(tmp.path(), &[("wizard", body)]);
+        assert!(gate_findings(&qed, "wizard").is_empty());
+    }
+
+    /// An alias may not silence the base's gate rule behind its back.
+    #[test]
+    fn an_alias_may_not_declare_allow_late_operator_block() {
+        let toml = r#"
+[pipeline]
+name = "spec"
+label = "Specialization"
+alias_of = "base"
+allow_late_operator_block = true
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let err = PipelineLoader::new(dir.path())
+            .load_from_str(toml)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("allow_late_operator_block"), "{msg}");
     }
 }

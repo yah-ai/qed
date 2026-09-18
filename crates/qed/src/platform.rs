@@ -546,12 +546,21 @@ enum TargetOs {
     Unknown,
 }
 
+/// Is `triple` a Windows target on the **MSVC** ABI? The ABI split is the whole
+/// reason Windows appears twice in W352's four-layer table: `-gnu` cross-builds
+/// from any host under zig, `-msvc` cross-builds from nowhere and needs a real
+/// Windows execution surface. One definition, shared by [`target_os`] and
+/// [`crate::buildcap`], so the two can't drift.
+pub fn target_is_msvc(triple: &str) -> bool {
+    triple.contains("windows") && triple.ends_with("msvc")
+}
+
 fn target_os(triple: &str) -> TargetOs {
     if triple.contains("linux") {
         TargetOs::Linux
     } else if triple.contains("windows") {
         TargetOs::Windows {
-            msvc: triple.ends_with("msvc"),
+            msvc: target_is_msvc(triple),
         }
     } else if triple.contains("darwin") || triple.contains("apple") {
         TargetOs::Darwin

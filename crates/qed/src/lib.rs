@@ -287,6 +287,7 @@
 pub mod artifact_local;
 pub mod artifact_retrieval;
 pub mod build_context;
+pub mod buildcap;
 pub mod config;
 pub mod dag;
 pub mod doc_source;
@@ -342,6 +343,10 @@ pub use native::{
     LoggingSigner, NativeTarballManifest, SignedBlob, SigningIdentity, SigstoreSigner,
     ENV_COSIGN_IDENTITY_TOKEN, ENV_COSIGN_KEY,
 };
+pub use buildcap::{
+    plan as plan_build_capacity, probe_and_plan as probe_build_capacity, BuildCapacity, Capacity,
+    HostProbe, InstallCommand, Requirement, Shell,
+};
 pub use nativecross::{
     is_native_cross_target, plan_native_cross, rewrite_build_argv, select_cross_tool, CrossTool,
     CrossToolUnavailable, NativeCrossPlan, ToolAvailability,
@@ -379,7 +384,10 @@ pub use runner::{
     pipeline_capability_demotions, pipeline_has_node_bound_participant,
     pipeline_is_fully_offloaded, pipeline_needs_offload, sub_pipeline_admission_gap,
     AdmissionControl, AdmissionGap, AdmissionLane,
-    ChildEventFactory, ChildRunInfo,
+    // R892-B1, drive-by: `camp.rs`'s `child_abort_hook` names this type and the
+    // export was missing, so the whole `yah` lib failed to resolve. The type
+    // itself is `runner::ChildAbortHook` and was already public there.
+    ChildAbortHook, ChildEventFactory, ChildRunInfo,
     LoggingOutcomeDispatcher,
     ManualAnswer, ManualGate, ManualParkHandle, ManualParkRequest, OutcomeDispatcher,
     PipelineRunner, RunWhere, RunnerError, StepPortability,
@@ -410,7 +418,8 @@ pub use types::{
     new_run_id, param_fingerprint, sub_pipeline_ref_token, validate_sub_pipeline_graph, CellRef,
     Environment,
     GhaWorkflowConfig,
-    ImportConfig, JobRow, ManifestStitchConfig, ManualConfig, Outcome, OutputDecl, Pipeline,
+    ImportConfig, JobRow, ManifestStitchConfig, ManualAudience, ManualConfig, Outcome, OutputDecl,
+    Pipeline,
     PipelineClass,
     ProducedArtifact, QedRunId, QedRunLaunch, QedRunMeta, QedStep, RunStatus, StepActivation,
     StepKind,
@@ -605,9 +614,14 @@ mod tests {
             eprintln!("skip: yah .yah/qed pipelines not present (standalone export)");
             return;
         };
+        // R707: the filename stem IS the pipeline name, so this string has to
+        // track the file. It named `desktop-release` after the camp's copy had
+        // become `yah-desktop-release.toml`, which made the test a permanent
+        // `NotFound` rather than the recipe check it is meant to be (found and
+        // fixed under R906-F2; red at bae81d65).
         let pipeline = PipelineLoader::new(qed_dir)
-            .load("desktop-release")
-            .expect("desktop-release pipeline loads");
+            .load("yah-desktop-release")
+            .expect("yah-desktop-release pipeline loads");
 
         const ARM_MAC: &str = "aarch64-apple-darwin";
         const ARM_LINUX: &str = "aarch64-unknown-linux-gnu";

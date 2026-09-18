@@ -473,6 +473,7 @@ mod tests {
 
     fn pipeline(name: &str, steps: Vec<QedStep>) -> Pipeline {
         Pipeline {
+            allow_late_operator_block: false,
             participants: None,
             max_parallel: None,
             description: None,
@@ -555,6 +556,7 @@ mod tests {
             prefix: None,
             base_url: None,
             require_explicit_version: false,
+            per_leg: false,
         }];
         let r = export_pipeline(&p);
         assert!(!r.shimmed, "subprocess-only steps still render faithfully");

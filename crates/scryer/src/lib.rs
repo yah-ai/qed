@@ -36,9 +36,14 @@
 //!
 //! F8 adds (P2 tier-2):
 //!   - [`ingestion::IngestionServer`] — Unix socket ingestion server for
-//!     `yah-log` service-scope events. Yubaba injects `YAH_SERVICE_IDENT` +
-//!     `YAH_SCRYER_SOCKET` into workload env; the shim connects and writes
-//!     JSON-lines with `scope_kind = "service"` scope envelope.
+//!     `yah-log` service-scope events and (R893-F16) passway spans. Bound by
+//!     this crate's own `yah-scryer --ingest-socket <path>`; **kamaji**, which
+//!     owns workload env, injects `YAH_SERVICE_IDENT` + `YAH_SCRYER_SOCKET`
+//!     pointing at it (`kamaji --scryer-socket <same path>`, R893-B17). The
+//!     client connects and writes JSON-lines carrying an
+//!     `observation::IngestLine` envelope with `scope_kind = "service"`.
+//!     Both halves are node-local opt-ins: with either absent a workload
+//!     simply runs untraced.
 //!
 //! F5 adds (P3 opt-in):
 //!   - [`long_tier::LongTierStore`] — per-day Parquet shard rollover from
@@ -63,7 +68,7 @@ pub mod snapshot;
 pub mod store;
 
 #[cfg(unix)]
-pub use ingestion::{IngestionError, IngestionServer};
+pub use ingestion::{BoundIngestion, IngestionError, IngestionServer};
 pub use long_tier::{
     InMemoryObjectStore, LongTierConfig, LongTierError, LongTierStore, MS_PER_DAY, ObjectStore,
 };
@@ -82,7 +87,8 @@ pub use federation::{
 };
 pub use federation_http::{
     BucketDto, FederateAggregateReq, FederateAggregateResp, FederateEventsReq, FederateEventsResp,
-    FederationState, HealthResp, HttpFederationPeer, OPERATOR_TAG_HEADER, ScopeInfoDto, ScopesResp,
+    FederateHopsReq, FederateHopsResp, FederationState, HealthResp, HttpFederationPeer,
+    OPERATOR_TAG_HEADER, ScopeInfoDto, ScopesResp,
     router as federation_router, serve as serve_federation,
 };
 pub use promotion::{

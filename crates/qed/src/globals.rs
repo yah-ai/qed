@@ -330,6 +330,7 @@ mod tests {
                 default: Some("block".to_string()),
                 options: vec!["block".to_string(), "warn".to_string()],
                 options_from: None,
+                options_cmd: None,
             },
         );
         crate::types::Pipeline {

@@ -95,7 +95,7 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use thiserror::Error;
@@ -145,9 +145,15 @@ pub struct SpawnOpts {
     pub pin: bool,
     /// Beholder attachment policy. Defaults to [`BeholderSelect::Auto`].
     pub beholder_select: BeholderSelect,
-    /// `true` when a human-facing terminal tile is attached. Causes `Rewriter`
-    /// beholders to decline in `Auto` mode so the human sees unmodified output.
-    pub tty_attached: bool,
+    /// `true` when this run's output is read as text by somebody downstream —
+    /// a human watching a terminal tile, or a client that promised its caller
+    /// byte-identical passthrough. Causes `Rewriter` beholders to decline in
+    /// `Auto` mode, since a rewrite changes what that reader gets.
+    ///
+    /// R739-B10 renamed this from `tty_attached`: a PTY was only ever a proxy
+    /// for "someone is reading this", and the proxy broke the moment
+    /// `yah build run` moved onto pipes (R739-F6).
+    pub verbatim_output: bool,
     /// Create a side-channel FIFO and export `YAH_TASK_RUN` / `YAH_LOG_PIPE`
     /// so Tier-2 shim libraries (yah-log-rust, @yah/log) can emit structured
     /// events. Has no effect on non-Unix platforms. Defaults to `true`.
@@ -173,7 +179,66 @@ pub struct SpawnOpts {
     /// process to exec, and a recorded `rewrite=…` that didn't happen would be
     /// a lie in the run metadata.
     pub argv: Option<Vec<String>>,
+    /// R739-F6 — spawn on **pipes** instead of a PTY. Defaults to `false`,
+    /// which is the PTY behaviour every existing caller already has.
+    ///
+    /// A PTY is right for an interactive terminal tile: the child gets a
+    /// controlling terminal, job control works, and `isatty` says yes, which is
+    /// what a human sitting in front of it expects. It is wrong for *emulating
+    /// a non-interactive shell invocation*, where three PTY properties show up
+    /// as divergence from running the same command directly (all three measured
+    /// in R739-F4 against `cargo check`):
+    ///
+    /// 1. `isatty(1)` is true, so tools colorize — plain `error: …` arrives as
+    ///    `\x1b[1m\x1b[91merror\x1b[0m: …`, which also defeats `| rg "^error"`.
+    /// 2. The line discipline's `ONLCR` rewrites every `\n` the child wrote
+    ///    into `\r\n`.
+    /// 3. The terminal merges stderr into stdout, so stream separation is gone
+    ///    by the time anything reads the capture.
+    ///
+    /// In pipe mode the child gets `pipe(2)` for stdout and stderr, chunks are
+    /// stored under their true [`Stream`], and `TERM` is left alone rather than
+    /// forced to `xterm-256color`. [`TaskDriver::resize_run`] and
+    /// [`TaskDriver::foreground_pid`] have no PTY to answer for and report
+    /// `NotFound` / `None`.
+    pub pipe: bool,
+    /// R901-B2 — run the `sh -c` line with `pipefail`, so a pipeline reports
+    /// the **leftmost** failing stage instead of its last one. Defaults to
+    /// `false`, i.e. POSIX behaviour, which is what every existing caller has.
+    ///
+    /// Without it a pipeline's status is the last stage's and nothing else:
+    /// `cargo check 2>&1 | tail -40` exits **0** on a build with 101 errors,
+    /// because `tail` succeeded. That is not a wrapper lying — the wrapper is
+    /// faithful, and the shell is answering the question it was actually
+    /// asked — but it is indistinguishable from a green build to everything
+    /// downstream, including the harness task notification an agent reads to
+    /// decide whether it is done. On 2026-09-13 two sessions read that 0 as a
+    /// pass and left `cargo check -p yah` red camp-wide for ~50 minutes.
+    ///
+    /// Only meaningful when [`SpawnOpts::argv`] is `None`; an explicit argv is
+    /// not a shell line and has no pipeline to take a status from.
+    ///
+    /// # Known cost, accepted deliberately
+    ///
+    /// `pipefail` also surfaces a producer killed by `SIGPIPE`, so
+    /// `cargo check 2>&1 | head -40` can now report failure once `head` closes
+    /// the pipe early on a build that was fine. That is a false RED, and it is
+    /// the right trade against the false GREEN above: a red is investigated,
+    /// a green ends the turn. Prefer `| tail` over `| head` on a build line.
+    pub pipefail: bool,
 }
+
+/// Prefix that turns `pipefail` on for the rest of a `sh -c` line.
+///
+/// Probing in a subshell rather than running `set -o pipefail` directly is
+/// load-bearing for portability, not caution. `pipefail` is a bash/ksh/zsh
+/// option; `/bin/sh` is bash on macOS but **dash** on most Linux distros, and
+/// dash rejects it. `set` is a POSIX *special* builtin, so a failure in one is
+/// entitled to terminate a non-interactive shell — which would turn "your
+/// pipeline now reports the truth" into "your command never ran at all" on
+/// every Linux camp. The subshell absorbs that exit; the outer shell only ever
+/// runs `set -o pipefail` on a shell that has already proved it accepts it.
+const PIPEFAIL_PRELUDE: &str = "if (set -o pipefail) 2>/dev/null; then set -o pipefail; fi\n";
 
 impl Default for SpawnOpts {
     fn default() -> Self {
@@ -187,10 +252,12 @@ impl Default for SpawnOpts {
             stdin_enabled: false,
             pin: false,
             beholder_select: BeholderSelect::Auto,
-            tty_attached: false,
+            verbatim_output: false,
             log_fd_enabled: true,
             origin: None,
             argv: None,
+            pipe: false,
+            pipefail: false,
         }
     }
 }
@@ -313,7 +380,41 @@ struct RunControl {
     /// Shared with the lifecycle task, which holds the same `Arc` so the PTY fd
     /// outlives `child.wait()`. `MasterPty::resize` takes `&self`, so a mutex is
     /// enough to make the `Box<dyn MasterPty + Send>` `Sync` across the two.
-    master: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
+    ///
+    /// `None` for a [`SpawnOpts::pipe`] run, which has no terminal to resize or
+    /// to ask for a foreground process group.
+    master: Option<Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>>,
+    /// R739-B12 — the run's [`SpawnOpts::origin`], copied here so
+    /// [`TaskDriver::reap_unattached`] can narrow to an opted-in origin set
+    /// without a store round-trip per candidate.
+    origin: Option<String>,
+    /// R739-B12 — when a client last looked at this run.
+    ///
+    /// Set at spawn (the caller that asked for the run is attached to it by
+    /// definition) and refreshed by [`TaskDriver::note_attached`], which the
+    /// embedder calls from whatever its "a client is watching" surface is —
+    /// for the camp daemon, `task.tail` and `task.status`.
+    ///
+    /// Monotonic rather than a wall clock: a clock step must not be able to
+    /// make a healthy build look abandoned.
+    last_attached_at: Instant,
+}
+
+/// Fires the reader-done signal when the LAST holder drops.
+///
+/// A PTY run has one reader; a piped run has two (stdout and stderr) and the
+/// lifecycle must not reap the child until both have hit EOF. Making this a
+/// drop guard behind an `Arc` means neither path has to count readers: the
+/// signal goes out when the refcount reaches zero, after each pump has finished
+/// its own `on_done` work.
+struct ReaderDone(Option<oneshot::Sender<()>>);
+
+impl Drop for ReaderDone {
+    fn drop(&mut self) {
+        if let Some(tx) = self.0.take() {
+            let _ = tx.send(());
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -439,8 +540,9 @@ impl TaskDriver {
     /// A beholder is selected via `opts.beholder_select` (default `Auto`). When
     /// a `Rewriter` beholder matches, its `adjust_argv` is applied to the
     /// command before spawning and the diff is recorded on `beholder_status`.
-    /// When `opts.tty_attached` is `true`, `Rewriter` beholders decline in
-    /// `Auto` mode to preserve human-readable output.
+    /// When `opts.verbatim_output` is `true`, `Rewriter` beholders decline in
+    /// `Auto` mode, because something downstream renders these bytes and a
+    /// rewrite would change them.
     ///
     /// Output is written to the store as `Stream::Stdout` chunks (the PTY
     /// kernel merges stdout and stderr). Signal handling and status updates
@@ -469,7 +571,7 @@ impl TaskDriver {
         } else {
             &opts.beholder_select
         };
-        let attach = registry.attach(cmd, select, opts.tty_attached);
+        let attach = registry.attach(cmd, select, opts.verbatim_output);
         // Reconstruct the command from argv ONLY when a beholder actually
         // rewrote it. `AttachResult.argv` is always populated — it is
         // `resolve_argv(cmd)` even when nothing attached — so joining it
@@ -503,40 +605,27 @@ impl TaskDriver {
             host_pid: Some(std::process::id()),
         }).await?;
 
-        // Open PTY pair.
-        let pty_sys = native_pty_system();
-        let pair = pty_sys
-            .openpty(PtySize {
-                rows: opts.pty_rows,
-                cols: opts.pty_cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .map_err(|e| DriverError::Pty(e.to_string()))?;
-
-        // Clone reader before spawning so the fd is ready immediately.
-        let pty_reader = pair
-            .master
-            .try_clone_reader()
-            .map_err(|e| DriverError::Pty(e.to_string()))?;
-
-        // Optional stdin relay: take the writer before spawning the child.
-        let stdin_tx: Option<mpsc::Sender<Vec<u8>>> = if opts.stdin_enabled {
-            let mut writer = pair
-                .master
-                .take_writer()
-                .map_err(|e| DriverError::Pty(e.to_string()))?;
-            let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
-            task::spawn(async move {
-                use std::io::Write;
-                while let Some(bytes) = rx.recv().await {
-                    let _ = writer.write_all(&bytes);
-                    let _ = writer.flush();
-                }
-            });
-            Some(tx)
-        } else {
-            None
+        // The program and argv both spawn modes exec. An explicit argv execs
+        // that program directly; otherwise the command line goes through `sh`
+        // so the caller's quoting, pipes and redirections mean what they say.
+        // An empty argv is a caller bug, not a request for an empty exec — fall
+        // back to the shell path rather than spawning nothing.
+        // R901-B2: `pipefail` is prepended HERE and not folded into
+        // `effective_cmd`, so `TaskRunMeta.command` keeps reading as the line
+        // the caller actually wrote. A run's recorded command is re-run by
+        // history and audited by agents against the relocation note; a prelude
+        // nobody asked for showing up in it would be the same class of lie as
+        // recording a beholder `rewrite=…` that never happened.
+        let (program, args): (String, Vec<String>) = match opts.argv.as_deref() {
+            Some([p, rest @ ..]) => (p.clone(), rest.to_vec()),
+            _ => {
+                let line = if opts.pipefail {
+                    format!("{PIPEFAIL_PRELUDE}{effective_cmd}")
+                } else {
+                    effective_cmd.clone()
+                };
+                ("sh".to_string(), vec!["-c".to_string(), line])
+            }
         };
 
         // ── Side-channel log FIFO (Tier 2 / yah-log shims) ──────────────────
@@ -595,49 +684,144 @@ impl TaskDriver {
             None
         };
 
-        // Build and spawn the child inside the slave. An explicit argv execs
-        // that program directly; otherwise the command line goes through `sh`
-        // so the caller's quoting, pipes and redirections mean what they say.
-        let mut cb = match opts.argv.as_deref() {
-            Some([program, args @ ..]) => {
-                let mut cb = CommandBuilder::new(program);
-                cb.args(args);
-                cb
-            }
-            // An empty argv is a caller bug, not a request for an empty exec —
-            // fall back to the shell path rather than spawning nothing.
-            _ => {
-                let mut cb = CommandBuilder::new("sh");
-                cb.args(["-c", &effective_cmd]);
-                cb
-            }
-        };
-        cb.cwd(&opts.cwd);
-        for (k, v) in &opts.env {
-            cb.env(k, v);
-        }
-        cb.env("TERM", "xterm-256color");
-
-        // Export YAH_TASK_RUN and YAH_LOG_PIPE if the FIFO was created.
+        // The FIFO env, applied identically by both spawn modes.
         #[cfg(unix)]
-        if let Some((_, _, ref fifo_path)) = log_fifo {
-            cb.env("YAH_TASK_RUN", id.to_string());
-            cb.env("YAH_LOG_PIPE", fifo_path.to_string_lossy().as_ref());
+        let fifo_env: Option<(String, String)> = log_fifo
+            .as_ref()
+            .map(|(_, _, path)| (id.to_string(), path.to_string_lossy().into_owned()));
+        #[cfg(not(unix))]
+        let fifo_env: Option<(String, String)> = None;
+
+        /* Spawn. The two modes differ only in what the child's stdio is
+           attached to, and everything downstream — reader pumps, lifecycle,
+           kill — is written against the uniform handles produced here:
+           `pid`, a `reap` closure that blocks until the child exits, and an
+           optional PTY master for resize / foreground-pid. */
+        let pid: u32;
+        let reap: Box<dyn FnOnce() -> Option<u32> + Send>;
+        let stdin_tx: Option<mpsc::Sender<Vec<u8>>>;
+        let master: Option<Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>>;
+        // Each entry is one blocking source to pump into the store. The PTY
+        // yields a single merged stream; pipes yield stdout and stderr apart.
+        let mut sources: Vec<(Box<dyn Read + Send>, Stream)> = Vec::new();
+
+        if opts.pipe {
+            use std::process::{Command, Stdio};
+
+            let mut cmd = Command::new(&program);
+            cmd.args(&args);
+            cmd.current_dir(&opts.cwd);
+            for (k, v) in &opts.env {
+                cmd.env(k, v);
+            }
+            /* Deliberately NOT setting TERM. The PTY path forces
+               `xterm-256color` because a child on a terminal that claims no
+               terminal type degrades badly; a child on a pipe should see
+               whatever the daemon's own environment says, exactly as it would
+               under a non-interactive shell. Forcing a terminal type here is
+               how a pipe-mode run would talk itself back into colorizing. */
+            if let Some((run_id_env, fifo_path)) = &fifo_env {
+                cmd.env("YAH_TASK_RUN", run_id_env);
+                cmd.env("YAH_LOG_PIPE", fifo_path);
+            }
+            cmd.stdout(Stdio::piped());
+            cmd.stderr(Stdio::piped());
+            cmd.stdin(if opts.stdin_enabled { Stdio::piped() } else { Stdio::null() });
+
+            let mut child = cmd.spawn().map_err(DriverError::Io)?;
+            pid = child.id();
+
+            if let Some(out) = child.stdout.take() {
+                sources.push((Box::new(out), Stream::Stdout));
+            }
+            if let Some(err) = child.stderr.take() {
+                sources.push((Box::new(err), Stream::Stderr));
+            }
+
+            stdin_tx = child.stdin.take().map(|mut writer| {
+                let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+                task::spawn(async move {
+                    use std::io::Write;
+                    while let Some(bytes) = rx.recv().await {
+                        let _ = writer.write_all(&bytes);
+                        let _ = writer.flush();
+                    }
+                });
+                tx
+            });
+
+            master = None;
+            reap = Box::new(move || child.wait().ok().and_then(|s| s.code()).map(|c| c as u32));
+        } else {
+            // Open PTY pair.
+            let pty_sys = native_pty_system();
+            let pair = pty_sys
+                .openpty(PtySize {
+                    rows: opts.pty_rows,
+                    cols: opts.pty_cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .map_err(|e| DriverError::Pty(e.to_string()))?;
+
+            // Clone reader before spawning so the fd is ready immediately.
+            let pty_reader = pair
+                .master
+                .try_clone_reader()
+                .map_err(|e| DriverError::Pty(e.to_string()))?;
+            sources.push((Box::new(pty_reader), Stream::Stdout));
+
+            // Optional stdin relay: take the writer before spawning the child.
+            stdin_tx = if opts.stdin_enabled {
+                let mut writer = pair
+                    .master
+                    .take_writer()
+                    .map_err(|e| DriverError::Pty(e.to_string()))?;
+                let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+                task::spawn(async move {
+                    use std::io::Write;
+                    while let Some(bytes) = rx.recv().await {
+                        let _ = writer.write_all(&bytes);
+                        let _ = writer.flush();
+                    }
+                });
+                Some(tx)
+            } else {
+                None
+            };
+
+            let mut cb = CommandBuilder::new(&program);
+            cb.args(&args);
+            cb.cwd(&opts.cwd);
+            for (k, v) in &opts.env {
+                cb.env(k, v);
+            }
+            cb.env("TERM", "xterm-256color");
+            if let Some((run_id_env, fifo_path)) = &fifo_env {
+                cb.env("YAH_TASK_RUN", run_id_env);
+                cb.env("YAH_LOG_PIPE", fifo_path);
+            }
+
+            let child = pair
+                .slave
+                .spawn_command(cb)
+                .map_err(|e| DriverError::Pty(e.to_string()))?;
+            // Drop the parent's slave handle so EOF propagates once the child exits.
+            drop(pair.slave);
+
+            pid = child.process_id().unwrap_or(0);
+
+            // Share the master between the lifecycle task (which must outlive
+            // `child.wait()` so the fd stays open) and `resize_run`.
+            let m: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>> =
+                Arc::new(Mutex::new(pair.master));
+            master = Some(Arc::clone(&m));
+            reap = Box::new(move || {
+                let mut c = child;
+                let _m = m; // dropped after wait() returns, closing the PTY fd
+                c.wait().ok().map(|s| s.exit_code())
+            });
         }
-
-        let child = pair
-            .slave
-            .spawn_command(cb)
-            .map_err(|e| DriverError::Pty(e.to_string()))?;
-        // Drop the parent's slave handle so EOF propagates once the child exits.
-        drop(pair.slave);
-
-        // Share the master between the lifecycle task (which must outlive
-        // `child.wait()` so the fd stays open) and `resize_run`.
-        let master: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>> =
-            Arc::new(Mutex::new(pair.master));
-
-        let pid = child.process_id().unwrap_or(0);
 
         // ── FIFO: launch receiver thread; pass write-end holder to lifecycle ──
         //
@@ -665,100 +849,32 @@ impl TaskDriver {
         let (kill_tx, kill_rx) = mpsc::channel::<KillRequest>(4);
         let (reader_done_tx, reader_done_rx) = oneshot::channel::<()>();
 
-        // Reader thread: PTY output → store chunks → beholder events.
-        // Runs on a dedicated OS thread because PTY reads are blocking.
+        /* Reader threads: child output → store chunks → beholder events. Each
+           runs on a dedicated OS thread because the reads are blocking. The
+           `ReaderDone` guard is shared across them, so the lifecycle's
+           reader-done signal fires only once every source has hit EOF — which
+           is what makes the two-pipe case correct without a reader count. */
         {
-            let store_r = Arc::clone(&self.store);
-            let id_r = id.clone();
+            let done = Arc::new(ReaderDone(Some(reader_done_tx)));
+            /* The beholder goes to stdout only. It parses a structured
+               protocol (cargo's JSON, say) that the child writes to stdout by
+               definition, and there is exactly one of it — handing the same
+               instance to two threads would need a lock for no gain, and
+               feeding it stderr would make `unknown_format_reason` fire on
+               human-readable diagnostics it was never meant to see. */
             let mut beholder = attach.beholder;
-            let output_tx = self.channels.output.clone();
-            let rt = tokio::runtime::Handle::current();
-            tokio::task::spawn_blocking(move || {
-                let mut buf = [0u8; READ_BUF_SIZE];
-                let mut reader = pty_reader;
-                loop {
-                    match reader.read(&mut buf) {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => {
-                            let offset = elapsed_ms(started_at_ms);
-                            let append_res = rt.block_on(store_r.append_chunk(
-                                &id_r,
-                                offset,
-                                Stream::Stdout,
-                                &buf[..n],
-                            ));
-                            if let Ok(seq) = append_res {
-                                /* Both the tap and the beholder want the same
-                                   owned chunk; build it once, and only when
-                                   someone is listening. */
-                                let chunk = (output_tx.is_some() || beholder.is_some()).then(|| {
-                                    OutputChunk {
-                                        run_id: id_r.clone(),
-                                        seq,
-                                        offset_ms: offset,
-                                        stream: Stream::Stdout,
-                                        bytes: buf[..n].to_vec(),
-                                    }
-                                });
-                                /* Tap first: it feeds live views, where latency
-                                   is visible to a human. Send failure means the
-                                   host dropped its receiver — never fatal. */
-                                if let (Some(tx), Some(c)) = (&output_tx, &chunk) {
-                                    let _ = tx.send(c.clone());
-                                }
-                                let mut detach_beholder = false;
-                                if let (Some(b), Some(chunk)) = (beholder.as_mut(), &chunk) {
-                                    for ev in b.parse_chunk(chunk) {
-                                        let _ = rt.block_on(store_r.append_event(
-                                            &ev.run_id,
-                                            ev.offset_ms,
-                                            ev.level,
-                                            &ev.target,
-                                            &ev.msg,
-                                            &ev.fields,
-                                            ev.anchor.as_ref().map(|a| a.seq),
-                                            &ev.source,
-                                        ));
-                                    }
-                                    if let Some(reason) = b.unknown_format_reason() {
-                                        let new_status = BeholderStatus::unknown_format_with_reason(
-                                            b.name(),
-                                            reason,
-                                        );
-                                        let _ = rt.block_on(
-                                            store_r.update_beholder_status(&id_r, &new_status),
-                                        );
-                                        detach_beholder = true;
-                                    }
-                                }
-                                if detach_beholder {
-                                    beholder = None;
-                                }
-                            }
-                        }
-                    }
-                }
-                if let Some(ref mut b) = beholder {
-                    let final_offset = elapsed_ms(started_at_ms);
-                    for ev in b.on_done(&id_r, final_offset) {
-                        let _ = rt.block_on(store_r.append_event(
-                            &ev.run_id,
-                            ev.offset_ms,
-                            ev.level,
-                            &ev.target,
-                            &ev.msg,
-                            &ev.fields,
-                            ev.anchor.as_ref().map(|a| a.seq),
-                            &ev.source,
-                        ));
-                    }
-                    if let Some(reason) = b.unknown_format_reason() {
-                        let new_status = BeholderStatus::unknown_format_with_reason(b.name(), reason);
-                        let _ = rt.block_on(store_r.update_beholder_status(&id_r, &new_status));
-                    }
-                }
-                let _ = reader_done_tx.send(());
-            });
+            for (reader, stream) in sources {
+                spawn_output_pump(
+                    reader,
+                    stream,
+                    Arc::clone(&self.store),
+                    id.clone(),
+                    started_at_ms,
+                    self.channels.output.clone(),
+                    if stream == Stream::Stdout { beholder.take() } else { None },
+                    Arc::clone(&done),
+                );
+            }
         }
 
         // Lifecycle task: monitor kill requests, wait for exit, update status.
@@ -768,7 +884,6 @@ impl TaskDriver {
             let store_l = Arc::clone(&self.store);
             let active_l = Arc::clone(&self.active);
             let id_l = id.clone();
-            let master_l = Arc::clone(&master);
             let completion_tx_l = self.channels.completion.clone();
             #[cfg(unix)]
             let wfd_l = log_wfd_holder;
@@ -778,8 +893,7 @@ impl TaskDriver {
                     active_l,
                     id_l,
                     pid,
-                    child,
-                    master_l,
+                    reap,
                     kill_rx,
                     reader_done_rx,
                     completion_tx_l,
@@ -793,7 +907,16 @@ impl TaskDriver {
         self.active
             .lock()
             .unwrap()
-            .insert(id.to_string(), RunControl { kill_tx, stdin_tx, master });
+            .insert(
+                id.to_string(),
+                RunControl {
+                    kill_tx,
+                    stdin_tx,
+                    master,
+                    origin: opts.origin.clone(),
+                    last_attached_at: Instant::now(),
+                },
+            );
 
         Ok(id)
     }
@@ -803,7 +926,9 @@ impl TaskDriver {
     /// signals the child).
     ///
     /// Returns `DriverError::NotFound` when the run is not active on this
-    /// driver instance — the same contract as [`TaskDriver::send_stdin`].
+    /// driver instance — the same contract as [`TaskDriver::send_stdin`] — and
+    /// also when it is active but was spawned in [`SpawnOpts::pipe`] mode, which
+    /// has no terminal to resize.
     pub async fn resize_run(
         &self,
         id: &TaskRunId,
@@ -815,7 +940,7 @@ impl TaskDriver {
             .lock()
             .unwrap()
             .get(&id.to_string())
-            .map(|c| Arc::clone(&c.master));
+            .and_then(|c| c.master.as_ref().map(Arc::clone));
 
         match master {
             Some(m) => {
@@ -838,15 +963,17 @@ impl TaskDriver {
     /// the shell forever, so anything derived from this pid (a live cwd probe,
     /// a "what is this pane doing" label) would answer for the wrong process.
     ///
-    /// `None` when the run is not active on this driver instance, or when the
-    /// platform has no notion of a foreground process group.
+    /// `None` when the run is not active on this driver instance, when it was
+    /// spawned in [`SpawnOpts::pipe`] mode (no controlling terminal, so no
+    /// foreground process group to read), or when the platform has no notion of
+    /// a foreground process group.
     pub fn foreground_pid(&self, id: &TaskRunId) -> Option<u32> {
         let master = self
             .active
             .lock()
             .unwrap()
             .get(&id.to_string())
-            .map(|c| Arc::clone(&c.master))?;
+            .and_then(|c| c.master.as_ref().map(Arc::clone))?;
         #[cfg(unix)]
         {
             let pid = master.lock().unwrap().process_group_leader()?;
@@ -898,6 +1025,84 @@ impl TaskDriver {
                 .map_err(|_| DriverError::NotFound(id.to_string())),
             None => Err(DriverError::NotFound(id.to_string())),
         }
+    }
+
+    /// R739-B12 — record that a client just looked at this run.
+    ///
+    /// A no-op for a run this driver does not own (already finished, or
+    /// spawned by another process against the same store): attachment only
+    /// means anything for a run something here could still signal.
+    pub fn note_attached(&self, id: &TaskRunId) {
+        if let Some(control) = self.active.lock().unwrap().get_mut(&id.to_string()) {
+            control.last_attached_at = Instant::now();
+        }
+    }
+
+    /// How long ago a client last looked at `id`, or `None` when this driver
+    /// does not own the run. The observable half of [`Self::note_attached`].
+    pub fn attached_age(&self, id: &TaskRunId) -> Option<Duration> {
+        self.active
+            .lock()
+            .unwrap()
+            .get(&id.to_string())
+            .map(|c| c.last_attached_at.elapsed())
+    }
+
+    /// R739-B12 — SIGTERM every run of an opted-in origin that no client has
+    /// looked at for `idle`. Returns the runs it signalled.
+    ///
+    /// This exists because a run outlives the client that asked for it. When
+    /// `yah build run` is SIGKILLed — its harness dies, the terminal goes away
+    /// — the cargo it relocated into the daemon keeps compiling with nobody
+    /// attached, holding the build-directory lock until a human finds the pid.
+    /// That happened on 2026-08-28 and stalled a whole camp for ~30 minutes.
+    /// R739-B9 closed every give-up the client is *alive* to make; this closes
+    /// the one it is not.
+    ///
+    /// **Not [`StaleRunPolicy`], and not that policy on a timer.** The policy
+    /// is a construction-time reconciliation of rows a *previous process*
+    /// left behind: it decides on `host_pid`, only ever calls
+    /// `store.update_status`, and tombstones any run outside its origin list
+    /// outright — so running it periodically would mark every in-flight run of
+    /// an un-adopted origin `Lost` while it compiles perfectly well, and would
+    /// still never signal the process that is the actual problem. This is the
+    /// opposite shape: it decides on *attachment*, it signals, and it touches
+    /// nothing outside `origins`.
+    ///
+    /// `origins` is an opt-in list precisely because most runs must never be
+    /// reaped on this rule. An interactive terminal tile is legitimately
+    /// unpolled for hours, and killing one would be a far worse bug than the
+    /// orphan this prevents — so an empty list reaps nothing at all, rather
+    /// than meaning "every origin" the way [`StaleRunPolicy`]'s list does.
+    pub async fn reap_unattached(&self, idle: Duration, origins: &[String]) -> Vec<TaskRunId> {
+        if origins.is_empty() {
+            return Vec::new();
+        }
+        let candidates: Vec<TaskRunId> = {
+            let active = self.active.lock().unwrap();
+            active
+                .iter()
+                .filter(|(_, c)| {
+                    c.origin
+                        .as_deref()
+                        .is_some_and(|o| origins.iter().any(|want| want == o))
+                        && c.last_attached_at.elapsed() >= idle
+                })
+                .filter_map(|(id, _)| id.parse::<TaskRunId>().ok())
+                .collect()
+        };
+
+        let mut reaped = Vec::new();
+        for id in candidates {
+            // SIGTERM, not SIGKILL: `kill_run` gives the child the same 5s
+            // grace a `task.kill` from a live client would, then escalates.
+            // A terminal status is also what releases the run's admission
+            // enrollment (R739-F7), so a reaped run frees the build key.
+            if self.kill_run(&id, None).await.is_ok() {
+                reaped.push(id);
+            }
+        }
+        reaped
     }
 }
 
@@ -968,13 +1173,118 @@ fn run_log_receiver(
 
 // ─── Lifecycle task ───────────────────────────────────────────────────────────
 
+/// Pump one blocking output source into the store, tapping and beholding on the
+/// way past.
+///
+/// Split out of `spawn_run` for R739-F6: a PTY run has one source and a piped
+/// run has two, and the only thing that differs between them is which [`Stream`]
+/// the chunks are stored under. `done` is the shared [`ReaderDone`] guard —
+/// dropping it here, after `on_done`, is what tells the lifecycle this source is
+/// finished.
+#[allow(clippy::too_many_arguments)]
+fn spawn_output_pump(
+    reader: Box<dyn Read + Send>,
+    stream: Stream,
+    store: Arc<TaskStore>,
+    id: TaskRunId,
+    started_at_ms: u64,
+    output_tx: Option<mpsc::UnboundedSender<OutputChunk>>,
+    beholder: Option<Box<dyn crate::beholders::Beholder>>,
+    done: Arc<ReaderDone>,
+) {
+    let rt = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || {
+        let _done = done;
+        let mut beholder = beholder;
+        let mut buf = [0u8; READ_BUF_SIZE];
+        let mut reader = reader;
+        loop {
+            match reader.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    let offset = elapsed_ms(started_at_ms);
+                    let append_res =
+                        rt.block_on(store.append_chunk(&id, offset, stream, &buf[..n]));
+                    if let Ok(seq) = append_res {
+                        /* Both the tap and the beholder want the same owned
+                           chunk; build it once, and only when someone is
+                           listening. */
+                        let chunk = (output_tx.is_some() || beholder.is_some()).then(|| {
+                            OutputChunk {
+                                run_id: id.clone(),
+                                seq,
+                                offset_ms: offset,
+                                stream,
+                                bytes: buf[..n].to_vec(),
+                            }
+                        });
+                        /* Tap first: it feeds live views, where latency is
+                           visible to a human. Send failure means the host
+                           dropped its receiver — never fatal. */
+                        if let (Some(tx), Some(c)) = (&output_tx, &chunk) {
+                            let _ = tx.send(c.clone());
+                        }
+                        let mut detach_beholder = false;
+                        if let (Some(b), Some(chunk)) = (beholder.as_mut(), &chunk) {
+                            for ev in b.parse_chunk(chunk) {
+                                let _ = rt.block_on(store.append_event(
+                                    &ev.run_id,
+                                    ev.offset_ms,
+                                    ev.level,
+                                    &ev.target,
+                                    &ev.msg,
+                                    &ev.fields,
+                                    ev.anchor.as_ref().map(|a| a.seq),
+                                    &ev.source,
+                                ));
+                            }
+                            if let Some(reason) = b.unknown_format_reason() {
+                                let new_status =
+                                    BeholderStatus::unknown_format_with_reason(b.name(), reason);
+                                let _ =
+                                    rt.block_on(store.update_beholder_status(&id, &new_status));
+                                detach_beholder = true;
+                            }
+                        }
+                        if detach_beholder {
+                            beholder = None;
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(ref mut b) = beholder {
+            let final_offset = elapsed_ms(started_at_ms);
+            for ev in b.on_done(&id, final_offset) {
+                let _ = rt.block_on(store.append_event(
+                    &ev.run_id,
+                    ev.offset_ms,
+                    ev.level,
+                    &ev.target,
+                    &ev.msg,
+                    &ev.fields,
+                    ev.anchor.as_ref().map(|a| a.seq),
+                    &ev.source,
+                ));
+            }
+            if let Some(reason) = b.unknown_format_reason() {
+                let new_status = BeholderStatus::unknown_format_with_reason(b.name(), reason);
+                let _ = rt.block_on(store.update_beholder_status(&id, &new_status));
+            }
+        }
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_lifecycle(
     store: Arc<TaskStore>,
     active: Arc<Mutex<HashMap<String, RunControl>>>,
     id: TaskRunId,
     pid: u32,
-    child: Box<dyn portable_pty::Child + Send>,
-    master: Arc<Mutex<Box<dyn portable_pty::MasterPty + Send>>>,
+    // `reap` blocks until the child exits and yields its exit code. It owns
+    // whatever the spawn mode has to keep alive across the wait — for a PTY run
+    // that includes the master fd, which must outlive `wait()`.
+    reap: Box<dyn FnOnce() -> Option<u32> + Send>,
     mut kill_rx: mpsc::Receiver<KillRequest>,
     reader_done_rx: oneshot::Receiver<()>,
     completion_tx: Option<tokio::sync::mpsc::UnboundedSender<(TaskRunId, RunStatus)>>,
@@ -1025,18 +1335,11 @@ async fn run_lifecycle(
         }
     }
 
-    // Reap the child (blocking) on a dedicated thread-pool slot.
-    // Move our master handle in here so the PTY fd outlives the wait. The
-    // matching `RunControl` (removed from `active` below) holds the other
-    // `Arc`, so the fd actually closes once both are gone.
-    let exit_code = task::spawn_blocking(move || {
-        let mut c = child;
-        let _m = master; // dropped after wait() returns
-        c.wait().ok().map(|s| s.exit_code())
-    })
-    .await
-    .ok()
-    .flatten();
+    // Reap the child (blocking) on a dedicated thread-pool slot. For a PTY run
+    // the closure also owns our master handle, so the fd outlives the wait; the
+    // matching `RunControl` (removed from `active` below) holds the other `Arc`,
+    // so the fd actually closes once both are gone.
+    let exit_code = task::spawn_blocking(reap).await.ok().flatten();
 
     let ended_at = unix_now_secs();
     let status = match sent_signal {
@@ -1409,6 +1712,204 @@ mod tests {
         );
     }
 
+    // ── Pipe mode (R739-F6) ───────────────────────────────────────────────────
+
+    /// Run `cmd` to completion and return its stored chunks.
+    async fn run_to_completion(
+        store: &Arc<TaskStore>,
+        driver: &TaskDriver,
+        cmd: &str,
+        opts: SpawnOpts,
+    ) -> Vec<OutputChunk> {
+        let id = driver.spawn_run(cmd, opts).await.unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let meta = store.get_run(&id).await.unwrap().unwrap();
+            if matches!(meta.status, RunStatus::Done { .. } | RunStatus::Lost { .. }) {
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("run did not complete in time, status={:?}", meta.status);
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        store.get_chunks(&id, &ChunkFilter::default()).await.unwrap()
+    }
+
+    fn joined(chunks: &[OutputChunk]) -> Vec<u8> {
+        chunks.iter().flat_map(|c| c.bytes.clone()).collect()
+    }
+
+    fn joined_stream(chunks: &[OutputChunk], stream: Stream) -> Vec<u8> {
+        chunks
+            .iter()
+            .filter(|c| c.stream == stream)
+            .flat_map(|c| c.bytes.clone())
+            .collect()
+    }
+
+    /// Divergence 1 of 3 (R739-F4): the child must not think it is on a
+    /// terminal. This is the one that makes cargo colorize.
+    #[tokio::test]
+    async fn pipe_mode_child_sees_no_tty_on_stdout() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(&dir).await;
+        let driver = TaskDriver::new(Arc::clone(&store)).await.unwrap();
+        let cmd = "if [ -t 1 ]; then echo TTY; else echo PIPE; fi";
+
+        let piped = run_to_completion(
+            &store,
+            &driver,
+            cmd,
+            SpawnOpts { cwd: "/tmp".into(), pipe: true, ..Default::default() },
+        )
+        .await;
+        assert_eq!(joined(&piped), b"PIPE\n");
+
+        // The PTY default is unchanged — the terminal tiles depend on it.
+        let ptied = run_to_completion(
+            &store,
+            &driver,
+            cmd,
+            SpawnOpts { cwd: "/tmp".into(), ..Default::default() },
+        )
+        .await;
+        assert_eq!(joined(&ptied), b"TTY\r\n");
+    }
+
+    /// Divergence 2 of 3: no `ONLCR`, so a `\n` the child wrote stays a `\n`.
+    /// This is what `build_run.rs::undo_onlcr` used to compensate for.
+    #[tokio::test]
+    async fn pipe_mode_does_not_translate_newlines() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(&dir).await;
+        let driver = TaskDriver::new(Arc::clone(&store)).await.unwrap();
+
+        let piped = run_to_completion(
+            &store,
+            &driver,
+            r"printf 'a\nb\n'",
+            SpawnOpts { cwd: "/tmp".into(), pipe: true, ..Default::default() },
+        )
+        .await;
+        assert_eq!(joined(&piped), b"a\nb\n");
+    }
+
+    /// Divergence 3 of 3: stdout and stderr stay apart, under their true
+    /// [`Stream`], instead of being merged by the terminal.
+    #[tokio::test]
+    async fn pipe_mode_keeps_stderr_separate_from_stdout() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(&dir).await;
+        let driver = TaskDriver::new(Arc::clone(&store)).await.unwrap();
+        let cmd = "printf 'to-out\n'; printf 'to-err\n' >&2";
+
+        let piped = run_to_completion(
+            &store,
+            &driver,
+            cmd,
+            SpawnOpts { cwd: "/tmp".into(), pipe: true, ..Default::default() },
+        )
+        .await;
+        assert_eq!(joined_stream(&piped, Stream::Stdout), b"to-out\n");
+        assert_eq!(joined_stream(&piped, Stream::Stderr), b"to-err\n");
+
+        // Under a PTY the kernel merges them and everything lands on stdout —
+        // the property that made stream separation unrecoverable downstream.
+        let ptied = run_to_completion(
+            &store,
+            &driver,
+            cmd,
+            SpawnOpts { cwd: "/tmp".into(), ..Default::default() },
+        )
+        .await;
+        assert!(
+            joined_stream(&ptied, Stream::Stderr).is_empty(),
+            "PTY runs have no stderr chunks; that is the behaviour pipe mode exists to fix",
+        );
+    }
+
+    /// Both pipes must reach EOF before the child is reaped, or a run whose
+    /// last bytes went to stderr would be marked terminal with output still
+    /// unread. The 4 KiB write is larger than a pipe's atomic-write buffer, so
+    /// this fails if either pump is dropped rather than awaited.
+    #[tokio::test]
+    async fn pipe_mode_drains_both_streams_before_the_run_is_terminal() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(&dir).await;
+        let driver = TaskDriver::new(Arc::clone(&store)).await.unwrap();
+
+        let piped = run_to_completion(
+            &store,
+            &driver,
+            "head -c 4096 /dev/zero | tr '\\0' 'x'; head -c 4096 /dev/zero | tr '\\0' 'y' >&2",
+            SpawnOpts { cwd: "/tmp".into(), pipe: true, ..Default::default() },
+        )
+        .await;
+        assert_eq!(joined_stream(&piped, Stream::Stdout).len(), 4096);
+        assert_eq!(joined_stream(&piped, Stream::Stderr).len(), 4096);
+    }
+
+    /// Exit codes have to survive the move to `std::process::Child`, which
+    /// reports them through a different type than `portable_pty::Child`.
+    #[tokio::test]
+    async fn pipe_mode_records_the_childs_exit_code() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(&dir).await;
+        let driver = TaskDriver::new(Arc::clone(&store)).await.unwrap();
+
+        let id = driver
+            .spawn_run(
+                "exit 101",
+                SpawnOpts { cwd: "/tmp".into(), pipe: true, ..Default::default() },
+            )
+            .await
+            .unwrap();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let meta = store.get_run(&id).await.unwrap().unwrap();
+            match meta.status {
+                RunStatus::Done { exit_code, .. } => {
+                    assert_eq!(exit_code, 101);
+                    return;
+                }
+                RunStatus::Lost { .. } | RunStatus::Killed { .. } => {
+                    panic!("unexpected terminal status {:?}", meta.status)
+                }
+                _ => {}
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("run did not complete in time");
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// A pipe run has no terminal, and the two PTY-only verbs must say so
+    /// rather than reaching into a `None` master.
+    #[tokio::test]
+    async fn pipe_mode_has_no_terminal_to_resize_or_read_a_foreground_pid_from() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(&dir).await;
+        let driver = TaskDriver::new(Arc::clone(&store)).await.unwrap();
+
+        let id = driver
+            .spawn_run(
+                "sleep 2",
+                SpawnOpts { cwd: "/tmp".into(), pipe: true, ..Default::default() },
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            driver.resize_run(&id, 100, 40).await,
+            Err(DriverError::NotFound(_))
+        ));
+        assert_eq!(driver.foreground_pid(&id), None);
+        let _ = driver.kill_run(&id, Some(SIGKILL)).await;
+    }
+
     /// Wait for a run to reach a terminal status, or panic.
     async fn await_done(store: &TaskStore, id: &TaskRunId) -> TaskRunMeta {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -1566,6 +2067,110 @@ mod tests {
             matches!(meta.status, RunStatus::Done { exit_code: 0, .. }),
             "expected Done(0), got {:?}",
             meta.status
+        );
+    }
+
+    /// R901-B2. The control is the whole point: without the `pipefail: false`
+    /// half this would pass if `pipefail` stopped existing, and with only the
+    /// `true` half it would pass if every pipeline had always reported its
+    /// leftmost failure. The pair pins the *difference*, which is the thing
+    /// that cost this camp ~50 minutes of red tree.
+    #[tokio::test]
+    async fn pipefail_reports_the_failing_stage_and_posix_reports_the_last_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(&dir).await;
+        let driver = TaskDriver::new(Arc::clone(&store)).await.unwrap();
+
+        // `(exit 101) | tail -1` is `cargo check 2>&1 | tail -40` with the
+        // compile stripped out: a failing producer feeding a succeeding tail.
+        let line = "(exit 101) | tail -1";
+
+        let posix = driver
+            .spawn_run(
+                line,
+                SpawnOpts { cwd: "/tmp".into(), pipefail: false, ..Default::default() },
+            )
+            .await
+            .unwrap();
+        let meta = await_done(&store, &posix).await;
+        assert!(
+            matches!(meta.status, RunStatus::Done { exit_code: 0, .. }),
+            "POSIX pipeline status is the LAST stage's — expected Done(0), got {:?}",
+            meta.status
+        );
+
+        let failing = driver
+            .spawn_run(
+                line,
+                SpawnOpts { cwd: "/tmp".into(), pipefail: true, ..Default::default() },
+            )
+            .await
+            .unwrap();
+        let meta = await_done(&store, &failing).await;
+        assert!(
+            matches!(meta.status, RunStatus::Done { exit_code: 101, .. }),
+            "pipefail must surface the producer's 101, got {:?}",
+            meta.status
+        );
+    }
+
+    /// The prelude must not reach [`TaskRunMeta::command`]: that string is what
+    /// history re-runs and what an agent audits the relocation note against.
+    #[tokio::test]
+    async fn pipefail_does_not_leak_into_the_recorded_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(&dir).await;
+        let driver = TaskDriver::new(Arc::clone(&store)).await.unwrap();
+
+        let id = driver
+            .spawn_run(
+                "echo recorded-verbatim | cat",
+                SpawnOpts { cwd: "/tmp".into(), pipefail: true, ..Default::default() },
+            )
+            .await
+            .unwrap();
+
+        let meta = await_done(&store, &id).await;
+        assert_eq!(meta.command, "echo recorded-verbatim | cat");
+        assert!(
+            !meta.command.contains("pipefail"),
+            "the prelude leaked into the recorded command: {:?}",
+            meta.command
+        );
+    }
+
+    /// The portability guard. On a `/bin/sh` that rejects `pipefail` (dash, i.e.
+    /// most Linux camps) the probe must degrade to plain POSIX semantics — it
+    /// must NOT take the shell down with it, because `set` is a special builtin
+    /// and a bare `set -o pipefail` there is entitled to exit before the
+    /// caller's command runs at all. Asserting the command still produces its
+    /// output is asserting exactly that.
+    #[tokio::test]
+    async fn the_pipefail_probe_never_costs_the_command_that_follows_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(&dir).await;
+        let driver = TaskDriver::new(Arc::clone(&store)).await.unwrap();
+
+        let id = driver
+            .spawn_run(
+                "echo probe-survived",
+                SpawnOpts { cwd: "/tmp".into(), pipefail: true, ..Default::default() },
+            )
+            .await
+            .unwrap();
+
+        let meta = await_done(&store, &id).await;
+        let text = output_of(&store, &id).await;
+        assert!(
+            matches!(meta.status, RunStatus::Done { exit_code: 0, .. }),
+            "expected Done(0), got {:?}",
+            meta.status
+        );
+        assert!(text.contains("probe-survived"), "command did not run, got: {text:?}");
+        // The probe itself must be silent — it runs on every relocated build.
+        assert!(
+            !text.contains("pipefail"),
+            "the probe printed a diagnostic into the build's own output: {text:?}"
         );
     }
 
@@ -1930,5 +2535,204 @@ mod tests {
             "expected no shim events when log_fd_enabled=false, got {}",
             events.len()
         );
+    }
+
+    // ── Unattached-run reaper (R739-B12) ─────────────────────────────────────
+
+    /// The origin `yah build run` tags its relocated builds with. Spelled out
+    /// here rather than imported: what the reaper must do is defined by the
+    /// string on the wire, not by any constant this crate owns.
+    const BUILD_RUN: &str = "build-run";
+
+    fn opted_in() -> Vec<String> {
+        vec![BUILD_RUN.to_string()]
+    }
+
+    async fn spawn_long_run(driver: &TaskDriver, origin: &str) -> TaskRunId {
+        driver
+            .spawn_run(
+                "sleep 30",
+                SpawnOpts {
+                    cwd: "/tmp".into(),
+                    origin: Some(origin.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn await_status(
+        store: &Arc<TaskStore>,
+        id: &TaskRunId,
+        want: fn(&RunStatus) -> bool,
+    ) -> RunStatus {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let status = store.get_run(id).await.unwrap().unwrap().status;
+            if want(&status) {
+                return status;
+            }
+            if std::time::Instant::now() > deadline {
+                panic!("run never reached the expected status, last={status:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+
+    /// The orphan this ticket exists for: the client is gone, so nothing polls
+    /// the run, so the daemon must end it.
+    #[tokio::test]
+    async fn an_unpolled_run_of_an_opted_in_origin_is_reaped() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(&dir).await;
+        let driver = TaskDriver::new(Arc::clone(&store)).await.unwrap();
+
+        let id = spawn_long_run(&driver, BUILD_RUN).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let reaped = driver
+            .reap_unattached(Duration::from_millis(200), &opted_in())
+            .await;
+        assert_eq!(reaped, vec![id.clone()], "the unattached run should be reaped");
+
+        let status = await_status(&store, &id, |s| {
+            matches!(s, RunStatus::Killed { .. } | RunStatus::Done { .. })
+        })
+        .await;
+        assert!(
+            matches!(status, RunStatus::Killed { .. }),
+            "a reaped run ends Killed, got {status:?}"
+        );
+    }
+
+    /// The regression that protects a healthy long build: a client that is
+    /// still polling keeps its run alive however long the build takes.
+    #[tokio::test]
+    async fn a_run_a_client_is_still_polling_is_never_reaped() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(&dir).await;
+        let driver = TaskDriver::new(Arc::clone(&store)).await.unwrap();
+
+        let id = spawn_long_run(&driver, BUILD_RUN).await;
+
+        // Six polls across three idle windows — what `yah build run`'s tail
+        // loop does, slowed down.
+        for _ in 0..6 {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            driver.note_attached(&id);
+            let reaped = driver
+                .reap_unattached(Duration::from_millis(200), &opted_in())
+                .await;
+            assert!(reaped.is_empty(), "a polled run must survive, reaped {reaped:?}");
+        }
+
+        assert!(
+            matches!(
+                store.get_run(&id).await.unwrap().unwrap().status,
+                RunStatus::Running
+            ),
+            "the polled run should still be running"
+        );
+
+        // And the moment the polling stops, it becomes reapable — same run,
+        // so this pins the refresh rather than a missing origin match.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let reaped = driver
+            .reap_unattached(Duration::from_millis(200), &opted_in())
+            .await;
+        assert_eq!(reaped, vec![id], "a run that stopped being polled is reapable");
+    }
+
+    /// The regression that protects real users' terminals. An interactive tile
+    /// sits unpolled for hours by design and must never be touched, however
+    /// long the reaper runs.
+    #[tokio::test]
+    async fn a_terminal_tile_is_never_reaped_however_long_it_idles() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(&dir).await;
+        let driver = TaskDriver::new(Arc::clone(&store)).await.unwrap();
+
+        let id = spawn_long_run(&driver, "terminal").await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        for _ in 0..3 {
+            let reaped = driver.reap_unattached(Duration::ZERO, &opted_in()).await;
+            assert!(
+                reaped.is_empty(),
+                "a terminal tile is outside the opted-in origins, reaped {reaped:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        assert!(
+            matches!(
+                store.get_run(&id).await.unwrap().unwrap().status,
+                RunStatus::Running
+            ),
+            "the terminal run must still be running"
+        );
+
+        driver.kill_run(&id, Some(SIGKILL)).await.unwrap();
+    }
+
+    /// A run with no origin at all — an ordinary `task.run` job — is outside
+    /// every opt-in list, and an empty list reaps nothing.
+    #[tokio::test]
+    async fn an_origin_less_run_and_an_empty_opt_in_list_reap_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(&dir).await;
+        let driver = TaskDriver::new(Arc::clone(&store)).await.unwrap();
+
+        let plain = driver
+            .spawn_run("sleep 30", SpawnOpts { cwd: "/tmp".into(), ..Default::default() })
+            .await
+            .unwrap();
+        let build = spawn_long_run(&driver, BUILD_RUN).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert!(
+            driver.reap_unattached(Duration::ZERO, &[]).await.is_empty(),
+            "an empty opt-in list must reap nothing, not everything"
+        );
+        assert_eq!(
+            driver.reap_unattached(Duration::ZERO, &opted_in()).await,
+            vec![build],
+            "only the opted-in origin is reapable"
+        );
+
+        assert!(
+            matches!(
+                store.get_run(&plain).await.unwrap().unwrap().status,
+                RunStatus::Running
+            ),
+            "the origin-less run must be untouched"
+        );
+        driver.kill_run(&plain, Some(SIGKILL)).await.unwrap();
+    }
+
+    /// `note_attached` is observable, and the age it resets is what the sweep
+    /// reads.
+    #[tokio::test]
+    async fn attached_age_resets_on_a_poll_and_is_none_for_a_foreign_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(&dir).await;
+        let driver = TaskDriver::new(Arc::clone(&store)).await.unwrap();
+
+        let id = spawn_long_run(&driver, BUILD_RUN).await;
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let aged = driver.attached_age(&id).expect("driver owns this run");
+        assert!(aged >= Duration::from_millis(100), "age should have grown, got {aged:?}");
+
+        driver.note_attached(&id);
+        let fresh = driver.attached_age(&id).unwrap();
+        assert!(fresh < aged, "a poll resets the age: {fresh:?} vs {aged:?}");
+
+        assert!(
+            driver.attached_age(&TaskRunId::new()).is_none(),
+            "a run this driver does not own has no attachment age"
+        );
+
+        driver.kill_run(&id, Some(SIGKILL)).await.unwrap();
     }
 }

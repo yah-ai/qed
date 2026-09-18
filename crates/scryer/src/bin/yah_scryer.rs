@@ -13,6 +13,20 @@
 //!                       node's tailnet IP (e.g. `100.64.0.7:6543`).
 //!   --data <dir>        default `/var/lib/yah/scryer/`. The short-disk SQLite
 //!                       file `events.db` is created under this directory.
+//!   --ingest-socket <path>
+//!                       bind the local-agent Unix ingestion socket here
+//!                       (typically `/run/yah/scryer.sock`). This is what
+//!                       `yah-log`'s service layer and passway's span exporter
+//!                       write to. OFF by default, and it is half a contract:
+//!                       the node's kamaji must be started with
+//!                       `--scryer-socket <the same path>` or no workload will
+//!                       ever be told where this socket is (R893-B17).
+//!
+//! `--listen` and `--ingest-socket` are different surfaces, not alternatives.
+//! `--listen` is the FEDERATION (cross-machine read) HTTP API; `--ingest-socket`
+//! is the local write path. A per-request span emitter paying HTTP framing to
+//! reach a collector in its own mount namespace would be strictly worse, which
+//! is why R893-F16 chose the socket.
 //!
 //! Long-tier promotion (R556-F5) — off unless a bucket is configured. When
 //! enabled, a background consumer rolls short-disk events older than the
@@ -60,7 +74,8 @@ use std::sync::Arc;
 
 use yah_object_store::R2ObjectStore;
 use yah_scryer::{
-    FederationState, LongTierConfig, LongTierStore, MS_PER_DAY, ObjectStore, OperatorTagAcl,
+    FederationState, IngestionServer, LongTierConfig, LongTierStore, MS_PER_DAY, ObjectStore,
+    OperatorTagAcl,
     PromotionConfig, PromotionConsumer, Scryer, ScryerConfig, SnapshotConfig, SnapshotProducer,
     serve_federation,
 };
@@ -70,6 +85,10 @@ fn main() -> ExitCode {
     let listen = parse_arg(&args, "--listen").unwrap_or_else(|| "127.0.0.1:6543".to_string());
     let data_dir =
         parse_arg(&args, "--data").unwrap_or_else(|| "/var/lib/yah/scryer/".to_string());
+    // R893-B17. Opt-in rather than defaulted: the default would be a path under
+    // /run that does not exist on a dev box, and a collector that fails to
+    // start is worse than one that was never asked to.
+    let ingest_socket = parse_arg(&args, "--ingest-socket").map(PathBuf::from);
 
     let addr: SocketAddr = match listen.parse() {
         Ok(a) => a,
@@ -170,6 +189,7 @@ fn main() -> ExitCode {
 
     let scryer = Arc::new(scryer);
     let promo_scryer = Arc::clone(&scryer);
+    let ingest_scryer = Arc::clone(&scryer);
     let state = FederationState::new(scryer, Arc::new(OperatorTagAcl));
     let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
         Ok(r) => r,
@@ -188,6 +208,35 @@ fn main() -> ExitCode {
             }
         };
         eprintln!("yah-scryer listening on {local}");
+
+        // R893-B17: the local write path. Bound before anything else is
+        // spawned and FAILED LOUDLY, for the same reason the federation bind
+        // above is: an operator who passed --ingest-socket asked for workload
+        // telemetry, and a daemon that came up serving reads while silently
+        // ingesting nothing is the exact silent-nowhere failure this ticket
+        // removes. Pair it with `kamaji --scryer-socket <the same path>`.
+        if let Some(path) = &ingest_socket {
+            let server = IngestionServer::new(ingest_scryer, path);
+            // Bind synchronously so a failure is a startup error rather than a
+            // background task nobody reads the result of.
+            match server.bind().await {
+                Ok(bound) => {
+                    eprintln!("yah-scryer ingesting on {}", path.display());
+                    tokio::spawn(async move {
+                        if let Err(e) = bound.serve().await {
+                            eprintln!("yah-scryer: ingestion socket stopped: {e}");
+                        }
+                    });
+                }
+                Err(e) => {
+                    eprintln!(
+                        "yah-scryer: cannot bind ingestion socket {}: {e}",
+                        path.display()
+                    );
+                    return ExitCode::from(1);
+                }
+            }
+        }
 
         if let Some(lt) = long_tier {
             eprintln!(

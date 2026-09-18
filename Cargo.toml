@@ -25,7 +25,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.8.37"
+version = "0.8.40"
 edition = "2021"
 authors = ["yah Dev <human@yah.dev>"]
 license = "MIT OR Apache-2.0"
@@ -43,3 +43,13 @@ repository = "https://github.com/yah-ai/qed"
 turso = { version = "0.7.2", default-features = false, features = ["fts"] }
 turso_core = { version = "0.7.2", features = [] }
 
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+opt-level = 1
+# W308/R745-T1: `-C incremental` makes sccache refuse a crate outright. This
+# glob applies to DEPENDENCIES and never to workspace members, so crates you
+# edit here keep incremental and crates you merely consume become cacheable.
+incremental = false

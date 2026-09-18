@@ -60,10 +60,11 @@ impl BeholderStatus {
     pub fn forced_against_flags(name: &str, version: &str) -> Self {
         Self::make(format!("forced-against-flags:{name}@{version}"))
     }
-    /// `BeholderSelect::Force` matched on a TTY-attached run where a Rewriter
-    /// beholder would normally decline to preserve human output.
-    pub fn forced_against_tty(name: &str, version: &str) -> Self {
-        Self::make(format!("forced-against-tty:{name}@{version}"))
+    /// `BeholderSelect::Force` matched on a run whose output is consumed
+    /// verbatim, where a Rewriter beholder would normally decline rather than
+    /// change what the caller reads.
+    pub fn forced_against_verbatim(name: &str, version: &str) -> Self {
+        Self::make(format!("forced-against-verbatim:{name}@{version}"))
     }
     pub fn unknown_format() -> Self {
         Self::make("unknown_format".to_string())

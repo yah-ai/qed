@@ -370,6 +370,7 @@ mod tests {
     /// step built in code), hence the explicit literal.
     fn step(name: &str, argv: &[&str]) -> QedStep {
         QedStep {
+            expect_slow: false,
             name: name.to_string(),
             argv: argv.iter().map(|s| s.to_string()).collect(),
             cwd: None,

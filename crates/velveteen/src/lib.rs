@@ -269,6 +269,27 @@ pub enum TaskRuntime {
     /// Like `Native`, it is carried to kamaji as an annotation on an ordinary
     /// `Workload::Container` rather than as a new wire shape; see
     /// [`workload_spec::WorkloadSpec::wants_microvm`].
+    ///
+    /// # Why this one variant overrides `rename_all`
+    ///
+    /// R605-T24. `rename_all = "snake_case"` spells this `micro_vm`, and not one
+    /// thing in the tree ever called it that: the qed runner's own refusal says
+    /// "step `x` declares runtime = microvm, which is remote-only"
+    /// (`qed::runner::local_microvm_is_refused`), `velveteen_exec::local` says
+    /// "runtime = microvm is remote-only", `admission` renders the substrate as
+    /// `"microvm"`, and the annotation kamaji routes on is `yah.exec = microvm`.
+    /// So an operator who wrote the value every error message in the system told
+    /// them to write got `unknown variant 'microvm', expected one of 'native',
+    /// 'container', 'micro_vm'` — from the TOML parser, before any of those
+    /// messages could ever be reached. That was the first thing R605-T24 hit
+    /// trying to author the first microVM pipeline in the tree, which is to say
+    /// the first time anyone tried this token at all.
+    ///
+    /// Renamed rather than changing the messages, because the messages agree
+    /// with the annotation and the annotation is the name of the thing. Free to
+    /// do: `micro_vm` appeared in no pipeline, no persisted run record and no
+    /// schema — nothing had ever successfully written it.
+    #[serde(rename = "microvm")]
     MicroVm,
 }
 

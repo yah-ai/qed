@@ -26,13 +26,19 @@ use crate::federation::{FederationPeer, FederationRule, ScopedEvent};
 use crate::long_tier::{LongTierError, LongTierStore};
 use crate::ring::{EventRing, RingConfig};
 use crate::store::{EventStore, ScryerStoreError, ScopeFilter, ScopeInfo};
-use observation::{Event, EventScope, Level};
+use observation::{Event, EventScope, HopRollup, Level};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use task_runs::{EventFilter as TaskEventFilter, StoreError as TaskStoreError, TaskStore};
 use thiserror::Error;
 use tokio::sync::broadcast;
+
+/// Ceiling on how many sub-window queries one bucketed
+/// [`Scryer::hop_rollups`] call may issue. Hit only by a long lookback asking
+/// for a fine bucket; the bucket is coarsened to fit rather than the range
+/// being cut short.
+pub const MAX_HOP_BUCKETS: u64 = 240;
 
 // ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -405,6 +411,60 @@ impl Scryer {
             .collect();
         buckets.sort_by(|a, b| b.count.cmp(&a.count).then(a.key.cmp(&b.key)));
         Ok(buckets)
+    }
+
+    /// Merge this node's span rollup windows overlapping
+    /// `[from_unix_nanos, to_unix_nanos)` into one [`HopRollup`] per
+    /// `(scope, peer, kind)` — the hop matrix (R893-F19).
+    ///
+    /// Cross-scope by construction, unlike [`Self::events_all_scoped`]: the
+    /// rollup table is already keyed by scope, so there is no per-scope loop to
+    /// write and no scope envelope to re-attach. Reads
+    /// [`EventStore::query_hop_rollups`] rather than the raw `spans` table
+    /// deliberately — R893-F15 pre-aggregates into 60s tumbling windows at
+    /// write time precisely so a panel load does not scan millions of spans,
+    /// and merging the stored explicit-bucket histograms is exact where
+    /// averaging per-window quantiles would be fabrication.
+    /// With `bucket_nanos` set, the range is split into consecutive sub-windows
+    /// and each one is rolled up separately, so the caller sees a hop's latency
+    /// *shape* move across the window instead of only its endpoint quantiles.
+    /// Each row carries the sub-window it covers, so the grid is
+    /// self-describing and re-merging to totals is an exact histogram add.
+    ///
+    /// The bucket is coarsened, never the range truncated: it is rounded up to
+    /// a whole rollup window and further up until at most
+    /// [`MAX_HOP_BUCKETS`] sub-queries cover the range. A silently clipped
+    /// window would make a long lookback look quiet at its far end, which is
+    /// the one thing a "how has it behaved" panel must not do.
+    pub fn hop_rollups(
+        &self,
+        from_unix_nanos: u64,
+        to_unix_nanos: u64,
+        bucket_nanos: Option<u64>,
+    ) -> Result<Vec<HopRollup>, ScryerError> {
+        let Some(requested) = bucket_nanos else {
+            return Ok(self
+                .store
+                .query_hop_rollups(None, from_unix_nanos, to_unix_nanos)?);
+        };
+        if to_unix_nanos <= from_unix_nanos {
+            return Ok(Vec::new());
+        }
+        let span = to_unix_nanos - from_unix_nanos;
+        let bucket = requested
+            .max(span.div_ceil(MAX_HOP_BUCKETS))
+            .max(observation::ROLLUP_WINDOW_NANOS)
+            .div_ceil(observation::ROLLUP_WINDOW_NANOS)
+            * observation::ROLLUP_WINDOW_NANOS;
+
+        let mut out = Vec::new();
+        let mut start = observation::rollup_window_start(from_unix_nanos);
+        while start < to_unix_nanos {
+            let end = start + bucket;
+            out.extend(self.store.query_hop_rollups(None, start, end)?);
+            start = end;
+        }
+        Ok(out)
     }
 
     pub fn ring(&self) -> &Arc<EventRing> {
