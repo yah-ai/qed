@@ -518,14 +518,19 @@ impl TaskDriver {
             if !stale_policy.tombstones(&meta) {
                 continue;
             }
-            store
-                .update_status(
-                    &meta.id,
-                    &RunStatus::Lost {
-                        reason: "daemon restarted while run was in-flight".to_string(),
-                    },
-                )
-                .await?;
+            let status = RunStatus::Lost {
+                reason: "daemon restarted while run was in-flight".to_string(),
+            };
+            store.update_status(&meta.id, &status).await?;
+            /* A sweep tombstone is a terminal status like any other, and a
+               client watching that run needs it as much as it needs an exit
+               code. Until R267-T12 this was the one status transition in the
+               driver that wrote the store and told nobody — which is precisely
+               the transition a client cannot discover on its own, because the
+               process that would have reported it is the one that died. */
+            if let Some(ref tx) = channels.completion {
+                let _ = tx.send((meta.id.clone(), status));
+            }
         }
         Ok(Self {
             store,
@@ -1437,6 +1442,53 @@ mod tests {
             matches!(meta.status, RunStatus::Lost { .. }),
             "stale run should be Lost, got {:?}",
             meta.status
+        );
+    }
+
+    /// R267-T12: a sweep tombstone must reach the completion channel.
+    ///
+    /// This was the one status transition that wrote the store and told
+    /// nobody — and it is the transition a client can least discover on its
+    /// own, because the process that would have reported the exit is the one
+    /// that died. A renderer that trusts pushes would leave the pane on
+    /// "running" for as long as it stayed open.
+    #[tokio::test]
+    async fn a_sweep_tombstone_fires_the_completion_channel() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open_store(&dir).await;
+
+        let stale_id = TaskRunId::new();
+        store
+            .insert_run(&TaskRunMeta {
+                id: stale_id.clone(),
+                command: "sleep 9999".to_string(),
+                cwd: "/tmp".into(),
+                env: vec![],
+                started_at: unix_now_secs() - 60,
+                status: RunStatus::Running,
+                label: None,
+                initiator: Initiator::Human { camp: "test".to_string() },
+                beholder_status: None,
+                pinned: false,
+                origin: None,
+                host_pid: None,
+            })
+            .await
+            .unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let _driver = TaskDriver::with_channels(
+            Arc::clone(&store),
+            DriverChannels { completion: Some(tx), output: None },
+        )
+        .await
+        .unwrap();
+
+        let (id, status) = rx.try_recv().expect("the sweep must announce what it tombstoned");
+        assert_eq!(id, stale_id);
+        assert!(
+            matches!(status, RunStatus::Lost { .. }),
+            "expected Lost, got {status:?}"
         );
     }
 

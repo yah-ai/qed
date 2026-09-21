@@ -3394,12 +3394,14 @@ timeout  = 9000
             &pipeline,
             "aarch64-apple-darwin",
             &crate::nativecross::ToolAvailability::FULL,
+            &crate::runner::NoopSubPipelineResolver,
         ));
         // On the x86 build-worker it's host-arch → no offload (runs there).
         assert!(!crate::runner::pipeline_needs_offload(
             &pipeline,
             "x86_64-unknown-linux-gnu",
             &crate::nativecross::ToolAvailability::FULL,
+            &crate::runner::NoopSubPipelineResolver,
         ));
     }
 

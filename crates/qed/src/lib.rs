@@ -383,7 +383,7 @@ pub use registries::{extract_registry_host, RegistryConfig, RegistryConfigError,
 pub use runner::{
     pipeline_capability_demotions, pipeline_has_node_bound_participant,
     pipeline_is_fully_offloaded, pipeline_needs_offload, sub_pipeline_admission_gap,
-    AdmissionControl, AdmissionGap, AdmissionLane,
+    AdmissionControl, AdmissionGap, AdmissionLane, NoopSubPipelineResolver,
     // R892-B1, drive-by: `camp.rs`'s `child_abort_hook` names this type and the
     // export was missing, so the whole `yah` lib failed to resolve. The type
     // itself is `runner::ChildAbortHook` and was already public there.

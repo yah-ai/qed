@@ -943,16 +943,86 @@ pub fn pipeline_has_node_bound_participant(pipeline: &Pipeline) -> bool {
 /// a caller reasoning about a *remote* host's pipeline passes that host's known
 /// set (or `FULL`), exactly as it would to
 /// [`PipelineRunner::with_cross_availability`].
+///
+/// R555-B15: `resolver` is the fourth reason, and the one that made this question
+/// wrong for a whole class of recipe. This used to read `pipeline.steps` and
+/// stop there, so a `kind = "sub-pipeline"` step — which declares no
+/// `platform` of its own and therefore resolves `NativeCross` — hid every
+/// offload need underneath it. `yah-release-wizard` is entirely that shape:
+/// its x86 musl work lives in `yah-cli-release`, reached through a
+/// sub-pipeline step, so this returned `false`, the CLI stood up no fleet
+/// client, and the leg died with "no remote dispatcher is wired" on a run
+/// that was already `--where=auto`. Running the *child* directly worked,
+/// which is what made it read as a placement bug rather than a probe one.
+/// Pass the same resolver the runner will get; [`NoopSubPipelineResolver`]
+/// only when the pipeline provably has no children.
+///
+/// @yah:ticket(R555-B15, "pipeline_needs_offload never descended into sub-pipeline children, so the release wizard stood up no fleet client")
+/// @yah:at(2026-09-18T16:34:41Z)
+/// @yah:status(review)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
+/// @yah:parent(R555)
+/// @yah:severity(high)
+/// @yah:next("pipeline_is_fully_offloaded has the same steps-only blindness and was deliberately left alone: a sub-pipeline step itself runs locally, so \"is every step remote\" is a different question from \"does anything need the fleet\". Decide whether it wants the same descent before something depends on its answer.")
+/// @yah:verify("cargo test --manifest-path oss/qed/Cargo.toml -p yah-qed --lib pipeline_needs_offload — 3/3 pass including the new pipeline_needs_offload_descends_into_sub_pipelines. cargo check -p yah-qed --all-targets and cargo check -p yah --all-targets both EXIT=0.")
+/// @yah:gotcha("A 422 body's `\"runtime\":\"stub\"` is NOT a capability report and proves nothing about the node. It is a hardcoded literal in check_deploy_body's `rejected` closure (oss/yubaba/crates/yubaba/src/lib.rs:5876), emitted on EVERY rejection regardless of which runtime the node has. A prior session read it as \"us-west-002 has no container runtime\", concluded build-worker selection was tie-breaking onto a node structurally unable to run containers, and raised an operator call for a selection-code fix. Wrong twice over: 002 runs kamaji built with containerd-integration and has buildkit pre-pulled, and us-west-003 rejected the identical body identically. Read the `error` field, not the `runtime` field.")
+/// @yah:next("NOT YET PROVEN END-TO-END. The daemon and the CLI both have to carry this before `yah qed run yah-release-wizard` can offload: `cargo xtask install` for ~/.local/bin/yah, and the app-bundle binary for the MCP surface. The live bar is a wizard run reaching publish-cli and dispatching the x86 musl leg — nobody has run it since the fix.")
+/// @yah:handoff("FIXED IN TREE, UNCOMMITTED. pipeline_needs_offload now takes a `&dyn SubPipelineResolver` fourth argument and recurses into `kind = \"sub-pipeline\"` children, mirroring validate_sub_pipeline_graph's walker (chain of sub_pipeline_ref_token + MAX_SUB_PIPELINE_DEPTH, so a caller with no load-time guarantee cannot hang). Signature changed rather than shimmed, per the pre-1.0 rule. Call sites updated: camp.rs matrix-fanout + single-run (both pass the daemon's existing sub_pipeline_resolver), qed.rs's --where=auto gate (builds a LoaderSubPipelineResolver from the gate_loader already in scope), 11 in-crate test sites and camp_qed_image_pins.rs (NoopSubPipelineResolver, which is now pub and re-exported from lib.rs).")
+/// @yah:handoff("Diagnosis correction worth keeping: the prior session's operator call (\"make build-worker selection require the container capability, so us-west-002 stops winning a tie-break for work it cannot run\") would have fixed nothing. Measured on both x86 workers with POST /workloads/validate and an identical body — us-west-003 rejected exactly as us-west-002 did. The node was never the discriminator. Two independent defects were being read as one: this probe bug, and a fleet version skew (R896-T4 deleted WorkloadSpec::schema_version on 2026-09-15 while both build workers stayed on yubaba 0.8.40-h4, which still required it; every other fleet node had already moved to h17/h20). The skew was closed by hotshipping yubaba+kamaji 0.8.41-h1/h2 to both nodes — see R880-B1 for what that ship broke on the way.")
 pub fn pipeline_needs_offload(
     pipeline: &Pipeline,
     host: &str,
     capability: &crate::nativecross::ToolAvailability,
+    resolver: &dyn crate::types::SubPipelineResolver,
 ) -> bool {
-    pipeline_has_node_bound_participant(pipeline)
-        || pipeline
-            .steps
-            .iter()
-            .any(|step| matches!(step_placement(step, host, capability), crate::platform::Resolution::Offload { .. }))
+    let mut chain: Vec<String> = Vec::new();
+    needs_offload_walk(pipeline, host, capability, resolver, &mut chain)
+}
+
+/// The recursive half of [`pipeline_needs_offload`] — `chain` carries the
+/// sub-pipeline targets already entered, mirroring
+/// [`crate::types::validate_sub_pipeline_graph`]'s walker.
+fn needs_offload_walk(
+    pipeline: &Pipeline,
+    host: &str,
+    capability: &crate::nativecross::ToolAvailability,
+    resolver: &dyn crate::types::SubPipelineResolver,
+    chain: &mut Vec<String>,
+) -> bool {
+    if pipeline_has_node_bound_participant(pipeline) {
+        return true;
+    }
+    for step in &pipeline.steps {
+        if matches!(
+            step_placement(step, host, capability),
+            crate::platform::Resolution::Offload { .. }
+        ) {
+            return true;
+        }
+        if step.kind != crate::types::StepKind::SubPipeline {
+            continue;
+        }
+        let Some(cfg) = step.sub_pipeline.as_ref() else {
+            continue;
+        };
+        let token = crate::types::sub_pipeline_ref_token(&cfg.target);
+        // Cycles are already rejected by `validate_sub_pipeline_graph` on the
+        // load path, but this runs from callers with no such guarantee and a
+        // pre-flight question must not hang.
+        if chain.contains(&token) || chain.len() > crate::types::MAX_SUB_PIPELINE_DEPTH {
+            continue;
+        }
+        let Some(child) = resolver.resolve(&cfg.target) else {
+            continue;
+        };
+        chain.push(token);
+        let child_offloads = needs_offload_walk(&child, host, capability, resolver, chain);
+        chain.pop();
+        if child_offloads {
+            return true;
+        }
+    }
+    false
 }
 
 /// One step's placement resolution against `host` and `capability` — the
@@ -1613,7 +1683,13 @@ pub struct PipelineRunner {
 /// [`PipelineRunner::with_sub_pipeline_resolver`]; tests pass an
 /// in-memory map. Keeping the default a no-op means a runner with no
 /// SubPipeline steps requires no extra configuration.
-struct NoopSubPipelineResolver;
+///
+/// Public because [`pipeline_needs_offload`] takes a resolver too, and a
+/// caller reasoning about a pipeline it knows has no `kind = "sub-pipeline"`
+/// step needs something to pass. Do NOT reach for it to silence that
+/// argument on a pipeline that *might* have children — a no-op resolver
+/// there reproduces exactly the blindness R555-B15 fixed.
+pub struct NoopSubPipelineResolver;
 
 impl crate::types::SubPipelineResolver for NoopSubPipelineResolver {
     fn resolve(&self, _target: &crate::types::SubPipelineRef) -> Option<Pipeline> {
@@ -5535,6 +5611,73 @@ impl PipelineRunner {
         })?;
         child.apply_params(&child_params);
 
+        // EXPAND THE CHILD'S MATRIX HERE, BECAUSE NOTHING ELSE DOES.
+        //
+        // `matrix::plan` had exactly two production callers, both in the CLI
+        // (`app/yah/cli/src/qed.rs` and `camp.rs`), so it ran only for a
+        // TOP-LEVEL run. A pipeline reached as a sub-pipeline child was handed
+        // to the child runner exactly as the loader parsed it, with every
+        // `${{ matrix.* }}` still a literal — the same class of defect
+        // transform.rs already records for step-level matrices ("the step runs
+        // once with the matrix expression literal in argv").
+        //
+        // How it surfaced, which is not how you would predict: the literal
+        // landed in `platform.target`, and a placeholder string can never equal
+        // a host triple, so EVERY step of `yah-desktop-release` resolved
+        // `Offload` and `fleet_portability_gate` refused the run at kick with
+        // 8 steps "routed to the fleet" — a recipe whose matrix is exactly one
+        // row, `aarch64-apple-darwin`, which IS the camp host. Nothing had
+        // asked for the fleet; the gate was reading an unexpanded pipeline and
+        // was right about what it saw. This blocked `yah-release-wizard`'s
+        // `desktop-channel` step (2026-09-20).
+        //
+        // Placed before the child runner is built because `child_lane`,
+        // `child_camp_root` and the struct literal below all read `child` —
+        // and `effective_concurrency_key()` can itself be a substituted value.
+        //
+        // The coord flows into the child runner's `matrix_coord` (see that
+        // field below, whose comment already anticipated this) so `if =
+        // "matrix.target == '…'"` gating evaluates per row, exactly as it does
+        // on the top-level path.
+        let child_matrix_coord = if crate::matrix::needs_expansion(&child) {
+            let mut planned = crate::matrix::plan(&child);
+            // FAN-OUT IS NOT SUPPORTED ON THIS PATH, AND IT REFUSES RATHER THAN
+            // PICKING A ROW. A multi-row child is N independent jobs; running
+            // only the first would publish a partial release that looks
+            // complete, which is worse than not starting. The top-level path
+            // fans out properly (qed.rs runs one `PlannedJob` per row) — so the
+            // fix for a recipe that needs this is to invoke it directly, or to
+            // teach this function to loop. No camp recipe hits it today:
+            // `yah-desktop-release` is the only pipeline with a
+            // `[pipeline.matrix]` and it declares a single target.
+            if planned.len() > 1 {
+                return Err(RunnerError::StepFailed {
+                    step: step.name.clone(),
+                    msg: format!(
+                        "sub-pipeline `{}` expands to {} matrix rows, and a sub-pipeline step \
+                         runs exactly one child. Running row 1 of {} would look like a complete \
+                         run and would not be one. Invoke it directly (`yah qed run {}`), which \
+                         fans out one run per row, or collapse its `[pipeline.matrix]` to a \
+                         single row.",
+                        sub_pipeline_target_label(&cfg.target),
+                        planned.len(),
+                        planned.len(),
+                        child.name,
+                    ),
+                });
+            }
+            let job = planned.pop().ok_or_else(|| RunnerError::InvalidConfig(format!(
+                "step `{}`: matrix::plan returned no jobs for sub-pipeline `{}` (plan always \
+                 yields at least one; this is a bug in matrix::plan, not in the recipe)",
+                step.name,
+                sub_pipeline_target_label(&cfg.target),
+            )))?;
+            child = job.pipeline;
+            job.coord
+        } else {
+            None
+        };
+
         // Build a child runner that inherits the parent's wiring. We can't
         // use the existing constructors because they reset every field to
         // defaults; instead, clone parent shape explicitly.
@@ -5747,8 +5890,12 @@ impl PipelineRunner {
             allow_emulate: self.allow_emulate,
             force: self.force,
             // Child runs don't inherit the parent's matrix coord — they may
-            // themselves be matrix-expanded.
-            matrix_coord: None,
+            // themselves be matrix-expanded, and now actually are: this is the
+            // coord from the child's OWN `matrix::plan` above, or `None` when
+            // it declares no matrix. It was hardcoded `None` while nothing
+            // expanded the child, which left `if = "matrix.target == '…'"`
+            // unevaluable in a child even once the substitution was fixed.
+            matrix_coord: child_matrix_coord,
             // Inherit the parent's host triple (R531-T1): a SubPipeline child
             // executes on the same host, so it shares the parent's platform
             // context rather than re-detecting (which would also lose a
@@ -12788,13 +12935,15 @@ mod tests {
         assert!(pipeline_needs_offload(
             &with_native,
             "aarch64-apple-darwin",
-            ALL_TOOLS
+            ALL_TOOLS,
+            &NoopSubPipelineResolver
         ));
         // Same step on the matching host: host-arch build, no offload.
         assert!(!pipeline_needs_offload(
             &with_native,
             "x86_64-unknown-linux-gnu",
-            ALL_TOOLS
+            ALL_TOOLS,
+            &NoopSubPipelineResolver
         ));
 
         let mut plain = native_offload_step();
@@ -12803,7 +12952,73 @@ mod tests {
         assert!(!pipeline_needs_offload(
             &no_native,
             "aarch64-apple-darwin",
-            ALL_TOOLS
+            ALL_TOOLS,
+            &NoopSubPipelineResolver
+        ));
+    }
+
+    /// R555-B15: the offload need lives one level down, inside a
+    /// `kind = "sub-pipeline"` child. The parent step declares no `platform`,
+    /// so it resolves `NativeCross` and a steps-only scan answers `false` —
+    /// which is how `yah-release-wizard` reached its `publish-cli` leg with no
+    /// fleet client wired and died on "no remote dispatcher is wired", from a
+    /// run that was already `--where=auto`, while `yah-cli-release` run
+    /// directly worked.
+    #[test]
+    fn pipeline_needs_offload_descends_into_sub_pipelines() {
+        struct OneChild(Pipeline);
+        impl crate::types::SubPipelineResolver for OneChild {
+            fn resolve(&self, _target: &crate::types::SubPipelineRef) -> Option<Pipeline> {
+                Some(self.0.clone())
+            }
+        }
+
+        let child = bg_pipeline("cli-release", vec![native_offload_step()]);
+
+        let mut gate = native_offload_step();
+        gate.name = "publish-cli".into();
+        gate.kind = crate::types::StepKind::SubPipeline;
+        gate.argv = Vec::new();
+        // The shape that hid the need: the sub-pipeline step has no platform.
+        gate.platform = None;
+        gate.sub_pipeline = Some(crate::types::SubPipelineConfig {
+            target: crate::types::SubPipelineRef::Builtin("cli-release".into()),
+            params: HashMap::new(),
+            propagate: crate::types::SubPipelineCollect {
+                produces: false,
+                outputs: Vec::new(),
+            },
+            opaque: false,
+            own_workspace: None,
+        });
+        let parent = bg_pipeline("release-wizard", vec![gate]);
+
+        assert!(
+            pipeline_needs_offload(
+                &parent,
+                "aarch64-apple-darwin",
+                ALL_TOOLS,
+                &OneChild(child.clone())
+            ),
+            "a resolvable child with a native cross step must make the parent need the fleet"
+        );
+
+        // A resolver that resolves nothing sees nothing — the old answer, and
+        // why NoopSubPipelineResolver is not a safe default for a pipeline that
+        // may have children.
+        assert!(!pipeline_needs_offload(
+            &parent,
+            "aarch64-apple-darwin",
+            ALL_TOOLS,
+            &NoopSubPipelineResolver
+        ));
+
+        // On the x86 worker the child's step is host-arch: no offload either way.
+        assert!(!pipeline_needs_offload(
+            &parent,
+            "x86_64-unknown-linux-gnu",
+            ALL_TOOLS,
+            &OneChild(child)
         ));
     }
 
@@ -12837,12 +13052,14 @@ mod tests {
         assert!(pipeline_needs_offload(
             &pipeline,
             "aarch64-apple-darwin",
-            ALL_TOOLS
+            ALL_TOOLS,
+            &NoopSubPipelineResolver
         ));
         assert!(pipeline_needs_offload(
             &pipeline,
             "x86_64-unknown-linux-gnu",
-            ALL_TOOLS
+            ALL_TOOLS,
+            &NoopSubPipelineResolver
         ));
 
         // A set whose every role is local still needs nothing: those steps run
@@ -12859,7 +13076,8 @@ mod tests {
         assert!(!pipeline_needs_offload(
             &local_only,
             "aarch64-apple-darwin",
-            ALL_TOOLS
+            ALL_TOOLS,
+            &NoopSubPipelineResolver
         ));
     }
 
@@ -12883,7 +13101,8 @@ mod tests {
         assert!(pipeline_needs_offload(
             &mixed,
             "aarch64-apple-darwin",
-            ALL_TOOLS
+            ALL_TOOLS,
+            &NoopSubPipelineResolver
         ));
         assert!(
             !pipeline_is_fully_offloaded(&mixed, "aarch64-apple-darwin", ALL_TOOLS),
@@ -12931,13 +13150,13 @@ mod tests {
         let pipeline = bg_pipeline("cross-build", vec![cross]);
 
         // Fully provisioned: it cross-compiles right here, no fleet wiring at all.
-        assert!(!pipeline_needs_offload(&pipeline, MAC, ALL_TOOLS));
+        assert!(!pipeline_needs_offload(&pipeline, MAC, ALL_TOOLS, &NoopSubPipelineResolver));
         assert!(!pipeline_is_fully_offloaded(&pipeline, MAC, ALL_TOOLS));
         assert!(pipeline_capability_demotions(&pipeline, MAC, ALL_TOOLS).is_empty());
 
         // Under-provisioned: the SAME pipeline now needs a dispatcher, and the
         // up-front question is the one that has to say so.
-        assert!(pipeline_needs_offload(&pipeline, MAC, NO_TOOLS));
+        assert!(pipeline_needs_offload(&pipeline, MAC, NO_TOOLS, &NoopSubPipelineResolver));
         assert!(pipeline_is_fully_offloaded(&pipeline, MAC, NO_TOOLS));
 
         // …and it is never silent: the demotion names the step and the tool.
@@ -16339,6 +16558,114 @@ produces    = ["native-tarball"]
         assert_eq!(
             std::fs::read_to_string(camp.path().join("out")).unwrap(),
             "from-step",
+        );
+    }
+
+    /// Build a single-axis `[pipeline.matrix]` for the tests below.
+    fn one_axis_matrix(key: &str, values: &[&str]) -> crate::matrix::MatrixSpec {
+        let mut dimensions = indexmap::IndexMap::new();
+        dimensions.insert(
+            key.to_string(),
+            values
+                .iter()
+                .map(|v| toml::Value::String((*v).to_string()))
+                .collect::<Vec<_>>(),
+        );
+        crate::matrix::MatrixSpec {
+            dimensions,
+            include: Vec::new(),
+            exclude: Vec::new(),
+        }
+    }
+
+    /// THE REGRESSION TEST FOR THE DEFECT THAT BLOCKED `yah-release-wizard`.
+    ///
+    /// `matrix::plan` had only top-level-run callers, so a pipeline reached as a
+    /// sub-pipeline CHILD kept every `${{ matrix.* }}` as a literal. The visible
+    /// symptom was placement, not argv: the literal sat in `platform.target`,
+    /// never equalled the host triple, and `fleet_portability_gate` refused
+    /// `yah-desktop-release` at kick with all 8 steps "routed to the fleet" —
+    /// for a recipe whose matrix is one row naming the camp host's own arch.
+    ///
+    /// Asserted through argv because that is observable without a fleet: if the
+    /// child's matrix expands, the step writes `aarch64-apple-darwin`; if it
+    /// does not, it writes the placeholder and this test fails with the literal
+    /// in the diff, naming the bug.
+    #[tokio::test]
+    async fn a_sub_pipeline_childs_own_matrix_is_expanded() {
+        let camp = tempfile::tempdir().unwrap();
+        let mut child = make_pipeline(
+            "inner",
+            vec![shell_step(
+                "probe",
+                vec!["sh", "-c", "printf %s '${{ matrix.target }}' > out"],
+            )],
+        );
+        child.matrix = Some(one_axis_matrix("target", &["aarch64-apple-darwin"]));
+        let resolver = MapResolver([("builtin:inner".to_string(), child)].into_iter().collect());
+        let parent = make_pipeline(
+            "outer",
+            vec![sub_step(
+                "nested",
+                SubPipelineRef::Builtin("inner".into()),
+                false,
+            )],
+        );
+
+        let meta = PipelineRunner::new(parent)
+            .with_camp_root(camp.path().to_path_buf())
+            .with_sub_pipeline_resolver(Arc::new(resolver))
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(meta.status, RunStatus::Success);
+        assert_eq!(
+            std::fs::read_to_string(camp.path().join("out")).unwrap(),
+            "aarch64-apple-darwin",
+            "the child's own [pipeline.matrix] must be expanded before it runs",
+        );
+    }
+
+    /// A multi-row child REFUSES rather than silently running row 1. Running one
+    /// row of three would produce a run that looks complete and is not — the
+    /// failure mode worth being loud about, since the caller is usually a
+    /// release wizard whose next step publishes.
+    #[tokio::test]
+    async fn a_multi_row_sub_pipeline_child_refuses_instead_of_picking_a_row() {
+        let camp = tempfile::tempdir().unwrap();
+        let mut child = make_pipeline(
+            "inner",
+            vec![shell_step("probe", vec!["sh", "-c", "true"])],
+        );
+        child.matrix = Some(one_axis_matrix(
+            "target",
+            &["aarch64-apple-darwin", "x86_64-apple-darwin"],
+        ));
+        let resolver = MapResolver([("builtin:inner".to_string(), child)].into_iter().collect());
+        let parent = make_pipeline(
+            "outer",
+            vec![sub_step(
+                "nested",
+                SubPipelineRef::Builtin("inner".into()),
+                false,
+            )],
+        );
+
+        let meta = PipelineRunner::new(parent)
+            .with_camp_root(camp.path().to_path_buf())
+            .with_sub_pipeline_resolver(Arc::new(resolver))
+            .run()
+            .await
+            .unwrap();
+        assert_eq!(meta.status, RunStatus::Failed);
+        let err = meta
+            .steps
+            .iter()
+            .find_map(|s| s.error.clone())
+            .unwrap_or_default();
+        assert!(
+            err.contains("2 matrix rows"),
+            "the refusal must say how many rows it found; got: {err}",
         );
     }
 
