@@ -7,18 +7,6 @@
 //!
 //! F2 will add Service scope via the containerd_logs and warden_rpc adapters.
 //!
-//! @yah:ticket(R556-T9, "scryer: /federate/{events,aggregate} + /scopes HTTP listener + cross-scope rollup helper + HttpFederationPeer impl")
-//! @yah:status(review)
-//! @yah:at(2026-06-30T06:20:17Z)
-//! @yah:assignee(agent:bundle-anthropic-ashguard)
-//! @yah:phase(P1)
-//! @yah:parent(R556)
-//! @yah:next("Add an HTTP listener with: POST /federate/events {filter, scopes?} -> {events}, POST /federate/aggregate {filter, group_by, scopes?} -> {buckets}, GET /scopes?limit=N -> {scopes}, GET /health -> {status:'ok'}. Scope-omitted = cross-scope rollup (the missing mesh-wide-by-level case at crates/yah/hub/src/in_process.rs:46).")
-//! @yah:next("Land the cross-scope rollup helper in scryer::service (cleanest spot per W264); HTTP layer just exposes it.")
-//! @yah:next("Gate the listener with OperatorTagAcl from scryer::federation (W264 §Trust boundary — gate sits at scryer's HTTP listener, not yubaba).")
-//! @yah:next("Add HttpFederationPeer: production FederationPeer impl, reqwest-based, name() = node tailnet hostname, events()/aggregate() POST to the new routes. Mock impls in federation.rs stay for tests.")
-//! @yah:next("Tests: integration suite starts an in-process scryer, POST /federate/events asserts payload, ACL rejection without operator tag.")
-//! @yah:next("Tier: Warrior — net-new HTTP surface + production FederationPeer + ACL wiring + integration tests; clear spec from W264 but real implementation breadth.")
 //! @arch:see(.yah/docs/working/W264-kamaji-managed-scryer.md)
 //! @arch:see(.yah/docs/architecture/A049-yah-scryer.md)
 

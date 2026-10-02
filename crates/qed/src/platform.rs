@@ -25,22 +25,7 @@
 //! decision table that consumes the host triple this module produces.
 //!
 //! @arch:see(.yah/docs/working/W235-remote-qed.md)
-//!
-//! @yah:relay(R631, "Placement mesh-tags carry no OS dimension — a darwin target routes to Linux build-workers")
-//! @yah:status(review)
-//! @yah:assignee(agent:bundle-anthropic-miravel)
-//! @yah:at(2026-07-24T05:11:43Z)
-//! @yah:gotcha("The failure is silent and picks the WRONG node rather than none. An aarch64-apple-darwin offload requests exactly the tag set the Raspberry Pi 5s (us-west-011/013/014) already carry; candidates are filtered by tag superset and ties break on declaration order, so a Linux Pi wins and then cannot emit Mach-O.")
-//! @yah:gotcha("qed already knows darwin cannot be cross-built from Linux — platform.rs resolve() sends such a target to Offload (see resolve_darwin_target_from_linux_host_offloads). So the placement decision is correct in isolation; it is only the TAG DERIVATION that loses the OS, which is why this survived.")
-//! @yah:gotcha("us-west-015 already declares os:darwin and tag:mac-builder, but nothing selects on them — they are descriptive until this lands. Its inventory file says so explicitly; update that note when the gap closes.")
 //! @arch:see(.yah/infra/machines/us-west-015.toml)
-//! @yah:next("Verify on live infra once R626-F5 (kamaji deploy route) lands: a real rusty-v8-musl-shaped arm64/darwin offload should route to us-west-015 and no other node.")
-//! @yah:handoff("Fixed the tag-derivation gap: build_worker_mesh_tags(arch, os) now takes an os token and emits an os:<os> requirement tag alongside tier:<arch> (oss/qed/crates/qed/src/platform.rs, new os_tag_of() helper reusing the existing target_os() triple classifier).")
-//! @yah:handoff("Updated all 6 call sites (oss/qed/crates/qed/src/runner.rs:471,3444,4303,4472,6390 and app/yah/cli/src/qed_images.rs:457) to pass the OS — derived from the full target triple where one is available, hardcoded \"linux\" where the call site only ever builds docker container images (which are always Linux).")
-//! @yah:handoff("Added os:linux to the mesh_tags of the four existing Linux build-workers (us-west-002/011/013/014) so they stay selectable now that build-worker placement requests an OS dimension; us-west-015 already declared os:darwin.")
-//! @yah:handoff("Updated us-west-015.toml's header commentary: the declaration-order/capacity-floor contingency it described is gone now that os:darwin no longer tag-matches the Pi5s at all — R626-F5 (deploy route stub) is the only remaining blocker for real work landing there.")
-//! @yah:handoff("All qed platform/runner unit tests updated and green (cargo test -p yah-qed --lib platform:: / runner::mesh_tags — new arm64_darwin_does_not_collide_with_arm64_linux regression test added); cargo check -p yah --bin yah is clean.")
-//! @yah:gotcha("SIBLING GAP, closed separately under R577-F2 (2026-08-04) -- flagged here because R631 alone did NOT make darwin routing work, and a reviewer signing this off could reasonably assume it did. The same arch-only blindness existed one layer UP, in platform::resolve_placement, which decides local-vs-offload before any mesh tag is derived. It compared arch_of(target) vs arch_of(host) only (with a test asserting 'different OS is irrelevant'), so on an arm64 Linux coordinator an aarch64-apple-darwin native=true step resolved NativeCross and never offloaded at all -- meaning R631's os:darwin tags were unreachable on that path. resolve_placement now compares (arch, OS), exempting steps that declare a container_platform. Same file; R577-F2's diff sits just above build_worker_mesh_tags. Nothing in R631's own change needed altering.")
 
 use serde::{Deserialize, Serialize};
 

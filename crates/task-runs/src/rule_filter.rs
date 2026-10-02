@@ -12,14 +12,6 @@
 //! [`EventsRuleFilter`] is the generalized form for both `events:` and
 //! `task-events:` (which desugars to `events:` with `scope: ScopeSpec::CurrentTaskRun`).
 //!
-//! @yah:ticket(Q068-F1, "Broaden task-events: rule grammar to unified events: form (scryer-aware)")
-//! @yah:assignee(agent:claude)
-//! @yah:at(2026-05-09T00:00:00Z)
-//! @yah:status(review)
-//! @yah:parent(Q068)
-//! @yah:handoff("Q068-F1 landed 2026-05-09. New EventsRuleFilter + ScopeSpec types in crates/yah/task-runs/src/rule_filter.rs. EventsRuleFilter accepts both 'events:' and 'task-events:' prefixes; scope=service(<mesh-ident>) routes to scryer, scope=taskrun(...)  desugars to CurrentTaskRun. gnomes/src/rules.rs: RuleCheck::Events { filter: EventsRuleFilter } added; task-events: and events: both parse to this variant. gnomes/src/verify.rs: ForgeVerifyDispatch gained optional scryer: Option<Arc<Scryer>> (via with_scryer() builder); Service-scope queries route to scryer.events(Service(MeshIdent(...))), absent scryer → N/A. task-runs/src/lib.rs re-exports EventsRuleFilter + ScopeSpec. gnomes/Cargo.toml: workload-spec dep added. 186 gnomes tests pass (3 new verify tests); 29 rule_filter tests pass (10 new EventsRuleFilter tests); cargo check --workspace clean.")
-//! @yah:verify("cargo test -p task-runs rule_filter — all EventsRuleFilter parse tests pass.")
-//! @yah:verify("cargo test -p gnomes verify:: — forge_dispatch, events_prefix_current_taskrun_scope, events_service_scope all pass.")
 //! @arch:see(.yah/docs/architecture/A036-yah-gnomes.md)
 //! @arch:see(.yah/docs/architecture/A049-yah-scryer.md)
 //! @arch:see(.yah/docs/working/yah-task-runs.md)

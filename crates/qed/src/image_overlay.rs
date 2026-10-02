@@ -19,12 +19,7 @@
 //! ghcr.io and the rewrite happens here at runtime. Image digests are
 //! content-addressed, so the bytes verified locally are identical to CI's.
 //!
-//! @yah:relay(R590, "R594 fleet followups: run gha image jobs on the arch-matched build-worker fleet")
-//! @yah:at(2026-07-01T08:04:26Z)
-//! @yah:assignee(agent:claude)
 //! @arch:see(.yah/docs/working/W235-remote-qed.md)
-//! @yah:depends_on(R555)
-//! @yah:depends_on(R572)
 //!
 //! R605-F2: [`QedImageBuilder::with_remote`] adds the fleet-dispatch half this
 //! module's own doc used to call "phase C" — a slug opts in per-camp via the

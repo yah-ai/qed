@@ -22,27 +22,6 @@
 //! store.update_beholder_status(run_id, &result.status)?;
 //! ```
 //!
-//! @yah:ticket(R739-B8, "The cargo beholder splices --message-format onto the LAST stage of a relocated shell line, destroying the command")
-//! @yah:at(2026-08-29T00:50:35Z)
-//! @yah:status(review)
-//! @yah:assignee(agent:bundle-anthropic-ashguard)
-//! @yah:parent(R739)
-//! @yah:severity(high)
-//! @yah:gotcha("REPRODUCED TWICE LIVE in this session, not inferred. `cargo check -p yah-agent-tools --lib 2>&1 | tail -15` relocated by R739-F4 into `yah build run` came back with: tail: unrecognized option `--message-format=json-render-diagnostics'. The build never ran.")
-//! @yah:gotcha("MECHANISM, end to end. build_run.rs:120 submits the agent's WHOLE bash line as TaskRunParams.cmd. driver.rs:472 calls registry.attach(cmd, ...). beholders.rs resolve_argv whitespace-tokenizes that line (tokenize is split_ascii_whitespace and its own doc says it does not handle shell quoting). CargoBeholderFactory::matches sees argv[0]==cargo plus a diag subcommand and attaches; its Rewriter adjust_argv does argv.push(--message-format=json-render-diagnostics) - onto the END of the token list, which for a piped line is tail's argv. driver.rs then rejoins with attach.argv.join(\" \") and hands that to sh -c.")
-//! @yah:gotcha("WHY IT IS THE COMMON CASE, NOT A CORNER. R767-S7 measured 76.5% of real bash calls as compound (27908/36479). The only thing sparing most of them is that matches() needs argv[0]==cargo verbatim, so a `cd x && cargo ...` or `RUSTFLAGS=y cargo ...` line declines by accident. A line that STARTS with cargo and pipes - the single commonest build shape in this camp - hits it every time.")
-//! @yah:gotcha("ANOTHER AGENT ALREADY HIT THIS AND WORKED AROUND IT rather than filing it: see the @yah:gotcha on oss/roadcase/crates/roadcase-registry/src/lib.rs advising `run cargo from a script that redirects to a log file`. That is a second independent sighting.")
-//! @yah:handoff("FIXED IN SOURCE, NOT YET LIVE. Two changes, both in oss/qed/crates/task-runs. (1) beholders.rs: BeholderRegistry::attach now returns bytes-only with status declined:auto reason=\"compound-command\" when is_single_simple_command(raw_cmd) is false - a character scan for | & ; < > ( ) ` $ and newline. Deliberately over-strict and deliberately not a shell parser: a false positive costs one run its structured events, a false negative costs that run its command. Force does not override it, because forcing a rewriter onto a pipeline breaks the command just as thoroughly as Auto would.")
-//! @yah:handoff("(2) driver.rs spawn_run: effective_cmd is now the caller's `cmd` verbatim unless a beholder ACTUALLY rewrote it (attach.status.rewrite_added non-empty). AttachResult.argv is populated on every run - it is resolve_argv(cmd) even under BeholderSelect::None - so joining it unconditionally put EVERY task.run command through a whitespace normalization nobody asked for. Two separate corruptions fixed by that: embedded newlines became spaces (a two-line cmd silently became one nonsense command), and resolve_argv's bunx/npx/pnpm wrapper stripping - which exists so a beholder's matches() sees the bare tool - reached the actual spawn.")
-//! @yah:handoff("VERIFIED: cd oss/qed && cargo test -p task-runs --lib -> 252 passed, 0 failed (was 246; 6 new tests, 4 in beholders.rs and 2 in driver.rs, each named for the failure it pins).")
-//! @yah:handoff("FOUND BY R739-S2 while trying to verify an unrelated edit. Filed and fixed rather than handed on, because it is a live camp-wide breakage on this relay's own rail.")
-//! @yah:next("OPERATOR ACTION REQUIRED, and it is the only thing between this fix and the camp: the running daemon is 0.8.28+cc33e693 and still carries the old task-runs. Rebuild the desktop and restart yah.app. Until then every relocated bash line that STARTS with cargo and contains a pipe still dies. Sessions can dodge it meanwhile by prefixing `cd <dir> && ` - that makes argv[0] not-cargo and the beholder declines.")
-//! @yah:verify("cd oss/qed && cargo test -p task-runs --lib  # 252/252 green")
-//! @yah:verify("After the daemon restart: a bare `cargo check -p yah-agent-tools --lib 2>&1 | tail -15` must produce cargo's own output, not tail's usage message.")
-//! @yah:verify("Check TaskRunMeta.beholder_status on such a run reads declined:auto reason=\"compound-command\" rather than attached:cargo@1.38.")
-//! @yah:handoff("Fix landed in source and unit-tested; awaiting the daemon rebuild that makes it live. Full mechanism, both changes and the verification are in this ticket's existing handoff/gotcha entries and in W302 section B.1.11.")
-//! @yah:gotcha("THIRD LIVE SIGHTING 2026-08-28 (R739-S3, session:42c7df73): relocated cargo check plus a tail pipe returned tail usage output. The skew banner named the daemon 0.8.28+cc33e693 - the exact stale build this ticket calls out. Operator rebuild+restart still outstanding.")
-//! @yah:gotcha("INTERACTION WITH R719-B8, new datum from that sighting: a destroyed command exits in milliseconds, but having been auto-backgrounded it still holds cargo-target for the watcher full 120s quiet window. The dead run was listed as queued to my own next call 1m28s after it exited. So each B8-destroyed build inflates every peer queue-position note by one slot for two minutes - the bug degrades the rung-1 note camp-wide, not just its own run.")
 
 use crate::types::{BeholderStatus, ChunkRef, Event, EventSource, Level, OutputChunk};
 

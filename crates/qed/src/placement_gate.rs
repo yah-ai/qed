@@ -1,11 +1,13 @@
 //! @yah:ticket(R435-F2, "Runner gates kicks on placement: CLI refuses ci-only without --force; GHA warns/refuses local-only")
 //! @yah:assignee(agent:claude)
-//! @yah:at(2026-06-04T19:15:56Z)
-//! @yah:status(in-progress)
+//! @yah:at(2026-09-23T06:02:50Z)
+//! @yah:status(review)
 //! @yah:phase(P1)
 //! @yah:parent(R435)
 //! @yah:depends_on(R435-F1)
 //! @arch:see(.yah/docs/working/W170-qed-recipe-discipline.md)
+//! @yah:handoff("Verified shipped 2026-09-22 (session:79c514ea). The W155 environment × runner matrix is in oss/qed/crates/qed/src/placement_gate.rs::evaluate. The CLI gates before the proxy (app/yah/cli/src/qed.rs:1973), and the daemon re-gates as a second check (app/yah/cli/src/camp.rs:10942). --force goes over the wire as QedRunParams.force (qed.rs:2078). ci-only on a Local runner is refused unless forced; workstation-only on a CI runner warns but is allowed. No code changes were needed in this pass.")
+//! @yah:verify("cd oss/qed && cargo test -p yah-qed --lib placement_gate → 9 passed, 0 failed (2026-09-22)")
 //!
 //! Single source of truth for the W155 environment × runner matrix. Both the
 //! CLI entry (`yah qed run`) and the camp daemon `qed.run` handler consult

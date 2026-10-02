@@ -34,13 +34,6 @@
 //! matching GHA's behavior for unset secrets — workflows that depend on a
 //! secret will fail at their own check or at the consuming step).
 //!
-//! @yah:relay(R500, "Vault UI: GHA secrets bridge editor + raw slot list")
-//! @yah:at(2026-06-10T01:38:49Z)
-//! @yah:status(open)
-//! @yah:next("R027 covers the curated Settings→API Keys panel for known model/cloud providers; this relay adds the two un-curated surfaces: (a) the raw vault slot dictionary, (b) the GHA-name↔vault-slot bridge that `secrets_bridge.rs` consumes. Same KeysStore underneath; no RBAC, no leases.")
-//! @yah:next("Three children: F1 = daemon RPC for slot list/set/delete + secrets.toml read/write, F2 = Settings→Vault pane (raw slot CRUD), F3 = QED→Secrets tab (GHA-name bridge editor + live resolution status, autocompletes slot names from F1).")
-//! @yah:next("F2 and F3 both consume F1; F3 also depends on F2's UI patterns. F2 stands alone (useful for any vault user, not just qed-gha).")
-//! @yah:gotcha("KeysStore::get returns the plaintext secret — the daemon RPC must NEVER ship values to the renderer, only slot NAMES + presence. The F2 'set' RPC takes a value but the response only echoes the name. R027-T7's single-blob storage already exists; this relay just exposes list/set/delete + a small TOML read/write for secrets.toml.")
 //! @arch:see(.yah/docs/architecture/A019-settings-api-keys.md)
 
 use std::collections::HashMap;

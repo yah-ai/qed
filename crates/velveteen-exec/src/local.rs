@@ -31,24 +31,7 @@
 //! the per-image `YAH_<NAME>_DIGEST` env vars (e.g. `YAH_RUST_BUN_DIGEST`)
 //! at compile time — see [`crate::default_image`] for the full list.
 //!
-//! @yah:ticket(R438-T13, "ForgeExecutor trait + LocalForgeDriver in task::local")
-//! @yah:assignee(agent:claude)
-//! @yah:at(2026-06-05T00:03:22Z)
-//! @yah:status(review)
-//! @yah:phase(P2)
-//! @yah:parent(R438)
-//! @yah:next("For ForgeCommand::BuildImage / Workload — defer (return Unsupported). Cloud reconciler only needs Subprocess; qed's BuildImage path stays in qed::runner for now and lands later.")
-//! @yah:verify("cargo check --workspace --locked  # nothing else depends on the new trait yet so this should stay clean")
-//! @yah:assumes("The minimal task::ExecEvent shape (Started/Output/Finished) is sufficient for both qed (which adapts to QedEvent::StepOutput) and cloud (which ignores). If qed needs richer events the adapter can fill them; if cloud needs progress for HTTP-tied transforms it's already covered via Output.")
 //! @arch:see(.yah/docs/working/W164-derived-static-assets.md)
-//! @yah:depends_on(R438-T1)
-//! @yah:depends_on(R438-T2)
-//! @yah:depends_on(R438-T3)
-//! @yah:depends_on(R438-T4)
-//! @yah:handoff("T13 landed. New module crates/yah/task/src/executor.rs defines: ForgeExecutor trait (async fn execute(spec, ctx, sink)), ExecContext {cwd, env}, ExecEvent (Started/Output{stream,line}/Finished{status}), OutputStream (Stdout/Stderr), ExecOutcome {status: ForgeStatus, stderr_tail: String}, ForgeExecutorError (Unsupported/Spawn/Io). Re-exported from task::lib. LocalForgeDriver added to task::local — implements ForgeExecutor for ForgeCommand::Subprocess (Native via tokio::process::Command, Container via existing local_container_command); rejects BuildImage/Workload with Unsupported. Drains stdout/stderr line-by-line in concurrent tasks; stderr tail captured into ExecOutcome.stderr_tail; sink optional. 8 new tests: native happy + non-zero + cwd/env passthrough + empty argv rejection + container-without-image rejection + container-routes-through-docker (mirror of qed's local_container_step_routes_through_docker_path) + BuildImage Unsupported + Workload Unsupported. cargo test -p task --lib: 67 pass (was 49). cargo check --workspace --locked clean.")
-//! @yah:next("R438-T15 (cloud reconciler materialize step) is also unblocked and can proceed in parallel with T14. Cloud reconciler adds `executor: Arc<dyn ForgeExecutor>` field (Arc::new(LocalForgeDriver::new()) default), no qed dep needed — only a new `task = { path = \"../task\" }` edge on cloud's Cargo.toml. Lowering: TransformRecipe -> ForgeSpec{ command: Subprocess{argv, image}, where_: TaskPlacement{Local, recipe.placement.runtime} }; ExecContext{cwd: workload_dir, env: vec![]} bind the YAH_TRANSFORM_IN_0 / OUT via substituted argv (recipe loader already handles that).")
-//! @yah:verify("cargo test -p task --lib  # 67 pass (was 49 — 8 new LocalForgeDriver tests under local::tests)")
-//! @yah:verify("cargo check --workspace --locked  # clean")
 
 use std::path::Path;
 use std::process::Stdio;

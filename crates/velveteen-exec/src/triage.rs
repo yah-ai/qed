@@ -15,21 +15,6 @@
 //!
 //! The output shapes (`Diagnostic`, `Triage`) are identical regardless of
 //! species — arch doc §forge-6 guarantee.
-//!
-//! @yah:relay(R598, "velveteen lib-test binary repair: finish the async migration at test call-sites")
-//! @yah:at(2026-07-06T07:54:15Z)
-//! @yah:status(open)
-//! @yah:assignee(agent:bundle-anthropic-ashguard)
-//!
-//! @yah:ticket(R598-B1, "~31 velveteen test call-sites call async fns (scryer.events/TaskStore/forge_triage/forge_list) without .await")
-//! @yah:status(review)
-//! @yah:at(2026-07-06T11:41:18Z)
-//! @yah:assignee(agent:bundle-anthropic-ashguard)
-//! @yah:parent(R598)
-//! @yah:severity(medium)
-//! @yah:verify("cargo test -p velveteen --lib compiles and runs green (incl R590-F2's buildctl_argv/build_image_command/round-trip tests)")
-//! @yah:gotcha("Discovered during R590-F2. On committed HEAD `cargo test -p velveteen --lib` fails to compile (~31 errors), blocking ALL velveteen lib tests. Root cause: scryer.events, TaskStore::open/insert_run, forge_triage, forge_list became `async fn` but their test call-sites still call .unwrap()/.expect() synchronously. Sites: triage.rs(15) list.rs(12) remote.rs(3) integration.rs(1). Fix = add .await + convert enclosing #[test]->#[tokio::test] async fn where needed. Tier: Thief (mechanical).")
-//! @yah:handoff("FIXED. velveteen `cargo test -p velveteen --lib` = 84 pass / 0 fail / 2 ignored (was ~31 compile errors). Added .await to async call-sites: integration.rs(scryer.events), remote.rs(3x scryer.events), list.rs(open_store+insert_local helpers made async fn, all 10 tests -> #[tokio::test], forge_list awaited). triage.rs converged via peer/linter edits on the shared tree. Unblocks R590-F2's velveteen-side unit tests (buildctl_argv_*, build_image_workload_spec_*, build_image_emits_platform_and_build_args all green now).")
 
 use observation::{Diagnostic, Event, EventScope, ForgeId, Level, TaskRunId};
 use yah_scryer::{EventFilter as ScryerEventFilter, Scryer, ScryerError};
