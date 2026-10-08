@@ -843,6 +843,7 @@ target = ["x86_64", "aarch64"]
         QedStep {
             expect_slow: false,
             participant: None,
+            node: None,
             needs: None,
             resource: None,
             inputs: Vec::new(),

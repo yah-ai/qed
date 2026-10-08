@@ -28,14 +28,19 @@
 //! here therefore contains only this stage's triples — a sequential publish of
 //! linux-x86_64 *after* darwin-aarch64 would overwrite the darwin view.
 //!
-//! To make cross-stage merge possible without R2 read-modify-write (which races
-//! between concurrent publishes), `stage_release` ALSO writes a per-triple
-//! manifest at `<binary>/release-manifest-<triple>.json` containing just that
-//! triple's bundle entry. These keys are stable and idempotent: a re-run of the
-//! same triple writes the same key, never clobbering a sibling triple's record.
-//! The GHA assembly job (which already owns macOS code signing — yubaba can't
-//! sign macOS) reads every `release-manifest-<triple>.json` and writes the
-//! authoritative signed shared `release-manifest.json` once all triples land.
+//! `stage_release` ALSO writes a per-triple manifest at
+//! `<binary>/release-manifest-<triple>.json` containing just that triple's
+//! bundle entry. These keys are stable and idempotent: a re-run of the same
+//! triple writes the same key, never clobbering a sibling triple's record.
+//!
+//! The GHA assembly job that used to unify the shared manifest is gone. Since
+//! R918-T6 the publisher does it: before writing, it reads the already-published
+//! `<binary>/<version>/manifest.json` and folds it in with
+//! [`merge_published_slices`], so the shared manifest, the per-version copy and
+//! `latest.json` all name every slice of the version. That read-modify-write is
+//! NOT a CAS — two slices of one version publishing concurrently can still
+//! drop one. Slices are run one after another by hand, so that is accepted;
+//! the version index, which is a permanent record, keeps its CAS.
 //!
 //! ## What this module owns vs. delegates
 //!
@@ -83,7 +88,6 @@ pub struct PublishRequest {
 ///
 /// @yah:ticket(R876-B19, "yah-cli-release publishes under the camp daemon's COMPILED version, not the tree's — and the build-skew gate cannot see it")
 /// @yah:at(2026-09-21T22:37:55Z)
-/// @yah:status(open)
 /// @yah:assignee(agent:bundle-anthropic-glimmerstone)
 /// @yah:parent(R876)
 /// @yah:severity(high)
@@ -700,6 +704,71 @@ pub fn triples_manifest(binary: &str, manifest: &ChannelManifest) -> Option<Trip
 /// Bucket key for a binary's install pointer.
 pub fn latest_key(prefix: Option<&str>, binary: &str) -> String {
     join_key(prefix, &[binary, "latest.json"])
+}
+
+/// Bucket key for a binary's per-version manifest, `<binary>/<version>/manifest.json`.
+pub fn versioned_manifest_key(prefix: Option<&str>, binary: &str, version: &str) -> String {
+    join_key(
+        prefix,
+        &[binary, version.trim_start_matches('v'), VERSIONED_MANIFEST_FILENAME],
+    )
+}
+
+/// Fold an already-published slice of the SAME version into this run's
+/// manifest (R918-T6). Returns the triples adopted from `published`.
+///
+/// A release lands in slices — `yah-cli-release` builds four triples on the
+/// camp, `yah-cli-release-windows` builds one on an ephemeral Windows box
+/// whenever it is awake. The version index already unions slices per triple
+/// ([`merge_index`] invariant 3), but the three objects a run writes from its
+/// [`ChannelManifest`] — `release-manifest.json`, `<version>/manifest.json`
+/// and `latest.json` — are each projected from that one run's triples, so
+/// without this the second slice to publish erases the first from all three.
+///
+/// Same rules as the index, one object over: this run's triples win (a re-run
+/// slice replaces its own entry), every triple it did not build survives, and
+/// `pub_date` stays the version's FIRST publication — a date is a historical
+/// fact, and [`pointer_would_regress`] orders pointers by it. A different
+/// version is not a slice of this one and merges nothing.
+pub fn merge_published_slices(ours: &mut ChannelManifest, published: &ChannelManifest) -> Vec<String> {
+    if published.version.trim_start_matches('v') != ours.version.trim_start_matches('v') {
+        return Vec::new();
+    }
+    ours.pub_date = published.pub_date.clone();
+    if ours.notes.is_none() {
+        ours.notes = published.notes.clone();
+    }
+    let mut adopted = Vec::new();
+    for (triple, bundle) in &published.host.bundle {
+        if !ours.host.bundle.contains_key(triple) {
+            ours.host.bundle.insert(triple.clone(), bundle.clone());
+            adopted.push(triple.clone());
+        }
+    }
+    adopted
+}
+
+/// Whether writing `pointer` over the live `latest.json` bytes would move
+/// "latest" BACKWARDS (R918-T6): the live pointer names a different version
+/// first published after this one. That is what a late slice of an older
+/// release looks like once [`merge_published_slices`] has restored its
+/// historical `pub_date`. Unparseable input never blocks — the pre-slice
+/// behaviour was an unconditional overwrite, and a refusal on garbage would
+/// leave a broken pointer standing instead of replacing it.
+pub fn pointer_would_regress(live: &str, pointer: &TriplesManifest) -> bool {
+    let Ok(live) = serde_json::from_str::<TriplesManifest>(live) else {
+        return false;
+    };
+    if live.version.trim_start_matches('v') == pointer.version.trim_start_matches('v') {
+        return false;
+    }
+    match (
+        chrono::DateTime::parse_from_rfc3339(&live.pub_date),
+        chrono::DateTime::parse_from_rfc3339(&pointer.pub_date),
+    ) {
+        (Ok(live), Ok(ours)) => live > ours,
+        _ => false,
+    }
 }
 
 /// Streaming SHA-256 of a staged artifact, returned as a BARE hex digest.
@@ -1825,6 +1894,62 @@ mod tests {
                 )]),
             },
         }
+    }
+
+    /// A signed single-triple slice of `version`, first published at `pub_date`.
+    fn slice(version: &str, pub_date: &str, triple: &str) -> ChannelManifest {
+        let mut m = signed_manifest(Some("https://x/b.sigstore.json"), Some("sha256:ab"));
+        m.version = version.into();
+        m.pub_date = pub_date.into();
+        let bundle = m.host.bundle.pop_first().unwrap().1;
+        m.host.bundle.insert(triple.into(), bundle);
+        m
+    }
+
+    /// R918-T6: the Windows slice publishes after the camp's four triples, and
+    /// every object projected from its manifest must still name all five.
+    #[test]
+    fn a_late_slice_adopts_the_published_triples_and_their_first_pub_date() {
+        let published = slice("0.8.43", "2026-10-01T00:00:00Z", "aarch64-apple-darwin");
+        let mut ours = slice("0.8.43", "2026-10-03T00:00:00Z", "x86_64-pc-windows-msvc");
+        let adopted = merge_published_slices(&mut ours, &published);
+        assert_eq!(adopted, vec!["aarch64-apple-darwin".to_string()]);
+        assert_eq!(
+            ours.host.bundle.keys().cloned().collect::<Vec<_>>(),
+            vec!["aarch64-apple-darwin".to_string(), "x86_64-pc-windows-msvc".to_string()]
+        );
+        assert_eq!(ours.pub_date, "2026-10-01T00:00:00Z", "a publication date is historical");
+        let pointer = triples_manifest("yah", &ours).expect("both slices are signed");
+        assert_eq!(pointer.triples.len(), 2);
+    }
+
+    #[test]
+    fn a_re_run_slice_replaces_its_own_triple_and_another_version_merges_nothing() {
+        let mut published = slice("0.8.43", "2026-10-01T00:00:00Z", "x86_64-pc-windows-msvc");
+        published.host.bundle.get_mut("x86_64-pc-windows-msvc").unwrap().url = "old".into();
+        let mut ours = slice("0.8.43", "2026-10-03T00:00:00Z", "x86_64-pc-windows-msvc");
+        assert!(merge_published_slices(&mut ours, &published).is_empty());
+        assert_ne!(ours.host.bundle["x86_64-pc-windows-msvc"].url, "old");
+
+        let older = slice("0.8.42", "2026-09-01T00:00:00Z", "aarch64-apple-darwin");
+        let mut ours = slice("0.8.43", "2026-10-03T00:00:00Z", "x86_64-pc-windows-msvc");
+        assert!(merge_published_slices(&mut ours, &older).is_empty());
+        assert_eq!(ours.pub_date, "2026-10-03T00:00:00Z");
+    }
+
+    #[test]
+    fn a_pointer_never_moves_back_to_an_older_release() {
+        let live = |m: &ChannelManifest| {
+            serde_json::to_string(&triples_manifest("yah", m).unwrap()).unwrap()
+        };
+        let v43 = slice("0.8.43", "2026-10-01T00:00:00Z", "aarch64-apple-darwin");
+        let v42 = slice("0.8.42", "2026-09-01T00:00:00Z", "x86_64-pc-windows-msvc");
+        let p42 = triples_manifest("yah", &v42).unwrap();
+        let p43 = triples_manifest("yah", &v43).unwrap();
+        assert!(pointer_would_regress(&live(&v43), &p42), "late 0.8.42 slice over live 0.8.43");
+        assert!(!pointer_would_regress(&live(&v42), &p43), "a newer release advances");
+        assert!(!pointer_would_regress(&live(&v43), &p43), "same version re-points");
+        assert!(!pointer_would_regress("not json", &p42), "garbage never blocks");
     }
 
     #[test]

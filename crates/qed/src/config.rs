@@ -107,6 +107,11 @@ pub enum ConfigError {
     InvalidBind(String),
     #[error("Invalid param: {0}")]
     InvalidParam(String),
+    /// R827-F1: a Tag/Path trigger whose glob doesn't compile (or a Path with
+    /// none). Rejected at load because the runtime symptom is a pipeline that
+    /// never fires — indistinguishable from "nothing matched".
+    #[error("Invalid trigger: {0}")]
+    InvalidTrigger(#[from] crate::types::TriggerError),
     /// R605-F3: the pipeline's `needs` edges don't form a runnable DAG — an
     /// unknown/self/ambiguous reference, or a cycle. Rejected at load time
     /// because the alternative is a run that reports Success having silently
@@ -119,6 +124,15 @@ pub enum ConfigError {
     /// connection refusal several layers from its cause.
     #[error("Invalid participant set: {0}")]
     InvalidParticipants(#[from] crate::participants::ParticipantError),
+    /// R636: an inline definition ([`PipelineLoader::load_definition`]) that
+    /// names `alias_of`. A specialization takes its body from a base the
+    /// loader reads off disk; an inline sender already has the body in hand,
+    /// so it sends the resolved pipeline rather than a pointer to one.
+    #[error(
+        "pipeline '{0}': an inline definition cannot be a specialization (`alias_of`) — send the \
+         resolved pipeline instead"
+    )]
+    InlineAlias(String),
     /// R555-T7 tombstone — the recipe still spells the pre-rename permission
     /// key. `[pipeline]` has no `deny_unknown_fields`, so the alternative to
     /// this error is not a warning, it is *silence*: the key is dropped and the
@@ -579,7 +593,7 @@ impl PipelineLoader {
         if parsed.pipeline.alias_of.is_some() {
             return self.resolve_specialization(parsed, content, chain);
         }
-        let mut pipeline = Pipeline {
+        let pipeline = Pipeline {
             name: parsed.pipeline.name,
             label: parsed.pipeline.label,
             // Explicit key wins; otherwise the file's own header block is the
@@ -609,9 +623,34 @@ impl PipelineLoader {
             participants: parsed.pipeline.participants,
             allow_late_operator_block: parsed.pipeline.allow_late_operator_block,
         };
+        self.validate_loaded(pipeline)
+    }
+
+    /// Accept a pipeline that was built in code or received over the wire
+    /// rather than read from `.yah/qed/` — `qed.run`'s inline `definition`
+    /// (R636), e.g. the one `yah qed images build` synthesizes.
+    ///
+    /// Held to exactly the checks a TOML file gets ([`Self::validate_loaded`]),
+    /// so "inline" is a transport, not a way around validation: a DAG cycle
+    /// or an unknown participant role fails here, at submission, instead of
+    /// mid-run.
+    pub fn load_definition(&self, pipeline: Pipeline) -> Result<Pipeline, ConfigError> {
+        if pipeline.alias_of.is_some() {
+            return Err(ConfigError::InlineAlias(pipeline.name));
+        }
+        self.validate_loaded(pipeline)
+    }
+
+    /// The load-time checks every non-specialization pipeline passes, whatever
+    /// its source. One copy, shared by [`Self::pipeline_from_str`] and
+    /// [`Self::load_definition`], for the R703-F3 reason given on the former.
+    fn validate_loaded(&self, mut pipeline: Pipeline) -> Result<Pipeline, ConfigError> {
         self.validate_steps(&pipeline)?;
         self.validate_dag(&pipeline)?;
         self.validate_binds(&pipeline)?;
+        for trigger in &pipeline.triggers {
+            trigger.validate()?;
+        }
         let camp_root = self.workspace_root();
         for (name, def) in pipeline.params.iter_mut() {
             resolve_options_cmd(&camp_root, name, def).map_err(ConfigError::InvalidParam)?;
@@ -3443,6 +3482,57 @@ pattern = "v*.*.*"
         ));
     }
 
+    #[test]
+    fn parses_path_trigger_from_toml() {
+        use crate::types::Trigger;
+
+        let loader = PipelineLoader::new(".yah/qed");
+        let toml = r#"
+[pipeline]
+name  = "notices"
+label = "Third-party notices"
+
+[[pipeline.steps]]
+name = "Generate"
+argv = ["./notices.sh"]
+
+[[pipeline.triggers]]
+kind  = "path"
+globs = ["Cargo.lock", "web/*/package.json", "**/ATTRIBUTION.md"]
+"#;
+        let pipeline = loader.load_from_str(toml).expect("should parse");
+        assert_eq!(pipeline.triggers.len(), 1);
+        assert!(matches!(
+            &pipeline.triggers[0],
+            Trigger::Path { globs } if globs.len() == 3 && globs[1] == "web/*/package.json"
+        ));
+    }
+
+    /// R827-F1: a glob that can't compile, or a path trigger with no globs,
+    /// is a load error — not a pipeline that silently never fires.
+    #[test]
+    fn rejects_bad_path_trigger_globs() {
+        let loader = PipelineLoader::new(".yah/qed");
+        let base = r#"
+[pipeline]
+name  = "notices"
+label = "Third-party notices"
+
+[[pipeline.steps]]
+name = "Generate"
+argv = ["./notices.sh"]
+
+[[pipeline.triggers]]
+kind  = "path"
+"#;
+        for globs in [r#"globs = ["src/[unclosed"]"#, "globs = []"] {
+            let err = loader
+                .load_from_str(&format!("{base}{globs}\n"))
+                .expect_err(globs);
+            assert!(matches!(err, ConfigError::InvalidTrigger(_)), "{globs}: {err}");
+        }
+    }
+
     // ---- R494-F2: cross-camp Peer resolution ---------------------------
 
     /// Build a fixture parent-camp + peer-camp pair under a tempdir.
@@ -4162,5 +4252,49 @@ allow_late_operator_block = true
             .unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("allow_late_operator_block"), "{msg}");
+    }
+
+    /// R636: `qed.run`'s inline `definition` is a transport, not a way around
+    /// validation — the same checks a `.yah/qed/*.toml` gets run on it, so a
+    /// dangling `needs` is refused at submission rather than mid-run.
+    #[test]
+    fn an_inline_definition_is_held_to_the_load_time_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        let loader = PipelineLoader::new(dir.path());
+        let step = |name: &str, needs: Option<Vec<String>>| crate::types::QedStep {
+            name: name.into(),
+            argv: vec!["true".into()],
+            needs,
+            ..Default::default()
+        };
+        let pipeline = |steps| Pipeline {
+            name: "inline".into(),
+            label: "inline".into(),
+            steps,
+            ..Default::default()
+        };
+
+        let ok = loader
+            .load_definition(pipeline(vec![
+                step("a", None),
+                step("b", Some(vec!["a".into()])),
+            ]))
+            .unwrap();
+        assert_eq!(ok.steps.len(), 2);
+
+        let dangling = loader.load_definition(pipeline(vec![step("a", Some(vec!["nope".into()]))]));
+        assert!(
+            matches!(dangling, Err(ConfigError::InvalidDag(_))),
+            "{dangling:?}"
+        );
+
+        let alias = loader.load_definition(Pipeline {
+            alias_of: Some("base".into()),
+            ..pipeline(vec![step("a", None)])
+        });
+        assert!(
+            matches!(&alias, Err(ConfigError::InlineAlias(n)) if n == "inline"),
+            "{alias:?}"
+        );
     }
 }

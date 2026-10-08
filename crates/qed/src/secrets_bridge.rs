@@ -289,6 +289,76 @@ pub fn resolve_source(source: &str, vault: Option<&fob::KeysStore>) -> Option<St
     None
 }
 
+/// Where [`write_source`] put a value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Written {
+    /// Stored in the yah vault under `slot`. The value it replaced is retained
+    /// by [`fob::KeysStore::set`] (`yah keys recover <slot>` puts it back).
+    Vault { slot: String },
+}
+
+/// Why a secret could not be written back. Every variant names the slot or
+/// source, never the value.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum WriteError {
+    /// The bridged name is not declared in `secrets.toml`.
+    #[error("secret `{0}` is not declared in the qed secrets bridge")]
+    NotDeclared(String),
+    /// The chain has no persistent sink: `env:` is a value this process was
+    /// handed, not a store, and a bare literal is fixed in the file.
+    #[error("source `{0}` has no writable sink (only `vault:` alternatives are writable)")]
+    NoWritableSink(String),
+    /// The vault could not be opened or refused the write.
+    #[error("vault slot `{slot}`: {error}")]
+    Vault { slot: String, error: String },
+    /// The write landed, but reading the source chain back does not yield the
+    /// value — an earlier alternative (an `env:` set in this environment)
+    /// shadows the vault, so the next read would return something else.
+    #[error("wrote vault slot `{slot}`, but source `{chain}` reads back a different value (an earlier alternative shadows it)")]
+    Shadowed { slot: String, chain: String },
+}
+
+/// The sink a write through `source` lands in: its first `vault:` alternative.
+/// Reads take the first alternative that resolves; writes take the first one
+/// that can *store*, which is the only place a later read can find the value.
+pub fn writable_sink(source: &str) -> Option<&str> {
+    source
+        .split('|')
+        .map(str::trim)
+        .find_map(|alt| alt.strip_prefix("vault:"))
+        .filter(|slot| !slot.is_empty())
+}
+
+/// Write `value` into the persistent sink of `source` — the inverse of
+/// [`resolve_source`], and QED's one secret-WRITE primitive (R743-T44): a
+/// pipeline that rotates a credential (a refresh token, a re-minted key)
+/// writes the successor back through the same name it read the predecessor
+/// by. Synchronous and verified: it returns only once reading `source` back
+/// through `vault` yields `value`, so a caller that writes BEFORE spending the
+/// new credential can never be stranded holding a rotation it did not persist.
+pub fn write_source(source: &str, value: &str, vault: &fob::KeysStore) -> Result<Written, WriteError> {
+    let slot = writable_sink(source).ok_or_else(|| WriteError::NoWritableSink(source.to_string()))?;
+    vault
+        .set(slot, value)
+        .map_err(|e| WriteError::Vault { slot: slot.to_string(), error: format!("{e:#}") })?;
+    if resolve_source(source, Some(vault)).as_deref() != Some(value) {
+        return Err(WriteError::Shadowed { slot: slot.to_string(), chain: source.to_string() });
+    }
+    Ok(Written::Vault { slot: slot.to_string() })
+}
+
+impl SecretsConfig {
+    /// Write a declared secret back through its bridged source
+    /// ([`write_source`]) in the canonical vault.
+    pub fn write_one(&self, name: &str, value: &str) -> Result<Written, WriteError> {
+        let source = self.secrets.get(name).ok_or_else(|| WriteError::NotDeclared(name.to_string()))?;
+        let slot = writable_sink(source).ok_or_else(|| WriteError::NoWritableSink(source.clone()))?;
+        let vault = fob::KeysStore::open()
+            .map_err(|e| WriteError::Vault { slot: slot.to_string(), error: format!("{e:#}") })?;
+        write_source(source, value, &vault)
+    }
+}
+
 /// Canonical path for the bridge file: `~/.yah/qed/secrets.toml`. `None`
 /// when HOME is unset (CI containers without a $HOME). Exposed so callers
 /// that need to read **and** write the file share the same path.
@@ -429,6 +499,77 @@ CF_R2_ACCESS_KEY = "vault:r2-access-key|env:CF_R2_ACCESS_KEY"
         // shape; this assertion just documents the invariant.
         assert_eq!(report[1].source, format!("env:{key}"));
         std::env::remove_var(key);
+    }
+
+    fn vault() -> (tempfile::TempDir, fob::KeysStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = fob::KeysStore::at(dir.path()).unwrap();
+        (dir, store)
+    }
+
+    #[test]
+    fn a_written_secret_reads_back_through_the_same_source() {
+        let (_dir, store) = vault();
+        let source = "vault:qed-write-rt|env:QED_WRITE_RT_UNSET_X1";
+        store.set("qed-write-rt", "token-1").unwrap();
+        assert_eq!(resolve_source(source, Some(&store)).as_deref(), Some("token-1"));
+        let written = write_source(source, "token-2", &store).unwrap();
+        assert_eq!(written, Written::Vault { slot: "qed-write-rt".into() });
+        assert_eq!(resolve_source(source, Some(&store)).as_deref(), Some("token-2"));
+        let kept: Vec<String> = store.previous("qed-write-rt").unwrap().into_iter().map(|p| p.value).collect();
+        assert!(kept.contains(&"token-1".to_string()), "the displaced value is recoverable: {kept:?}");
+    }
+
+    #[test]
+    fn the_sink_is_the_first_vault_alternative() {
+        assert_eq!(writable_sink("env:A|vault:s1|vault:s2"), Some("s1"));
+        assert_eq!(writable_sink("env:A"), None);
+        assert_eq!(writable_sink("literal"), None);
+        assert_eq!(writable_sink("vault:"), None);
+    }
+
+    #[test]
+    fn a_source_with_no_store_is_refused_and_nothing_is_written() {
+        let (_dir, store) = vault();
+        for source in ["env:QED_WRITE_ENV_ONLY", "a-literal"] {
+            assert_eq!(
+                write_source(source, "v", &store),
+                Err(WriteError::NoWritableSink(source.to_string()))
+            );
+        }
+        assert!(store.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_write_an_earlier_env_alternative_shadows_fails_loudly() {
+        let (_dir, store) = vault();
+        let var = "QED_WRITE_SHADOW_VAR_CCCC";
+        std::env::set_var(var, "from-env");
+        let source = format!("env:{var}|vault:qed-write-shadow");
+        let err = write_source(&source, "rotated", &store).unwrap_err();
+        assert!(matches!(&err, WriteError::Shadowed { slot, .. } if slot == "qed-write-shadow"), "{err:?}");
+        assert!(!err.to_string().contains("rotated"), "an error never carries the value: {err}");
+        std::env::remove_var(var);
+    }
+
+    #[test]
+    fn a_vault_that_cannot_store_is_a_typed_failure() {
+        use std::os::unix::fs::PermissionsExt;
+        let (dir, store) = vault();
+        store.set("qed-write-fail", "old").unwrap();
+        // A vault whose directory has gone read-only cannot store the successor.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let err = write_source("vault:qed-write-fail", "new", &store).unwrap_err();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(matches!(&err, WriteError::Vault { slot, .. } if slot == "qed-write-fail"), "{err:?}");
+        assert!(!err.to_string().contains("new"), "an error never carries the value: {err}");
+        assert_eq!(store.get("qed-write-fail").unwrap().as_deref(), Some("old"), "nothing half-written");
+    }
+
+    #[test]
+    fn write_one_refuses_an_undeclared_name() {
+        let cfg = SecretsConfig::default();
+        assert_eq!(cfg.write_one("NOPE", "v"), Err(WriteError::NotDeclared("NOPE".into())));
     }
 
     fn string_at(v: &yah_qed_gha::Value, key: &str) -> Option<String> {

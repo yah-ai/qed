@@ -167,6 +167,7 @@ fn render_on(triggers: &[Trigger], degradations: &mut Vec<Degradation>) -> Strin
     };
     let mut tags: Vec<&str> = Vec::new();
     let mut crons: Vec<&str> = Vec::new();
+    let mut paths: Vec<&str> = Vec::new();
     for t in effective {
         match t {
             Trigger::Manual => {
@@ -176,6 +177,7 @@ fn render_on(triggers: &[Trigger], degradations: &mut Vec<Degradation>) -> Strin
                 }
             }
             Trigger::Tag { pattern } => tags.push(pattern),
+            Trigger::Path { globs } => paths.extend(globs.iter().map(String::as_str)),
             Trigger::Schedule { cron } => crons.push(cron),
             Trigger::Pipeline { id, status } => {
                 degradations.push(Degradation {
@@ -193,10 +195,31 @@ fn render_on(triggers: &[Trigger], degradations: &mut Vec<Degradation>) -> Strin
             }
         }
     }
+    // One `push:` key for both tags and paths — a mapping can't repeat it.
+    // Inside one Actions `push:` block, ref filters and `paths` are ANDed, so
+    // "on a tag OR when these files change" is not expressible: keep the tags
+    // (the release edge) and record the path half as lost (R827-F1).
     if !tags.is_empty() {
         out.push_str("  push:\n    tags:\n");
         for pat in tags {
             out.push_str(&format!("      - {}\n", yaml_flow_scalar(pat)));
+        }
+        if !paths.is_empty() {
+            degradations.push(Degradation {
+                site: "triggers".into(),
+                feature: "trigger:tag-or-path".into(),
+                detail: format!(
+                    "QED fires on a matching tag OR a change to [{}]; a GHA `push:` block ANDs \
+                     ref filters with `paths`, so only the tag filter is emitted — the path \
+                     trigger does not fire under GHA",
+                    paths.join(", ")
+                ),
+            });
+        }
+    } else if !paths.is_empty() {
+        out.push_str("  push:\n    paths:\n");
+        for glob in paths {
+            out.push_str(&format!("      - {}\n", yaml_flow_scalar(glob)));
         }
     }
     if !crons.is_empty() {
@@ -690,6 +713,41 @@ mod tests {
         let wf = yah_qed_gha::parse_workflow(&r.yaml).expect("valid GHA");
         assert!(wf.triggers.push.as_ref().map(|p| !p.tags.is_empty()).unwrap_or(false));
         assert_eq!(wf.triggers.schedule.len(), 1);
+    }
+
+    /// R827-F1: a path-only trigger renders as `push: paths:` and round-trips
+    /// through the real parser with no degradation.
+    #[test]
+    fn path_trigger_renders_push_paths() {
+        let mut p = pipeline("notices", vec![step("Notices", &["./notices.sh"])]);
+        p.triggers = vec![Trigger::Path {
+            globs: vec!["Cargo.lock".into(), "web/*/package.json".into()],
+        }];
+        let r = export_pipeline(&p);
+        let wf = yah_qed_gha::parse_workflow(&r.yaml).expect("valid GHA");
+        let push = wf.triggers.push.expect("push block");
+        assert_eq!(push.paths, vec!["Cargo.lock", "web/*/package.json"]);
+        assert!(push.tags.is_empty());
+        assert!(!r.degradations.iter().any(|d| d.site == "triggers"));
+    }
+
+    /// R827-F1: Tag + Path is an OR in QED but an AND inside one GHA `push:`
+    /// block. Exactly one `push:` key (a repeated key is invalid YAML), tags
+    /// kept, paths dropped with a degradation.
+    #[test]
+    fn tag_and_path_triggers_degrade_to_one_push_block() {
+        let mut p = pipeline("notices", vec![step("Notices", &["./notices.sh"])]);
+        p.triggers = vec![
+            Trigger::Tag { pattern: "v*.*.*".into() },
+            Trigger::Path { globs: vec!["Cargo.lock".into()] },
+        ];
+        let r = export_pipeline(&p);
+        assert_eq!(r.yaml.matches("\n  push:\n").count(), 1, "{}", r.yaml);
+        let wf = yah_qed_gha::parse_workflow(&r.yaml).expect("valid GHA");
+        let push = wf.triggers.push.expect("push block");
+        assert_eq!(push.tags, vec!["v*.*.*"]);
+        assert!(push.paths.is_empty(), "ANDed paths would narrow the tag trigger");
+        assert!(r.degradations.iter().any(|d| d.feature == "trigger:tag-or-path"));
     }
 
     #[test]

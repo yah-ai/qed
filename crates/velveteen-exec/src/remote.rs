@@ -968,16 +968,6 @@ pub const NODE_SELECTOR_NODE_ANNOTATION: &str = "yah.node-selector.node";
 
 // ─── BuildKit workload synthesis (R381-T5) ────────────────────────────────────
 
-/// Conventional output dir bind-mounted into the BuildKit container when an
-/// OCI archive is requested. Worker-local: unlike the context, this one is a
-/// correct bind on any host, because yubaba creates it at deploy
-/// ([`workload_spec::forge_state`]) rather than expecting it to already exist
-/// on the machine that composed the spec.
-///
-/// Cross-node consumers of the *archive* should still set `push=true` and let
-/// the registry handle distribution — nothing pulls this file back to camp yet.
-const BUILDKIT_HOST_OUT_DIR: &str = workload_spec::forge_state::BUILD_OUT_DIR;
-
 /// Default BuildKit image used by remote build-image dispatch.
 ///
 /// Held in `option_env!` so a deployment can pin a different version without
@@ -1013,9 +1003,9 @@ const BUILDCTL: &str = "buildctl-daemonless.sh";
 /// The container runs [`BUILDCTL`] (provided by the rootless image) which boots
 /// an in-process `buildkitd` and pipes the build through it.  When `push=true`
 /// the result is pushed straight to the tag's registry, otherwise an OCI
-/// archive is written to a bind-mounted host directory
-/// ([`BUILDKIT_HOST_OUT_DIR`]) — that one is worker-*local*, so it is a correct
-/// bind on any host.
+/// archive is written to the forge's durable produced dir
+/// ([`oci_archive_container_path`]) — worker-*local*, so a correct bind on any
+/// host, and retrievable from camp after the forge exits.
 ///
 /// # Where the context comes from
 ///
@@ -1031,6 +1021,25 @@ const BUILDCTL: &str = "buildctl-daemonless.sh";
 /// Bind volume mounts require `tier == "infra"`, which yubaba's shape
 /// validation enforces; the forge convention picks infra by default so this is
 /// safe for the v1 dogfood path.
+///
+/// @yah:ticket(R636-B3, "Offloaded build-image is never admitted: BuildKit's nested-sandbox widening needs a signed admission grant and nothing signs or attaches one")
+/// @yah:at(2026-10-08T07:25:41Z)
+/// @yah:assignee(agent:bundle-anthropic-glimmerstone)
+/// @yah:parent(R636)
+/// @yah:severity(high)
+/// @yah:next("A grant binds image ref WITH digest + entrypoint + argv template (AdmissionGrant::from_spec). default_buildkit_image() digest = option_env!(YAH_BUILDKIT_DIGEST), unset in the tree → ImageRef::UNPINNED_DIGEST sentinel. Pin a real moby/buildkit:v0.12.5-rootless digest first, then: grant template for build_image_workload_spec's argv with {{holes}} for context URL / filename / name= / dest; signing flow via `cargo xtask recipe-sign` (operator key yah-recipe-signing-key); runner attaches the envelope in execute_step_build_image_remote.")
+/// @yah:gotcha("LIVE 2026-10-08 (opt-in yah 0.8.43+ed267990): `yah qed images build yah-base --platform linux/amd64 --in-process` from the arm64 Mac → yubaba 100.64.0.9 422: 'workload not admitted: workload carries no admission grant and one is required: the workload requests the nested-sandbox widening (annotation yah.sandbox=nested). Sign the recipe with `cargo xtask recipe-sign`'. Rule: workload-spec admission.rs ~957 — widening ⇒ grant required regardless of node policy. Only transform recipes have grants (velveteen_exec::admission::envelope_for_recipe_step); the qed runner attaches none to a remote build-image spec. So R636-B2's grant can never be used today.")
+/// @yah:handoff("OPERATOR DECISION 2026-10-08 (ask_user F4350): option A — ONE operator-signed builder grant for the qed BuildKit workload (pinned BuildKit digest, argv holes for context URL / tag / output dest), attached to every remote build-image. Not per-catalog-entry grants, not dropping offload.")
+/// @yah:handoff("Diagnosed + decided, not built. Live refusal reproduced 2026-10-08 with opt-in yah 0.8.43+ed267990 (see gotcha). Operator chose option A (ask_user F4350): ONE operator-signed builder grant for the qed BuildKit workload, attached to every remote build-image. R636 follow-ups 1+2 (archive retrieval to .yah/cache/images, daemon proxy) are landed and unit-tested but CANNOT be proven live on the fleet until this ticket ships — this is the first thing that will exercise them.")
+/// @yah:handoff("Tree anchor at handoff: dc3ddb1c5b8d8941c392dc57a54dc7f307f29b50 — the shared tree as I left it. Diff against it (`git diff dc3ddb1c5b8d8941c392dc57a54dc7f307f29b50..HEAD`) to see what landed under you, and quote this SHA rather than 'HEAD' in any revert/restore instruction.")
+/// @yah:next("1. Pin the BuildKit image: velveteen-exec remote.rs default_buildkit_image() falls back to ImageRef::UNPINNED_DIGEST because YAH_BUILDKIT_DIGEST is set nowhere. A grant binds image@digest (AdmissionGrant::from_spec), so pin the real index digest of moby/buildkit:v0.12.5-rootless (`docker buildx imagetools inspect`) as the default.")
+/// @yah:next("2. Derive the grant from the SAME builder, no second copy: add `pub fn buildkit_builder_grant(tier) -> AdmissionGrant` in velveteen-exec = from_spec(\"qed-buildkit-builder\", spec) where spec comes from build_image_workload_spec fed hole values. That needs the OCI dest to be a parameter (today it is derived from the tag via oci_archive_container_path, which would mangle a `{{tag}}` hole): buildctl_argv(\"{{dockerfile}}\", Some(\"{{context}}\"), &[\"{{tag}}\"], &[], &[], false, Some(\"{{dest}}\")). Holes match via workload_spec::admission::template_matches; values must pass hole_is_safe (context URLs, single tags and /yah/produced paths do).")
+/// @yah:next("3. Signature storage is CAMP-local (the key is the camp operator's, not bundled in oss): `.yah/qed/admission/buildkit-builder.toml` with `[admission] signature/key`. Extend xtask/src/recipe_sign.rs (sign + --check) to cover it, reusing sign_grant + the YAH_RECIPE_SIGNING_KEY / fob slot yah-recipe-signing-key flow.")
+/// @yah:next("4. Attach at dispatch: runner execute_step_build_image_remote loads that file and attaches AdmissionEnvelope{grant: buildkit_builder_grant(tier).encode(), signature, key} so velveteen's apply_exec_context-style `attach` runs LAST on the finished spec (see RemoteForgeDriver::start_with_context / ExecContext.admission for the subprocess precedent). Missing file → fail the step BEFORE the context upload, naming the xtask command, instead of a yubaba 422.")
+/// @yah:next("5. OPERATOR (outward, ask first): keygen ceremony if the slot does not exist; `cargo xtask recipe-sign`; pin YAH_ADMISSION_KEYS=<pubkey> on the arch:x86 / arch:arm build-workers. Then live proof: `yah qed images build yah-base --platform linux/amd64 --in-process` from the arm64 Mac must land .yah/cache/images/cr.yah.dev_yah-base_<tag>.tar and reap the forge.")
+/// @yah:gotcha("NO GRANT HAS EVER BEEN SIGNED outside test fixtures (admission.rs GRANT_MAGIC doc; recipe_sign.rs: every transform recipe is location=local and skipped). The yah-recipe-signing-key slot may not exist yet — minting it is an operator act, never a build step.")
+/// @yah:gotcha("One argv template covers ONE output shape: the OCI-archive build (`type=oci,name=<tag>,dest=<path>`) that `yah qed images build` uses. A push=true remote build emits `type=image,...,push=true` and a multi-tag build quotes `\"name=a,b\"` — `\"` is a FORBIDDEN_HOLE_CHAR — so neither is covered by this grant; refuse them with a clear message rather than widening the template.")
+/// @yah:gotcha("A grant does NOT cover volumes (from_spec fields: recipe, image, tier, runtime, host_network, nested_sandbox, workdir, entrypoint, argv, env_names, secrets). Bind safety for forge mounts comes from tier=infra + forge_state::is_forge_state_path, not from the grant.")
 #[allow(clippy::too_many_arguments)]
 fn build_image_workload_spec(
     forge_id: &ForgeId,
@@ -1117,20 +1126,22 @@ fn build_image_workload_spec(
     // An OCI archive is only emitted when we neither push nor load into the
     // worker's local image store — the archive is the sole way an out-of-band
     // consumer retrieves the bytes. Its basename derives from the first tag.
+    //
+    // R636: it goes in this forge's durable produced dir, the same bind a
+    // subprocess forge's `produces` uses, so the runner pulls it back to camp
+    // over yubaba's `/produced` endpoint and yubaba's destroy reaps it. It used
+    // to go to one worker-wide `build-out` dir that nothing read and nothing
+    // cleaned: every offloaded image build left a multi-GB tar on the worker,
+    // two builds of one tag overwrote each other, and `--publish` had no bytes.
     let oci_archive_remote = (!push && !load).then(|| {
-        ws.volumes.push(VolumeMount {
-            source: VolumeSource::Bind {
-                host_path: PathBuf::from(BUILDKIT_HOST_OUT_DIR),
-            },
-            target: PathBuf::from("/yah/build/out"),
-            read_only: false,
-            from_secret_mount: false,
-        });
-        format!("/yah/build/out/{}", oci_archive_basename(first_tag))
+        ws.volumes
+            .push(workload_spec::forge_produced::durable_mount(&forge_id.to_string()));
+        oci_archive_container_path(first_tag)
     });
 
     // Split program from arguments so the image's baked `rootlesskit buildkitd`
     // entrypoint is REPLACED rather than prefixed — see [`BUILDCTL`].
+    let oci_archive_remote = oci_archive_remote.map(|p| p.to_string_lossy().into_owned());
     let mut argv = buildctl_argv(
         dockerfile_basename,
         context_url,
@@ -1144,6 +1155,17 @@ fn build_image_workload_spec(
     ws.entrypoint = Some(vec![program]);
     ws.command = Some(argv);
     Ok(ws)
+}
+
+/// Container-side path a remote build-image forge writes its OCI archive to
+/// when it neither pushes nor loads — inside
+/// [`forge_produced::CONTAINER_DIR`](workload_spec::forge_produced::CONTAINER_DIR),
+/// so it is retrievable with [`RemoteForgeDriver::fetch_produced_file`] after
+/// the forge exits (R636). Public because the retriever must ask for exactly
+/// the path the spec told BuildKit to write; a second derivation of it is how
+/// a fetch 404s on a build that succeeded.
+pub fn oci_archive_container_path(tag: &str) -> PathBuf {
+    Path::new(workload_spec::forge_produced::CONTAINER_DIR).join(oci_archive_basename(tag))
 }
 
 /// Map a docker tag (`reg/repo:ver`) to a filesystem-safe basename for the
@@ -2292,7 +2314,7 @@ mod remote {
             ws.resources.memory_mb
         );
 
-        // Bind mounts: context (ro), dockerfile dir (ro), out dir (rw).
+        // Bind mounts: context (ro), dockerfile dir (ro), produced dir (rw).
         let mounts: Vec<_> = ws
             .volumes
             .iter()
@@ -2313,8 +2335,8 @@ mod remote {
         assert!(
             mounts
                 .iter()
-                .any(|(t, ro)| t == "/yah/build/out" && !*ro),
-            "build-out dir bind-mount must be writable when push=false: {mounts:?}"
+                .any(|(t, ro)| t == workload_spec::forge_produced::CONTAINER_DIR && !*ro),
+            "the durable produced dir must be mounted writable when push=false: {mounts:?}"
         );
 
         // The image's baked `rootlesskit buildkitd` entrypoint must be
@@ -2329,9 +2351,18 @@ mod remote {
         // when push=false.
         let argv = ws.command.expect("command must be set");
         assert_eq!(argv.first().map(String::as_str), Some("build"));
+        // R636: the archive is written exactly where the runner will ask
+        // yubaba for it — a second derivation of this path is a 404 on a
+        // build that succeeded.
+        let dest = oci_archive_container_path("ghcr.io/yah-ai/yah-rust:dev");
+        assert_eq!(
+            dest,
+            PathBuf::from("/yah/produced/ghcr.io_yah-ai_yah-rust_dev.tar")
+        );
         assert!(
-            argv.iter().any(|a| a.starts_with("type=oci,")),
-            "push=false must emit --output type=oci: {argv:?}",
+            argv.iter()
+                .any(|a| a.starts_with("type=oci,") && a.contains(&*dest.to_string_lossy())),
+            "push=false must emit --output type=oci into the produced dir: {argv:?}",
         );
         assert!(
             argv.iter().any(|a| a == "filename=yah-rust.Dockerfile"),
@@ -2340,7 +2371,7 @@ mod remote {
     }
 
     /// push=true switches the buildctl output to a registry push and drops the
-    /// build-out bind-mount.
+    /// produced-dir bind-mount.
     #[test]
     fn build_image_workload_spec_push_true_uses_registry_output() {
         let ws = synth(&build_image_parts(build_image_spec(true)));
@@ -2354,10 +2385,10 @@ mod remote {
         let has_out_dir = ws
             .volumes
             .iter()
-            .any(|v| v.target == PathBuf::from("/yah/build/out"));
+            .any(|v| v.target == PathBuf::from(workload_spec::forge_produced::CONTAINER_DIR));
         assert!(
             !has_out_dir,
-            "push=true must NOT mount the build-out dir: {:?}",
+            "push=true must NOT mount the produced dir: {:?}",
             ws.volumes,
         );
     }
@@ -2409,7 +2440,8 @@ mod remote {
 
     /// With a `context_url`, the synthesized workload must reference NOTHING
     /// from the composing host's filesystem — that is the whole bug. The one
-    /// surviving bind is `/yah/build/out`, which is a worker-local path.
+    /// surviving bind is the forge's durable produced dir, which is
+    /// worker-local.
     #[test]
     fn remote_context_url_drops_every_camp_host_bind_mount() {
         let ws = synth(&build_image_parts(build_image_spec_with_url(
@@ -2427,10 +2459,10 @@ mod remote {
                 _ => None,
             })
             .collect();
-        assert_eq!(
-            binds,
-            vec![BUILDKIT_HOST_OUT_DIR.to_string()],
-            "the only bind left may be the worker-local OCI out dir: {binds:?}",
+        assert!(
+            binds.len() == 1
+                && binds[0].starts_with(workload_spec::forge_produced::HOST_ROOT),
+            "the only bind left may be the worker-local produced dir: {binds:?}",
         );
         assert!(
             !binds.iter().any(|b| b.starts_with("/tmp/camp")),

@@ -10,18 +10,16 @@
 //! @arch:see(.yah/docs/working/W330-distributing-camp-compute.md)
 //! @yah:ticket(R833-F9, "Artifact retrieval to the invoker: point produces / Outcome::Publish at the Phase 1 LAN store")
 //! @yah:at(2026-08-29T20:53:54Z)
-//! @yah:status(open)
 //! @yah:assignee(agent:bundle-anthropic-ashguard)
 //! @yah:phase(P4)
 //! @yah:parent(R833)
 //! @arch:see(.yah/docs/working/W330-distributing-camp-compute.md)
 //! @yah:depends_on(R833-T2)
 //! @yah:next("Artifacts are build outputs and DO NOT belong in git history -- that is the constraint this ticket exists to respect. ProducedArtifact / produces / Outcome::Publish already work, including object-store staging; the change is pointing that staging at the Phase 1 LAN store (R833-T2) so a remote run's outputs come back to the invoker over the mesh.")
-//! @yah:next("Tier: Warrior -- the publish machinery exists and works; this is wiring it to a new destination plus the retrieval leg back to the invoker.")
+//! @yah:next("Tier: Cleric -- the publish machinery exists and works; this is wiring it to a new destination plus the retrieval leg back to the invoker.")
 //! @yah:gotcha("ONE STORE SERVES BOTH. W330 is explicit that the LAN store carries the compile cache AND the QED artifacts -- do not stand up a second store for artifacts. If R833-T2 has not landed yet, that is what this ticket is waiting on; it is the only cross-phase dependency in the relay.")
 //! @yah:ticket(R833-T17, "Give isolated runs a stable worktree path so they at least share a cache with each other")
 //! @yah:at(2026-08-30T03:01:58Z)
-//! @yah:status(open)
 //! @yah:assignee(agent:bundle-anthropic-ashguard)
 //! @yah:parent(R833)
 //! @yah:next("R833-S1 measured that a workspace='isolated' run gets 0 percent sccache reuse against the camp tree (1 hit / 727 misses on cargo build -p camp-identity), and that this is NOT configurable -- sccache 0.17.0 applies basedirs on the C/C++ path only and hashes cwd plus CARGO_MANIFEST_DIR into every Rust key. Sharing with the camp tree is therefore off the table.")
@@ -31,7 +29,6 @@
 //! @yah:gotcha("Do not 'fix' this by moving the worktrees under /Users/leif/ss so a common base dir covers them and the camp tree. That was R833-S1's assigned hypothesis and it was measured false: a common ancestor cannot make two different sub-paths hash alike, and sccache strips nothing on the Rust path regardless. Measured with the common ancestor as a single basedir, and with both roots listed as basedirs -- 0 hits either way.")
 //! @yah:relay(R906, "Agent-supervised QED runs: qed.await with tree-wide wake, manual-step audience, and the operator-gate position rule")
 //! @yah:at(2026-09-14T17:49:53Z)
-//! @yah:status(open)
 //! @yah:assignee(agent:bundle-anthropic-glimmerstone)
 //! @yah:next("Design was settled in conversation with the operator 2026-09-14; the full brief is in this relay's handoff entries. Read them before opening a child.")
 //! @yah:handoff("THE PROBLEM. An agent can start a QED run (`yah qed run …` over Bash) but cannot supervise one. There is no `qed_*` MCP tool at all — the agent surface is board/camp/party/subagent/inbox/sql and nothing else — so an agent that launches a release wave must either block a shell for hours or poll, and polling costs a full-context API call per poll. The operator's ask: run a QED, park, and let the camp daemon wake the agent for failures, for a periodic liveness tick, and for gates the agent itself can answer. The daemon already holds everything needed: `QedEventWire` carries RunQueued/RunStarted/StepStarted/StepFinished/StepAwaitingHuman/SubPipelineStarted/SubPipelineFinished/RunFinished, there is a ring buffer plus append-only JSONL at `.yah/jit/qed/<run-id>.events.jsonl`, and `yah qed` already proxies to the camp daemon. This is a tool surface over an existing event rail, NOT a new daemon subsystem.")
@@ -471,6 +468,10 @@ fn needs_offload_walk(
     if pipeline_has_node_bound_participant(pipeline) {
         return true;
     }
+    // R918-T6: a node-pinned step is fleet work whatever its platform says.
+    if pipeline.steps.iter().any(|s| s.node.is_some()) {
+        return true;
+    }
     for step in &pipeline.steps {
         if matches!(
             step_placement(step, host, capability),
@@ -586,10 +587,11 @@ pub fn pipeline_is_fully_offloaded(
 ) -> bool {
     !pipeline.steps.is_empty()
         && pipeline.steps.iter().all(|step| {
-            matches!(
-                step_placement(step, host, capability),
-                crate::platform::Resolution::Offload { .. }
-            )
+            step.node.is_some()
+                || matches!(
+                    step_placement(step, host, capability),
+                    crate::platform::Resolution::Offload { .. }
+                )
         })
 }
 
@@ -2599,15 +2601,17 @@ impl PipelineRunner {
         self
     }
 
-    /// The [`TaskLocation`] a remotely-placed step dispatches to: the pinned
-    /// node when the operator named one (R833-F8), otherwise the R594
-    /// tag-matched `RemoteAny` the caller derived from the step.
+    /// The [`TaskLocation`] a remotely-placed step dispatches to: the step's
+    /// own `node` pin (R918-T6), else the node the operator named for the run
+    /// (R833-F8), otherwise the R594 tag-matched `RemoteAny` the caller derived
+    /// from the step.
     ///
     /// Single seam for both remote dispatch sites (subprocess and build-image)
     /// so a pin cannot be honoured by one and dropped by the other.
-    fn remote_location(&self, mesh_tags: Vec<String>) -> TaskLocation {
-        match &self.pinned_node {
-            Some(node) => TaskLocation::Remote { node: node.clone() },
+    fn remote_location(&self, step: &crate::types::QedStep, mesh_tags: Vec<String>) -> TaskLocation {
+        let step_pin = step.node.as_ref().map(|n| workload_spec::MeshIdent(n.clone()));
+        match step_pin.or_else(|| self.pinned_node.clone()) {
+            Some(node) => TaskLocation::Remote { node },
             None => TaskLocation::RemoteAny {
                 tier: TierTag("infra".into()),
                 mesh_tags,
@@ -2915,6 +2919,11 @@ impl PipelineRunner {
         // rendezvous, which is why this arm precedes the forced-mode fast path
         // rather than following it.
         if self.participant_binding(step).is_some_and(|p| p.node.is_some()) {
+            return RunWhere::Remote;
+        }
+        // R918-T6: same reasoning for a step pinned with `node = "…"` — the
+        // build it declares can only happen on that machine.
+        if step.node.is_some() {
             return RunWhere::Remote;
         }
         match self.run_where {
@@ -6249,6 +6258,25 @@ impl PipelineRunner {
                     msg: format!("manual: could not reach a human ({e})"),
                 })?;
 
+            // R906-B7: the announcement goes out BEFORE `StepAwaitingHuman`, and
+            // `StepAwaitingHuman` must be the last event carrying this index
+            // until the park resolves. The camp daemon's meta fold reads the
+            // next same-index `StepOutput` as the resume (the runner has no
+            // explicit resume event), so emitting this line second un-parked
+            // the run within microseconds: `qed.status` read `running` for the
+            // whole park and `qed.await` never woke with `needs_agent`.
+            self.emit(QedEvent::StepOutput {
+                index: event_index,
+                name: step.name.clone(),
+                stream: OutputStream::Stdout,
+                line: match advance {
+                    Some(cond) => format!(
+                        "manual: parking on a human (concurrency key released); \
+                         auto-advances when `{cond}` exits 0"
+                    ),
+                    None => "manual: parking on a human (concurrency key released)".to_string(),
+                },
+            });
             self.emit(QedEvent::StepAwaitingHuman {
                 index: event_index,
                 name: step.name.clone(),
@@ -6258,18 +6286,6 @@ impl PipelineRunner {
                 prompt: cfg.prompt.clone(),
                 terminal: cfg.terminal.clone(),
                 at: Utc::now(),
-            });
-            self.emit(QedEvent::StepOutput {
-                index: event_index,
-                name: step.name.clone(),
-                stream: OutputStream::Stdout,
-                line: match advance {
-                    Some(cond) => format!(
-                        "manual: parked on a human (concurrency key released); \
-                         auto-advances when `{cond}` exits 0"
-                    ),
-                    None => "manual: parked on a human (concurrency key released)".to_string(),
-                },
             });
 
             // Race the human against the condition. Whichever lands first wins;
@@ -7688,7 +7704,7 @@ impl PipelineRunner {
         // silently came out host-arch (or emulated).
         if matches!(self.effective_placement(step), RunWhere::Remote) {
             let forge_id = self
-                .execute_step_build_image_remote(step, &prepared)
+                .execute_step_build_image_remote(index, step, &prepared)
                 .await?;
             return Ok(Some(forge_id));
         }
@@ -8183,6 +8199,7 @@ impl PipelineRunner {
 
     async fn execute_step_build_image_remote(
         &self,
+        index: usize,
         step: &crate::types::QedStep,
         prepared: &PreparedBuildImage,
     ) -> Result<ObsForgeId, RunnerError> {
@@ -8236,10 +8253,13 @@ impl PipelineRunner {
                 //
                 // R833-F8: unless the operator named a node, in which case that
                 // wins over the derived tags — see `remote_location`.
-                self.remote_location(crate::platform::build_worker_mesh_tags(
-                    &self.remote_build_image_arch(step),
-                    "linux",
-                )),
+                self.remote_location(
+                    step,
+                    crate::platform::build_worker_mesh_tags(
+                        &self.remote_build_image_arch(step),
+                        "linux",
+                    ),
+                ),
                 TaskRuntime::Container,
             ),
             timeout: step.timeout.map(Millis::from_secs),
@@ -8254,12 +8274,13 @@ impl PipelineRunner {
             .await
             .map_err(|e| RunnerError::Remote(e.to_string()));
 
+        let mut forge_id: Option<ObsForgeId> = None;
         let outcome = match dispatch {
             Err(e) => Err(e),
             Ok(handle) => {
-                let forge_id = handle.id.clone();
+                forge_id = Some(handle.id.clone());
                 match handle.wait().await {
-                    ForgeStatus::Done { exit_code: 0, .. } => Ok(forge_id),
+                    ForgeStatus::Done { exit_code: 0, .. } => Ok(()),
                     ForgeStatus::Done { exit_code, .. } => Err(RunnerError::StepFailed {
                         step: step.name.clone(),
                         msg: format!("buildkit exited with code {exit_code}"),
@@ -8291,7 +8312,99 @@ impl PipelineRunner {
             publisher.discard(&context_key).await;
         }
 
-        outcome
+        // R636: an archive build's deliverable is on the worker; bring it to
+        // the same `.yah/cache/images/<tag>.tar` a local build writes, so what
+        // reads it next (`yah qed images build --publish`) has one path to
+        // read whichever machine built it. Push and load builds leave nothing
+        // to fetch — their result is in a registry or the worker's store.
+        let mut fetch_failed = false;
+        let outcome = match (outcome, &forge_id) {
+            (Ok(()), Some(id)) if !step.push && !step.load => {
+                let fetched = self
+                    .retrieve_remote_oci_archive(index, driver, id, step, prepared)
+                    .await;
+                fetch_failed = fetched.is_err();
+                fetched
+            }
+            (outcome, _) => outcome,
+        };
+
+        // Reap after retrieval, on a failed build too — the R555-F6 ordering
+        // `execute_step` documents, for the same reasons: yubaba's destroy
+        // deletes the produced dir the archive sits in, and keeping a failed
+        // forge's record buys no post-mortem. Except when the fetch itself
+        // failed: the archive may still be on the worker, and reaping is the
+        // one move that makes fetching it by hand impossible.
+        match (&forge_id, fetch_failed) {
+            (Some(id), false) => self.reap_remote_workload(id, &step.name).await,
+            (Some(id), true) => tracing::warn!(
+                step = %step.name,
+                forge_id = %id,
+                "leaving forge.{id} on the build-worker: its OCI archive could not be \
+                 retrieved and destroy would reap it",
+            ),
+            (None, _) => {}
+        }
+
+        outcome.map(|()| forge_id.expect("a successful outcome implies a dispatched forge"))
+    }
+
+    /// R636: fetch a remote build-image forge's OCI archive off the build-worker
+    /// (via yubaba's `/produced` endpoint) and land it at the step's local
+    /// `archive_path`.
+    ///
+    /// Written to a sibling `.partial` and renamed, so an interrupted transfer
+    /// can never leave a truncated tar where `--publish` would read a "built"
+    /// image. The whole archive is held in memory in transit — the existing
+    /// produced-file transport is not streaming — which is fine at today's
+    /// catalog sizes and is the first thing to revisit if an image outgrows it.
+    async fn retrieve_remote_oci_archive(
+        &self,
+        index: usize,
+        driver: &RemoteForgeDriver,
+        forge_id: &ObsForgeId,
+        step: &crate::types::QedStep,
+        prepared: &PreparedBuildImage,
+    ) -> Result<(), RunnerError> {
+        let remote = velveteen_exec::remote::oci_archive_container_path(&prepared.tag);
+        let bytes = driver
+            .fetch_produced_file(forge_id, &remote)
+            .await
+            .map_err(|e| RunnerError::StepFailed {
+                step: step.name.clone(),
+                msg: format!(
+                    "the image built, but retrieving its OCI archive {} off the build-worker \
+                     failed: {e}. forge.{forge_id} is left in place so the archive can still \
+                     be fetched.",
+                    remote.display()
+                ),
+            })?;
+
+        let dest = &prepared.archive_path;
+        if let Some(parent) = dest.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .map_err(RunnerError::Io)?;
+        }
+        let partial = dest.with_extension("tar.partial");
+        tokio::fs::write(&partial, &bytes)
+            .await
+            .map_err(RunnerError::Io)?;
+        tokio::fs::rename(&partial, dest)
+            .await
+            .map_err(RunnerError::Io)?;
+
+        self.emit(QedEvent::StepOutput {
+            index,
+            name: step.name.clone(),
+            stream: OutputStream::Stdout,
+            line: format!(
+                "retrieved OCI archive from the build-worker ({} bytes) → {}",
+                bytes.len(),
+                dest.display()
+            ),
+        });
+        Ok(())
     }
 
     /// Dispatch a `kind = "package-native-tarball"` step (R407-T2).
@@ -8700,7 +8813,7 @@ impl PipelineRunner {
             // R833-F8: `remote_location` returns the pinned node when the
             // operator named one and the R594 tag-matched `RemoteAny`
             // otherwise, so inference is untouched for every unpinned run.
-            where_: TaskPlacement::new(self.remote_location(mesh_tags), runtime),
+            where_: TaskPlacement::new(self.remote_location(step, mesh_tags), runtime),
             timeout: step.timeout.map(Millis::from_secs),
             label: Some(step.name.clone()),
             // Camp name will be threaded through once yubaba RPC stabilises (R091).
@@ -9700,6 +9813,7 @@ mod tests {
             steps: vec![crate::types::QedStep {
                             expect_slow: false,
                             participant: None,
+                            node: None,
                 needs: None,
                 resource: None,
                 inputs: Vec::new(),
@@ -10089,6 +10203,43 @@ mod tests {
                 .annotations
                 .contains_key(velveteen_exec::remote::NODE_SELECTOR_MESH_TAGS_ANNOTATION),
             "an explicit target must not be re-filtered by inferred arch tags",
+        );
+    }
+
+    /// R918-T6: a step's own `node` pin sends THAT step to the named machine on
+    /// an `Auto` run, ahead of a run-wide pin, and leaves its siblings local —
+    /// the shape `yah-cli-release-windows` needs (stamp here, build on 002).
+    #[tokio::test]
+    async fn a_node_pinned_step_goes_to_its_node_and_its_siblings_stay_local() {
+        let dir = TempDir::new().unwrap();
+        let scryer = make_scryer(&dir);
+        let yubaba = Arc::new(DeployCapturingWarden::new(vec!["ok".into()], 0));
+
+        let mut pipeline = one_step_pipeline("pinned-step", vec!["true".to_string()]);
+        let mut stamp = pipeline.steps[0].clone();
+        stamp.name = "stamp".into();
+        pipeline.steps[0].node = Some("us-west-002".into());
+        pipeline.steps.insert(0, stamp);
+        assert!(
+            pipeline_needs_offload(&pipeline, "aarch64-apple-darwin", ALL_TOOLS, &NoopSubPipelineResolver),
+            "a pinned step needs a dispatcher even though nothing in it is cross-arch",
+        );
+        assert!(!pipeline_is_fully_offloaded(&pipeline, "aarch64-apple-darwin", ALL_TOOLS));
+
+        let runner = PipelineRunner::new_auto(pipeline, scryer, yubaba.clone())
+            .with_pinned_node(MeshIdent("us-west-003".into()));
+        assert_eq!(runner.effective_placement(&runner.pipeline.steps[0]), RunWhere::Local);
+        assert_eq!(runner.effective_placement(&runner.pipeline.steps[1]), RunWhere::Remote);
+        let meta = runner.run().await.unwrap();
+        assert_eq!(meta.status, RunStatus::Success);
+
+        let spec = yubaba.only_spec();
+        assert_eq!(
+            spec.annotations
+                .get(velveteen_exec::remote::NODE_SELECTOR_NODE_ANNOTATION)
+                .map(String::as_str),
+            Some("us-west-002"),
+            "the step's own pin wins over the run's",
         );
     }
 
@@ -11077,6 +11228,7 @@ mod tests {
         pipeline.steps.push(crate::types::QedStep {
                                 expect_slow: false,
                                 participant: None,
+                                node: None,
             needs: None,
             resource: None,
             inputs: Vec::new(),
@@ -11203,6 +11355,7 @@ mod tests {
             steps: vec![crate::types::QedStep {
                             expect_slow: false,
                             participant: None,
+                            node: None,
                 needs: None,
                 resource: None,
                 inputs: Vec::new(),
@@ -13637,6 +13790,25 @@ mod tests {
             .expect("StepAwaitingHuman emitted");
         assert_eq!(awaiting.0.as_deref(), Some("form-1"));
         assert_eq!(awaiting.1, "push-tag");
+
+        // R906-B7: nothing may carry the parked step's index between the park
+        // and its resolution — the camp daemon reads the next same-index event
+        // as the resume, so a trailing output line un-parks the run at once.
+        let park_at = events
+            .iter()
+            .position(|e| matches!(e, QedEvent::StepAwaitingHuman { .. }))
+            .unwrap();
+        let next_same_index = events[park_at + 1..].iter().find(|e| match e {
+            QedEvent::StepOutput { index, .. } | QedEvent::StepFinished { index, .. } => {
+                *index == 0
+            }
+            _ => false,
+        });
+        assert!(
+            matches!(next_same_index, Some(QedEvent::StepFinished { .. })),
+            "the event after StepAwaitingHuman for this step must be its resolution, \
+             got {next_same_index:?}"
+        );
     }
 
     /// Resume is not a bare continue. The tree can move during a park, so a
@@ -14830,6 +15002,7 @@ remote_sha="$(git ls-remote --tags origin | awk -v peeled="refs/tags/${name}^{}"
             steps: vec![crate::types::QedStep {
                             expect_slow: false,
                             participant: None,
+                            node: None,
                 needs: None,
                 resource: None,
                 inputs: Vec::new(),
@@ -14923,11 +15096,12 @@ remote_sha="$(git ls-remote --tags origin | awk -v peeled="refs/tags/${name}^{}"
     async fn build_image_remote_dispatch_round_trip() {
         let dir = TempDir::new().unwrap();
         let scryer = make_scryer(&dir);
-        let yubaba = Arc::new(ScriptedWarden {
-            lines: vec![],
-            exit_code: 0,
-            produced_files: HashMap::new(),
-        });
+        // R636: a green archive build now pulls its OCI tar back, so the
+        // worker has to have written one.
+        let yubaba = Arc::new(ScriptedWarden::new(vec![], 0).with_produced_file(
+            velveteen_exec::remote::oci_archive_container_path("yah-rust:dev"),
+            b"oci".to_vec(),
+        ));
         let ctx = Arc::new(RecordingContextPublisher::default());
         let pipeline = build_image_pipeline("yah-rust");
         let runner = PipelineRunner::new_remote(pipeline, scryer, yubaba)
@@ -14993,6 +15167,84 @@ remote_sha="$(git ls-remote --tags origin | awk -v peeled="refs/tags/${name}^{}"
         let meta = runner.run().await.unwrap();
         assert_eq!(meta.status, RunStatus::Failed);
         assert_eq!(meta.steps[0].status, RunStatus::Failed);
+    }
+
+    /// R636: an offloaded archive build's OCI tar is the deliverable, and it
+    /// used to stay on the worker forever — `yah qed images build --publish`
+    /// had to refuse every cross-arch build for want of bytes. It now lands at
+    /// the same `.yah/cache/images/<tag>.tar` a local build writes, and the
+    /// forge is reaped only AFTER the fetch, because yubaba's destroy deletes
+    /// the produced dir the tar sits in.
+    #[tokio::test]
+    async fn build_image_remote_retrieves_the_archive_then_reaps() {
+        let dir = TempDir::new().unwrap();
+        let camp = TempDir::new().unwrap();
+        let scryer = make_scryer(&dir);
+        let yubaba = Arc::new(CallLogWarden::new(0).with_produced_file(
+            velveteen_exec::remote::oci_archive_container_path("yah-rust:dev"),
+            b"oci-layout-bytes".to_vec(),
+        ));
+        let runner =
+            PipelineRunner::new_remote(build_image_pipeline("yah-rust"), scryer, yubaba.clone())
+                .with_camp_root(camp.path().to_path_buf())
+                .with_build_context_publisher(Arc::new(RecordingContextPublisher::default()));
+        let meta = runner.run().await.unwrap();
+
+        assert_eq!(meta.status, RunStatus::Success, "{:?}", meta.steps[0].error);
+        let archive = camp.path().join(".yah/cache/images/yah-rust_dev.tar");
+        assert_eq!(std::fs::read(&archive).unwrap(), b"oci-layout-bytes");
+        assert!(
+            !archive.with_extension("tar.partial").exists(),
+            "the staging file must be renamed into place, not left beside it"
+        );
+        assert_eq!(
+            yubaba.calls(),
+            vec!["deploy", "fetch_produced", "teardown"],
+            "the forge must be reaped, and only once its archive is in camp",
+        );
+    }
+
+    /// The build succeeded but the archive could not be fetched: the step is
+    /// red (there is no image here to publish), and the forge is NOT reaped —
+    /// destroy would delete the one copy of a possibly hour-long build that an
+    /// operator can still fetch by hand.
+    #[tokio::test]
+    async fn build_image_remote_keeps_the_forge_when_the_archive_fetch_fails() {
+        let dir = TempDir::new().unwrap();
+        let camp = TempDir::new().unwrap();
+        let scryer = make_scryer(&dir);
+        let yubaba = Arc::new(CallLogWarden::new(0));
+        let runner =
+            PipelineRunner::new_remote(build_image_pipeline("yah-rust"), scryer, yubaba.clone())
+                .with_camp_root(camp.path().to_path_buf())
+                .with_build_context_publisher(Arc::new(RecordingContextPublisher::default()));
+        let meta = runner.run().await.unwrap();
+
+        assert_eq!(meta.status, RunStatus::Failed);
+        let err = meta.steps[0].error.clone().unwrap_or_default();
+        assert!(
+            err.contains("the image built") && err.contains("left in place"),
+            "the failure must say the build itself succeeded: {err}"
+        );
+        assert!(!camp.path().join(".yah/cache/images/yah-rust_dev.tar").exists());
+        assert_eq!(yubaba.calls(), vec!["deploy", "fetch_produced"]);
+    }
+
+    /// A failed remote build has nothing to fetch and is reaped like any other
+    /// failed remote step — before R636 no build-image forge was ever reaped.
+    #[tokio::test]
+    async fn build_image_remote_failed_build_is_reaped_without_a_fetch() {
+        let dir = TempDir::new().unwrap();
+        let scryer = make_scryer(&dir);
+        let yubaba = Arc::new(CallLogWarden::new(2));
+        let runner =
+            PipelineRunner::new_remote(build_image_pipeline("yah-rust"), scryer, yubaba.clone())
+                .with_camp_root(dir.path().to_path_buf())
+                .with_build_context_publisher(Arc::new(RecordingContextPublisher::default()));
+        let meta = runner.run().await.unwrap();
+
+        assert_eq!(meta.status, RunStatus::Failed);
+        assert_eq!(yubaba.calls(), vec!["deploy", "teardown"]);
     }
 
     /// A per-camp catalog entry that extends a nonexistent parent surfaces
@@ -15101,6 +15353,7 @@ description = "smoke test image"
             steps: vec![crate::types::QedStep {
                             expect_slow: false,
                             participant: None,
+                            node: None,
                 needs: None,
                 resource: None,
                 inputs: Vec::new(),
@@ -15379,6 +15632,7 @@ produces    = ["native-tarball"]
             steps: vec![crate::types::QedStep {
                             expect_slow: false,
                             participant: None,
+                            node: None,
                 needs: None,
                 resource: None,
                 inputs: Vec::new(),
@@ -15521,6 +15775,7 @@ produces    = ["native-tarball"]
                 crate::types::QedStep {
                     expect_slow: false,
                     participant: None,
+                    node: None,
                     needs: None,
                     resource: None,
                     inputs: Vec::new(),
@@ -15564,6 +15819,7 @@ produces    = ["native-tarball"]
                 crate::types::QedStep {
                     expect_slow: false,
                     participant: None,
+                    node: None,
                     needs: None,
                     resource: None,
                     inputs: Vec::new(),
@@ -15637,6 +15893,7 @@ produces    = ["native-tarball"]
             steps: vec![crate::types::QedStep {
                             expect_slow: false,
                             participant: None,
+                            node: None,
                 needs: None,
                 resource: None,
                 inputs: Vec::new(),
@@ -15897,6 +16154,7 @@ produces    = ["native-tarball"]
             toolchain: None,
             outputs: Vec::new(),
             participant: None,
+            node: None,
         }
     }
 
@@ -16361,6 +16619,7 @@ produces    = ["native-tarball"]
         crate::types::QedStep {
             expect_slow: false,
             participant: None,
+            node: None,
             needs: None,
             resource: None,
             inputs: Vec::new(),
@@ -17655,6 +17914,7 @@ jobs:
         let step = crate::types::QedStep {
                        expect_slow: false,
                        participant: None,
+                       node: None,
             needs: None,
             resource: None,
             inputs: Vec::new(),
@@ -17940,6 +18200,7 @@ jobs:
         let step = crate::types::QedStep {
                        expect_slow: false,
                        participant: None,
+                       node: None,
             needs: None,
             resource: None,
             inputs: Vec::new(),
@@ -19357,6 +19618,7 @@ jobs:
         crate::types::QedStep {
             expect_slow: false,
             participant: None,
+            node: None,
             needs: None,
             resource: None,
             inputs: Vec::new(),

@@ -24,34 +24,35 @@
 //!
 //! @yah:relay(R827, "QED trigger coverage — pipelines can only fire on tag, cron, chain or manual")
 //! @yah:at(2026-08-21T01:18:53Z)
-//! @yah:status(open)
 //! @yah:assignee(agent:bundle-anthropic-glimmerstone)
 //! @arch:see(oss/qed/crates/qed/src/export.rs)
 //! @arch:see(oss/qed/crates/qed/src/config.rs)
 //! @yah:ticket(R827-F1, "Trigger::Path { globs } — fire a pipeline when specific files change")
-//! @yah:at(2026-08-21T01:19:24Z)
-//! @yah:status(open)
-//! @yah:assignee(agent:bundle-anthropic-glimmerstone)
+//! @yah:status(review)
+//! @yah:at(2026-10-08T06:44:02Z)
+//! @yah:assignee(agent:bundle-anthropic-ashguard)
 //! @yah:parent(R827)
 //! @arch:see(oss/qed/crates/qed/src/export.rs)
 //! @arch:see(oss/qed/crates/qed/src/config.rs)
-//! @yah:next("Tier: Cleric — three small sites plus tests; the judgment is in who dispatches, not in what the exporter renders.")
+//! @yah:next("Tier: Warrior — three small sites plus tests; the judgment is in who dispatches, not in what the exporter renders.")
 //! @yah:next("Trigger is Manual | Tag { pattern } | Schedule { cron } | Pipeline { id, status } (types.rs:346). Add Path { globs: Vec<String> }: 'run this pipeline when these files change'.")
 //! @yah:next("DEFINE IT IN QED'S OWN TERMS. types.rs:365 already states the model: qed has no polling daemon — a Trigger is a declaration of WHEN, and some host fires it. Tag is fired by a git-mirror hook, Schedule by almanac, Manual by the CLI/desktop. Path is a git-diff-aware dispatch and belongs with Tag, i.e. the yubaba git-mirror hook. THAT is the substance of this ticket.")
 //! @yah:next("Site 1 — types.rs: the variant. Trigger is a plain serde enum and config.rs takes `triggers: Vec<Trigger>` with #[serde(default)] (config.rs:304), so TOML parsing comes free.")
-//! @yah:next("Site 2 — the dispatcher: whichever hook fires Tag today needs to compare the push's changed paths against the globs. This is the real work; the enum variant is not.")
 //! @yah:next("Site 3 — export.rs::render_on, LAST and least. Accumulate globs into a Vec inside the match loop as tags and crons already are, render after the loop.")
 //! @yah:next("Tests: a config.rs parse test and an export.rs rendered-YAML test, mirroring the Tag/Schedule pairs at config.rs:2442 and config.rs:3196.")
 //! @yah:next("MOTIVATING CONSUMER (noisetable camp, R660-T1): a third-party licence manifest generated from Cargo.lock plus an npm tree, with a drift guard. Tag-only means the first time you learn a new copyleft transitive arrived is at release. The interim there is a Schedule{cron} nightly — it works, and it is not the right answer.")
 //! @yah:gotcha("CORRECTION TO THIS TICKET'S FIRST DRAFT: it specified Path around what an Actions `on: push: paths:` block can express. That is backwards. crates/qed-gha is an IMPORT front-end — its own header says 'QED imports a workflow, it does not faithfully emulate GitHub', and its tier-3 service overrides were retired rather than extended. R605 is actively taking GitHub off the release critical path, with the engine already done. Do not let a lossy export target define a QED vocabulary word.")
 //! @yah:gotcha("Exporter bug, not a design constraint: render_on emits its `push:` block for Tag triggers after the match loop. A Path arm that emits its own `  push:\\n    paths:\\n` produces TWO `push:` keys in one `on:` mapping — invalid YAML that reads as correct in review. The accumulate-then-render shape already used for tags and crons is the fix.")
 //! @yah:gotcha("When a card carries BOTH a Tag and a Path trigger, the exporter cannot render it faithfully: inside one Actions `push:` block, ref filters and `paths` are ANDed, so 'on release OR when these files change' is not expressible there. Push a Degradation, exactly as the Pipeline arm does for workflow_run. Do NOT reject the combination at config time — QED's own dispatchers can express it fine, and refusing a valid pipeline because one export target is lossy would be the tail wagging the dog.")
-//! @yah:assumes("That the git-mirror hook which fires Tag can see the changed-path list for a push. If it cannot, the dispatch half of this ticket is bigger than the enum half and should be split — confirm before estimating.")
-//! @yah:assumes("Trigger::Tag is matched only in export.rs and config.rs tests across external/yah (grepped 2026-08-20), so the hook that types.rs:365 describes was not located in this pass. Find it before writing the dispatch code.")
-//! @yah:next("REVERSE EDGE, added from the noisetable camp (R660-S6): when this lands, go flip the motivating consumer yourself. In ~/ss/noisetable, .yah/qed/third-party-notices.toml carries a Schedule{cron} '15 4 * * *' nightly as the interim (comment at lines 18-29 says so); replace it with a Path trigger over Cargo.lock, web/*/package.json and the ATTRIBUTION.md files, then close noisetable's R660-S6. This @yah:next IS the edge — a notify_on cannot carry it, because dep_status (crates/yah/board/src/ticket.rs:1114) returns Unresolvable for an id the local board never saw, so a cross-camp notify_on never fires.")
+//! @yah:handoff("Trigger::Path { globs } + PushEvent { tags, changed_paths } + Trigger::fires_on_push / Trigger::validate + TriggerError in oss/qed/crates/qed/src/types.rs. Glob semantics via the `glob` crate with require_literal_separator: `*` stays inside one segment, `**/` crosses (and matches zero dirs). Tag and Path are ORed alternatives.")
+//! @yah:handoff("config.rs: ConfigError::InvalidTrigger; pipeline_from_str validates every trigger at load, so a bad glob or an empty Path is a load error, not a pipeline that silently never fires.")
+//! @yah:handoff("export.rs render_on: paths are collected alongside tags/crons and rendered once, so there is a single `push:` key. Tag+Path keeps the tags and records a `trigger:tag-or-path` Degradation, because GHA ANDs ref filters with paths.")
+//! @yah:handoff("Dispatch split out to R827-F2: no host fires Tag either (verified by grep). F2 also carries the noisetable R660-S6 reverse edge, which must NOT be flipped before F2 ships.")
+//! @yah:handoff("Wider than the title: regenerated .yah/schema/qed-pipeline.toml.schema.json, and connection.toml.schema.json for a peer's drifted R960-F11 doc comment. glob = \"0.3\" added to oss/qed/crates/qed/Cargo.toml (already present transitively); root Cargo.lock updated.")
+//! @yah:verify("cargo test -p yah-qed --lib -- trigger path_trigger tag_trigger export:: (run from oss/qed): 23 passed, EXIT=0, /tmp/r827f1-t2.log")
+//! @yah:verify("New tests: types::tests::{path_trigger_matches_changed_paths, tag_trigger_matches_pushed_tags_only, trigger_validate_refuses_bad_globs}, config::tests::{parses_path_trigger_from_toml, rejects_bad_path_trigger_globs}, export::tests::{path_trigger_renders_push_paths, tag_and_path_triggers_degrade_to_one_push_block} (the latter two round-trip through yah_qed_gha::parse_workflow)")
 //! @yah:ticket(R833-F10, "DEFERRED: trigger dispatch — nothing fires Trigger::Tag, and a dispatcher needs a build-storm guard designed in before it ships")
 //! @yah:at(2026-08-29T20:54:08Z)
-//! @yah:status(open)
 //! @yah:assignee(agent:bundle-anthropic-ashguard)
 //! @yah:phase(P4)
 //! @yah:parent(R833)
@@ -97,8 +98,9 @@ pub fn new_run_id() -> QedRunId {
 /// What can cause a pipeline to start.
 ///
 /// Triggers are *declared* in the pipeline TOML but *dispatched* by the appropriate
-/// scheduler — qed has no polling daemon. Tag triggers are fired by the GHA shim (or a
-/// yubaba git-mirror hook); schedule triggers are fired by almanac; manual is the default.
+/// scheduler — qed has no polling daemon. Tag and Path triggers are push-driven: a
+/// push hook builds a [`PushEvent`] and asks [`Trigger::fires_on_push`]. Schedule
+/// triggers are fired by almanac; manual is the default.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
@@ -111,6 +113,87 @@ pub enum Trigger {
     Schedule { cron: String },
     /// Another pipeline completed with the given status, chained by qed outcomes.
     Pipeline { id: String, status: RunStatus },
+    /// A git push changed at least one repo-relative path matching any of these
+    /// globs (R827-F1). Fired by the same push hook as [`Trigger::Tag`] — see
+    /// [`Trigger::fires_on_push`] for the matching contract. `*` stays inside one
+    /// path segment and `**` crosses them, so `web/*/package.json` and
+    /// `**/ATTRIBUTION.md` mean what they read as.
+    Path { globs: Vec<String> },
+}
+
+/// What one git push did, as a push-driven dispatcher sees it: the tags it
+/// created and the repo-relative paths its commits changed. The input to
+/// [`Trigger::fires_on_push`].
+///
+/// @yah:ticket(R827-F2, "Push dispatcher — fire Tag/Path pipeline triggers from a real git push")
+/// @yah:at(2026-10-08T06:43:51Z)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
+/// @yah:parent(R827)
+/// @yah:next("Nothing in the tree dispatches Trigger::Tag or Trigger::Path today (grepped app/ crates/ oss/ 2026-10-07: only export.rs reads pipeline.triggers). The old types.rs doc named 'the GHA shim or a yubaba git-mirror hook' — the shim is retired (R605) and the hook was never built. This ticket builds the host.")
+/// @yah:next("Contract is done (R827-F1): build a PushEvent { tags, changed_paths } per push and fire every loaded pipeline where any trigger.fires_on_push(&event). changed_paths = `git diff --name-only <old>..<new>` per updated ref; new tags from the ref updates.")
+/// @yah:next("Decide the host: camp-service watching the camp repo's refs (local commits/pushes, no network) vs a post-receive on a mirror remote. Camp-local is the defensible default — it needs no fleet piece and covers the noisetable consumer.")
+/// @yah:next("REVERSE EDGE (noisetable R660-S6): once this fires for real, in ~/ss/noisetable replace the Schedule{cron} '15 4 * * *' interim in .yah/qed/third-party-notices.toml (comment lines 18-29) with a Path trigger over Cargo.lock, web/*/package.json and the ATTRIBUTION.md files, then close R660-S6. Do NOT flip it before this ships — a Path trigger with no dispatcher never fires, which is a regression from the nightly.")
+/// @yah:depends_on(R827-F1)
+/// @yah:gotcha("PARKED by operator 2026-10-07 (ask_user F4344, answer 'Park F2'): the dispatcher stays unbuilt for now. Do not pick this up without a fresh operator go-ahead on the host (camp ref watcher vs remote push hook).")
+/// @yah:blocked_on(operator)
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PushEvent {
+    pub tags: Vec<String>,
+    pub changed_paths: Vec<String>,
+}
+
+/// An invalid glob in a [`Trigger::Tag`] pattern or [`Trigger::Path`] glob list.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum TriggerError {
+    #[error("path trigger declares no globs — it could never fire")]
+    EmptyPathGlobs,
+    #[error("invalid glob `{glob}`: {reason}")]
+    BadGlob { glob: String, reason: String },
+}
+
+impl Trigger {
+    /// Load-time check: every glob compiles, and a path trigger has at least
+    /// one. A bad glob would otherwise surface as a pipeline that silently never
+    /// fires, which reads exactly like "nothing changed".
+    pub fn validate(&self) -> Result<(), TriggerError> {
+        match self {
+            Trigger::Tag { pattern } => compile_glob(pattern).map(drop),
+            Trigger::Path { globs } if globs.is_empty() => Err(TriggerError::EmptyPathGlobs),
+            Trigger::Path { globs } => globs.iter().try_for_each(|g| compile_glob(g).map(drop)),
+            Trigger::Manual | Trigger::Schedule { .. } | Trigger::Pipeline { .. } => Ok(()),
+        }
+    }
+
+    /// Does `push` fire this trigger? `Tag` fires when any pushed tag matches
+    /// its pattern; `Path` when any changed path matches any glob. A pipeline
+    /// carrying both fires on EITHER — triggers are alternatives, never ANDed.
+    /// Non-push triggers never fire here. An uncompilable glob matches nothing;
+    /// [`Trigger::validate`] is what refuses it at load.
+    pub fn fires_on_push(&self, push: &PushEvent) -> bool {
+        let any_match = |glob: &str, candidates: &[String]| {
+            compile_glob(glob)
+                .map(|p| candidates.iter().any(|c| p.matches_with(c, GLOB_OPTS)))
+                .unwrap_or(false)
+        };
+        match self {
+            Trigger::Tag { pattern } => any_match(pattern, &push.tags),
+            Trigger::Path { globs } => globs.iter().any(|g| any_match(g, &push.changed_paths)),
+            Trigger::Manual | Trigger::Schedule { .. } | Trigger::Pipeline { .. } => false,
+        }
+    }
+}
+
+const GLOB_OPTS: glob::MatchOptions = glob::MatchOptions {
+    case_sensitive: true,
+    require_literal_separator: true,
+    require_literal_leading_dot: false,
+};
+
+fn compile_glob(glob: &str) -> Result<glob::Pattern, TriggerError> {
+    glob::Pattern::new(glob).map_err(|e| TriggerError::BadGlob {
+        glob: glob.to_string(),
+        reason: e.msg.to_string(),
+    })
 }
 
 /// Which *class of host* a recipe is allowed to run on (W155 principle 2). The
@@ -1197,6 +1280,20 @@ pub struct QedStep {
     /// second way to say "this runs in the background".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub participant: Option<String>,
+    /// Pin this one step to a named fleet machine (R918-T6) — the declarative,
+    /// per-step form of `--where=node:<name>` (R833-F8).
+    ///
+    /// The run-wide flag forces EVERY step remote, so a recipe that stamps a
+    /// version locally and then builds on one particular box could not be
+    /// expressed: `yah-cli-release-windows` needs its MSVC leg on us-west-002
+    /// (nothing cross-compiles to the MSVC ABI, and the node is a Linux kernel
+    /// whose mesh tags rightly say `os:linux`, so tag inference has no answer)
+    /// while its credential check and stamp stay on the coordinator. A pinned
+    /// step dispatches to exactly this machine, ahead of `--where` in both
+    /// directions — like a node-bound participant, there is no honest local
+    /// fallback for a build that can only happen on that box.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
 }
 
 fn default_enabled() -> bool {
@@ -3367,6 +3464,13 @@ pub struct QedRunLaunch {
     /// The single doc cell the run was narrowed to; `None` ran the whole doc.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cell: Option<String>,
+    /// The inline pipeline the run was sourced from (R636) — JSON form of a
+    /// [`Pipeline`] that was never written to `.yah/qed/`, e.g. a `yah qed
+    /// images build`. Without it a rerun looks the run's pipeline name up in
+    /// the loader, finds nothing, and refuses. Kept as JSON rather than a
+    /// `Pipeline` so this struct stays `Eq`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition: Option<serde_json::Value>,
     /// 0-based index the run started from, dropping the steps before it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from_step: Option<u32>,
@@ -3668,6 +3772,57 @@ pub struct JobRow {
 mod tests {
     use super::*;
 
+    fn push(tags: &[&str], paths: &[&str]) -> PushEvent {
+        PushEvent {
+            tags: tags.iter().map(|s| s.to_string()).collect(),
+            changed_paths: paths.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    /// R827-F1: the matching contract a push dispatcher relies on.
+    #[test]
+    fn path_trigger_matches_changed_paths() {
+        let t = Trigger::Path {
+            globs: vec![
+                "Cargo.lock".into(),
+                "web/*/package.json".into(),
+                "**/ATTRIBUTION.md".into(),
+            ],
+        };
+        assert!(t.fires_on_push(&push(&[], &["Cargo.lock"])));
+        assert!(t.fires_on_push(&push(&[], &["README.md", "web/app/package.json"])));
+        assert!(t.fires_on_push(&push(&[], &["ATTRIBUTION.md"])), "`**/` matches zero dirs");
+        assert!(t.fires_on_push(&push(&[], &["vendor/x/ATTRIBUTION.md"])));
+        // `*` stays within one segment.
+        assert!(!t.fires_on_push(&push(&[], &["web/a/b/package.json"])));
+        assert!(!t.fires_on_push(&push(&[], &["crates/x/Cargo.lock"])));
+        assert!(!t.fires_on_push(&push(&["v1.0.0"], &[])), "a tag is not a path change");
+    }
+
+    #[test]
+    fn tag_trigger_matches_pushed_tags_only() {
+        let t = Trigger::Tag { pattern: "v*.*.*".into() };
+        assert!(t.fires_on_push(&push(&["v0.8.43"], &[])));
+        assert!(!t.fires_on_push(&push(&["nightly"], &["v1.2.3"])));
+        for t in [Trigger::Manual, Trigger::Schedule { cron: "* * * * *".into() }] {
+            assert!(!t.fires_on_push(&push(&["v1.2.3"], &["Cargo.lock"])));
+        }
+    }
+
+    #[test]
+    fn trigger_validate_refuses_bad_globs() {
+        assert_eq!(
+            Trigger::Path { globs: vec![] }.validate(),
+            Err(TriggerError::EmptyPathGlobs)
+        );
+        assert!(matches!(
+            Trigger::Path { globs: vec!["ok".into(), "[bad".into()] }.validate(),
+            Err(TriggerError::BadGlob { glob, .. }) if glob == "[bad"
+        ));
+        assert!(Trigger::Tag { pattern: "v[".into() }.validate().is_err());
+        assert!(Trigger::Path { globs: vec!["**/*.rs".into()] }.validate().is_ok());
+    }
+
     fn one_step(argv: Vec<&str>, env: &[(&str, &str)]) -> Pipeline {
         Pipeline {
             allow_late_operator_block: false,
@@ -3680,6 +3835,7 @@ mod tests {
             steps: vec![QedStep {
                             expect_slow: false,
                             participant: None,
+                            node: None,
                 needs: None,
                 resource: None,
                 inputs: Vec::new(),
@@ -4335,6 +4491,7 @@ checklist = ["Diff reviewed"]
         QedStep {
             expect_slow: false,
             participant: None,
+            node: None,
             needs: None,
             resource: None,
             inputs: Vec::new(),
@@ -4381,6 +4538,7 @@ checklist = ["Diff reviewed"]
         QedStep {
             expect_slow: false,
             participant: None,
+            node: None,
             needs: None,
             resource: None,
             inputs: Vec::new(),
@@ -4427,6 +4585,7 @@ checklist = ["Diff reviewed"]
         QedStep {
             expect_slow: false,
             participant: None,
+            node: None,
             needs: None,
             resource: None,
             inputs: Vec::new(),
@@ -4627,6 +4786,7 @@ checklist = ["Diff reviewed"]
         QedStep {
             expect_slow: false,
             participant: None,
+            node: None,
             needs: None,
             resource: None,
             inputs: Vec::new(),
@@ -5112,6 +5272,7 @@ checklist = ["Diff reviewed"]
         QedStep {
             expect_slow: false,
             participant: None,
+            node: None,
             needs: None,
             resource: None,
             inputs: Vec::new(),

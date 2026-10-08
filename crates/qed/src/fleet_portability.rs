@@ -411,6 +411,7 @@ mod tests {
             needs: None,
             resource: None,
             participant: None,
+            node: None,
         }
     }
 

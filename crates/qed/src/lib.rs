@@ -20,7 +20,6 @@
 //! @arch:see(.yah/docs/working/W296-executable-docs-notebook-cells.md)
 //! @yah:ticket(R577-B5, "desktop-release lost its two Linux matrix rows; the R577-F2 assertion still expects three")
 //! @yah:at(2026-08-12T03:16:57Z)
-//! @yah:status(open)
 //! @yah:assignee(agent:bundle-anthropic-ashguard)
 //! @yah:parent(R577)
 //! @yah:severity(low)
