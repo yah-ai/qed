@@ -76,19 +76,33 @@ pub struct PublishRequest {
     pub artifacts: Vec<ProducedArtifact>,
 }
 
-/// Resolve the release version: `YAH_RELEASE_VERSION` env override (set by the
-/// release tag / GHA), falling back to the version this binary was built at
-/// (`CARGO_PKG_VERSION`, which is the workspace version — `version.workspace`).
+/// Resolve the release version for a run whose workspace is `workspace_root`:
+/// the `YAH_RELEASE_VERSION` env override when set, otherwise the version
+/// declared by the RUN's workspace — `[workspace.package] version`, else the
+/// root `[package] version` — read from `<workspace_root>/Cargo.toml` (walking
+/// upward when that manifest inherits `version.workspace = true`).
 ///
-/// This fallback is safe only where invoking the pipeline at all IS the
-/// deliberate release act (`yah-cli-release`, run by hand to cut a release).
+/// Never the version this binary was compiled at. Under the camp daemon the
+/// runner is routinely a release behind the tree it is building, so
+/// `env!("CARGO_PKG_VERSION")` named the daemon, not the artifacts, and the
+/// v0.8.41 bytes were published over `yah/0.8.40/` (R876-B19). For a
+/// `workspace = "isolated"` run `workspace_root` is the isolated worktree —
+/// the same tree `stamp-build-id` reads in `.yah/qed/yah-cli-release.toml` —
+/// so both derivations name the same version; [`check_stamped_release_version`]
+/// asserts that they do.
+///
+/// Returns `(version, source)`, where `source` describes where the version
+/// came from for refusal messages. An unreadable workspace version is an
+/// error, never a guess.
+///
 /// A pipeline that also serves as a build-only iteration loop must NOT use
 /// this for its publish outcome — see [`resolve_release_version_explicit`]
 /// and `Outcome::Publish::require_explicit_version` (R876-F6).
 ///
 /// @yah:ticket(R876-B19, "yah-cli-release publishes under the camp daemon's COMPILED version, not the tree's — and the build-skew gate cannot see it")
-/// @yah:at(2026-09-21T22:37:55Z)
-/// @yah:assignee(agent:bundle-anthropic-glimmerstone)
+/// @yah:status(review)
+/// @yah:at(2026-10-10T03:43:23Z)
+/// @yah:assignee(agent:bundle-anthropic-ashguard)
 /// @yah:parent(R876)
 /// @yah:severity(high)
 /// @yah:gotcha("MEASURED 2026-09-21, and it was about to publish. `yah qed run yah-cli-release` (no env) submitted to the camp daemon as run 332b5ca3-02fe-4278-b634-f6e31d837261, `executor_build_id: 0.8.40+4c7faa90-dirty`, while the tree is at 0.8.41 (HEAD 782c7cc0 \"release v0.8.41\", `[workspace.package] version = \"0.8.41\"`). Two different answers to \"what version is this\" inside one run: the `stamp-build-id` step reads the isolated worktree's Cargo.toml and stamps 0.8.41 into the tarball (.yah/qed/yah-cli-release.toml:269-272), but the terminal `Outcome::Publish` resolves through `publish::resolve_release_version`, whose fallback is `env!(\"CARGO_PKG_VERSION\")` — the version the RUNNER BINARY was compiled at, i.e. the daemon's 0.8.40. So the run would have uploaded 0.8.41 binaries to `yah/0.8.40/`, OVERWRITTEN the live `yah/0.8.40/manifest.json`, and re-pointed `yah/latest.json` at a \"0.8.40\" that is really 0.8.41. Cancelled 11s in, during `build-aarch64-apple-darwin`; the publish is a terminal outcome so nothing reached R2 (run status `cancelled`, verified).")
@@ -96,10 +110,85 @@ pub struct PublishRequest {
 /// @yah:next("WORKAROUND IN USE TODAY, so nobody re-discovers this the hard way: `YAH_RELEASE_VERSION=<ver> yah qed run yah-cli-release --in-process`. `run_one_in_process` (app/yah/cli/src/qed.rs:1363) wires the real `CloudReleasePublisher`, so this publishes for real; the cost is that the run is absent from `yah qed list` and the desktop QED tab.")
 /// @yah:next("THE FIX IS ONE OF THREE, AND THE DOC COMMENT IS WRONG EITHER WAY. `resolve_release_version`'s own docs call the fallback \"the version this binary was built at (CARGO_PKG_VERSION, which is the workspace version — version.workspace)\", and that parenthetical is only true when the runner IS the tree's build. Under the camp daemon it is never reliably true. Options: (a) make `yah-cli-release` set `require_explicit_version = true` like mesofact-musl and have the recipe carry the version as a `--param`, which also gives `yah qed run` a way to state a version without `--in-process`; (b) resolve the fallback from the RUN's workspace Cargo.toml rather than from `env!`, so it agrees with `stamp-build-id`; (c) refuse when the two disagree. (b) is the one that makes the existing doc comment true. Whatever lands, add the assertion that `stamp-build-id`'s `release_version` output and the publish outcome's version are the same string — they are two independent derivations of one fact and nothing currently compares them.")
 /// @yah:gotcha("THIS IS NOT A NEAR-MISS. IT ALREADY FIRED, ON THE v0.8.41 RELEASE, AND THE CDN IS WRONG RIGHT NOW. The wizard run 29a6b2e5's `publish-cli` child (run d26bf2cf-b5aa-43a1-9aea-af1402eec08f, `yah-cli-release`, all steps green, completed 2026-09-21T19:17:19Z) published under the daemon's 0.8.40. PROVEN BY RUNNING THE ARTIFACT, not inferred from timestamps: `curl cdn.yah.dev/yah/latest.json` reports version 0.8.40, pub_date 2026-09-21T19:16:55Z; downloading the `aarch64-apple-darwin` tarball it names and executing the binary prints `yah 0.8.41+782c7cc0` — 782c7cc0 being HEAD, the \"release v0.8.41\" commit. So `yah/0.8.40/manifest.json` (uploaded immutable) AND the four `yah/0.8.40/<triple>/` tarballs were OVERWRITTEN with 0.8.41 bytes, and `curl yah.dev/install.sh | sh` has been installing 0.8.41 labelled 0.8.40 since 19:16Z. SECOND, SEPARATE HARM: the genuine 0.8.40 artifacts are gone from the CDN — this destroyed a published release's bytes, not just mislabelled new ones. Recovering them means rebuilding from the v0.8.40 tag; whether that is worth doing is an operator call.")
-/// @yah:next("THE 0.8.41 CLI IS STILL UNPUBLISHED, AND THE OPERATOR HAS RULED ON THE DAMAGE. `yah/0.8.41/manifest.json` is 404 and `yah/latest.json` still serves 0.8.41 bytes labelled 0.8.40. The corrective run `YAH_RELEASE_VERSION=0.8.41 yah qed run yah-cli-release --in-process` was attempted 2026-09-21 22:38Z and FAILED at its last step: the three local legs (aarch64/x86_64-apple-darwin, aarch64-unknown-linux-musl) built clean in 16m51s, then `build-x86_64-unknown-linux-musl` — which resolves as `Offload (needs x86_64-unknown-linux-musl runner)` to us-west-003 — died with repeated `state poll error: transport error contacting yubaba` and `lost: container exited but no exit code available`. Most likely cause is the CAMP END, not the worker: the operator was on a cellular link at the time and us-west-003 had completed the mesofact-musl x86 leg cleanly ~30 min earlier. Retry the same command on a good connection. Nothing published on the failed run — the publish is an on_success terminal outcome and the pointer was verified unchanged afterwards. SEPARATELY, the operator's call on the overwritten 0.8.40 prefix (2026-09-21) is LEAVE IT, FIX FORWARD ONLY: do not rebuild 0.8.40 from its tag. `yah/0.8.40/` holds 0.8.41 bytes permanently; this gotcha is the record of why.")
 /// @yah:next("A FOURTH FIX OPTION, WEIGHED AND DELIBERATELY NOT TAKEN — it needs an operator call because the cost is one they just felt. The wizard's `publish-cli` step is `kind = \"sub-pipeline\"`, so it runs inside the daemon and inherits the daemon's compiled version; converting it to an argv step running `yah qed run yah-cli-release --in-process` with the version exported would fix it entirely inside `.yah/qed/yah-release-wizard.toml` — the same shape R560-B16 used for `publish-mesofact-musl`, and isolation survives because yah-cli-release declares `workspace = \"isolated\"` itself. The cost is that the step then vanishes from `yah qed list` and the desktop QED tab. That is not theoretical: during this session the operator watched two `--in-process` runs and asked whether they were running at all, because the QED tab showed nothing. Making a SECOND publish leg invisible buys a version fix at a real observability price, so options (a)-(c) above are likely better.")
-pub fn resolve_release_version() -> String {
-    resolve_release_version_explicit().unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
+/// @yah:gotcha("OPERATOR RULING 2026-09-21 (carried over from a removed next-entry that said 0.8.41 was unpublished, which is false as of 2026-10-09: cdn.yah.dev/yah/0.8.41/manifest.json is 200 and yah/latest.json serves 0.8.43): the overwritten yah/0.8.40/ prefix is LEAVE IT, FIX FORWARD ONLY. Do not rebuild 0.8.40 from its tag; yah/0.8.40/ holds 0.8.41 bytes permanently.")
+/// @yah:handoff("2026-10-09 courier Ashguard: implemented option (b) + cross-check. oss/qed/crates/qed/src/publish.rs: resolve_release_version(workspace_root: &Path) -> Result<(version, source), String> replaces the env!(CARGO_PKG_VERSION) fallback. It returns YAH_RELEASE_VERSION if set, else [workspace.package] version or the string [package] version from <root>/Cargo.toml, walking upward past version.workspace=true. If none is found it errors and never guesses. New pub STAMPED_RELEASE_VERSION_OUTPUT = release_version and check_stamped_release_version(publish_version, source, step_outputs), which refuses on any step whose release_version output differs and names both values and both sources. Doc comment rewritten. resolve_release_version_explicit and require_explicit_version semantics are unchanged.; oss/qed/crates/qed/src/runner.rs dispatch_terminal_outcomes now takes step_outputs (run_inner passes step_context at all 3 call sites; resume_terminal_publish_for_remote_step passes an empty map because step outputs do not survive a daemon restart, so a resumed publish has no cross-check). It lazily resolves the version from positioned_workspace, else camp_root, else cwd. For Publish it then runs check_stamped_release_version before outcome_dispatcher.publish, so a mismatch errors with no upload. Outcome::Provider uses the same resolver. The package-native-tarball manifest version now resolves from camp_root (resolve_camp_root) and fails the step if it cannot. No other caller exists in the tree (grep app/ crates/ oss/ xtask/), so app/yah/cli/src/qed.rs needed no change.; Tests: publish.rs gains resolve_release_version_reads_run_workspace_not_runner_binary (case a, plus the version.workspace walk-up) and check_stamped_release_version_refuses_mismatch; resolve_release_version_prefers_env was rewritten to use a temp workspace. runner.rs gains publish_refuses_when_stamped_release_version_disagrees (case b: run errors, dispatcher records no publish) and publish_explicit_version_wins_when_it_agrees_with_stamp (case c). Fixtures init_git_repo, stage_native_tarball_camp and resume_publishes_retrieved_remote_artifact now write a Cargo.toml with [workspace.package] version, because a run with no workspace version now refuses by design. Nine existing tests failed without that.")
+/// @yah:verify("cd oss/qed && cargo test -p yah-qed --lib -> 1053 passed, 0 failed, 1 ignored (/tmp/r876b19-after4.log, EXIT=0). Baseline was NOT cleanly captured: the pre-edit run (/tmp/r876b19-base1.log) compiled mid-edit and failed E0425. The inferred baseline is 1049 (1053 minus 4 net-new tests); it was not measured. The root yah workspace was not rebuilt, and it has no callers of the changed signature per grep.")
+/// @yah:handoff("Leader re-verified 2026-10-09 (courier @Ashguard:dragon, session:1e732ba0). resolve_release_version(root) now resolves YAH_RELEASE_VERSION, else the RUN's workspace Cargo.toml ([workspace.package] or [package] version, walking up). The env!(CARGO_PKG_VERSION) fallback is deleted. runner.rs dispatch_terminal_outcomes now takes step_outputs, and check_stamped_release_version refuses the publish before any upload when a step's release_version output disagrees, naming both values and sources. The native-tarball manifest also resolves from camp_root. No callers outside the qed crate (grepped app/, crates/, oss/yubaba).")
+/// @yah:verify("Leader re-run: cargo test --manifest-path oss/qed/Cargo.toml -p yah-qed --lib = 1053 passed / 0 failed / 1 ignored (includes publish_refuses_when_stamped_release_version_disagrees and publish_explicit_version_wins_when_it_agrees_with_stamp).")
+pub fn resolve_release_version(
+    workspace_root: &std::path::Path,
+) -> Result<(String, String), String> {
+    if let Some(v) = resolve_release_version_explicit() {
+        return Ok((v, "YAH_RELEASE_VERSION".to_string()));
+    }
+    let manifest = workspace_version_manifest(workspace_root)?;
+    Ok((manifest.1, manifest.0.display().to_string()))
+}
+
+/// Find the Cargo.toml that declares a concrete version for the workspace at
+/// `root`: `[workspace.package] version` or a string `[package] version`.
+/// A `version.workspace = true` package walks upward to its workspace root.
+fn workspace_version_manifest(
+    root: &std::path::Path,
+) -> Result<(std::path::PathBuf, String), String> {
+    let mut dir = Some(root);
+    while let Some(d) = dir {
+        let path = d.join("Cargo.toml");
+        if path.is_file() {
+            let text = std::fs::read_to_string(&path)
+                .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+            let doc: toml::Value = toml::from_str(&text)
+                .map_err(|e| format!("cannot parse {}: {e}", path.display()))?;
+            if let Some(v) = doc
+                .get("workspace")
+                .and_then(|w| w.get("package"))
+                .and_then(|p| p.get("version"))
+                .and_then(|v| v.as_str())
+            {
+                return Ok((path, v.to_string()));
+            }
+            if let Some(v) = doc
+                .get("package")
+                .and_then(|p| p.get("version"))
+                .and_then(|v| v.as_str())
+            {
+                return Ok((path, v.to_string()));
+            }
+        }
+        dir = d.parent();
+    }
+    Err(format!(
+        "no workspace version found at or above {} (looked for `[workspace.package] version` / `[package] version` in Cargo.toml) — refusing to guess a release version",
+        root.display()
+    ))
+}
+
+/// The name of the step output `stamp-build-id` writes the version it stamped
+/// into the artifacts under.
+pub const STAMPED_RELEASE_VERSION_OUTPUT: &str = "release_version";
+
+/// R876-B19 cross-check: the version a publish is about to use and the
+/// version a step stamped into the artifacts (`release_version` output) are
+/// two independent derivations of one fact. Refuse when any stamped value
+/// disagrees — publishing tree bytes under another label is the bug.
+pub fn check_stamped_release_version(
+    publish_version: &str,
+    publish_source: &str,
+    step_outputs: &std::collections::HashMap<String, std::collections::HashMap<String, String>>,
+) -> Result<(), String> {
+    let mut steps: Vec<_> = step_outputs.iter().collect();
+    steps.sort_by(|a, b| a.0.cmp(b.0));
+    for (step, outputs) in steps {
+        if let Some(stamped) = outputs.get(STAMPED_RELEASE_VERSION_OUTPUT) {
+            if stamped.trim() != publish_version {
+                return Err(format!(
+                    "refusing to publish: version mismatch — publish would use `{publish_version}` (from {publish_source}) but step `{step}` stamped `{stamped}` into the artifacts (its `{STAMPED_RELEASE_VERSION_OUTPUT}` output)"
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The same `YAH_RELEASE_VERSION` override, without the workspace-version
@@ -2286,11 +2375,62 @@ mod tests {
     #[test]
     fn resolve_release_version_prefers_env() {
         let _guard = RELEASE_VERSION_ENV_LOCK.lock().unwrap();
+        let dir = tempfile::TempDir::new().unwrap();
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            "[workspace.package]\nversion = \"1.2.3\"\n",
+        )
+        .unwrap();
         std::env::set_var("YAH_RELEASE_VERSION", "9.9.9");
-        assert_eq!(resolve_release_version(), "9.9.9");
+        assert_eq!(resolve_release_version(dir.path()).unwrap().0, "9.9.9");
         std::env::remove_var("YAH_RELEASE_VERSION");
-        // Falls back to the compiled crate version (non-empty).
-        assert!(!resolve_release_version().is_empty());
+        assert_eq!(resolve_release_version(dir.path()).unwrap().0, "1.2.3");
+    }
+
+    /// R876-B19 (a): with no override, the version comes from the RUN's
+    /// workspace Cargo.toml — never the runner's compiled CARGO_PKG_VERSION.
+    #[test]
+    fn resolve_release_version_reads_run_workspace_not_runner_binary() {
+        let _guard = RELEASE_VERSION_ENV_LOCK.lock().unwrap();
+        std::env::remove_var("YAH_RELEASE_VERSION");
+        let dir = tempfile::TempDir::new().unwrap();
+        let tree_version = "42.0.7";
+        assert_ne!(tree_version, env!("CARGO_PKG_VERSION"));
+        std::fs::write(
+            dir.path().join("Cargo.toml"),
+            format!("[workspace]\nmembers = []\n[workspace.package]\nversion = \"{tree_version}\"\n"),
+        )
+        .unwrap();
+        let (v, src) = resolve_release_version(dir.path()).unwrap();
+        assert_eq!(v, tree_version);
+        assert!(src.ends_with("Cargo.toml"), "{src}");
+
+        // A member manifest inheriting `version.workspace = true` walks up.
+        let member = dir.path().join("crates/m");
+        std::fs::create_dir_all(&member).unwrap();
+        std::fs::write(
+            member.join("Cargo.toml"),
+            "[package]\nname = \"m\"\nversion.workspace = true\n",
+        )
+        .unwrap();
+        assert_eq!(resolve_release_version(&member).unwrap().0, tree_version);
+    }
+
+    #[test]
+    fn check_stamped_release_version_refuses_mismatch() {
+        let mut outputs = std::collections::HashMap::new();
+        outputs.insert(
+            "stamp-build-id".to_string(),
+            std::collections::HashMap::from([(
+                STAMPED_RELEASE_VERSION_OUTPUT.to_string(),
+                "0.8.41".to_string(),
+            )]),
+        );
+        let err = check_stamped_release_version("0.8.40", "YAH_RELEASE_VERSION", &outputs)
+            .unwrap_err();
+        assert!(err.contains("0.8.40") && err.contains("0.8.41"), "{err}");
+        assert!(err.contains("stamp-build-id") && err.contains("YAH_RELEASE_VERSION"), "{err}");
+        assert!(check_stamped_release_version("0.8.41", "x", &outputs).is_ok());
     }
 
     /// R876-F6 — the invariant the whole ticket exists to land: with no

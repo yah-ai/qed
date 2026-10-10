@@ -4249,10 +4249,10 @@ impl PipelineRunner {
         // replay this exact chain for a remote run that reached terminal
         // Success while the daemon was down.
         if work_status == RunStatus::Success {
-            self.dispatch_terminal_outcomes(&self.pipeline.on_success, &produced)
+            self.dispatch_terminal_outcomes(&self.pipeline.on_success, &produced, &step_context)
                 .await?;
         } else {
-            self.dispatch_terminal_outcomes(&self.pipeline.on_fail, &produced)
+            self.dispatch_terminal_outcomes(&self.pipeline.on_fail, &produced, &step_context)
                 .await?;
             // R560-F15: a FAILED run still ships the legs that succeeded, but
             // only through the outcomes that declared `per_leg`, and only with
@@ -4266,7 +4266,7 @@ impl PipelineRunner {
                     .filter(|o| matches!(o, Outcome::Publish { per_leg: true, .. }))
                     .cloned()
                     .collect();
-                self.dispatch_terminal_outcomes(&per_leg, &whole_leg_produced)
+                self.dispatch_terminal_outcomes(&per_leg, &whole_leg_produced, &step_context)
                     .await?;
             }
         }
@@ -4712,6 +4712,10 @@ impl PipelineRunner {
         &self,
         outcomes: &[Outcome],
         produced: &[ProducedArtifact],
+        step_outputs: &std::collections::HashMap<
+            String,
+            std::collections::HashMap<String, String>,
+        >,
     ) -> Result<(), RunnerError> {
 
         // Terminal outcomes operate on the run's produced artifacts, resolved
@@ -4737,7 +4741,6 @@ impl PipelineRunner {
         // Deliberately NOT `resolve_camp_root()`: that falls back to the
         // process CWD. Keep the "no root at all ⇒ leave the path alone" arm
         // exactly as it was and only change WHICH root wins when there is one.
-        let version = crate::publish::resolve_release_version();
         let workspace_root = self
             .positioned_workspace
             .get()
@@ -4759,6 +4762,21 @@ impl PipelineRunner {
                 .collect()
         } else {
             produced.to_vec()
+        };
+
+        // R876-B19: the release version comes from the RUN's workspace (the
+        // isolated worktree when isolated) or the explicit override — never
+        // the runner's compiled version, and only when an outcome needs it.
+        let resolve_version = || -> Result<(String, String), RunnerError> {
+            let root = match workspace_root {
+                Some(r) => r.clone(),
+                None => std::env::current_dir().map_err(|e| {
+                    RunnerError::InvalidConfig(format!(
+                        "cannot resolve release version: no workspace root and no cwd: {e}"
+                    ))
+                })?,
+            };
+            crate::publish::resolve_release_version(&root).map_err(RunnerError::InvalidConfig)
         };
 
         for outcome in outcomes {
@@ -4796,9 +4814,9 @@ impl PipelineRunner {
                     // resolves the workspace-version fallback into a
                     // publishable number. Refuse loudly rather than silently
                     // skipping, so an operator scanning run output sees why.
-                    let publish_version = if *require_explicit_version {
+                    let (publish_version, publish_source) = if *require_explicit_version {
                         match crate::publish::resolve_release_version_explicit() {
-                            Some(v) => v,
+                            Some(v) => (v, "YAH_RELEASE_VERSION".to_string()),
                             None => {
                                 tracing::warn!(
                                     run_id = %self.run_id,
@@ -4808,8 +4826,16 @@ impl PipelineRunner {
                             }
                         }
                     } else {
-                        version.clone()
+                        resolve_version()?
                     };
+                    // R876-B19: the stamped `release_version` output and the
+                    // publish version must be the same string, before any upload.
+                    crate::publish::check_stamped_release_version(
+                        &publish_version,
+                        &publish_source,
+                        step_outputs,
+                    )
+                    .map_err(RunnerError::InvalidConfig)?;
                     let req = crate::publish::PublishRequest {
                         provider: provider.clone(),
                         bucket: bucket.clone(),
@@ -4839,6 +4865,7 @@ impl PipelineRunner {
                     }
                     // Per-dispatch scratch dir for materialized credentials /
                     // generated artifacts; dropped (and cleaned) at arm exit.
+                    let (version, _) = resolve_version()?;
                     let work = tempfile::tempdir()?;
                     let report = {
                         let ctx = crate::provider::ProviderContext {
@@ -4924,8 +4951,14 @@ impl PipelineRunner {
         // and may already be reaped", and destroying the record would remove
         // the operator's last chance at those bytes.
         self.reap_remote_workload(forge_id, &step.name).await;
-        self.dispatch_terminal_outcomes(&self.pipeline.on_success, &produced)
-            .await
+        // The resumed run's step outputs did not survive the daemon restart,
+        // so there is no stamped version to cross-check here.
+        self.dispatch_terminal_outcomes(
+            &self.pipeline.on_success,
+            &produced,
+            &std::collections::HashMap::new(),
+        )
+        .await
     }
 
     /// Resolve, configure, and run a SubPipeline child step (R488-F2).
@@ -8509,7 +8542,12 @@ impl PipelineRunner {
 
         let manifest = crate::native::NativeTarballManifest {
             name: entry.name.clone(),
-            version: crate::publish::resolve_release_version(),
+            version: crate::publish::resolve_release_version(&camp_root)
+                .map_err(|msg| RunnerError::StepFailed {
+                    step: step.name.clone(),
+                    msg,
+                })?
+                .0,
             triple: triple.clone(),
             binary: format!("bin/{bin_basename}"),
             description: if entry.description.is_empty() {
@@ -11580,6 +11618,67 @@ mod tests {
         );
     }
 
+    fn stamping_publish_pipeline(stamped: &str) -> Pipeline {
+        pipeline_with_outcomes(
+            vec![Outcome::Publish {
+                provider: "r2".into(),
+                bucket: "yah-dev".into(),
+                prefix: None,
+                base_url: None,
+                require_explicit_version: false,
+                per_leg: false,
+            }],
+            vec![],
+            vec![
+                "sh".to_string(),
+                "-c".to_string(),
+                format!("echo release_version={stamped} >> \"$YAH_OUTPUTS\""),
+            ],
+        )
+    }
+
+    /// R876-B19 (b): a step stamped one version into the artifacts and the
+    /// publish resolved another — refuse before any upload, naming both.
+    #[tokio::test]
+    async fn publish_refuses_when_stamped_release_version_disagrees() {
+        let _guard = RELEASE_VERSION_ENV_LOCK.lock().unwrap();
+        std::env::set_var("YAH_RELEASE_VERSION", "0.8.40");
+        let dispatcher = RecordingDispatcher::new();
+        let runner = PipelineRunner::new_with_dispatcher(
+            stamping_publish_pipeline("0.8.41"),
+            dispatcher.clone(),
+        );
+        let result = runner.run().await;
+        std::env::remove_var("YAH_RELEASE_VERSION");
+
+        let err = result.expect_err("a version mismatch must fail the publish").to_string();
+        assert!(err.contains("0.8.40") && err.contains("0.8.41"), "{err}");
+        assert!(err.contains("YAH_RELEASE_VERSION") && err.contains("step-1"), "{err}");
+        assert!(
+            dispatcher.recorded().is_empty(),
+            "no publish call may reach the dispatcher on a version mismatch"
+        );
+    }
+
+    /// R876-B19 (c): an explicit override that agrees with the stamped
+    /// version still wins and publishes under exactly that version.
+    #[tokio::test]
+    async fn publish_explicit_version_wins_when_it_agrees_with_stamp() {
+        let _guard = RELEASE_VERSION_ENV_LOCK.lock().unwrap();
+        std::env::set_var("YAH_RELEASE_VERSION", "5.6.7");
+        let dispatcher = RecordingDispatcher::new();
+        let runner = PipelineRunner::new_with_dispatcher(
+            stamping_publish_pipeline("5.6.7"),
+            dispatcher.clone(),
+        );
+        let meta = runner.run().await.unwrap();
+        std::env::remove_var("YAH_RELEASE_VERSION");
+
+        assert_eq!(meta.status, RunStatus::Success);
+        assert_eq!(dispatcher.recorded(), vec!["publish:yah-dev:0"]);
+        assert_eq!(*dispatcher.publish_versions.lock().unwrap(), vec!["5.6.7".to_string()]);
+    }
+
     /// R603-T4: `resume_terminal_publish_for_remote_step` replays the terminal
     /// publish for a remote step that finished while the daemon was down. It
     /// retrieves the step's `produces` off the (scripted) build-worker and fires
@@ -11591,6 +11690,7 @@ mod tests {
     async fn resume_publishes_retrieved_remote_artifact() {
         let dir = TempDir::new().unwrap();
         let camp = TempDir::new().unwrap();
+        std::fs::write(camp.path().join("Cargo.toml"), "[workspace.package]\nversion = \"0.0.1\"\n").unwrap();
         let scryer = make_scryer(&dir);
 
         let container_path = "/tmp/out/librusty_v8-x86_64-unknown-linux-musl.tar.gz";
@@ -15414,6 +15514,8 @@ description = "smoke test image"
 
     fn stage_native_tarball_camp(image_name: &str, produces: &str, binary_rel: &str) -> TempDir {
         let camp = TempDir::new().unwrap();
+        // R876-B19: the release version is read from the run's workspace.
+        std::fs::write(camp.path().join("Cargo.toml"), "[workspace.package]\nversion = \"0.0.1\"\n").unwrap();
         let images = camp.path().join(".yah/qed/images");
         std::fs::create_dir_all(&images).unwrap();
         std::fs::write(
@@ -16722,6 +16824,8 @@ produces    = ["native-tarball"]
         git(&["config", "user.email", "t@t.t"]);
         git(&["config", "user.name", "t"]);
         std::fs::write(tmp.path().join("f.txt"), "v1").unwrap();
+        // R876-B19: the release version is read from the run's workspace.
+        std::fs::write(tmp.path().join("Cargo.toml"), "[workspace.package]\nversion = \"0.0.1\"\n").unwrap();
         git(&["add", "."]);
         git(&["commit", "-m", "init"]);
         tmp
